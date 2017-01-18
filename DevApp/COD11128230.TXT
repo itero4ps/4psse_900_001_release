@@ -1,0 +1,712 @@
+OBJECT Codeunit 11128230 Employee Notification Mgt.
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PSSE;
+  }
+  PROPERTIES
+  {
+    TableNo=472;
+    OnRun=BEGIN
+            //>>IME302 ITERO.WG
+            CompanyInfo.GET;
+            CASE CompanyInfo."Country/Region Code" OF
+              'NO' : GLOBALLANGUAGE(1044);
+              'SE' : GLOBALLANGUAGE(1054);
+              'DK' : GLOBALLANGUAGE(1030);
+              'FI' : GLOBALLANGUAGE(1035);
+            END;
+            //<<IME302
+
+            CASE "Parameter String" OF
+              'TIMESHEET RELEASE':
+                TimesheetReleaseNotification;
+              'TIMESHEET DENIED':
+                TimesheetDeniedNotification;
+              'TIMESHEET CHANGED':
+                TimesheetChangedNotification;
+              'OPEN CONSENT LINES':
+                OpenConsentLinesNotification;
+              'SENDMAIL':
+                SendEMailsFromQueue;
+              ELSE
+                FIELDERROR("Parameter String");
+            END;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      HumanResourcesSetup@1100294004 : Record 5218;
+      JobsSetup@1100294003 : Record 315;
+      CompanyInfo@1100294002 : Record 79;
+      HoursConsentManagement@1100294000 : Codeunit 11012206;
+      Text000@1100294005 : TextConst 'ENU=You have %1 %2s waiting for consent.\View %2s?';
+      NotificationType@1100294001 : 'Popup,E-Mail';
+      Text001@1100294006 : TextConst 'ENU=You have %1 %2s that should be released.\View %2s?';
+      Text002@1100294007 : TextConst 'ENU=You have %1 %2s that were denied.\View %2s?';
+      Text003@1100294008 : TextConst 'ENU=You have %1 %2s that were changed.\View %2s?';
+      Text004@1100294009 : TextConst 'ENU=Release hour accounting';
+      Text005@1100294010 : TextConst 'ENU=Hour accounting (lines) denied by consenter';
+      Text006@1100294011 : TextConst 'ENU=Hour accounting changed by consenter';
+      Text007@1100294012 : TextConst 'ENU=Open hour consent lines';
+      recRef@1100285000 : RecordRef;
+
+    PROCEDURE SendEMailsFromQueue@1100294010();
+    VAR
+      EmployeeEMailQueue@1100294000 : Record 11128235;
+      EmployeeEMailQueueTemp@1100294001 : TEMPORARY Record 11128235;
+    BEGIN
+      EmployeeEMailQueue.SETCURRENTKEY(Status);
+      EmployeeEMailQueue.SETRANGE(Status,EmployeeEMailQueue.Status::Created);
+      IF EmployeeEMailQueue.FINDSET THEN
+        REPEAT
+          IF CODEUNIT.RUN(CODEUNIT::"Employee E-Mail Sender",EmployeeEMailQueue) THEN BEGIN
+            EmployeeEMailQueueTemp := EmployeeEMailQueue;
+            EmployeeEMailQueueTemp.VALIDATE(Status,EmployeeEMailQueueTemp.Status::Sent);
+            EmployeeEMailQueueTemp.INSERT;
+          END ELSE BEGIN
+            EmployeeEMailQueueTemp := EmployeeEMailQueue;
+            EmployeeEMailQueueTemp.VALIDATE(Status,EmployeeEMailQueueTemp.Status::Error);
+            EmployeeEMailQueueTemp."Error Text" := GETLASTERRORTEXT;
+            EmployeeEMailQueueTemp.INSERT;
+          END;
+        UNTIL EmployeeEMailQueue.NEXT = 0;
+
+      IF EmployeeEMailQueueTemp.FINDSET THEN
+        REPEAT
+          EmployeeEMailQueue := EmployeeEMailQueueTemp;
+          EmployeeEMailQueue.MODIFY;
+        UNTIL EmployeeEMailQueueTemp.NEXT = 0;
+    END;
+
+    PROCEDURE CheckShowPopups@1100294004();
+    BEGIN
+      COMMIT;
+      TimesheetReleasePopup;
+      COMMIT;
+      TimesheetDeniedPopup;
+      COMMIT;
+      TimesheetChangedPopup;
+      COMMIT;
+    END;
+
+    PROCEDURE TimesheetReleasePopup@1100294007();
+    VAR
+      UserSetup@1100294000 : Record 91;
+      Employee@1100294001 : Record 5200;
+      HourAccounting@1100294002 : Record 11012038;
+    BEGIN
+      GetJobsSetup;
+      IF NOT JobsSetup."Show Popup Release Hours" THEN
+        EXIT;
+
+      IF UserSetup.GET(USERID) THEN
+        IF FindOpenHourAcc(HourAccounting,UserSetup."Employee No.") THEN
+          IF CONFIRM(STRSUBSTNO(Text001,HourAccounting.COUNT,HourAccounting.TABLECAPTION,TRUE)) THEN
+            ShowHourAccounting(HourAccounting);
+    END;
+
+    PROCEDURE TimesheetReleaseNotification@1100294000();
+    VAR
+      HourAccounting@1100294001 : Record 11012038;
+      UserSetup@1100294000 : Record 91;
+      EMailOnBehalf@1100294002 : Record 11012768;
+      EMailBodyText@1100294003 : Record 11012769;
+      MailEntryNo@1100285500 : Integer;
+    BEGIN
+      UserSetup.SETFILTER("Employee No.",'<>%1', '');
+      IF UserSetup.FINDSET THEN
+        REPEAT
+          IF UserSetup."Employee No." <> '' THEN
+            IF FindOpenHourAcc(HourAccounting,UserSetup."Employee No.") THEN BEGIN
+              MailEntryNo :=  //ENH032
+                CreateEMail(
+                  EMailOnBehalf.Usage::"Open Hour Accounting",
+                  GetEmployeeEmail(UserSetup."Employee No."),
+                  Text004,
+                  //GetEmailBodyText(EMailBodyText.Usage::"45",UserSetup."Employee No."),
+                  GetEmailBodyText(EMailBodyText.Usage::"Open Hour Accounting",UserSetup."Employee No.",TRUE),   //WvG 13-10-04
+                  UserSetup."Employee No.");
+              AppendPageLink(MailEntryNo,EMailOnBehalf.Usage::"Open Hour Accounting",UserSetup."Employee No.");//ENH032
+            END;
+        UNTIL UserSetup.NEXT = 0;
+    END;
+
+    PROCEDURE FindOpenHourAcc@1100294011(VAR HourAccounting@1100294002 : Record 11012038;EmployeeNo@1100294003 : Code[20]) : Boolean;
+    BEGIN
+      //>>I035  IME-033
+      CLEAR(HourAccounting);
+      //<<I035
+      HourAccounting.RESET;
+      HourAccounting.SETFILTER(Year,'<=%1',DATE2DMY(WORKDATE,3));
+      HourAccounting.SETFILTER(Week,'<%1',DATE2DWY(WORKDATE,2));
+      HourAccounting.SETRANGE("Employee No.",EmployeeNo);
+      HourAccounting.SETRANGE(Status,HourAccounting.Status::Open);
+
+      //>>I035  IME-033
+      //EXIT(NOT HourAccounting.ISEMPTY);
+      CLEAR(recRef);
+      IF HourAccounting.ISEMPTY THEN
+        EXIT(FALSE);
+
+      IF HourAccounting.FINDFIRST THEN BEGIN
+        recRef.GETTABLE(HourAccounting);
+        recRef.SETPOSITION(HourAccounting.GETPOSITION(FALSE));
+      END;
+
+      EXIT(TRUE);
+      //<<I035
+    END;
+
+    PROCEDURE TimesheetDeniedPopup@1100294006();
+    VAR
+      HourAccounting@1100294002 : Record 11012038;
+      HoursConsentLine@1100294001 : Record 11020437;
+      HourAccountingLine@1100294003 : Record 11012039;
+      UserSetup@1100294000 : Record 91;
+    BEGIN
+      IF HumanResourcesSetup.GET THEN
+      //>>ENH032
+        //IF NOT HumanResourcesSetup."Consent Hours" THEN
+      //>>SS002149
+        //  IF NOT HumanResourcesSetup."Consent Hours" AND (NOT HumanResourcesSetup."Show Popup Denied-Changed Hrs.") THEN
+        IF NOT HumanResourcesSetup."Show Popup Denied-Changed Hrs." THEN
+      //<<SS002149
+      //<<ENH032
+          EXIT;
+
+      IF UserSetup.GET(USERID) THEN
+        IF FindDeniedLines(HoursConsentLine,UserSetup."Employee No.",FALSE) THEN
+          IF CONFIRM(STRSUBSTNO(Text002,HoursConsentLine.COUNT,HoursConsentLine.TABLECAPTION,TRUE)) THEN
+            IF FindDeniedAccLines(HoursConsentLine,HourAccountingLine) THEN
+              IF FindHourAccForLines(HourAccountingLine,HourAccounting) THEN
+                ShowHourAccounting(HourAccounting);
+    END;
+
+    PROCEDURE TimesheetDeniedNotification@1100294001();
+    VAR
+      HourAccountingLine@1100294005 : Record 11012039;
+      HoursConsentLine@1100294000 : Record 11020437;
+      UserSetup@1100294001 : Record 91;
+      EMailOnBehalf@1100294003 : Record 11012768;
+      EMailBodyText@1100294002 : Record 11012769;
+      MailEntryNo@1100294004 : Integer;
+    BEGIN
+      UserSetup.SETFILTER("Employee No.",'<>%1', '');
+      IF UserSetup.FINDSET THEN
+        REPEAT
+          IF UserSetup."Employee No." <> '' THEN
+            IF FindDeniedLines(HoursConsentLine,UserSetup."Employee No.",TRUE) THEN BEGIN
+
+              MailEntryNo :=
+                CreateEMail(
+                  EMailOnBehalf.Usage::"Denied Hour Consent Lines",
+                  GetEmployeeEmail(UserSetup."Employee No."),
+                  Text005,
+                  //GetEmailBodyText(EMailBodyText.Usage::"47",UserSetup."Employee No."),
+                  GetEmailBodyText(EMailBodyText.Usage::"Denied Hour Lines",UserSetup."Employee No.",TRUE),   //WvG 13-10-04
+                  UserSetup."Employee No.");
+
+              AppendPageLink(MailEntryNo,EMailOnBehalf.Usage::"Denied Hour Consent Lines",UserSetup."Employee No.");  //ENH032
+
+              HourAccountingLine.CLEARMARKS;  //4PS036
+
+              IF FindDeniedAccLines(HoursConsentLine,HourAccountingLine) THEN
+                CreateEMailAttachments(HourAccountingLine,EMailOnBehalf.Usage::"Denied Hour Consent Lines",MailEntryNo);
+
+              HoursConsentLine.MODIFYALL("Inform Employee",FALSE);
+              COMMIT;
+            END;
+        UNTIL UserSetup.NEXT = 0;
+    END;
+
+    PROCEDURE FindDeniedLines@1100294012(VAR HoursConsentLine@1100294000 : Record 11020437;EmployeeNo@1100294001 : Code[20];NotInformedOnly@1100294002 : Boolean) : Boolean;
+    BEGIN
+      HoursConsentLine.RESET;
+      HoursConsentLine.SETCURRENTKEY(Employee,Denied,"Inform Employee");
+      HoursConsentLine.SETRANGE(Employee,EmployeeNo);
+      HoursConsentLine.SETRANGE(Denied,TRUE);
+      IF NotInformedOnly THEN
+        HoursConsentLine.SETRANGE("Inform Employee",TRUE);
+
+      //>>I058
+      //EXIT(NOT HoursConsentLine.ISEMPTY);
+      CLEAR(recRef);
+      IF HoursConsentLine.ISEMPTY THEN
+        EXIT(FALSE);
+
+      IF HoursConsentLine.FINDFIRST THEN BEGIN
+        recRef.GETTABLE(HoursConsentLine);
+        recRef.SETPOSITION(HoursConsentLine.GETPOSITION(FALSE));
+      END;
+
+      EXIT(TRUE);
+      //<<I058
+    END;
+
+    PROCEDURE FindDeniedAccLines@1100294024(VAR HoursConsentLine@1100294000 : Record 11020437;VAR HourAccountingLine@1100294002 : Record 11012039) : Boolean;
+    BEGIN
+      WITH HoursConsentLine DO BEGIN
+        IF FINDSET THEN
+          REPEAT
+            IF HourAccountingLine.GET(Year,Week,Employee,"Line No.") THEN
+              HourAccountingLine.MARK(TRUE);
+          UNTIL NEXT = 0;
+
+          HourAccountingLine.MARKEDONLY(TRUE);
+
+        EXIT(NOT HourAccountingLine.ISEMPTY);
+      END;
+    END;
+
+    PROCEDURE TimesheetChangedPopup@1100294005();
+    VAR
+      UserSetup@1100294000 : Record 91;
+      HoursLogEntryLine@1100294001 : Record 11072025;
+      HourAccounting@1100294002 : Record 11012038;
+      HourAccountingLine@1100294003 : Record 11012039;
+    BEGIN
+      //>>ENH032
+      IF HumanResourcesSetup.GET THEN
+        IF NOT HumanResourcesSetup."Show Popup Denied-Changed Hrs." THEN
+          EXIT;
+      //<<ENH032
+
+      IF UserSetup.GET(USERID) THEN
+        IF FindChangedLines(HoursLogEntryLine,UserSetup."Employee No.") THEN
+          IF FindAccChangedLines(HoursLogEntryLine,HourAccountingLine) THEN
+            IF CONFIRM(STRSUBSTNO(Text003,HourAccountingLine.COUNT,HourAccountingLine.TABLECAPTION,TRUE)) THEN
+              IF FindHourAccForLines(HourAccountingLine,HourAccounting) THEN
+                ShowHourAccounting(HourAccounting);
+    END;
+
+    PROCEDURE TimesheetChangedNotification@1100294002();
+    VAR
+      HoursLogEntryLine@1100294000 : Record 11072025;
+      HourAccountingLine@1100294005 : Record 11012039;
+      UserSetup@1100294003 : Record 91;
+      EMailOnBehalf@1100294002 : Record 11012768;
+      EMailBodyText@1100294001 : Record 11012769;
+      MailEntryNo@1100294004 : Integer;
+    BEGIN
+      UserSetup.SETFILTER("Employee No.",'<>%1', '');
+      IF UserSetup.FINDSET THEN
+        REPEAT
+          IF UserSetup."Employee No." <> '' THEN
+            IF FindChangedLines(HoursLogEntryLine,UserSetup."Employee No.") THEN BEGIN
+              MailEntryNo :=
+                CreateEMail(
+                  EMailOnBehalf.Usage::"Changed Hour Consent Lines",
+                  GetEmployeeEmail(UserSetup."Employee No."),
+                  Text006,
+                  //GetEmailBodyText(EMailBodyText.Usage::"48",UserSetup."Employee No."),
+                  GetEmailBodyText(EMailBodyText.Usage::"Changed Hour Lines",UserSetup."Employee No.",TRUE),  //WvG 13-10-04
+                  UserSetup."Employee No.");
+
+              AppendPageLink(MailEntryNo,EMailOnBehalf.Usage::"Changed Hour Consent Lines",UserSetup."Employee No.");//ENH032
+
+              HourAccountingLine.CLEARMARKS;  //4PS036
+
+              IF FindAccChangedLines(HoursLogEntryLine,HourAccountingLine) THEN
+                CreateEMailAttachments(HourAccountingLine,EMailOnBehalf.Usage::"Changed Hour Consent Lines",MailEntryNo);
+
+              HoursLogEntryLine.MODIFYALL(Informed,TRUE);
+              COMMIT;
+            END;
+        UNTIL UserSetup.NEXT = 0;
+    END;
+
+    PROCEDURE FindChangedLines@1100294023(VAR HoursLogEntryLine@1100294000 : Record 11072025;EmployeeNo@1100294001 : Code[20]) : Boolean;
+    BEGIN
+      WITH HoursLogEntryLine DO BEGIN
+        RESET;
+        SETCURRENTKEY("Employee No.","Consentor Change",Informed);
+        SETRANGE("Employee No.",EmployeeNo);
+        SETFILTER("Consentor Change",'<>%1','');
+        SETRANGE(Informed,FALSE);
+
+      //>>I058
+        //EXIT(NOT ISEMPTY);
+        CLEAR(recRef);
+        IF ISEMPTY THEN
+          EXIT(FALSE);
+
+        IF FINDFIRST THEN BEGIN
+          recRef.GETTABLE(HoursLogEntryLine);
+          recRef.SETPOSITION(GETPOSITION(FALSE));
+        END;
+
+        EXIT(TRUE);
+      //<<I058
+      END;
+    END;
+
+    PROCEDURE FindAccChangedLines@1100294017(VAR HoursLogEntryLine@1100294000 : Record 11072025;VAR HourAccountingLine@1100294002 : Record 11012039) : Boolean;
+    BEGIN
+      WITH HoursLogEntryLine DO BEGIN
+        IF FINDSET THEN
+          REPEAT
+            IF HourAccountingLine.GET(Year,Week,"Employee No.","Hour Acc. Line No.") THEN
+              HourAccountingLine.MARK(TRUE);
+          UNTIL NEXT = 0;
+        HourAccountingLine.MARKEDONLY(TRUE);
+
+        EXIT(NOT HourAccountingLine.ISEMPTY);
+      END;
+    END;
+
+    PROCEDURE OpenConsentLinesNotification@1100485002();
+    VAR
+      UserSetup@1100294002 : Record 91;
+      HoursConsentLine@1100485002 : Record 11020437;
+      EMailBodyText@1100294000 : Record 11012769;
+      EMailOnBehalf@1100294001 : Record 11012768;
+      ConsentFilterString@1100525000 : Text[1000];
+      FoundLines@1100285000 : Boolean;
+      MailEntryNo@1100285500 : Integer;
+    BEGIN
+      IF HumanResourcesSetup.GET THEN
+        IF NOT HumanResourcesSetup."Consent Hours" THEN
+          EXIT;
+
+      UserSetup.SETFILTER("Employee No.",'<>%1', '');
+      IF UserSetup.FINDSET THEN
+        REPEAT
+          IF UserSetup."Employee No." <> '' THEN BEGIN
+            BuildFilterStringForUser(ConsentFilterString,UserSetup."User ID");
+            HoursConsentLine.SETCURRENTKEY(Consenter,"Serial Number");
+            HoursConsentLine.SETFILTER(Consenter,ConsentFilterString);
+            //>>IME307
+            //HoursConsentLine.SETRANGE(LineType,HoursConsentLine.LineType::Main);
+            HoursConsentLine.SETRANGE(LineType,HoursConsentLine.LineType::Normal);
+            //<<IME307
+            HoursConsentLine.SETRANGE(Consent,FALSE);
+            HoursConsentLine.SETRANGE(Denied,FALSE);
+      //>>I058
+            //IF NOT HoursConsentLine.ISEMPTY THEN BEGIN
+            CLEAR(recRef);
+            FoundLines := TRUE;
+            IF HoursConsentLine.ISEMPTY THEN
+              FoundLines := FALSE;
+
+            IF FoundLines AND HoursConsentLine.FINDFIRST THEN BEGIN
+              recRef.GETTABLE(HoursConsentLine);
+              recRef.SETPOSITION(HoursConsentLine.GETPOSITION(FALSE));
+            END;
+
+            IF FoundLines THEN BEGIN
+      //<<I058
+              MailEntryNo := //ENH032
+              CreateEMail(
+                EMailOnBehalf.Usage::"Open Hour Consent Lines",
+                GetEmployeeEmail(UserSetup."Employee No."),
+                Text007,
+                //GetEmailBodyText(EMailBodyText.Usage::"46",UserSetup."Employee No."),
+                GetEmailBodyText(EMailBodyText.Usage::"Open Hour Consent Lines",UserSetup."Employee No.",TRUE),       //WvG 13-10-04
+                UserSetup."Employee No.");
+              AppendPageLink(MailEntryNo,EMailOnBehalf.Usage::"Open Hour Consent Lines",UserSetup."Employee No.");//ENH032
+            END;
+          END;
+        UNTIL UserSetup.NEXT = 0;
+    END;
+
+    PROCEDURE FindHourAccForLines@1100294013(VAR HourAccountingLine@1100294000 : Record 11012039;VAR HourAccounting@1100294001 : Record 11012038) : Boolean;
+    BEGIN
+      IF HourAccountingLine.FINDSET THEN
+        REPEAT
+          IF HourAccounting.GET(HourAccountingLine.Year,HourAccountingLine.Week,HourAccountingLine."Employee No.") THEN
+            HourAccounting.MARK(TRUE);
+        UNTIL HourAccountingLine.NEXT = 0;
+
+      HourAccounting.MARKEDONLY(TRUE);
+
+      EXIT(NOT HourAccounting.ISEMPTY);
+    END;
+
+    PROCEDURE ShowHourAccounting@1100294025(VAR HourAccounting@1100294000 : Record 11012038);
+    BEGIN
+      IF NOT HourAccounting.MARKEDONLY OR
+        (HourAccounting.COUNT = 1)
+      THEN
+        PAGE.RUNMODAL(PAGE::"Hour Accounting",HourAccounting)
+      ELSE
+        PAGE.RUNMODAL(0,HourAccounting);
+    END;
+
+    PROCEDURE CreateEMail@1100528800(Usage@1100294004 : Integer;RecipientEmail@1100528818 : Text[80];Subject@1100294001 : Text[250];Body@1100294003 : Text[250];EmployeeNo@1100294009 : Code[20]) : Integer;
+    VAR
+      EMailOnBehalf@1100528815 : Record 11012768;
+      EMailBodyText@1100528814 : Record 11012769;
+      EmployeeEMailQueue@1100294000 : Record 11128235;
+      EmployeeEMailAttachment@1100294006 : Record 11128236;
+      ReportSelections@1100294005 : Record 77;
+      SaveReportAsPDF@1100294002 : Codeunit 11020228;
+      FolderName@1100294007 : Text[250];
+      FileName@1100294008 : Text[250];
+    BEGIN
+      EmployeeEMailQueue.INIT;
+
+      EMailOnBehalf.SETRANGE(Usage,Usage);
+      IF EMailOnBehalf.FINDFIRST THEN BEGIN
+        EMailOnBehalf.TESTFIELD("Send On Behalf Of E-mail");
+        EmployeeEMailQueue."From Address" := EMailOnBehalf."Send On Behalf Of E-mail";
+        EmployeeEMailQueue."From Name" := EMailOnBehalf."Send On Behalf Of Name";
+      END ELSE BEGIN
+        CompanyInfo.GET;
+        EmployeeEMailQueue."From Address" := CompanyInfo.Name;
+        EmployeeEMailQueue."From Name" := CompanyInfo."E-Mail";
+      END;
+
+      EmployeeEMailQueue."To Address" := RecipientEmail;
+      EmployeeEMailQueue."Subject Line" := Subject;
+      EmployeeEMailQueue."Body Line" := Body;
+      EmployeeEMailQueue."Employee No." := EmployeeNo;
+      EmployeeEMailQueue.INSERT(TRUE);
+
+      EXIT(EmployeeEMailQueue."Entry No.");
+    END;
+
+    PROCEDURE CreateEMailAttachments@1100294003(VAR HourAccountingLine@1100294001 : Record 11012039;CurrUsage@1100294004 : Integer;ForEmailEntryNo@1100294003 : Integer);
+    VAR
+      EMailOnBehalf@1100528815 : Record 11012768;
+      ReportSelections@1100294005 : Record 77;
+      EmployeeEMailQueue@1100294009 : Record 11128235;
+      EmployeeEMailAttachment@1100294000 : Record 11128236;
+      SaveReportAsPDF@1100294002 : Codeunit 11020228;
+      FolderName@1100294007 : Text[250];
+      FileName@1100294008 : Text[250];
+      CurrDateTime@1100294006 : DateTime;
+    BEGIN
+      WITH ReportSelections DO BEGIN
+        CASE CurrUsage OF
+          EMailOnBehalf.Usage::"Denied Hour Consent Lines":
+            SETRANGE(Usage,8230);
+          EMailOnBehalf.Usage::"Changed Hour Consent Lines":
+            SETRANGE(Usage,8231);
+          ELSE
+            EXIT;
+        END;
+        ReportSelections.SETRANGE("Default Selection",TRUE);
+        IF FINDSET THEN BEGIN
+          CurrDateTime := CURRENTDATETIME;
+          EmployeeEMailQueue.GET(ForEmailEntryNo);
+          REPEAT
+            ReportSelections.CALCFIELDS("Report Caption");
+            FileName := ReportSelections."Report Caption" + '_' + EmployeeEMailQueue."Employee No.";
+            SaveReportAsPDF.HourAccLines(HourAccountingLine,ReportSelections."Report ID",FolderName,FileName,30000);
+            EmployeeEMailAttachment.INIT;
+            EmployeeEMailAttachment."Empl. E-Mail Queue Entry No." := ForEmailEntryNo;
+            IF FolderName <> '' THEN
+              EmployeeEMailAttachment."Attached File Name" := FolderName + FileName
+            ELSE
+              EmployeeEMailAttachment."Attached File Name" := FileName;
+            EmployeeEMailAttachment.INSERT(TRUE);
+          UNTIL NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE GetEmployeeEmail@1100294020(EmployeeNo@1100294000 : Code[20]) : Text[250];
+    VAR
+      HumanResourcesSetup@1100294001 : Record 5218;
+      Employee@1100294002 : Record 5200;
+    BEGIN
+      HumanResourcesSetup.GET;
+      Employee.GET(EmployeeNo);
+
+      CASE HumanResourcesSetup."E-Mail Employees" OF
+        HumanResourcesSetup."E-Mail Employees"::"E-Mail":
+          EXIT(Employee."E-Mail");
+        HumanResourcesSetup."E-Mail Employees"::"Company E-Mail":
+          EXIT(Employee."Company E-Mail");
+      END;
+    END;
+
+    PROCEDURE GetEmailBodyText@1100294008(Usage@1100294000 : Integer;EmployeeNo@1100294003 : Code[20];isHTML@1100285500 : Boolean) : Text[250];
+    VAR
+      EMailBodyText@1100294001 : Record 11012769;
+      Body@1100294002 : Text[250];
+      fldRef@1100285000 : FieldRef;
+      EMailBodyTextText@1100285001 : Text[300];
+    BEGIN
+      EMailBodyText.SETRANGE(Usage,Usage);
+      EMailBodyText.SETRANGE("Language Code",GetEmployeeLangCode(EmployeeNo));
+      IF EMailBodyText.FINDSET THEN
+        REPEAT
+          //>>I035.I036  IME-033
+          EMailBodyTextText := EMailBodyText.Text;
+          IF (NOT recRef.ISEMPTY) AND (STRPOS(EMailBodyTextText,'%') <> 0) THEN
+            CASE EMailBodyText."Table No." OF
+
+              EMailBodyText."Table No."::"Hour Accounting":      //TimesheetReleaseNotification()
+                IF recRef.NUMBER = DATABASE::"Hour Accounting" THEN BEGIN
+                  fldRef := recRef.FIELD(EMailBodyText."Field No.");
+                  IF UPPERCASE(FORMAT(fldRef.CLASS)) = 'FLOWFIELD' THEN
+                    fldRef.CALCFIELD;
+                  EMailBodyTextText := STRSUBSTNO(EMailBodyText.Text,fldRef.VALUE);
+                END;
+      //>>I058
+              EMailBodyText."Table No."::"Hours Consent Line":      //TimesheetDeniedNotification(),
+                IF recRef.NUMBER = DATABASE::"Hours Consent Line" THEN BEGIN
+                  fldRef := recRef.FIELD(EMailBodyText."Field No.");
+                  IF UPPERCASE(FORMAT(fldRef.CLASS)) = 'FLOWFIELD' THEN
+                    fldRef.CALCFIELD;
+                  EMailBodyTextText := STRSUBSTNO(EMailBodyText.Text,fldRef.VALUE);
+                END;
+      //<<I058
+            END;
+      //>>ENH032
+          IF isHTML THEN
+            EMailBodyTextText += '<br>';
+      //<<ENH032
+          //IF STRLEN(Body + EMailBodyText.Text + CrLf) <= MAXSTRLEN(Body) THEN
+          //  Body := Body + EMailBodyText.Text + CrLf;
+          IF STRLEN(Body + EMailBodyTextText + CrLf) <= MAXSTRLEN(Body) THEN
+            Body := Body + EMailBodyTextText + CrLf;
+          //<<I035.I036
+        UNTIL EMailBodyText.NEXT = 0;
+
+      EXIT(Body);
+    END;
+
+    PROCEDURE GetJobsSetup@1100294009();
+    BEGIN
+      IF NOT JobsSetup.MARK THEN BEGIN
+        JobsSetup.GET;
+        JobsSetup.MARK(TRUE);
+      END;
+    END;
+
+    PROCEDURE BuildFilterStringForUser@1100485012(VAR ConsentFilterString@1100485000 : Text[1000];lUserID@1100294000 : Code[50]);
+    VAR
+      HoursConsenter@1100528400 : Record 11020438;
+    BEGIN
+      ConsentFilterString := lUserID;
+      HoursConsenter.SETRANGE("User ID Substitute",lUserID);
+      HoursConsenter.SETRANGE("Substitute Active",TRUE);
+      IF HoursConsenter.FINDSET THEN
+        REPEAT
+          ConsentFilterString := ConsentFilterString + '|' + HoursConsenter."User ID";
+        UNTIL HoursConsenter.NEXT = 0;
+    END;
+
+    PROCEDURE GetEmployeeLangCode@1210190011(EmployeeNo@1100294000 : Code[20]) : Code[20];
+    VAR
+      ContactBusinessRelation@1000 : Record 5054;
+      Contact@1001 : Record 5050;
+      Employee@1100294001 : Record 5200;
+    BEGIN
+      IF EmployeeNo = '' THEN
+        EXIT;
+
+      WITH ContactBusinessRelation DO BEGIN
+        SETCURRENTKEY("Link to Table","No.");
+        SETRANGE("Link to Table",ContactBusinessRelation."Link to Table"::Employee);
+        SETRANGE("No.",EmployeeNo);
+        IF FINDFIRST THEN BEGIN
+          Contact.GET("Contact No.");
+          IF Contact."Language Code" <> '' THEN
+            EXIT(Contact."Language Code");
+        END;
+
+        Employee.GET(EmployeeNo);
+        EXIT(Employee."Country/Region Code");
+      END;
+    END;
+
+    PROCEDURE CrLf@1100525000() Result : Text[2];
+    BEGIN
+      Result[1] := 13;
+      Result[2] := 10;
+    END;
+
+    PROCEDURE AppendPageLink@1100285503(MailEntryNo@1100285500 : Integer;EMailOnBehalfUsage@1100285501 : Integer;UserSetupEmployeeNo@1100285000 : Code[20]);
+    VAR
+      EmployeeEMailAttachment@1100285502 : Record 11128236;
+      EMailOnBehalf@1100285503 : Record 11012768;
+      SystemUri@1100285504 : DotNet "'System, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Uri";
+      txtLink@1100285505 : TextConst 'ENU=Click here to goto to the Hour Accounting';
+      TextSystemUri@1100285506 : Text;
+      ServerInstance@1100285508 : Record 2000000112;
+      CompanyInformation@1100285509 : Record 79;
+      chr39@1100285001 : Text[1];
+      txtLineToSend@1100285400 : Text;
+    BEGIN
+      //ENH032
+      chr39[1] := 39;  //'
+
+      EmployeeEMailAttachment.INIT;
+      EmployeeEMailAttachment."Empl. E-Mail Queue Entry No." := MailEntryNo;
+      EmployeeEMailAttachment."Attached File Name" := '';
+
+      //DynamicsNAV://<Server/ServerInstance>/<Company>/
+      //DynamicsNAV://<Server/ServerInstance>/Company/RunPage?Page=21
+      //DynamicsNAV://localhost/DynamicsNAV70/CRONUS%20International%20Ltd./
+      //dynamicsnav://itero-app02.iteroab.local:7406/gaia_test_2013_2/Test%20Imtech%20Elteknik/runpage?page=11012039&$filter='Hour%20Accounting'.'Employee%20No.'%20IS%20'ANST00021'&mode=View
+      //>>ENH032 140411
+      CompanyInformation.GET;
+      ServerInstance.SETRANGE("Server Computer Name",CompanyInformation."Server Computer Name");
+      ServerInstance.SETRANGE("Server Instance Name",CompanyInformation."Server Instance Name");
+      //>>ENH032 140411
+
+      TextSystemUri := 'DynamicsNAV:+//';
+      IF ServerInstance.FINDLAST THEN
+        TextSystemUri := 'DynamicsNAV://'+
+          ServerInstance."Server Computer Name"+':'+FORMAT(ServerInstance."Server Port",0,1)+'/'+
+          ServerInstance."Server Instance Name"+'/';
+      TextSystemUri += SystemUri.EscapeDataString(COMPANYNAME);
+
+      CASE EMailOnBehalfUsage OF
+        EMailOnBehalf.Usage::"Open Hour Accounting",
+        EMailOnBehalf.Usage::"Denied Hour Consent Lines",
+        EMailOnBehalf.Usage::"Changed Hour Consent Lines":
+      //>>141120 ITERO.WG IME240
+          BEGIN
+          txtLineToSend :=
+            '<p><a href="'+
+              STRSUBSTNO('%1/RunPage?Page=%2',TextSystemUri,PAGE::"Hour Accounting List")+
+              '&$filter='+chr39+'Hour%20Accounting'+chr39+'.'+chr39+'Employee%20No.'+chr39+'%20IS%20'+chr39+UserSetupEmployeeNo+chr39+'&mode=View'+
+            '">'+txtLink+'</a>';
+
+          EmployeeEMailAttachment."Extra body textline" :=
+            COPYSTR(txtLineToSend, 1, MAXSTRLEN(EmployeeEMailAttachment."Extra body textline"));
+          IF STRLEN(txtLineToSend) > MAXSTRLEN(EmployeeEMailAttachment."Extra body textline") THEN
+            EmployeeEMailAttachment."Extra body textline2" :=
+              COPYSTR(txtLineToSend, STRLEN(EmployeeEMailAttachment."Extra body textline")+1);
+          END;
+      //>>141120 ITERO.WG IME240
+
+        EMailOnBehalf.Usage::"Open Hour Consent Lines":
+          EmployeeEMailAttachment."Extra body textline" :=
+            '<p><a href="'+
+              STRSUBSTNO('%1/RunPage?Page=%2',TextSystemUri,PAGE::"Hours Consent Lines")+
+            '">'+txtLink+'</a>';
+
+      END;
+
+      EmployeeEMailAttachment.INSERT(TRUE);
+    END;
+
+    BEGIN
+    {
+      SESB.I035.I036 Message when dissaproving-correcting hours
+         VKO 26.07.2013 Object created
+
+      IME-058 Three job queues are giving the same error 'Posten „r inte ”ppen'
+      140311 4PPSE.DL, added filter for each UserSetup."Employee No.", corrections of GetEmailBodyText()
+      140111 ITERO.DL ENH032 added links to email
+
+      140424 ITERO.DL 4PS036 added CLEARMARKS
+      141120 ITERO.WG IME240 Error when starting the job queue
+      150123 ITERO.WG SS002149 Changed TimesheetDeniedPopup
+      150303 ITERO.WG IME302 Elements in mail from 4PS is in Swedish
+      150715 ITERO.WG IME307 Hour consenter will receive e-mail even if there is no hours consent lines
+    }
+    END.
+  }
+}
+

@@ -1,0 +1,1062 @@
+OBJECT Codeunit 11128579 OIOUBL Export Sales Invoice
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVDK9.00.00.45834,4PSSE (13609);
+  }
+  PROPERTIES
+  {
+    TableNo=62;
+    Permissions=TableData 112=rm;
+    OnRun=VAR
+            SalesInvoiceHeader@1060000 : Record 112;
+            RecordRef@1060001 : RecordRef;
+          BEGIN
+            RecordRef.GET(RecordID);
+            RecordRef.SETTABLE(SalesInvoiceHeader);
+
+            ServerFilePath := CreateXML(SalesInvoiceHeader);
+            MODIFY;
+
+            SalesInvoiceHeader."Electronic Invoice Created" := TRUE;
+            SalesInvoiceHeader.MODIFY;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      CompanyInfo@1101100003 : Record 79;
+      GLSetup@1101100004 : Record 98;
+      PaymentTerms@1101100009 : Record 3;
+      Currency@1060002 : Record 4;
+      ItemCharge@1101100013 : Record 5800;
+      SalesSetup@1101100014 : Record 311;
+      OIOUBLDocumentEncode@1101100008 : Codeunit 11128570;
+      OIOUBLDOMManagement@1101100007 : Codeunit 11128571;
+      Header@1101100006 : Text[1000];
+      CompanyInfoRead@1101100001 : Boolean;
+      GLSetupRead@1101100002 : Boolean;
+      PleaseUsetheStdInvoicePath@1060000 : TextConst 'ENU=Please save the file under %1.';
+      UsetheIOULBClientPath@1060003 : TextConst 'ENU=Please save the file to a location from which it can be retrieved by the OIOUBL function.';
+
+    PROCEDURE ExportXML@1060003(SalesInvoiceHeader@1060000 : Record 112);
+    VAR
+      SalesInvHeader2@1060026 : Record 112;
+      RBMgt@1060020 : Codeunit 419;
+      FromFile@1060014 : Text[1024];
+      ToFile@1060013 : Text[1024];
+      FileName@1060010 : Text;
+      DocumentType@1060002 : 'Quote,Order,Invoice,Credit Memo,Blanket Order,Return Order,Finance Charge,Reminder';
+    BEGIN
+      FromFile := CreateXML(SalesInvoiceHeader);
+
+      SalesSetup.GET;
+      SalesSetup."OIOUBL Invoice Path" := DELCHR(SalesSetup."OIOUBL Invoice Path",'>','\');
+
+      IF RBMgt.CanRunDotNetOnClient THEN BEGIN
+        SalesSetup.VerifyAndSetOIOUBLPathSetup(DocumentType::Invoice);
+        ToFile := RBMgt.DownloadTempFile(FromFile);
+        RBMgt.CopyClientFile(ToFile,STRSUBSTNO('%1\%2.xml',SalesSetup."OIOUBL Invoice Path",SalesInvoiceHeader."No."),TRUE);
+      END ELSE BEGIN
+        IF SalesSetup."OIOUBL Invoice Path" <> '' THEN
+          MESSAGE(STRSUBSTNO(PleaseUsetheStdInvoicePath,SalesSetup."OIOUBL Invoice Path"))
+        ELSE
+          MESSAGE(UsetheIOULBClientPath);
+        FileName := STRSUBSTNO('%1.xml',SalesInvoiceHeader."No.");
+        DOWNLOAD(FromFile,'',SalesSetup."OIOUBL Invoice Path",'',FileName);
+      END;
+
+      SalesInvHeader2.GET(SalesInvoiceHeader."No.");
+      SalesInvHeader2."Electronic Invoice Created" := TRUE;
+      SalesInvHeader2.MODIFY;
+    END;
+
+    LOCAL PROCEDURE CreateXML@1060004(SalesInvoiceHeader@1060000 : Record 112) FromFile : Text[250];
+    VAR
+      SalesInvLine@1060024 : Record 113;
+      SalesInvLine2@1060023 : Record 113;
+      SalespersonPurchaser@1060022 : Record 13;
+      OIOUBLProfile@1060021 : Record 11128570;
+      RBMgt@1060019 : Codeunit 419;
+      XMLCurrNode@1060018 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      XMLNewChild@1060017 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      XMLdocOut@1060016 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      Prefix@1060015 : Text[30];
+      DocNameSpace@1060014 : Text[250];
+      DocNameSpace2@1060011 : Text[250];
+      Prefix2@1060010 : Text[30];
+      CurrencyCode@1060008 : Code[10];
+      VATPercentage@1060007 : Decimal;
+      TaxableAmount@1060006 : Decimal;
+      TaxAmount@1060005 : Decimal;
+      TotalAmount@1060004 : Decimal;
+      TotalInvDiscountAmount@1060003 : Decimal;
+      TotalTaxAmount@1060002 : Decimal;
+      DiscountAmount@1060001 : Decimal;
+    BEGIN
+      CODEUNIT.RUN(CODEUNIT::"OIOUBL Check Sales Invoice",SalesInvoiceHeader);
+      ReadGLSetup;
+      ReadCompanyInfo;
+
+      IF SalesInvoiceHeader."Currency Code" = '' THEN
+        CurrencyCode := GLSetup."LCY Code"
+      ELSE
+        CurrencyCode := SalesInvoiceHeader."Currency Code";
+
+      IF CurrencyCode = GLSetup."LCY Code" THEN
+        Currency.InitRoundingPrecision
+      ELSE BEGIN
+        Currency.GET(CurrencyCode);
+        Currency.TESTFIELD("Amount Rounding Precision");
+      END;
+
+      SalesInvLine.SETRANGE("Document No.",SalesInvoiceHeader."No.");
+      SalesInvLine.SETFILTER(Type,'>%1',0);
+      SalesInvLine.SETFILTER("No.",'<>%1',' ');
+      SalesInvLine.SETFILTER(Quantity,'<>0');
+      IF NOT SalesInvLine.FINDSET THEN
+        EXIT;
+
+      XMLdocOut := XMLdocOut.XmlDocument;
+
+      FromFile := RBMgt.ServerTempFileName('');
+
+      // Invoice
+      Header := '<?xml version="1.0" encoding="UTF-8" ?> ' +
+        '<Invoice xsi:schemaLocation="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2 UBL-Invoice-2.0.xsd" ' +
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2" ' +
+        'xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2" ' +
+        'xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2" ' +
+        'xmlns:ccts="urn:oasis:names:specification:ubl:schema:xsd:CoSalesInvoiceHeaderomponentParameters-2" ' +
+        'xmlns:sdt="urn:oasis:names:specification:ubl:schema:xsd:SpecializedDatatypes-2" ' +
+        'xmlns:udt="urn:un:unece:uncefact:data:specification:UnqualifiedDataTypesSchemaModule:2"/> ';
+
+      XMLdocOut.LoadXml := Header;
+      XMLCurrNode := XMLdocOut.DocumentElement;
+
+      WITH OIOUBLDOMManagement DO BEGIN
+        DocNameSpace := 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2';
+        DocNameSpace2 := 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2';
+
+        Prefix := 'cbc';
+        Prefix2 := 'cac';
+
+        AddElement(XMLCurrNode,'UBLVersionID','2.0',DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'CustomizationID','OIOUBL-2.02',DocNameSpace,XMLNewChild,Prefix);
+
+        AddElement(
+          XMLCurrNode,'ProfileID',
+          OIOUBLProfile.GetOIOUBLProfileID(SalesInvoiceHeader."OIOUBL Profile Code",SalesInvoiceHeader."Sell-to Customer No."),
+          DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLNewChild;
+        AddAttribute(XMLCurrNode,'schemeID','urn:oioubl:id:profileid-1.2');
+        AddAttribute(XMLCurrNode,'schemeAgencyID','320');
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        AddElement(XMLCurrNode,'ID',SalesInvoiceHeader."No.",DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'CopyIndicator',OIOUBLDocumentEncode.BooleanToText(SalesInvoiceHeader."Electronic Invoice Created"),
+          DocNameSpace,XMLNewChild,Prefix);
+        AddElement(
+          XMLCurrNode,'IssueDate',OIOUBLDocumentEncode.DateToText(SalesInvoiceHeader."Posting Date"),DocNameSpace,XMLNewChild,Prefix);
+
+        AddElement(XMLCurrNode,'InvoiceTypeCode','380',DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLNewChild;
+        AddAttribute(XMLCurrNode,'listID','urn:oioubl:codelist:invoicetypecode-1.1');
+        AddAttribute(XMLCurrNode,'listAgencyID','320');
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        //4PSSE
+        AddElement(XMLCurrNode,'Note','<![CDATA['+SalesInvoiceHeader."Invoice Text"+']]>',DocNameSpace,XMLNewChild,Prefix);
+
+        AddElement(XMLCurrNode,'DocumentCurrencyCode',CurrencyCode,DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'AccountingCostCode',SalesInvoiceHeader."Account Code DK",DocNameSpace,XMLNewChild,Prefix);
+
+        // Invoice->OrderReference
+        AddElement(XMLCurrNode,'OrderReference','',DocNameSpace2,XMLNewChild,Prefix2);
+        XMLCurrNode := XMLNewChild;
+
+        AddElement(XMLCurrNode,'ID',SalesInvoiceHeader."External Document No.",DocNameSpace,XMLNewChild,Prefix);
+
+        IF SalesInvoiceHeader."Order No." <> '' THEN
+          AddElement(XMLCurrNode,'SalesOrderID',SalesInvoiceHeader."Order No.",DocNameSpace,XMLNewChild,Prefix)
+        ELSE
+          AddElement(XMLCurrNode,'SalesOrderID',SalesInvoiceHeader."Pre-Assigned No.",DocNameSpace,XMLNewChild,Prefix);
+        AddElement(
+          XMLCurrNode,'IssueDate',OIOUBLDocumentEncode.DateToText(SalesInvoiceHeader."Order Date"),DocNameSpace,XMLNewChild,Prefix);
+
+        // Invoice->AccountingSupplierParty
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        AddElement(XMLCurrNode,'AccountingSupplierParty','',DocNameSpace2,XMLNewChild,Prefix2);
+        XMLCurrNode := XMLNewChild;
+
+        AddElement(XMLCurrNode,'Party','',DocNameSpace2,XMLNewChild,Prefix2);
+
+        XMLCurrNode := XMLNewChild;
+        AddElement(XMLCurrNode,'WebsiteURI',CompanyInfo."Home Page",DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'EndpointID',OIOUBLDocumentEncode.GetCompanyVATRegNo(CompanyInfo."VAT Registration No."),
+          DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLNewChild;
+        AddAttribute(XMLCurrNode,'schemeID','DK:CVR');
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        // Invoice->AccountingSupplierParty->PartyIdentification
+        AddElement(XMLCurrNode,'PartyIdentification','',DocNameSpace2,XMLNewChild,Prefix2);
+
+        XMLCurrNode := XMLNewChild;
+        AddElement(XMLCurrNode,'ID',OIOUBLDocumentEncode.GetCompanyVATRegNo(CompanyInfo."VAT Registration No."),
+          DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLNewChild;
+        AddAttribute(XMLCurrNode,'schemeID','DK:CVR');
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        // Invoice->AccountingSupplierParty->PartyName
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        AddElement(XMLCurrNode,'PartyName','',DocNameSpace2,XMLNewChild,Prefix2);
+
+        XMLCurrNode := XMLNewChild;
+        AddElement(XMLCurrNode,'Name',CompanyInfo.Name,DocNameSpace,XMLNewChild,Prefix);
+
+        // Invoice->AccountingSupplierParty->PostalAddress
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        AddElement(XMLCurrNode,'PostalAddress','',DocNameSpace2,XMLNewChild,Prefix2);
+
+        XMLCurrNode := XMLNewChild;
+        AddElement(XMLCurrNode,'AddressFormatCode','StructuredLax',DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLNewChild;
+        AddAttribute(XMLCurrNode,'listID','urn:oioubl:codelist:addressformatcode-1.1');
+        AddAttribute(XMLCurrNode,'listAgencyID','320');
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        AddElement(XMLCurrNode,'StreetName',CompanyInfo.Address,DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'AdditionalStreetName',CompanyInfo."Address 2",DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'InhouseMail',CompanyInfo."E-Mail",DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'CityName',CompanyInfo.City,DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'PostalZone',CompanyInfo."Post Code",DocNameSpace,XMLNewChild,Prefix);
+
+        // Invoice->AccountingSupplierParty->Address->Country
+        AddElement(XMLCurrNode,'Country','',DocNameSpace2,XMLNewChild,Prefix2);
+
+        XMLCurrNode := XMLNewChild;
+        AddElement(XMLCurrNode,'IdentificationCode',CompanyInfo."Country/Region Code",DocNameSpace,XMLNewChild,Prefix);
+
+        // Invoice->AccountingSupplierParty->PartyTextScheme
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        AddElement(XMLCurrNode,'PartyTaxScheme','',DocNameSpace2,XMLNewChild,Prefix2);
+
+        XMLCurrNode := XMLNewChild;
+        AddElement(XMLCurrNode,'CompanyID',OIOUBLDocumentEncode.GetCompanyVATRegNo(CompanyInfo."VAT Registration No."),
+          DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLNewChild;
+        AddAttribute(XMLCurrNode,'schemeID','DK:SE');
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        AddElement(XMLCurrNode,'TaxScheme','',DocNameSpace2,XMLNewChild,Prefix2);
+
+        XMLCurrNode := XMLNewChild;
+        AddElement(XMLCurrNode,'ID','63',DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLNewChild;
+        AddAttribute(XMLCurrNode,'schemeAgencyID','320');
+        AddAttribute(XMLCurrNode,'schemeID','urn:oioubl:id:taxschemeid-1.1');
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        AddElement(XMLCurrNode,'Name','Moms',DocNameSpace,XMLNewChild,Prefix);
+
+        // Invoice->AccountingSupplierParty->PartyLegalEntity
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        AddElement(XMLCurrNode,'PartyLegalEntity','',DocNameSpace2,XMLNewChild,Prefix2);
+
+        XMLCurrNode := XMLNewChild;
+        AddElement(XMLCurrNode,'RegistrationName',CompanyInfo.Name,DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'CompanyID',OIOUBLDocumentEncode.GetCompanyVATRegNo(CompanyInfo."VAT Registration No."),
+          DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLNewChild;
+        AddAttribute(XMLCurrNode,'schemeID','DK:CVR');
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        // Invoice->AccountingSupplierParty->Contact
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        IF SalespersonPurchaser.GET(SalesInvoiceHeader."Salesperson Code") THEN BEGIN
+          AddElement(XMLCurrNode,'Contact','',DocNameSpace2,XMLNewChild,Prefix2);
+          XMLCurrNode := XMLNewChild;
+          AddElement(XMLCurrNode,'ID',SalesInvoiceHeader."Salesperson Code",DocNameSpace,XMLNewChild,Prefix);
+          AddElement(XMLCurrNode,'Name',SalespersonPurchaser.Name,DocNameSpace,XMLNewChild,Prefix);
+          AddElement(XMLCurrNode,'Telephone',SalespersonPurchaser."Phone No.",DocNameSpace,XMLNewChild,Prefix);
+          AddElement(XMLCurrNode,'ElectronicMail',SalespersonPurchaser."E-Mail",DocNameSpace,XMLNewChild,Prefix);
+          XMLCurrNode := XMLCurrNode.ParentNode;
+        END;
+
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        // Invoice->AccountingCustomerParty
+        AddElement(XMLCurrNode,'AccountingCustomerParty','',DocNameSpace2,XMLNewChild,Prefix2);
+        XMLCurrNode := XMLNewChild;
+
+        AddElement(XMLCurrNode,'Party','',DocNameSpace2,XMLNewChild,Prefix2);
+
+        XMLCurrNode := XMLNewChild;
+        AddElement(XMLCurrNode,'EndpointID',SalesInvoiceHeader."EAN No.",DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLNewChild;
+        AddAttribute(XMLCurrNode,'schemeAgencyID','9');
+        AddAttribute(XMLCurrNode,'schemeID','GLN');
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        // Invoice->AccountingCustomerParty->PartyIdentification
+        AddElement(XMLCurrNode,'PartyIdentification','',DocNameSpace2,XMLNewChild,Prefix2);
+
+        XMLCurrNode := XMLNewChild;
+        AddElement(XMLCurrNode,'ID',OIOUBLDocumentEncode.GetCustomerVATRegNo(SalesInvoiceHeader."VAT Registration No."),
+          DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLNewChild;
+        AddAttribute(XMLCurrNode,'schemeID','DK:CVR');
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        // Invoice->AccountingCustomerParty->PartyName
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        AddElement(XMLCurrNode,'PartyName','',DocNameSpace2,XMLNewChild,Prefix2);
+
+        XMLCurrNode := XMLNewChild;
+        AddElement(XMLCurrNode,'Name',
+          SalesInvoiceHeader."Bill-to Name",DocNameSpace,XMLNewChild,Prefix);
+
+        // Invoice->AccountingCustomerParty->PostalAddress
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        AddElement(XMLCurrNode,'PostalAddress','',DocNameSpace2,XMLNewChild,Prefix2);
+
+        XMLCurrNode := XMLNewChild;
+        AddElement(XMLCurrNode,'AddressFormatCode','StructuredLax',DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLNewChild;
+        AddAttribute(XMLCurrNode,'listID','urn:oioubl:codelist:addressformatcode-1.1');
+        AddAttribute(XMLCurrNode,'listAgencyID','320');
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        AddElement(XMLCurrNode,'StreetName',SalesInvoiceHeader."Bill-to Address",DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'AdditionalStreetName',SalesInvoiceHeader."Bill-to Address 2",DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'CityName',SalesInvoiceHeader."Bill-to City",DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'PostalZone',SalesInvoiceHeader."Bill-to Post Code",DocNameSpace,XMLNewChild,Prefix);
+
+        // Invoice->AccountingCustomerParty->Address->Country
+        AddElement(XMLCurrNode,'Country','',DocNameSpace2,XMLNewChild,Prefix2);
+
+        XMLCurrNode := XMLNewChild;
+        AddElement(
+          XMLCurrNode,'IdentificationCode',
+          OIOUBLDocumentEncode.GetOIOUBLCountryRegionCode(SalesInvoiceHeader."Bill-to Country/Region Code"),
+          DocNameSpace,XMLNewChild,Prefix);
+
+        // Invoice->AccountingCustomerParty->Contact
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        AddElement(XMLCurrNode,'Contact','',DocNameSpace2,XMLNewChild,Prefix2);
+        XMLCurrNode := XMLNewChild;
+        AddElement(XMLCurrNode,'ID',SalesInvoiceHeader."Sell-to Contact",DocNameSpace,XMLNewChild,Prefix);
+
+        AddElement(XMLCurrNode,'Name',SalesInvoiceHeader."Sell-to Contact",DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'Telephone',SalesInvoiceHeader."Sell-to Contact Phone No.",DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'Telefax',SalesInvoiceHeader."Sell-to Contact Fax No.",DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'ElectronicMail',SalesInvoiceHeader."Sell-to Contact E-Mail",DocNameSpace,XMLNewChild,Prefix);
+
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        // Invoice->Delivery
+        AddElement(XMLCurrNode,'Delivery','',DocNameSpace2,XMLNewChild,Prefix2);
+        XMLCurrNode := XMLNewChild;
+
+        AddElement(XMLCurrNode,'ActualDeliveryDate',
+          OIOUBLDocumentEncode.DateToText(SalesInvoiceHeader."Shipment Date"),DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'DeliveryLocation','',DocNameSpace2,XMLNewChild,Prefix2);
+        XMLCurrNode := XMLNewChild;
+
+        // Invoice->Delivery->Address
+        AddElement(XMLCurrNode,'Address','',DocNameSpace2,XMLNewChild,Prefix2);
+        XMLCurrNode := XMLNewChild;
+
+        AddElement(XMLCurrNode,'AddressFormatCode','StructuredLax',DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLNewChild;
+        AddAttribute(XMLCurrNode,'listID','urn:oioubl:codelist:addressformatcode-1.1');
+        AddAttribute(XMLCurrNode,'listAgencyID','320');
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        AddElement(XMLCurrNode,'StreetName',SalesInvoiceHeader."Ship-to Address",DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'AdditionalStreetName',SalesInvoiceHeader."Ship-to Address 2",DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'CityName',SalesInvoiceHeader."Ship-to City",DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'PostalZone',SalesInvoiceHeader."Ship-to Post Code",DocNameSpace,XMLNewChild,Prefix);
+
+        // Invoice->Delivery->Address->Country
+        AddElement(XMLCurrNode,'Country','',DocNameSpace2,XMLNewChild,Prefix2);
+
+        XMLCurrNode := XMLNewChild;
+        AddElement(XMLCurrNode,'IdentificationCode',SalesInvoiceHeader."Ship-to Country/Region Code",DocNameSpace,XMLNewChild,Prefix);
+
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        // Invoice->PaymentMeans
+        AddElement(XMLCurrNode,'PaymentMeans','',DocNameSpace2,XMLNewChild,Prefix2);
+        XMLCurrNode := XMLNewChild;
+
+        AddElement(XMLCurrNode,'ID','1',DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'PaymentMeansCode','42',DocNameSpace,XMLNewChild,Prefix);
+        AddElement(
+          XMLCurrNode,'PaymentDueDate',OIOUBLDocumentEncode.DateToText(SalesInvoiceHeader."Due Date"),DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'PaymentChannelCode',GetPaymentChannelCode,DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLNewChild;
+        AddAttribute(XMLCurrNode,'listAgencyID','320');
+        AddAttribute(XMLCurrNode,'listID','urn:oioubl:codelist:paymentchannelcode-1.1');
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        // Invoice->PaymentMeans->PayeeFinancialAccount
+        AddElement(XMLCurrNode,'PayeeFinancialAccount','',DocNameSpace2,XMLNewChild,Prefix2);
+        XMLCurrNode := XMLNewChild;
+
+        AddElement(XMLCurrNode,'ID',CompanyInfo."Bank Account No.",DocNameSpace,XMLNewChild,Prefix);
+
+        // Invoice->PaymentMeans->PayeeFinancialAccount->FinancialInstitutionBranch
+        AddElement(XMLCurrNode,'FinancialInstitutionBranch','',DocNameSpace2,XMLNewChild,Prefix2);
+        XMLCurrNode := XMLNewChild;
+
+        AddElement(XMLCurrNode,'ID',CompanyInfo."Bank Branch No.",DocNameSpace,XMLNewChild,Prefix);
+
+        // Invoice->PaymentMeans->PayeeFinancialAccount->FinancialInstitutionBranch->FinancialInstitution
+        AddElement(XMLCurrNode,'FinancialInstitution','',DocNameSpace2,XMLNewChild,Prefix2);
+        XMLCurrNode := XMLNewChild;
+
+        IF CompanyInfo."SWIFT Code" <> '' THEN
+          AddElement(XMLCurrNode,'ID',CompanyInfo."SWIFT Code",DocNameSpace,XMLNewChild,Prefix)
+        ELSE
+          AddElement(XMLCurrNode,'ID','null',DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'Name',CompanyInfo."Bank Name",DocNameSpace,XMLNewChild,Prefix);
+
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        // Invoice->PaymentTerms
+        SalesInvLine2.RESET;
+        SalesInvLine2.COPY(SalesInvLine);
+        SalesInvLine2.SETRANGE(Type);
+        SalesInvLine2.SETRANGE("No.");
+        SalesInvLine2.SETRANGE(Quantity);
+        SalesInvLine2.CALCSUMS(Amount,"Amount Including VAT","Inv. Discount Amount");
+
+        AddElement(XMLCurrNode,'PaymentTerms','',DocNameSpace2,XMLNewChild,Prefix2);
+        XMLCurrNode := XMLNewChild;
+
+        AddElement(XMLCurrNode,'ID','1',DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'PaymentMeansID','1',DocNameSpace,XMLNewChild,Prefix);
+        PaymentTerms.GET(SalesInvoiceHeader."Payment Terms Code");
+        AddElement(XMLCurrNode,'Note',PaymentTerms.Description,DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'SettlementDiscountPercent',OIOUBLDocumentEncode.DecimalToText(SalesInvoiceHeader."Payment Discount %"),
+          DocNameSpace,XMLNewChild,Prefix);
+        AddElement(XMLCurrNode,'Amount',OIOUBLDocumentEncode.DecimalToText(SalesInvLine2."Amount Including VAT"),
+          DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLNewChild;
+        AddAttribute(XMLCurrNode,'currencyID',SalesInvoiceHeader."Currency Code");
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        // Invoice->PaymentTerms->SettlementPeriod
+        AddElement(XMLCurrNode,'SettlementPeriod','',DocNameSpace2,XMLNewChild,Prefix2);
+        XMLCurrNode := XMLNewChild;
+
+        AddElement(XMLCurrNode,'EndDate',OIOUBLDocumentEncode.DateToText(
+            SalesInvoiceHeader."Pmt. Discount Date"),DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        // Invoice->PaymentTerms->PenaltyPeriod
+        AddElement(XMLCurrNode,'PenaltyPeriod','',DocNameSpace2,XMLNewChild,Prefix2);
+        XMLCurrNode := XMLNewChild;
+
+        AddElement(
+          XMLCurrNode,'StartDate',OIOUBLDocumentEncode.DateToText(SalesInvoiceHeader."Due Date"),DocNameSpace,XMLNewChild,Prefix);
+
+        XMLCurrNode := XMLCurrNode.ParentNode;
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        TotalInvDiscountAmount := 0;
+        IF SalesInvLine2.FINDSET THEN
+          REPEAT
+            ExcludeVAT(SalesInvLine2,SalesInvoiceHeader."Prices Including VAT");
+            TotalInvDiscountAmount := TotalInvDiscountAmount + GetDiscountAmount(SalesInvLine2);
+          UNTIL SalesInvLine2.NEXT = 0;
+
+        IF TotalInvDiscountAmount > 0 THEN BEGIN
+          AddElement(XMLCurrNode,'AllowanceCharge','',DocNameSpace2,XMLNewChild,Prefix2);
+          XMLCurrNode := XMLNewChild;
+
+          AddElement(XMLCurrNode,'ID','1',DocNameSpace,XMLNewChild,Prefix);
+          AddElement(XMLCurrNode,'ChargeIndicator','false',
+            DocNameSpace,XMLNewChild,Prefix);
+          AddElement(XMLCurrNode,'AllowanceChargeReason','Rabat',DocNameSpace,XMLNewChild,Prefix);
+          AddElement(XMLCurrNode,'MultiplierFactorNumeric','1.000',DocNameSpace,XMLNewChild,Prefix);
+          AddElement(XMLCurrNode,'SequenceNumeric','1',DocNameSpace,XMLNewChild,Prefix);
+
+          AddElement(XMLCurrNode,'Amount',OIOUBLDocumentEncode.DecimalToText(TotalInvDiscountAmount),
+            DocNameSpace,XMLNewChild,Prefix);
+          XMLCurrNode := XMLNewChild;
+          AddAttribute(XMLCurrNode,'currencyID',CurrencyCode);
+          XMLCurrNode := XMLCurrNode.ParentNode;
+
+          AddElement(XMLCurrNode,'BaseAmount',OIOUBLDocumentEncode.DecimalToText(TotalInvDiscountAmount),
+            DocNameSpace,XMLNewChild,Prefix);
+          XMLCurrNode := XMLNewChild;
+          AddAttribute(XMLCurrNode,'currencyID',CurrencyCode);
+          XMLCurrNode := XMLCurrNode.ParentNode;
+          // Invoice->AllowanceCharge->TaxCategory
+          AddElement(XMLCurrNode,'TaxCategory','',DocNameSpace2,XMLNewChild,Prefix2);
+          XMLCurrNode := XMLNewChild;
+
+          AddElement(XMLCurrNode,'ID',GetTaxCategoryID(SalesInvLine2."VAT Calculation Type",SalesInvLine2."VAT %"),
+            DocNameSpace,XMLNewChild,Prefix);
+          XMLCurrNode := XMLNewChild;
+          AddAttribute(XMLCurrNode,'schemeID','urn:oioubl:id:taxcategoryid-1.1');
+          AddAttribute(XMLCurrNode,'schemeAgencyID','320');
+          XMLCurrNode := XMLCurrNode.ParentNode;
+
+          AddElement(XMLCurrNode,'Percent',OIOUBLDocumentEncode.DecimalToText(SalesInvLine2."VAT %"),
+            DocNameSpace,XMLNewChild,Prefix);
+
+          // Invoice->AllowanceCharge->TaxCategory->TaxScheme
+          AddElement(XMLCurrNode,'TaxScheme','',DocNameSpace2,XMLNewChild,Prefix2);
+          XMLCurrNode := XMLNewChild;
+
+          AddElement(XMLCurrNode,'ID','63',DocNameSpace,XMLNewChild,Prefix);
+          XMLCurrNode := XMLNewChild;
+          AddAttribute(XMLCurrNode,'schemeID','urn:oioubl:id:taxschemeid-1.1');
+          XMLCurrNode := XMLCurrNode.ParentNode;
+          AddElement(XMLCurrNode,'Name','Moms',DocNameSpace,XMLNewChild,Prefix);
+
+          XMLCurrNode := XMLCurrNode.ParentNode;
+          XMLCurrNode := XMLCurrNode.ParentNode;
+          XMLCurrNode := XMLCurrNode.ParentNode;
+        END;
+
+        SalesInvLine2.RESET;
+        SalesInvLine2.COPY(SalesInvLine);
+        SalesInvLine2.SETFILTER(
+          "VAT Calculation Type",'%1|%2|%3',
+          SalesInvLine2."VAT Calculation Type"::"Normal VAT",
+          SalesInvLine2."VAT Calculation Type"::"Full VAT",
+          SalesInvLine2."VAT Calculation Type"::"Reverse Charge VAT");
+        IF SalesInvLine2.FINDFIRST THEN BEGIN
+          TotalTaxAmount := 0;
+          SalesInvLine2.CALCSUMS(Amount,"Amount Including VAT");
+          TotalTaxAmount := SalesInvLine2."Amount Including VAT" - SalesInvLine2.Amount;
+
+          AddElement(XMLCurrNode,'TaxTotal','',DocNameSpace2,XMLNewChild,Prefix2);
+          XMLCurrNode := XMLNewChild;
+          AddElement(
+            XMLCurrNode,'TaxAmount',
+            OIOUBLDocumentEncode.DecimalToText(TotalTaxAmount),DocNameSpace,XMLNewChild,Prefix);
+          XMLCurrNode := XMLNewChild;
+          AddAttribute(XMLCurrNode,'currencyID',SalesInvoiceHeader."Currency Code");
+          XMLCurrNode := XMLCurrNode.ParentNode;
+
+          // Invoice->TaxTotal (for ("Normal VAT" AND "VAT %" <> 0) OR "Full VAT")
+          SalesInvLine2.SETFILTER(
+            "VAT Calculation Type",'%1|%2',
+            SalesInvLine2."VAT Calculation Type"::"Normal VAT",
+            SalesInvLine2."VAT Calculation Type"::"Full VAT");
+          IF SalesInvLine2.FINDFIRST THEN BEGIN
+            TaxableAmount := 0;
+            TaxAmount := 0;
+            SalesInvLine2.SETFILTER("VAT %",'<>0');
+            IF SalesInvLine2.FINDSET THEN BEGIN
+              VATPercentage := SalesInvLine2."VAT %";
+              REPEAT
+                UpdateTaxAmtAndTaxableAmt(SalesInvLine2.Amount,SalesInvLine2."Amount Including VAT",TaxableAmount,TaxAmount);
+              UNTIL SalesInvLine2.NEXT = 0;
+              // Invoice->TaxTotal->TaxSubtotal
+              AddElement(XMLCurrNode,'TaxSubtotal','',DocNameSpace2,XMLNewChild,Prefix2);
+              XMLCurrNode := XMLNewChild;
+              AddElement(XMLCurrNode,'TaxableAmount',
+                OIOUBLDocumentEncode.DecimalToText(TaxableAmount),DocNameSpace,XMLNewChild,Prefix);
+              XMLCurrNode := XMLNewChild;
+              AddAttribute(XMLCurrNode,'currencyID',SalesInvoiceHeader."Currency Code");
+              XMLCurrNode := XMLCurrNode.ParentNode;
+
+              AddElement(XMLCurrNode,'TaxAmount',
+                OIOUBLDocumentEncode.DecimalToText(TaxAmount),DocNameSpace,XMLNewChild,Prefix);
+              XMLCurrNode := XMLNewChild;
+              AddAttribute(XMLCurrNode,'currencyID',SalesInvoiceHeader."Currency Code");
+              XMLCurrNode := XMLCurrNode.ParentNode;
+
+              // Invoice->TaxTotal->TaxSubtotal->TaxCategory
+              AddElement(XMLCurrNode,'TaxCategory','',DocNameSpace2,XMLNewChild,Prefix2);
+              XMLCurrNode := XMLNewChild;
+
+              AddElement(XMLCurrNode,'ID',GetTaxCategoryID(SalesInvLine2."VAT Calculation Type",VATPercentage),
+                DocNameSpace,XMLNewChild,Prefix);
+              XMLCurrNode := XMLNewChild;
+              AddAttribute(XMLCurrNode,'schemeID','urn:oioubl:id:taxcategoryid-1.1');
+              AddAttribute(XMLCurrNode,'schemeAgencyID','320');
+              XMLCurrNode := XMLCurrNode.ParentNode;
+
+              AddElement(XMLCurrNode,'Percent',OIOUBLDocumentEncode.DecimalToText(VATPercentage),
+                DocNameSpace,XMLNewChild,Prefix);
+
+              // Invoice->TaxTotal->TaxSubtotal->TaxCategory->TaxScheme
+              AddElement(XMLCurrNode,'TaxScheme','',DocNameSpace2,XMLNewChild,Prefix2);
+              XMLCurrNode := XMLNewChild;
+
+              AddElement(XMLCurrNode,'ID','63',DocNameSpace,XMLNewChild,Prefix);
+              XMLCurrNode := XMLNewChild;
+              AddAttribute(XMLCurrNode,'schemeID','urn:oioubl:id:taxschemeid-1.1');
+              XMLCurrNode := XMLCurrNode.ParentNode;
+              AddElement(XMLCurrNode,'Name','Moms',DocNameSpace,XMLNewChild,Prefix);
+
+              XMLCurrNode := XMLCurrNode.ParentNode;
+              XMLCurrNode := XMLCurrNode.ParentNode;
+              XMLCurrNode := XMLCurrNode.ParentNode;
+            END;
+
+            TaxableAmount := 0;
+            TaxAmount := 0;
+            SalesInvLine2.SETRANGE("VAT %",0);
+            IF SalesInvLine2.FINDSET THEN BEGIN
+              VATPercentage := SalesInvLine2."VAT %";
+              REPEAT
+                UpdateTaxAmtAndTaxableAmt(SalesInvLine2.Amount,SalesInvLine2."Amount Including VAT",TaxableAmount,TaxAmount);
+              UNTIL SalesInvLine2.NEXT = 0;
+              // Invoice->TaxTotal->TaxSubtotal
+              AddElement(XMLCurrNode,'TaxSubtotal','',DocNameSpace2,XMLNewChild,Prefix2);
+              XMLCurrNode := XMLNewChild;
+              AddElement(XMLCurrNode,'TaxableAmount',
+                OIOUBLDocumentEncode.DecimalToText(TaxableAmount),DocNameSpace,XMLNewChild,Prefix);
+              XMLCurrNode := XMLNewChild;
+              AddAttribute(XMLCurrNode,'currencyID',SalesInvoiceHeader."Currency Code");
+              XMLCurrNode := XMLCurrNode.ParentNode;
+
+              AddElement(XMLCurrNode,'TaxAmount',
+                OIOUBLDocumentEncode.DecimalToText(TaxAmount),DocNameSpace,XMLNewChild,Prefix);
+              XMLCurrNode := XMLNewChild;
+              AddAttribute(XMLCurrNode,'currencyID',SalesInvoiceHeader."Currency Code");
+              XMLCurrNode := XMLCurrNode.ParentNode;
+
+              // Invoice->TaxTotal->TaxSubtotal->TaxCategory
+              AddElement(XMLCurrNode,'TaxCategory','',DocNameSpace2,XMLNewChild,Prefix2);
+              XMLCurrNode := XMLNewChild;
+
+              AddElement(XMLCurrNode,'ID',GetTaxCategoryID(SalesInvLine2."VAT Calculation Type",VATPercentage),
+                DocNameSpace,XMLNewChild,Prefix);
+              XMLCurrNode := XMLNewChild;
+              AddAttribute(XMLCurrNode,'schemeID','urn:oioubl:id:taxcategoryid-1.1');
+              AddAttribute(XMLCurrNode,'schemeAgencyID','320');
+              XMLCurrNode := XMLCurrNode.ParentNode;
+
+              AddElement(XMLCurrNode,'Percent',OIOUBLDocumentEncode.DecimalToText(VATPercentage),
+                DocNameSpace,XMLNewChild,Prefix);
+
+              // Invoice->TaxTotal->TaxSubtotal->TaxCategory->TaxScheme
+              AddElement(XMLCurrNode,'TaxScheme','',DocNameSpace2,XMLNewChild,Prefix2);
+              XMLCurrNode := XMLNewChild;
+
+              AddElement(XMLCurrNode,'ID','63',DocNameSpace,XMLNewChild,Prefix);
+              XMLCurrNode := XMLNewChild;
+              AddAttribute(XMLCurrNode,'schemeID','urn:oioubl:id:taxschemeid-1.1');
+              XMLCurrNode := XMLCurrNode.ParentNode;
+              AddElement(XMLCurrNode,'Name','Moms',DocNameSpace,XMLNewChild,Prefix);
+
+              XMLCurrNode := XMLCurrNode.ParentNode;
+              XMLCurrNode := XMLCurrNode.ParentNode;
+              XMLCurrNode := XMLCurrNode.ParentNode;
+            END;
+          END;
+
+          // Invoice->TaxTotal (for "Reverse Charge VAT")
+          SalesInvLine2.SETRANGE("VAT %");
+          SalesInvLine2.SETRANGE("VAT Calculation Type",SalesInvLine2."VAT Calculation Type"::"Reverse Charge VAT");
+          IF SalesInvLine2.FINDSET THEN BEGIN
+            TaxableAmount := 0;
+            TaxAmount := 0;
+            VATPercentage := SalesInvLine2."VAT %";
+            REPEAT
+              UpdateTaxAmtAndTaxableAmt(SalesInvLine2.Amount,SalesInvLine2."Amount Including VAT",TaxableAmount,TaxAmount);
+            UNTIL SalesInvLine2.NEXT = 0;
+            // Invoice->TaxTotal->TaxSubtotal
+            AddElement(XMLCurrNode,'TaxSubtotal','',DocNameSpace2,XMLNewChild,Prefix2);
+            XMLCurrNode := XMLNewChild;
+            AddElement(XMLCurrNode,'TaxableAmount',
+              OIOUBLDocumentEncode.DecimalToText(TaxableAmount),DocNameSpace,XMLNewChild,Prefix);
+            XMLCurrNode := XMLNewChild;
+            AddAttribute(XMLCurrNode,'currencyID',SalesInvoiceHeader."Currency Code");
+            XMLCurrNode := XMLCurrNode.ParentNode;
+
+            AddElement(XMLCurrNode,'TaxAmount',
+              OIOUBLDocumentEncode.DecimalToText(TaxAmount),DocNameSpace,XMLNewChild,Prefix);
+            XMLCurrNode := XMLNewChild;
+            AddAttribute(XMLCurrNode,'currencyID',SalesInvoiceHeader."Currency Code");
+            XMLCurrNode := XMLCurrNode.ParentNode;
+
+            // Invoice->TaxTotal->TaxSubtotal->TaxCategory
+            AddElement(XMLCurrNode,'TaxCategory','',DocNameSpace2,XMLNewChild,Prefix2);
+            XMLCurrNode := XMLNewChild;
+
+            AddElement(XMLCurrNode,'ID',GetTaxCategoryID(SalesInvLine2."VAT Calculation Type",VATPercentage),
+              DocNameSpace,XMLNewChild,Prefix);
+            XMLCurrNode := XMLNewChild;
+            AddAttribute(XMLCurrNode,'schemeID','urn:oioubl:id:taxcategoryid-1.1');
+            AddAttribute(XMLCurrNode,'schemeAgencyID','320');
+            XMLCurrNode := XMLCurrNode.ParentNode;
+
+            AddElement(XMLCurrNode,'Percent',OIOUBLDocumentEncode.DecimalToText(VATPercentage),
+              DocNameSpace,XMLNewChild,Prefix);
+
+            // Invoice->TaxTotal->TaxSubtotal->TaxCategory->TaxScheme
+            AddElement(XMLCurrNode,'TaxScheme','',DocNameSpace2,XMLNewChild,Prefix2);
+            XMLCurrNode := XMLNewChild;
+
+            AddElement(XMLCurrNode,'ID','63',DocNameSpace,XMLNewChild,Prefix);
+            XMLCurrNode := XMLNewChild;
+            AddAttribute(XMLCurrNode,'schemeID','urn:oioubl:id:taxschemeid-1.1');
+            XMLCurrNode := XMLCurrNode.ParentNode;
+            AddElement(XMLCurrNode,'Name','Moms',DocNameSpace,XMLNewChild,Prefix);
+
+            XMLCurrNode := XMLCurrNode.ParentNode;
+            XMLCurrNode := XMLCurrNode.ParentNode;
+            XMLCurrNode := XMLCurrNode.ParentNode;
+          END;
+          XMLCurrNode := XMLCurrNode.ParentNode;
+        END;
+
+        // Invoice->LegalMonetaryTotal
+        TaxableAmount := 0;
+        TaxAmount := 0;
+
+        SalesInvLine2.RESET;
+        SalesInvLine2.COPY(SalesInvLine);
+        IF SalesInvLine2.FINDSET THEN
+          REPEAT
+            TaxableAmount := TaxableAmount + SalesInvLine2.Amount + GetDiscountAmount(SalesInvLine2);
+            TotalAmount := TotalAmount + SalesInvLine2."Amount Including VAT";
+            TaxAmount := TaxAmount + SalesInvLine2."Amount Including VAT" - SalesInvLine2.Amount;
+          UNTIL SalesInvLine2.NEXT = 0;
+
+        AddElement(XMLCurrNode,'LegalMonetaryTotal','',DocNameSpace2,XMLNewChild,Prefix2);
+        XMLCurrNode := XMLNewChild;
+
+        AddElement(XMLCurrNode,'LineExtensionAmount',OIOUBLDocumentEncode.DecimalToText(TaxableAmount),
+          DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLNewChild;
+        AddAttribute(XMLCurrNode,'currencyID',CurrencyCode);
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        AddElement(XMLCurrNode,'TaxExclusiveAmount',OIOUBLDocumentEncode.DecimalToText(TaxAmount),
+          DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLNewChild;
+        AddAttribute(XMLCurrNode,'currencyID',SalesInvoiceHeader."Currency Code");
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        AddElement(XMLCurrNode,'TaxInclusiveAmount',OIOUBLDocumentEncode.DecimalToText(TotalAmount),
+          DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLNewChild;
+        AddAttribute(XMLCurrNode,'currencyID',SalesInvoiceHeader."Currency Code");
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        AddElement(XMLCurrNode,'PayableAmount',OIOUBLDocumentEncode.DecimalToText(TotalAmount),
+          DocNameSpace,XMLNewChild,Prefix);
+        XMLCurrNode := XMLNewChild;
+        AddAttribute(XMLCurrNode,'currencyID',SalesInvoiceHeader."Currency Code");
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        XMLCurrNode := XMLCurrNode.ParentNode;
+
+        // Invoice->InvoiceLine
+        REPEAT
+          SalesInvLine.TESTFIELD(Description);
+
+          ExcludeVAT(SalesInvLine,SalesInvoiceHeader."Prices Including VAT");
+
+          AddElement(XMLCurrNode,'InvoiceLine','',DocNameSpace2,XMLNewChild,Prefix2);
+          XMLCurrNode := XMLNewChild;
+
+          AddElement(XMLCurrNode,'ID',FORMAT(SalesInvLine."Line No."),DocNameSpace,XMLNewChild,Prefix);
+          AddElement(XMLCurrNode,'InvoicedQuantity',OIOUBLDocumentEncode.DecimalToText(SalesInvLine.Quantity),
+            DocNameSpace,XMLNewChild,Prefix);
+          XMLCurrNode := XMLNewChild;
+          AddAttribute(XMLCurrNode,'unitCode',OIOUBLDocumentEncode.GetUoMCode(SalesInvLine."Unit of Measure Code"));
+          XMLCurrNode := XMLCurrNode.ParentNode;
+
+          AddElement(XMLCurrNode,'LineExtensionAmount',
+            OIOUBLDocumentEncode.DecimalToText(SalesInvLine.Amount + GetDiscountAmount(SalesInvLine)),DocNameSpace,XMLNewChild,Prefix);
+          XMLCurrNode := XMLNewChild;
+          AddAttribute(XMLNewChild,'currencyID',SalesInvoiceHeader."Currency Code");
+          XMLCurrNode := XMLCurrNode.ParentNode;
+
+          DiscountAmount := GetDiscountAmount(SalesInvLine);
+          IF DiscountAmount > 0 THEN BEGIN
+            AddElement(
+              XMLCurrNode,'AllowanceCharge',OIOUBLDocumentEncode.DecimalToText(DiscountAmount),DocNameSpace,XMLNewChild,Prefix);
+            XMLCurrNode := XMLNewChild;
+            AddAttribute(XMLNewChild,'currencyID',SalesInvoiceHeader."Currency Code");
+            XMLCurrNode := XMLCurrNode.ParentNode;
+          END;
+
+          AddElement(XMLCurrNode,'AccountingCost',SalesInvLine."Account Code DK",DocNameSpace,XMLNewChild,Prefix);
+
+          // Invoice->InvoiceLine->OrderLineReference
+          AddElement(XMLCurrNode,'OrderLineReference','',DocNameSpace2,XMLNewChild,Prefix2);
+          XMLCurrNode := XMLNewChild;
+
+          AddElement(XMLCurrNode,'LineID',FORMAT(SalesInvLine."Line No."),DocNameSpace,XMLNewChild,Prefix);
+
+          // Invoice->InvoiceLine->OrderLineReference->OrderReference
+          AddElement(XMLCurrNode,'OrderReference','',DocNameSpace2,XMLNewChild,Prefix2);
+          XMLCurrNode := XMLNewChild;
+
+          AddElement(XMLCurrNode,'ID',SalesInvoiceHeader."External Document No.",DocNameSpace,XMLNewChild,Prefix);
+
+          XMLCurrNode := XMLCurrNode.ParentNode;
+          XMLCurrNode := XMLCurrNode.ParentNode;
+
+          // Invoice->InvoiceLine->AllowanceCharge
+          IF SalesInvLine.Type = SalesInvLine.Type::"Charge (Item)" THEN BEGIN
+            ItemCharge.GET(SalesInvLine."No.");
+
+            AddElement(XMLCurrNode,'AllowanceCharge','',DocNameSpace2,XMLNewChild,Prefix2);
+            XMLCurrNode := XMLNewChild;
+
+            AddElement(XMLCurrNode,'ID','1',DocNameSpace,XMLNewChild,Prefix);
+            AddElement(XMLCurrNode,'ChargeIndicator','false',DocNameSpace,XMLNewChild,Prefix);
+
+            CASE ItemCharge."Charge Category" OF
+              ItemCharge."Charge Category"::"General Rebate":
+                AddElement(XMLCurrNode,'AllowanceChargeReason','Rabat',DocNameSpace,XMLNewChild,Prefix);
+              ItemCharge."Charge Category"::"General Fine":
+                AddElement(XMLCurrNode,'AllowanceChargeReason','Gebyr',DocNameSpace,XMLNewChild,Prefix);
+              ItemCharge."Charge Category"::"Freight Charge":
+                AddElement(XMLCurrNode,'AllowanceChargeReason','Fragt',DocNameSpace,XMLNewChild,Prefix);
+              ItemCharge."Charge Category"::Duty:
+                AddElement(XMLCurrNode,'AllowanceChargeReason','Afgift',DocNameSpace,XMLNewChild,Prefix);
+              ItemCharge."Charge Category"::Tax:
+                AddElement(XMLCurrNode,'AllowanceChargeReason','Told',DocNameSpace,XMLNewChild,Prefix);
+            END;
+
+            AddElement(XMLCurrNode,'MultiplierFactorNumeric','1.000',DocNameSpace,XMLNewChild,Prefix);
+            AddElement(XMLCurrNode,'SequenceNumeric','1',DocNameSpace,XMLNewChild,Prefix);
+
+            AddElement(XMLCurrNode,'Amount',OIOUBLDocumentEncode.DecimalToText(SalesInvLine."Amount Including VAT"),
+              DocNameSpace,XMLNewChild,Prefix);
+            XMLCurrNode := XMLNewChild;
+            AddAttribute(XMLCurrNode,'currencyID',SalesInvoiceHeader."Currency Code");
+            XMLCurrNode := XMLCurrNode.ParentNode;
+
+            AddElement(XMLCurrNode,'BaseAmount',OIOUBLDocumentEncode.DecimalToText(SalesInvLine."Amount Including VAT"),
+              DocNameSpace,XMLNewChild,Prefix);
+            XMLCurrNode := XMLNewChild;
+            AddAttribute(XMLCurrNode,'currencyID',SalesInvoiceHeader."Currency Code");
+            XMLCurrNode := XMLCurrNode.ParentNode;
+
+            // Invoice->InvoiceLine->TaxCategory
+            AddElement(XMLCurrNode,'TaxCategory','',DocNameSpace2,XMLNewChild,Prefix2);
+            XMLCurrNode := XMLNewChild;
+
+            AddElement(XMLCurrNode,'ID',GetTaxCategoryID(SalesInvLine."VAT Calculation Type",SalesInvLine."VAT %"),
+              DocNameSpace,XMLNewChild,Prefix);
+            XMLCurrNode := XMLNewChild;
+            AddAttribute(XMLCurrNode,'schemeID','urn:oioubl:id:taxcategoryid-1.1');
+            AddAttribute(XMLCurrNode,'schemeAgencyID','320');
+            XMLCurrNode := XMLCurrNode.ParentNode;
+
+            AddElement(XMLCurrNode,'Percent',OIOUBLDocumentEncode.DecimalToText(SalesInvLine."VAT %"),
+              DocNameSpace,XMLNewChild,Prefix);
+            AddElement(XMLCurrNode,'TaxScheme','',DocNameSpace2,XMLNewChild,Prefix2);
+            XMLCurrNode := XMLNewChild;
+
+            AddElement(XMLCurrNode,'ID','63',DocNameSpace,XMLNewChild,Prefix);
+            XMLCurrNode := XMLNewChild;
+            AddAttribute(XMLCurrNode,'schemeID','urn:oioubl:id:taxschemeid-1.1');
+            XMLCurrNode := XMLCurrNode.ParentNode;
+            AddElement(XMLCurrNode,'Name','Moms',DocNameSpace,XMLNewChild,Prefix);
+            XMLCurrNode := XMLCurrNode.ParentNode;
+            XMLCurrNode := XMLCurrNode.ParentNode;
+            XMLCurrNode := XMLCurrNode.ParentNode;
+          END;
+
+          // Invoice->InvoiceLine->TaxTotal
+          AddElement(XMLCurrNode,'TaxTotal','',DocNameSpace2,XMLNewChild,Prefix2);
+          XMLCurrNode := XMLNewChild;
+
+          AddElement(XMLCurrNode,'TaxAmount',
+            OIOUBLDocumentEncode.DecimalToText(SalesInvLine."Amount Including VAT" - SalesInvLine.Amount),
+            DocNameSpace,XMLNewChild,Prefix);
+          XMLCurrNode := XMLNewChild;
+          AddAttribute(XMLCurrNode,'currencyID',CurrencyCode);
+          XMLCurrNode := XMLCurrNode.ParentNode;
+
+          // Invoice->InvoiceLine->TaxTotal->TaxSubtotal
+          AddElement(XMLCurrNode,'TaxSubtotal','',DocNameSpace2,XMLNewChild,Prefix2);
+          XMLCurrNode := XMLNewChild;
+          AddElement(XMLCurrNode,'TaxableAmount',
+            OIOUBLDocumentEncode.DecimalToText(SalesInvLine.Amount),DocNameSpace,XMLNewChild,Prefix);
+          XMLCurrNode := XMLNewChild;
+          AddAttribute(XMLCurrNode,'currencyID',CurrencyCode);
+          XMLCurrNode := XMLCurrNode.ParentNode;
+
+          AddElement(XMLCurrNode,'TaxAmount',
+            OIOUBLDocumentEncode.DecimalToText(SalesInvLine."Amount Including VAT" - SalesInvLine.Amount),
+            DocNameSpace,XMLNewChild,Prefix);
+          XMLCurrNode := XMLNewChild;
+          AddAttribute(XMLCurrNode,'currencyID',CurrencyCode);
+          XMLCurrNode := XMLCurrNode.ParentNode;
+
+          // Invoice->InvoiceLine->TaxTotal->TaxSubtotal->TaxCategory
+          AddElement(XMLCurrNode,'TaxCategory','',DocNameSpace2,XMLNewChild,Prefix2);
+          XMLCurrNode := XMLNewChild;
+
+          AddElement(XMLCurrNode,'ID',GetTaxCategoryID(SalesInvLine."VAT Calculation Type",SalesInvLine."VAT %"),
+            DocNameSpace,XMLNewChild,Prefix);
+          XMLCurrNode := XMLNewChild;
+          AddAttribute(XMLCurrNode,'schemeID','urn:oioubl:id:taxcategoryid-1.1');
+          AddAttribute(XMLCurrNode,'schemeAgencyID','320');
+          XMLCurrNode := XMLCurrNode.ParentNode;
+
+          AddElement(XMLCurrNode,'Percent',OIOUBLDocumentEncode.DecimalToText(SalesInvLine."VAT %"),
+            DocNameSpace,XMLNewChild,Prefix);
+
+          // Invoice->InvoiceLine->TaxTotal->TaxSubtotal->TaxCategory->TaxScheme
+          AddElement(XMLCurrNode,'TaxScheme','',DocNameSpace2,XMLNewChild,Prefix2);
+          XMLCurrNode := XMLNewChild;
+
+          AddElement(XMLCurrNode,'ID','63',DocNameSpace,XMLNewChild,Prefix);
+          XMLCurrNode := XMLNewChild;
+          AddAttribute(XMLCurrNode,'schemeID','urn:oioubl:id:taxschemeid-1.1');
+          XMLCurrNode := XMLCurrNode.ParentNode;
+          AddElement(XMLCurrNode,'Name','Moms',DocNameSpace,XMLNewChild,Prefix);
+
+          XMLCurrNode := XMLCurrNode.ParentNode;
+          XMLCurrNode := XMLCurrNode.ParentNode;
+          XMLCurrNode := XMLCurrNode.ParentNode;
+          XMLCurrNode := XMLCurrNode.ParentNode;
+
+          // Invoice->InvoiceLine->Item
+          AddElement(XMLCurrNode,'Item','',DocNameSpace2,XMLNewChild,Prefix2);
+          XMLCurrNode := XMLNewChild;
+
+          AddElement(XMLCurrNode,'Description',SalesInvLine.Description,DocNameSpace,XMLNewChild,Prefix);
+          AddElement(XMLCurrNode,'Name',COPYSTR(SalesInvLine.Description,1,40),DocNameSpace,XMLNewChild,Prefix);
+
+          // Invoice->InvoiceLine->Item->SellersItemIdentification
+          AddElement(XMLCurrNode,'SellersItemIdentification','',DocNameSpace2,XMLNewChild,Prefix2);
+          XMLCurrNode := XMLNewChild;
+
+          AddElement(XMLCurrNode,'ID',SalesInvLine."No.",DocNameSpace,XMLNewChild,Prefix);
+          XMLCurrNode := XMLNewChild;
+          AddAttribute(XMLCurrNode,'schemeID','n/a');
+          XMLCurrNode := XMLCurrNode.ParentNode;
+
+          XMLCurrNode := XMLCurrNode.ParentNode;
+          XMLCurrNode := XMLCurrNode.ParentNode;
+
+          // Invoice->InvoiceLine->Price
+          AddElement(XMLCurrNode,'Price','',DocNameSpace2,XMLNewChild,Prefix2);
+          XMLCurrNode := XMLNewChild;
+
+          AddElement(XMLCurrNode,'PriceAmount',FORMAT(SalesInvLine."Unit Price",0,9),
+            DocNameSpace,XMLNewChild,Prefix);
+          XMLCurrNode := XMLNewChild;
+          AddAttribute(XMLCurrNode,'currencyID',CurrencyCode);
+          XMLCurrNode := XMLCurrNode.ParentNode;
+
+          AddElement(XMLCurrNode,'BaseQuantity',OIOUBLDocumentEncode.DecimalToText(SalesInvLine.Quantity),
+            DocNameSpace,XMLNewChild,Prefix);
+          XMLCurrNode := XMLNewChild;
+          AddAttribute(XMLNewChild,'unitCode',OIOUBLDocumentEncode.GetUoMCode(SalesInvLine."Unit of Measure Code"));
+          XMLCurrNode := XMLCurrNode.ParentNode;
+
+          XMLCurrNode := XMLCurrNode.ParentNode;
+          XMLCurrNode := XMLCurrNode.ParentNode;
+
+        UNTIL SalesInvLine.NEXT = 0;
+      END;
+
+      XMLdocOut.Save(FromFile);
+    END;
+
+    PROCEDURE ReadCompanyInfo@1101100003();
+    BEGIN
+      IF NOT CompanyInfoRead THEN BEGIN
+        CompanyInfo.GET;
+        CompanyInfoRead := TRUE;
+      END;
+    END;
+
+    PROCEDURE ReadGLSetup@1101100011();
+    BEGIN
+      IF NOT GLSetupRead THEN BEGIN
+        GLSetup.GET;
+        GLSetupRead := TRUE;
+      END;
+    END;
+
+    PROCEDURE GetPaymentChannelCode@1060014() : Text[7];
+    BEGIN
+      EXIT(CompanyInfo.GetPaymentChannelCode);
+    END;
+
+    PROCEDURE GetTaxCategoryID@1060038(Type@1060000 : 'Normal VAT,Reverse Charge VAT,Full VAT,Sales Tax';VATPercent@1060001 : Decimal) : Text[15];
+    BEGIN
+      CASE Type OF
+        Type::"Normal VAT":
+          BEGIN
+            IF VATPercent <> 0 THEN
+              EXIT('StandardRated');
+            EXIT('ZeroRated');
+          END;
+        Type::"Full VAT":
+          EXIT('StandardRated');
+        Type::"Reverse Charge VAT":
+          EXIT('ReverseCharge');
+        ELSE
+          EXIT('ZeroRated');
+      END;
+    END;
+
+    PROCEDURE UpdateTaxAmtAndTaxableAmt@1060000(Amount@1060000 : Decimal;AmountIncludingVAT@1060001 : Decimal;VAR TaxableAmountParam@1060002 : Decimal;VAR TaxAmountParam@1060003 : Decimal);
+    BEGIN
+      TaxableAmountParam := TaxableAmountParam + Amount;
+      TaxAmountParam := TaxAmountParam + AmountIncludingVAT - Amount;
+    END;
+
+    PROCEDURE ExcludeVAT@1060001(VAR SalesInvLine@1060001 : Record 113;PricesInclVAT@1060000 : Boolean);
+    VAR
+      ExclVATFactor@1060002 : Decimal;
+    BEGIN
+      IF NOT PricesInclVAT THEN
+        EXIT;
+      WITH SalesInvLine DO BEGIN
+        ExclVATFactor := 1 + "VAT %" / 100;
+        "Line Discount Amount" := ROUND("Line Discount Amount" / ExclVATFactor,Currency."Amount Rounding Precision");
+        "Inv. Discount Amount" := ROUND("Inv. Discount Amount" / ExclVATFactor,Currency."Amount Rounding Precision");
+        "Unit Price" := ROUND("Unit Price" / ExclVATFactor,Currency."Amount Rounding Precision");
+      END;
+    END;
+
+    LOCAL PROCEDURE GetDiscountAmount@1060002(SalesInvLine@1060000 : Record 113) : Decimal;
+    BEGIN
+      WITH SalesInvLine DO BEGIN
+        IF "Line Discount %" = 100 THEN
+          EXIT(Quantity * "Unit Price");
+        EXIT("Inv. Discount Amount" + "Line Discount Amount");
+      END;
+    END;
+
+    BEGIN
+    {
+      http://oioubl.info/Classes/da/Invoice.html
+
+      150205 ITERO.DL Added
+        AddElement(XMLCurrNode,'Note','<![CDATA['+Rec."Invoice Text"+']]>',DocNameSpace,XMLNewChild,Prefix);
+    }
+    END.
+  }
+}
+

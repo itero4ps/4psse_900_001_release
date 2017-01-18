@@ -4,14 +4,18 @@ OBJECT Codeunit 1211 Payment Export Gen. Jnl Check
   {
     Date=;
     Time=;
-    Version List=NAVW19.00;
+    Version List=NAVW19.00,NAVDK9;
   }
   PROPERTIES
   {
     TableNo=81;
     OnRun=VAR
             GenJnlBatch@1001 : Record 232;
+            PaymentMethod@1060000 : Record 289;
+            VendBankAcc@1060003 : Record 288;
+            PmtExportMgt@1060005 : Codeunit 1210;
             BankAccount@1000 : Record 270;
+            CustomerBankAcc@1060004 : Record 287;
           BEGIN
             DeletePaymentFileErrors;
             GenJnlBatch.GET("Journal Template Name","Journal Batch Name");
@@ -47,9 +51,9 @@ OBJECT Codeunit 1211 Payment Export Gen. Jnl Check
               InsertPaymentFileError(STRSUBSTNO(SimultaneousPaymentDetailsErr,
                   FIELDCAPTION("Recipient Bank Account"),FIELDCAPTION("Creditor No.")));
 
-            IF ("Recipient Bank Account" = '') AND ("Creditor No." = '') THEN
+            IF ("Recipient Bank Account" = '') AND ("Creditor No." = '') AND ("Giro Acc. No." = '') THEN
               InsertPaymentFileError(STRSUBSTNO(EmptyPaymentDetailsErr,
-                  FIELDCAPTION("Recipient Bank Account"),FIELDCAPTION("Creditor No.")));
+                  FIELDCAPTION("Recipient Bank Account"),FIELDCAPTION("Creditor No."),FIELDCAPTION("Giro Acc. No.")));
 
             IF "Bal. Account Type" <> "Bal. Account Type"::"Bank Account" THEN
               InsertPaymentFileError(STRSUBSTNO(WrongBalAccountErr,FIELDCAPTION("Bal. Account Type"),
@@ -61,20 +65,51 @@ OBJECT Codeunit 1211 Payment Export Gen. Jnl Check
 
             IF Amount <= 0 THEN
               InsertPaymentFileError(MustBePositiveErr);
+
+            IF ("Recipient Bank Account" <> '') AND ("Giro Acc. No." <> '') THEN
+              InsertPaymentFileError(STRSUBSTNO(SimultaneousPaymentDetailsErr,
+                  FIELDCAPTION("Recipient Bank Account"),FIELDCAPTION("Giro Acc. No.")));
+
+            IF ("Creditor No." <> '') AND ("Payment Reference" = '') THEN BEGIN
+              IF PaymentMethod.GET("Payment Method Code") THEN
+                IF PaymentMethod."Payment Type Validation" = PaymentMethod."Payment Type Validation"::"FIK 71" THEN
+                  AddFieldEmptyError(Rec,TABLECAPTION,FIELDCAPTION("Payment Reference"),'');
+            END;
+
+            IF ("Giro Acc. No." <> '') AND ("Payment Reference" = '') THEN BEGIN
+              IF PaymentMethod.GET("Payment Method Code") THEN
+                IF PaymentMethod."Payment Type Validation" = PaymentMethod."Payment Type Validation"::"FIK 04" THEN
+                  AddFieldEmptyError(Rec,TABLECAPTION,FIELDCAPTION("Payment Reference"),'');
+            END;
+
+            CASE "Account Type" OF
+              "Account Type"::Vendor:
+                IF VendBankAcc.GET("Account No.","Recipient Bank Account") THEN
+                  CheckBankTransferCountryRegion(Rec,VendBankAcc."Country/Region Code");
+               "Account Type"::Customer:
+                 IF CustomerBankAcc.GET("Account No.","Recipient Bank Account") THEN
+                   CheckBankTransferCountryRegion(Rec,CustomerBankAcc."Country/Region Code");
+            END;
           END;
 
   }
   CODE
   {
     VAR
-      EmptyPaymentDetailsErr@1002 : TextConst '@@@="%1=Field;%2=Field";ENU=%1 or %2 must be used for payments.';
+      EmptyPaymentDetailsErr@1002 : TextConst '@@@="%1=Field;%2=Field;%3=Field";ENU=%1, %2 or %3 must be used for payments.';
+      FieldIsNotEmptyErr@1060003 : TextConst 'ENU=%1 must have a value';
       SimultaneousPaymentDetailsErr@1000 : TextConst '@@@="%1=Field;%2=Field";ENU=%1 and %2 cannot be used simultaneously for payments.';
       WrongBalAccountErr@1001 : TextConst '@@@="%1=Field;%1=Table;%3=Value;%4=Table;%5=Value";ENU=%1 for the %2 is different from %3 on %4: %5.';
+      WrongCreditorCurrencyErr@1060001 : TextConst '@@@="%1=Field;%2=Table;%3=Value";ENU=%1 for one or more %2 is incorrect. You can only use %3.';
+      WrongTransferCurrencyErr@1060000 : TextConst '@@@="%1=Field;%2=Table;%3=Value;%4=Value";ENU=%1 for one or more %2 is incorrect. You can only use %3 or %4.';
       MustBeVendorOrCustomerErr@1013 : TextConst 'ENU=The account must be a vendor or customer account.';
       MustBeVendPmtOrCustRefundErr@1012 : TextConst 'ENU=Only vendor payments and customer refunds are allowed.';
       MustBePositiveErr@1011 : TextConst 'ENU=The amount must be positive.';
       FieldBlankErr@1007 : TextConst '@@@="%1=table name, %2=field name. Example: Customer must have a value in Name.";ENU=%1 must have a value in %2.';
       FieldKeyBlankErr@1006 : TextConst '@@@="%1=table name, %2=key field value, %3=field name. Example: Customer 10000 must have a value in Name.";ENU=%1 %2 must have a value in %3.';
+      PaymentTypeShouldBeErr@1060002 : TextConst 'ENU=%1 should be %2 in %3.';
+      PaymentTypeShouldNotBeErr@1060004 : TextConst 'ENU=%1 should not be %2 in %3.';
+      MustBeVendorPmtErr@1060005 : TextConst 'ENU=The selected export format only supports vendor payments.';
 
     LOCAL PROCEDURE AddFieldEmptyError@1(VAR GenJnlLine@1000 : Record 81;TableCaption@1001 : Text;FieldCaption@1002 : Text;KeyValue@1003 : Text);
     VAR
@@ -92,6 +127,54 @@ OBJECT Codeunit 1211 Payment Export Gen. Jnl Check
       GenJnlBatch@1001 : Record 232;
     BEGIN
       AddFieldEmptyError(GenJnlLine,GenJnlBatch.TABLECAPTION,FieldCaption,FORMAT(KeyValue));
+    END;
+
+    LOCAL PROCEDURE CheckBankTransferCountryRegion@1060005(GenJournalLine@1060000 : Record 81;RecipientBankAccCountryRegionCode@1060001 : Code[10]);
+    VAR
+      BankAccount@1060002 : Record 270;
+      PaymentMethod@1060003 : Record 289;
+      CompanyInformation@1060004 : Record 79;
+    BEGIN
+      CompanyInformation.GET;
+      WITH GenJournalLine DO
+        IF PaymentMethod.GET("Payment Method Code") AND BankAccount.GET("Bal. Account No.") THEN
+          IF PaymentMethod."Payment Type Validation" <> PaymentMethod."Payment Type Validation"::" " THEN
+            IF CompanyInformation.GetCountryRegionCode(BankAccount."Country/Region Code") <>
+               CompanyInformation.GetCountryRegionCode(RecipientBankAccCountryRegionCode) THEN BEGIN
+                IF PaymentMethod."Payment Type Validation" <> PaymentMethod."Payment Type Validation"::International THEN
+                  InsertPaymentFileError(STRSUBSTNO(PaymentTypeShouldBeErr,PaymentMethod.FIELDCAPTION("Payment Type Validation"),
+                    PaymentMethod."Payment Type Validation"::International,PaymentMethod.TABLECAPTION));
+            END ELSE
+              IF PaymentMethod."Payment Type Validation" = PaymentMethod."Payment Type Validation"::International THEN
+                InsertPaymentFileError(STRSUBSTNO(PaymentTypeShouldNotBeErr,PaymentMethod.FIELDCAPTION("Payment Type Validation"),
+                PaymentMethod."Payment Type Validation"::International,PaymentMethod.TABLECAPTION));
+    END;
+
+    PROCEDURE CheckFormatSpecificPaymentRules@1060009(GenJournalLine@1060002 : Record 81);
+    VAR
+      EuroCurrency@1060001 : Record 4;
+      GeneralLedgerSetup@1060000 : Record 98;
+    BEGIN
+      GeneralLedgerSetup.GET;
+      EuroCurrency.SETRANGE("EMU Currency",TRUE);
+      EuroCurrency.FINDFIRST;
+
+      WITH GenJournalLine DO BEGIN
+        IF "Account Type" <> "Account Type"::Vendor THEN
+          InsertPaymentFileError(MustBeVendorPmtErr);
+
+        IF ("Recipient Bank Account" <> '') AND (("Currency Code" <> '') AND ("Currency Code" <> EuroCurrency.Code)) THEN
+          InsertPaymentFileError(STRSUBSTNO(WrongTransferCurrencyErr,
+            FIELDCAPTION("Currency Code"),TABLECAPTION,GeneralLedgerSetup."LCY Code",EuroCurrency.Code));
+
+        IF ("Creditor No." <> '') AND ("Currency Code" <> '') THEN
+          InsertPaymentFileError(STRSUBSTNO(WrongCreditorCurrencyErr,
+            FIELDCAPTION("Currency Code"),TABLECAPTION,GeneralLedgerSetup."LCY Code"));
+
+        IF ("Giro Acc. No." <> '') AND ("Currency Code" <> '') THEN
+          InsertPaymentFileError(STRSUBSTNO(WrongCreditorCurrencyErr,
+            FIELDCAPTION("Currency Code"),TABLECAPTION,GeneralLedgerSetup."LCY Code"));
+      END;
     END;
 
     BEGIN

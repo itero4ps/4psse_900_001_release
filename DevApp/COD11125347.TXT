@@ -17,39 +17,29 @@ OBJECT Codeunit 11125347 4PS Data Upgrade
   {
     VAR
       Text001@1100529200 : TextConst 'ENU=General';
-      StartDateTime@1100529201 : DateTime;
-      InstallationManagement@1100529203 : Codeunit 11012268;
+      StartDateTime@1100529205 : DateTime;
+      InstallationManagement@1100529204 : Codeunit 11012268;
+      NewCompany@1100529203 : Boolean;
+      NewDatabase@1100529201 : Boolean;
+
+    PROCEDURE GetLastCompanyConversionStatus@1100529201() : Integer;
+    BEGIN
+      EXIT(4101);   // Always update last ADU status when inserting new company level function !!
+    END;
+
+    PROCEDURE GetLastDatabaseConversionStatus@1100529200() : Integer;
+    BEGIN
+      EXIT(4101);   // Always update last ADU status when inserting new database level function !!
+    END;
 
     [UpgradePerCompany]
     PROCEDURE UpgradeDataPerCompanyTables@1100529233();
     VAR
-      JobsSetup@1100529203 : Record 315;
-      FirstCompanyConversionStatus@1100529202 : Integer;
-      LastCompanyConversionStatus@1100529200 : Integer;
       CompanyInitialize@1100529201 : Codeunit 2;
     BEGIN
       GLOBALLANGUAGE(InstallationManagement.GetDataUpgradeLanguage(FALSE));
 
-      FirstCompanyConversionStatus := 4100;
-      LastCompanyConversionStatus := 4101;
-
-      IF NOT JobsSetup.GET THEN
-        EXIT;
-
-      IF JobsSetup."Conversion Status" = 0 THEN BEGIN
-        JobsSetup."Conversion Status" := LastCompanyConversionStatus;
-        JobsSetup.MODIFY;
-        InsertNewCompanyUpgradeLogs(FirstCompanyConversionStatus,LastCompanyConversionStatus);
-        COMMIT;
-        EXIT;
-      END;
-
-      // 4PSNL 9.00-001
-      UpdateServiceContractBillToCustomer(4100);
-      UpdateVendorBlockForQuote(4101);
-
-      JobsSetup."Conversion Status" := LastCompanyConversionStatus;
-      JobsSetup.MODIFY;
+      ExecuteDataPerCompanyUpgrade;
 
       CompanyInitialize.RUN;
       COMMIT;
@@ -57,16 +47,45 @@ OBJECT Codeunit 11125347 4PS Data Upgrade
     END;
 
     [UpgradePerDatabase]
-    PROCEDURE UpgradeDataPerCompanyNoTables@1100529244();
-    VAR
-      DatabaseSetup@1100529202 : Record 11229358;
-      FirstDatabaseConversionStatus@1100529201 : Integer;
-      LastDatabaseConversionStatus@1100529200 : Integer;
+    PROCEDURE UpgradeDataPerDatabaseTables@1100529220();
     BEGIN
       GLOBALLANGUAGE(InstallationManagement.GetDataUpgradeLanguage(TRUE));
 
-      FirstDatabaseConversionStatus := 4100;
-      LastDatabaseConversionStatus := 4101;
+      ExecuteDataPerDatabaseUpgrade;
+
+      InsertExtendedTableProperties;
+      InsertPossibleDocLinks;
+      InsertConvCentralMgtFields;
+      InitAndCheckPossibleWebServices;
+    END;
+
+    PROCEDURE ExecuteDataPerCompanyUpgrade@1100529202();
+    VAR
+      JobsSetup@1100529201 : Record 315;
+      LastCompanyConversionStatus@1100529200 : Integer;
+    BEGIN
+      IF NOT JobsSetup.GET THEN
+        EXIT;
+
+      LastCompanyConversionStatus := GetLastCompanyConversionStatus;
+      NewCompany := (LastCompanyConversionStatus = JobsSetup."Conversion Status");
+
+      // 4PSW1 9.00-001 == Start with 4100
+      UpdateServiceContractBillToCustomer(4100);
+      UpdateVendorBlockForQuote(4101);
+
+      // 4PSW1 9.00-002 == Start with 4200
+
+      JobsSetup."Conversion Status" := LastCompanyConversionStatus;
+      JobsSetup.MODIFY;
+    END;
+
+    PROCEDURE ExecuteDataPerDatabaseUpgrade@1100529217();
+    VAR
+      DatabaseSetup@1100529202 : Record 11229358;
+      LastDatabaseConversionStatus@1100529200 : Integer;
+    BEGIN
+      LastDatabaseConversionStatus := GetLastDatabaseConversionStatus;
 
       IF NOT DatabaseSetup.GET THEN BEGIN
         DatabaseSetup.INIT;
@@ -74,17 +93,14 @@ OBJECT Codeunit 11125347 4PS Data Upgrade
         DatabaseSetup.INSERT;
       END;
 
-      IF DatabaseSetup."Conversion Status" = 0 THEN BEGIN
-        DatabaseSetup."Conversion Status" := LastDatabaseConversionStatus;
-        InsertNewDatabaseUpgradeLogs(FirstDatabaseConversionStatus,LastDatabaseConversionStatus);
-        DatabaseSetup.MODIFY;
-        COMMIT;
-        EXIT;
-      END;
+      IF DatabaseSetup."Conversion Status" = 0 THEN
+        NewDatabase := TRUE;
 
-      // 4PSNL 9.00-001
+      // 4PSW1 9.00-001 == Start with 4100
       UpdateCompanyPlanSetup(4100);
       UpdateIntercompanyRelationsICAccount(4101);
+
+      // 4PSW1 9.00-002 == Start with 4200
 
       DatabaseSetup."Conversion Status" := LastDatabaseConversionStatus;
       DatabaseSetup.MODIFY;
@@ -97,27 +113,28 @@ OBJECT Codeunit 11125347 4PS Data Upgrade
       ServiceContract@1100525000 : Record 11012812;
       TypeOfLog@1100529202 : 'Execute,No License Permission,New Company';
     BEGIN
-      IF NOT CompanyDataUpgradeLog.LogExists(ConversionStatus) THEN BEGIN
-        InstallationManagement.InitDataUpgradeLog(DATABASE::"Service-Contract",TypeOfLog,StartDateTime,FALSE);
-        IF TypeOfLog = TypeOfLog::Execute THEN BEGIN
-          WITH ServiceContract DO BEGIN
-            SETFILTER("Bill-to Customer No. (Contr.)", '<>%1', '');
-            IF ISEMPTY THEN BEGIN
-              SETRANGE("Bill-to Customer No. (Contr.)");
-              IF FINDSET THEN BEGIN
-                REPEAT
-                  "Bill-to Customer No. (Contr.)" := "Bill-to Customer No. (CP)";
-                  "Alt. Bill-to Address (Contr.)" := "Alt. Bill-to Address (CP)";
-                  "Use Bill-to as Sell-to (Contr)" := "Use Bill-to as Sell-to (CP)";
-                  MODIFY;
-                UNTIL NEXT = 0;
-              END;
+      IF CompanyDataUpgradeLog.LogExists(ConversionStatus) THEN
+        EXIT;
+
+      InstallationManagement.InitDataUpgradeLog(DATABASE::"Service-Contract",TypeOfLog,StartDateTime,NewCompany);
+      IF TypeOfLog = TypeOfLog::Execute THEN BEGIN
+        WITH ServiceContract DO BEGIN
+          SETFILTER("Bill-to Customer No. (Contr.)", '<>%1', '');
+          IF ISEMPTY THEN BEGIN
+            SETRANGE("Bill-to Customer No. (Contr.)");
+            IF FINDSET THEN BEGIN
+              REPEAT
+                "Bill-to Customer No. (Contr.)" := "Bill-to Customer No. (CP)";
+                "Alt. Bill-to Address (Contr.)" := "Alt. Bill-to Address (CP)";
+                "Use Bill-to as Sell-to (Contr)" := "Use Bill-to as Sell-to (CP)";
+                MODIFY;
+              UNTIL NEXT = 0;
             END;
           END;
         END;
-        CompanyDataUpgradeLog.InsertLog(ConversionStatus,StartDateTime,TypeOfLog);
-        COMMIT;
       END;
+      CompanyDataUpgradeLog.InsertLog(ConversionStatus,StartDateTime,TypeOfLog);
+      COMMIT;
     END;
 
     LOCAL PROCEDURE UpdateVendorBlockForQuote@1100528800(ConversionStatus@1100529200 : Integer);
@@ -126,21 +143,22 @@ OBJECT Codeunit 11125347 4PS Data Upgrade
       TypeOfLog@1100529202 : 'Execute,No License Permission,New Company';
       Vendor@1100528800 : Record 23;
     BEGIN
-      IF NOT CompanyDataUpgradeLog.LogExists(ConversionStatus) THEN BEGIN
-        InstallationManagement.InitDataUpgradeLog(DATABASE::Vendor,TypeOfLog,StartDateTime,FALSE);
-        IF TypeOfLog = TypeOfLog::Execute THEN BEGIN
-          WITH Vendor DO BEGIN
-            SETRANGE(Blocked, Blocked::All);
-            IF FINDSET THEN
-              REPEAT
-                "Block Purchase Quote" := TRUE;
-                MODIFY;
-              UNTIL NEXT = 0;
-          END;
+      IF CompanyDataUpgradeLog.LogExists(ConversionStatus) THEN
+        EXIT;
+
+      InstallationManagement.InitDataUpgradeLog(DATABASE::Vendor,TypeOfLog,StartDateTime,NewCompany);
+      IF TypeOfLog = TypeOfLog::Execute THEN BEGIN
+        WITH Vendor DO BEGIN
+          SETRANGE(Blocked, Blocked::All);
+          IF FINDSET THEN
+            REPEAT
+              "Block Purchase Quote" := TRUE;
+              MODIFY;
+            UNTIL NEXT = 0;
         END;
-        CompanyDataUpgradeLog.InsertLog(ConversionStatus,StartDateTime,TypeOfLog);
-        COMMIT;
       END;
+      CompanyDataUpgradeLog.InsertLog(ConversionStatus,StartDateTime,TypeOfLog);
+      COMMIT;
     END;
 
     LOCAL PROCEDURE UpdateCompanyPlanSetup@1100529245(ConversionStatus@1100529200 : Integer);
@@ -150,31 +168,32 @@ OBJECT Codeunit 11125347 4PS Data Upgrade
       CentralGWPSetupOBS@1100525001 : Record 11229283;
       TypeOfLog@1100529202 : 'Execute,No License Permission,New Company';
     BEGIN
-      IF NOT DatabaseDataUpgradeLog.LogExists(ConversionStatus) THEN BEGIN
-        InstallationManagement.InitDataUpgradeLog(DATABASE::"Company Plan Group",TypeOfLog,StartDateTime,FALSE);
-        IF TypeOfLog = TypeOfLog::Execute THEN BEGIN
-          WITH CentralGWPSetupOBS DO BEGIN
-            IF FINDFIRST THEN BEGIN
-              CompanyPlanGroup.Code := '001';
-              CompanyPlanGroup.Description := Text001;
-              CompanyPlanGroup."Window (Days)" := "Window (Days)";
-              CompanyPlanGroup."Start Window (Days b. WorkDat)" := "Start Window (Days b. WorkDat)";
-              CompanyPlanGroup."Show in Planning until Status" := "Show in Planning until Status";
-              CompanyPlanGroup."Update Planning Automatically" := "Update Planning Automatically";
-              CompanyPlanGroup."Update Planning Interval (Sec)" := "Update Planning Interval (Sec)";
-              CompanyPlanGroup."Automatic Scheduling" := "Automatic Scheduling";
-              CompanyPlanGroup."Setup Company" := "Setup Company";
-              CompanyPlanGroup."Server Address" := "Server Address";
-              CompanyPlanGroup."OData Service Port" := "OData Service Port";
-              CompanyPlanGroup."SOAP Service Port" := "SOAP Service Port";
-              CompanyPlanGroup."Instance Name" := "Instance Name";
-              CompanyPlanGroup.INSERT;
-            END;
+      IF DatabaseDataUpgradeLog.LogExists(ConversionStatus) THEN
+        EXIT;
+
+      InstallationManagement.InitDataUpgradeLog(DATABASE::"Company Plan Group",TypeOfLog,StartDateTime,NewDatabase);
+      IF TypeOfLog = TypeOfLog::Execute THEN BEGIN
+        WITH CentralGWPSetupOBS DO BEGIN
+          IF FINDFIRST THEN BEGIN
+            CompanyPlanGroup.Code := '001';
+            CompanyPlanGroup.Description := Text001;
+            CompanyPlanGroup."Window (Days)" := "Window (Days)";
+            CompanyPlanGroup."Start Window (Days b. WorkDat)" := "Start Window (Days b. WorkDat)";
+            CompanyPlanGroup."Show in Planning until Status" := "Show in Planning until Status";
+            CompanyPlanGroup."Update Planning Automatically" := "Update Planning Automatically";
+            CompanyPlanGroup."Update Planning Interval (Sec)" := "Update Planning Interval (Sec)";
+            CompanyPlanGroup."Automatic Scheduling" := "Automatic Scheduling";
+            CompanyPlanGroup."Setup Company" := "Setup Company";
+            CompanyPlanGroup."Server Address" := "Server Address";
+            CompanyPlanGroup."OData Service Port" := "OData Service Port";
+            CompanyPlanGroup."SOAP Service Port" := "SOAP Service Port";
+            CompanyPlanGroup."Instance Name" := "Instance Name";
+            CompanyPlanGroup.INSERT;
           END;
         END;
-        DatabaseDataUpgradeLog.InsertLog(ConversionStatus,StartDateTime,TypeOfLog);
-        COMMIT;
       END;
+      DatabaseDataUpgradeLog.InsertLog(ConversionStatus,StartDateTime,TypeOfLog);
+      COMMIT;
     END;
 
     LOCAL PROCEDURE UpdateIntercompanyRelationsICAccount@1100525000(ConversionStatus@1100529200 : Integer);
@@ -183,48 +202,57 @@ OBJECT Codeunit 11125347 4PS Data Upgrade
       IntercompanyRelation@1100525000 : Record 11012057;
       TypeOfLog@1100529202 : 'Execute,No License Permission,New Company';
     BEGIN
-      IF NOT DatabaseDataUpgradeLog.LogExists(ConversionStatus) THEN BEGIN
-        InstallationManagement.InitDataUpgradeLog(DATABASE::"Intercompany Relation",TypeOfLog,StartDateTime,FALSE);
-        IF TypeOfLog = TypeOfLog::Execute THEN BEGIN
-          WITH IntercompanyRelation DO BEGIN
-            SETRANGE("Receiving Company IC Account", '');
-            IF FINDSET THEN BEGIN
-              REPEAT
-                "Receiving Company IC Account" := "Supplying Company IC Account";
-                MODIFY;
-              UNTIL NEXT = 0;
-            END;
+      IF DatabaseDataUpgradeLog.LogExists(ConversionStatus) THEN
+        EXIT;
+
+      InstallationManagement.InitDataUpgradeLog(DATABASE::"Intercompany Relation",TypeOfLog,StartDateTime,NewDatabase);
+      IF TypeOfLog = TypeOfLog::Execute THEN BEGIN
+        WITH IntercompanyRelation DO BEGIN
+          SETRANGE("Receiving Company IC Account", '');
+          IF FINDSET THEN BEGIN
+            REPEAT
+              "Receiving Company IC Account" := "Supplying Company IC Account";
+              MODIFY;
+            UNTIL NEXT = 0;
           END;
         END;
-        DatabaseDataUpgradeLog.InsertLog(ConversionStatus,StartDateTime,TypeOfLog);
-        COMMIT;
       END;
+      DatabaseDataUpgradeLog.InsertLog(ConversionStatus,StartDateTime,TypeOfLog);
+      COMMIT;
     END;
 
-    LOCAL PROCEDURE InsertNewCompanyUpgradeLogs@1100529203(FirstNewCompanyLogEntry@1100529202 : Integer;LastNewCompanyLogEntry@1100529203 : Integer);
+    LOCAL PROCEDURE InsertExtendedTableProperties@1100525005();
     VAR
-      CompanyDataUpgradeLog@1100529200 : Record 11229360;
-      i@1100529201 : Integer;
-      TypeOfLog@1100529204 : 'Execute,No License Permission,New Company';
+      UpdateExtTableProperties@1100525000 : Codeunit 11020226;
+      ExtendedTableProperty@1100525001 : Record 11020573;
     BEGIN
-      FOR i := FirstNewCompanyLogEntry TO LastNewCompanyLogEntry DO
-        IF NOT CompanyDataUpgradeLog.LogExists(i) THEN BEGIN
-          InstallationManagement.InitDataUpgradeLog(0,TypeOfLog,StartDateTime,TRUE);
-          CompanyDataUpgradeLog.InsertLog(i,StartDateTime,TypeOfLog);
-        END;
+      //**4PS
+      UpdateExtTableProperties.RUN;
     END;
 
-    LOCAL PROCEDURE InsertNewDatabaseUpgradeLogs@1100529200(FirstNewDatabaseLogEntry@1100529202 : Integer;LastNewDatabaseLogEntry@1100529203 : Integer);
+    LOCAL PROCEDURE InsertPossibleDocLinks@1100525003();
     VAR
-      DatabaseDataUpgradeLog@1100529200 : Record 11229359;
-      i@1100529201 : Integer;
-      TypeOfLog@1100529204 : 'Execute,No License Permission,New Company';
+      PossibleDocLink@1199198000 : Record 11012748;
+      DocumentLinkManagement@1100525000 : Codeunit 11012401;
     BEGIN
-      FOR i := FirstNewDatabaseLogEntry TO LastNewDatabaseLogEntry DO
-        IF NOT DatabaseDataUpgradeLog.LogExists(i) THEN BEGIN
-          InstallationManagement.InitDataUpgradeLog(0,TypeOfLog,StartDateTime,TRUE);
-          DatabaseDataUpgradeLog.InsertLog(i,StartDateTime,TypeOfLog);
-        END;
+      //**4PS
+      IF PossibleDocLink.READPERMISSION THEN
+        DocumentLinkManagement.GeneratePossibleDocLinks();
+    END;
+
+    LOCAL PROCEDURE InsertConvCentralMgtFields@1100525001();
+    VAR
+      CentralDataManagement@1100525000 : Codeunit 11012010;
+    BEGIN
+      //**4PS
+      CentralDataManagement.InitCentralMgtFieldsSetup;
+    END;
+
+    LOCAL PROCEDURE InitAndCheckPossibleWebServices@1100529207();
+    VAR
+      PossibleWebServiceMgt@1100525000 : Codeunit 11125354;
+    BEGIN
+      PossibleWebServiceMgt.RUN;
     END;
 
     LOCAL PROCEDURE UpdateDataPerCompanyTableDummy@1100525009(ConversionStatus@1100529200 : Integer);
@@ -232,31 +260,32 @@ OBJECT Codeunit 11125347 4PS Data Upgrade
       CompanyDataUpgradeLog@1100529201 : Record 11229360;
       TypeOfLog@1100529202 : 'Execute,No License Permission,New Company';
     BEGIN
-      IF NOT CompanyDataUpgradeLog.LogExists(ConversionStatus) THEN BEGIN
-        //Activate line below and fill TableIDForLicenseCheck
-        //InstallationManagement.InitDataUpgradeLog(TableIDForLicenseCheck,TypeOfLog,StartDateTime,FALSE);
-        IF TypeOfLog = TypeOfLog::Execute THEN BEGIN
-
-        END;
-        CompanyDataUpgradeLog.InsertLog(ConversionStatus,StartDateTime,TypeOfLog);
-        COMMIT;
+      IF CompanyDataUpgradeLog.LogExists(ConversionStatus) THEN
+        EXIT;
+      //Activate line below and fill TableIDForLicenseCheck
+      //InstallationManagement.InitDataUpgradeLog(TableIDForLicenseCheck,TypeOfLog,StartDateTime,NewCompany);
+      IF TypeOfLog = TypeOfLog::Execute THEN BEGIN
+      //Write your ADU
       END;
+      CompanyDataUpgradeLog.InsertLog(ConversionStatus,StartDateTime,TypeOfLog);
+      COMMIT;
     END;
 
-    LOCAL PROCEDURE UpdateDataPerCompanyNoTableDummy@1100525002(ConversionStatus@1100529200 : Integer);
+    LOCAL PROCEDURE UpdateDataPerDatabaseTableDummy@1100525002(ConversionStatus@1100529200 : Integer);
     VAR
       DatabaseDataUpgradeLog@1100529201 : Record 11229359;
       TypeOfLog@1100529202 : 'Execute,No License Permission,New Company';
     BEGIN
-      IF NOT DatabaseDataUpgradeLog.LogExists(ConversionStatus) THEN BEGIN
-        //Activate line below and fill TableIDForLicenseCheck
-        //InstallationManagement.InitDataUpgradeLog(TableIDForLicenseCheck,TypeOfLog,StartDateTime,FALSE);
-        IF TypeOfLog = TypeOfLog::Execute THEN BEGIN
+      IF DatabaseDataUpgradeLog.LogExists(ConversionStatus) THEN
+        EXIT;
 
-        END;
-        DatabaseDataUpgradeLog.InsertLog(ConversionStatus,StartDateTime,TypeOfLog);
-        COMMIT;
+      //Activate line below and fill TableIDForLicenseCheck
+      //InstallationManagement.InitDataUpgradeLog(TableIDForLicenseCheck,TypeOfLog,StartDateTime,NewDatabase);
+      IF TypeOfLog = TypeOfLog::Execute THEN BEGIN
+      //Write your ADU
       END;
+      DatabaseDataUpgradeLog.InsertLog(ConversionStatus,StartDateTime,TypeOfLog);
+      COMMIT;
     END;
 
     BEGIN

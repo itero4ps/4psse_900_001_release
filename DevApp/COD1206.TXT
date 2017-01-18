@@ -4,7 +4,7 @@ OBJECT Codeunit 1206 Pmt Export Mgt Gen. Jnl Line
   {
     Date=;
     Time=;
-    Version List=NAVW19.00;
+    Version List=NAVW19.00,NAVDK9,4PSSE.DK;
   }
   PROPERTIES
   {
@@ -24,6 +24,8 @@ OBJECT Codeunit 1206 Pmt Export Mgt Gen. Jnl Line
       ProgressMsg@1001 : TextConst 'ENU=Processing line no. #1######.';
       HasErrorsErr@1008 : TextConst 'ENU=The file export has one or more errors. For each of the lines to be exported, resolve any errors that are displayed in the File Export Errors FactBox.';
       PaymentExportMgt@1003 : Codeunit 1210;
+      GLSetup@1100285500 : Record 98;
+      gotGLSetup@1100285501 : Boolean;
 
     PROCEDURE ExportJournalPaymentFileYN@2(VAR GenJnlLine@1001 : Record 81);
     BEGIN
@@ -51,12 +53,17 @@ OBJECT Codeunit 1206 Pmt Export Mgt Gen. Jnl Line
     LOCAL PROCEDURE CheckGenJnlLine@9(VAR GenJnlLine@1000 : Record 81);
     VAR
       GenJnlLine2@1001 : Record 81;
+      PaymentExportGenJnlCheck@1060000 : Codeunit 1211;
     BEGIN
       GenJnlLine.DeletePaymentFileBatchErrors;
       GenJnlLine2.COPYFILTERS(GenJnlLine);
+      GetGLSetup;  //4PSSE.DK
       IF GenJnlLine2.FINDSET THEN
         REPEAT
           CODEUNIT.RUN(CODEUNIT::"Payment Export Gen. Jnl Check",GenJnlLine2);
+          //NAVDK
+          IF GLSetup."Danish localization active" THEN
+            PaymentExportGenJnlCheck.CheckFormatSpecificPaymentRules(GenJnlLine2);
         UNTIL GenJnlLine2.NEXT = 0;
 
       IF GenJnlLine2.HasPaymentFileErrorsInBatch THEN BEGIN
@@ -72,6 +79,9 @@ OBJECT Codeunit 1206 Pmt Export Mgt Gen. Jnl Line
       CreditTransferEntry@1006 : Record 1206;
       Window@1002 : Dialog;
       LineNo@1003 : Integer;
+      LineAmount@1060003 : Decimal;
+      TransferDate@1060004 : Date;
+      TotalAmount@1060005 : Decimal;
     BEGIN
       GenJnlLine2.COPYFILTERS(GenJnlLine);
       GenJnlLine2.FINDSET;
@@ -84,7 +94,8 @@ OBJECT Codeunit 1206 Pmt Export Mgt Gen. Jnl Line
         LineNo += 1;
         Window.UPDATE(1,LineNo);
 
-        CreateGenJnlDataExchLine(DataExch."Entry No.",GenJnlLine2,LineNo);
+        CreateGenJnlDataExchLine(DataExch."Entry No.",GenJnlLine2,LineNo,LineAmount,TransferDate);
+        TotalAmount += LineAmount;
 
         CreditTransferEntry.CreateNew(CreditTransferRegister."No.",LineNo,
           GenJnlLine2."Account Type",GenJnlLine2."Account No.",GenJnlLine2.GetAppliesToDocEntryNo,
@@ -93,17 +104,23 @@ OBJECT Codeunit 1206 Pmt Export Mgt Gen. Jnl Line
       UNTIL GenJnlLine2.NEXT = 0;
       Window.CLOSE;
 
-      PaymentExportMgt.ExportToFile(DataExch."Entry No.");
+      GetGLSetup;  //4PSSE.DK
+      IF GLSetup."Danish localization active" THEN
+        ExportDataFromBuffer(GenJnlLine."Bal. Account No.",DataExch."Entry No.",LineNo,TotalAmount,TransferDate)  //NAVDK
+      ELSE
+        PaymentExportMgt.ExportToFile(DataExch."Entry No.");
 
       CODEUNIT.RUN(CODEUNIT::"Exp. User Feedback Gen. Jnl.",DataExch);
     END;
 
-    LOCAL PROCEDURE CreateGenJnlDataExchLine@16(DataExchEntryNo@1000 : Integer;GenJnlLine@1001 : Record 81;LineNo@1002 : Integer);
+    LOCAL PROCEDURE CreateGenJnlDataExchLine@16(DataExchEntryNo@1000 : Integer;GenJnlLine@1001 : Record 81;LineNo@1002 : Integer;VAR PmtExportLineAmount@1060001 : Decimal;VAR PmtExportTransferDate@1060002 : Date);
     VAR
       TempPaymentExportData@1004 : TEMPORARY Record 1226;
     BEGIN
       WITH GenJnlLine DO BEGIN
         PreparePaymentExportDataJnl(TempPaymentExportData,GenJnlLine,DataExchEntryNo,LineNo);
+        PmtExportLineAmount := TempPaymentExportData.Amount;  //NAVDK
+        PmtExportTransferDate := TempPaymentExportData."Transfer Date";  //NAVDK
         PaymentExportMgt.CreatePaymentLines(TempPaymentExportData);
       END;
     END;
@@ -148,7 +165,7 @@ OBJECT Codeunit 1206 Pmt Export Mgt Gen. Jnl Line
           "Recipient Bank City" := COPYSTR(VendorBankAccount."Post Code" + VendorBankAccount.City,1,35);
           "Recipient Bank BIC" := VendorBankAccount."SWIFT Code";
         END ELSE
-          IF GenJnlLine."Creditor No." <> '' THEN BEGIN
+          IF (GenJnlLine."Creditor No." <> '') OR (GenJnlLine."Giro Acc. No." <> '') THEN BEGIN
             Amount := GenJnlLine."Amount (LCY)";
             "Currency Code" := GeneralLedgerSetup."LCY Code";
           END;
@@ -167,8 +184,37 @@ OBJECT Codeunit 1206 Pmt Export Mgt Gen. Jnl Line
         IF PaymentMethod.GET(GenJnlLine."Payment Method Code") THEN
           "Data Exch. Line Def Code" := PaymentMethod."Pmt. Export Line Definition";
         "Recipient Creditor No." := GenJnlLine."Creditor No.";
+        "Recipient Giro Acc. No." := GenJnlLine."Giro Acc. No.";
         INSERT(TRUE);
       END;
+    END;
+
+    LOCAL PROCEDURE ExportDataFromBuffer@1060002(BalAccountNo@1060001 : Code[20];DataExchEntryNo@1060004 : Integer;LineCount@1060006 : Integer;TotalAmount@1060007 : Decimal;TransferDate@1060008 : Date);
+    VAR
+      BankAccount@1060000 : Record 270;
+      BankExportImportSetup@1060002 : Record 1200;
+      DataExchDef@1060003 : Record 1222;
+      TempPaymentExportData@1060005 : TEMPORARY Record 1226;
+      DataExch@1060009 : Record 1220;
+    BEGIN
+      GetGLSetup;  //NAVDK
+      IF NOT GLSetup."Danish localization active" THEN EXIT;
+      //NAVDK
+      BankAccount.GET(BalAccountNo);
+      BankExportImportSetup.GET(BankAccount."Payment Export Format");
+      DataExchDef.GET(BankExportImportSetup."Data Exch. Def. Code");
+      IF DataExchDef."Reading/Writing Codeunit" = CODEUNIT::"Export BankData Fixed Width" THEN BEGIN
+        TempPaymentExportData.INIT;
+        TempPaymentExportData."Data Exch Entry No." := DataExchEntryNo;
+        TempPaymentExportData."Line No." := LineCount;
+        TempPaymentExportData.Amount := TotalAmount;
+        TempPaymentExportData."Transfer Date" := TransferDate;
+        TempPaymentExportData.INSERT;
+        CODEUNIT.RUN(DataExchDef."Reading/Writing Codeunit",TempPaymentExportData);
+        DataExch.GET(DataExchEntryNo);
+        CODEUNIT.RUN(DataExchDef."Ext. Data Handling Codeunit",DataExch);
+      END ELSE
+        PaymentExportMgt.ExportToFile(DataExchEntryNo);
     END;
 
     PROCEDURE EnableExportToServerTempFile@27(SilentServerMode@1000 : Boolean;ServerFileExtension@1001 : Text[3]);
@@ -179,6 +225,14 @@ OBJECT Codeunit 1206 Pmt Export Mgt Gen. Jnl Line
     PROCEDURE GetServerTempFileName@29() : Text[1024];
     BEGIN
       EXIT(PaymentExportMgt.GetServerTempFileName);
+    END;
+
+    LOCAL PROCEDURE GetGLSetup@1100285500();
+    BEGIN
+      //4PSSE.DK
+      IF NOT gotGLSetup THEN
+        GLSetup.GET;
+      gotGLSetup := TRUE;
     END;
 
     BEGIN

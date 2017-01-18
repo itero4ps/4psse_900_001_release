@@ -1,0 +1,189 @@
+OBJECT Codeunit 12013631 Web Receipt Post
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=EXF350003;
+  }
+  PROPERTIES
+  {
+    TableNo=12013609;
+    OnRun=VAR
+            ExFlowSetup@1100285010 : Record 12013601;
+            DocLineOrg@1100285008 : Record 12013609;
+            PurchLine@1100285007 : Record 39;
+            DocLine2@1100285006 : Record 12013609;
+            PurchOrder@1100285005 : Record 38;
+            ExDocLineApprover@1100285004 : Record 12013610;
+            cu90@1100285003 : Codeunit 90;
+            ExFlowPurchPost@1100285002 : Codeunit 12013603;
+            NewQuantity@1100285001 : Decimal;
+            DocReleased@1100285000 : Boolean;
+          BEGIN
+            ExFlowSetup.GET(COMPANYNAME,0); //350003
+            DocLineOrg.RESET;
+            DocLineOrg.SETRANGE(ID, "Connected Line ID");
+            DocLineOrg.FIND('-');
+            "Base No. of Periods" := DocLineOrg."Line No.";
+            "Line Type" := DocLineOrg."Line Type";
+            "No." := DocLineOrg."No.";
+            MODIFY(FALSE);
+            CopyExDocDim(DocLineOrg,Rec);
+
+            PurchOrder.GET(1, "Document No.");
+            PurchOrder."New Line" := TRUE;
+
+            DocReleased := FALSE;
+            IF PurchOrder.Status = PurchOrder.Status::Released THEN BEGIN
+              DocReleased := TRUE;
+              PurchOrder.Status := PurchOrder.Status::Open;
+            END;
+            PurchOrder.MODIFY;
+
+            PurchLine.RESET;
+            PurchLine.SETRANGE("Document Type", "Document Type");
+            PurchLine.SETRANGE("Document No.", "Document No.");
+            IF PurchLine.FINDSET(TRUE) THEN
+              REPEAT
+                IF ExFlowSetup."Web Receipts" = ExFlowSetup."Web Receipts"::"NAV Receipts" THEN BEGIN
+                  IF PurchLine."Line No." = DocLineOrg."Line No." THEN BEGIN
+                    // Permission to over receive is set on the web
+                    NewQuantity := ABS(Quantity) + PurchLine."Quantity Received";
+                    IF ABS(Quantity) > PurchLine."Qty. to Receive" THEN
+                      PurchLine.VALIDATE(Quantity, NewQuantity);
+
+                    PurchLine.VALIDATE("Qty. to Receive",ABS(Quantity));
+                    PurchLine."Web Receipt" := TRUE;
+                    PurchLine.MODIFY(FALSE);
+                    // 342521
+                  END
+                  ELSE BEGIN
+                    PurchLine.VALIDATE("Qty. to Receive",0);
+                    PurchLine.MODIFY(FALSE);
+                  END;
+                END
+                ELSE BEGIN // Web confirmation only where Qty To Receive is set to zero for confirmed lines.
+                  IF PurchLine."Line No." = DocLineOrg."Line No." THEN BEGIN
+                    IF ((PurchLine.Quantity - PurchLine."Quantity Received") - ABS(Quantity)) >= 0  THEN BEGIN
+                      PurchLine.VALIDATE("Qty. to Receive", ABS(Quantity));
+                      PurchLine."Web Receipt" := TRUE;
+                      PurchLine."Quantity Received" := PurchLine."Quantity Received" + PurchLine."Qty. to Receive";
+                      PurchLine."Qty. Received (Base)" := PurchLine."Qty. Received (Base)" + PurchLine."Qty. to Receive (Base)";
+                      PurchLine.InitOutstanding;
+                      PurchLine.VALIDATE("Qty. to Receive", PurchLine.Quantity-PurchLine."Quantity Received");
+                      PurchLine.MODIFY(FALSE);
+                    END
+                    ELSE BEGIN
+                      DocLine2.RetrieveRecord(DocLine2,"Company Name", "Document Type", "Document No.", "Line No.");
+                      DocLine2."Error Message" := STRSUBSTNO(Text008,PurchLine.Quantity - PurchLine."Quantity Received");
+                      DocLine2.MODIFY(FALSE);
+                    END;
+                  END;
+                END;
+              UNTIL PurchLine.NEXT = 0;
+
+            PurchOrder.Receive := TRUE;
+            PurchOrder.Invoice := FALSE;
+
+            PurchOrder.SetHideValidationDialog(TRUE);
+            IF ExFlowSetup."Set Posting Date to (Web Rec.)" = ExFlowSetup."Set Posting Date to (Web Rec.)"::"Today's date" THEN
+              PurchOrder.VALIDATE("Posting Date", TODAY);
+
+            PurchOrder.MODIFY;
+
+            IF ExFlowSetup."Web Receipts" = ExFlowSetup."Web Receipts"::"NAV Receipts" THEN BEGIN
+              COMMIT;
+              CLEARLASTERROR;
+
+              CLEAR(cu90);
+              IF cu90.RUN(PurchOrder) THEN
+                BEGIN
+                  // New Doc line was created in cu90
+                  DocLine2.RESET;
+                  DocLine2.SETCURRENTKEY("Document No.");
+                  DocLine2.SETRANGE("Company Name", COMPANYNAME);
+                  DocLine2.SETRANGE("Document Type", "Document Type");
+                  DocLine2.SETRANGE("Document No.", "Document No.");
+                  DocLine2.SETRANGE("Connected Line ID", "Connected Line ID");
+                  DocLine2.SETFILTER(ID, '<>%1', ID);
+                  DocLine2.FINDLAST;
+                  DocLine2.DELETE;
+
+                  DocLine2.GET(ID);
+                  DocLine2."New Line" := FALSE;
+                  DocLine2.MODIFY(FALSE);
+
+                  // 344752
+                  ExDocLineApprover.RESET;
+                  ExDocLineApprover.SETCURRENTKEY("Document Line ID");
+                  ExDocLineApprover.SETRANGE("Document Line ID", DocLine2.ID);
+                  ExDocLineApprover.DELETEALL;
+                  // 344752
+                END
+              ELSE
+                BEGIN
+                  DocLine2.GET(ID);
+                  DocLine2."Error Message" := COPYSTR(GETLASTERRORTEXT,1,MAXSTRLEN(DocLine2."Error Message"));
+                  DocLine2.MODIFY(FALSE);
+                END;
+            END
+            ELSE BEGIN
+              ExFlowPurchPost.CheckPurchaseHeader(PurchOrder);
+
+              ExFlowPurchPost.SetStatusToReceived(PurchOrder);
+
+              DocLine2.GET(ID);
+              DocLine2."New Line" := FALSE;
+
+              // 344752
+              ExDocLineApprover.RESET;
+              ExDocLineApprover.SETCURRENTKEY("Document Line ID");
+              ExDocLineApprover.SETRANGE("Document Line ID", DocLine2.ID);
+              ExDocLineApprover.DELETEALL;
+              // 344752
+
+              DocLine2.MODIFY(FALSE);
+            END;
+
+            PurchOrder.GET(PurchOrder."Document Type",PurchOrder."No.");
+            IF DocReleased THEN
+              PurchOrder.Status := PurchOrder.Status::Released;
+
+            PurchOrder."New Line" := FALSE;
+            PurchOrder.MODIFY;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text008@1100285001 : TextConst 'ENU=You cannot receive more than %1 units.';
+
+    PROCEDURE CopyExDocDim@1100285000(FromDocLine@1100285000 : Record 12013609;ToDocLine@1100285001 : Record 12013609);
+    VAR
+      FromExDocLineDim@1100285003 : Record 12013611;
+      ToExDocLineDim@1100285002 : Record 12013611;
+    BEGIN
+      FromExDocLineDim.RESET;
+      FromExDocLineDim.SETCURRENTKEY("Document Line ID");
+      FromExDocLineDim.SETRANGE("Document Line ID", FromDocLine.ID);
+      IF FromExDocLineDim.FINDSET THEN
+        REPEAT
+          ToExDocLineDim.INIT;
+          ToExDocLineDim.TRANSFERFIELDS(FromExDocLineDim);
+          ToExDocLineDim.ID := 0;
+          ToExDocLineDim."Company Name" := ToDocLine."Company Name";
+          ToExDocLineDim."Document Type" := ToDocLine."Document Type";
+          ToExDocLineDim."Document No." := ToDocLine."Document No.";
+          ToExDocLineDim."Line No." := ToDocLine."Line No.";
+          ToExDocLineDim."Document Line ID" := ToDocLine.ID;
+          ToExDocLineDim.INSERT;
+        UNTIL FromExDocLineDim.NEXT = 0;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

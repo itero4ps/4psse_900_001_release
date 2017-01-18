@@ -1,0 +1,345 @@
+OBJECT Codeunit 11128055 Export Svefaktura
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PSSE;
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 112=rm,
+                TableData 114=rm,
+                TableData 304=rm;
+    OnRun=BEGIN
+            NASRunExportAll;  // IME271
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      xmldoc@1100285500 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      element@1100285504 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlElement";
+      blobTemp@1100285501 : Record 99008535;
+      Outstreamobj@1100285502 : OutStream;
+      Instreamobj@1100285503 : InStream;
+      Svefaktura@1100285505 : XMLport 11128055;
+      SalesInvoiceHeader@1100285506 : Record 112;
+      SalesCrMemoHeader@1100285508 : Record 114;
+      IssuedFinChargeMemoHdr@1100285513 : Record 304;
+      SalesInvoiceHeaderTEMP@1100285507 : TEMPORARY Record 112;
+      SalesInvoiceLineTEMP@1100285509 : TEMPORARY Record 113;
+      SalesCrMemoLine@1100285510 : Record 115;
+      SalesInvoiceLine@1100285511 : Record 113;
+      SalesRecSetup@1100285512 : Record 311;
+      GenericSalesHeaderTEMP@1100285000 : TEMPORARY Record 11071888;
+      GenericSalesLineTEMP@1100285001 : TEMPORARY Record 11071889;
+      SalesReportTextManagement@1100285003 : Codeunit 11012369;
+      FromNAS@1100285514 : Boolean;
+
+    PROCEDURE NASRunExportAll@1100285504();
+    BEGIN
+      // *** IME271 ****
+      // Runs export of invoices and marks "Invoice exported by xml" to TRUE when physically exported.
+      CLEARALL;
+      SalesRecSetup.GET();
+      IF NOT SalesRecSetup."Svefaktura Background Export" THEN EXIT;
+      FromNAS := TRUE;
+
+      // ******************* Sales Invoices ***************************
+      SalesInvoiceHeader.SETRANGE("Invoice Exported by XML", FALSE);
+      SalesInvoiceHeader.SETRANGE("Electronic Invoice Created", TRUE);
+      SalesInvoiceHeader.SETRANGE("Electronic Invoicing", SalesInvoiceHeader."Electronic Invoicing"::"Svefaktura (XML)");
+      IF NOT (SalesInvoiceHeader.ISEMPTY) THEN BEGIN
+         CreateSveSalesInvoice(SalesInvoiceHeader);
+      END;
+
+      // ******************* Sales Cr. Memo ***************************
+      SalesCrMemoHeader.SETRANGE("Invoice Exported by XML", FALSE);
+      SalesCrMemoHeader.SETRANGE("Electronic Credit Memo Created", TRUE);
+      SalesCrMemoHeader.SETRANGE("Electronic Invoicing", SalesCrMemoHeader."Electronic Invoicing"::"Svefaktura (XML)");
+      IF NOT (SalesCrMemoHeader.ISEMPTY) THEN BEGIN
+         CreateSveSalesCreditMemo(SalesCrMemoHeader);
+         SalesCrMemoHeader.MODIFYALL("Invoice Exported by XML", TRUE, FALSE);
+      END;
+
+      // ******************* Fin. Charge Memo ***************************
+      IssuedFinChargeMemoHdr.SETRANGE("Invoice Exported by XML", FALSE);
+      IssuedFinChargeMemoHdr.SETRANGE("Elec. Fin. Charge Memo Created", TRUE);
+      IF NOT (IssuedFinChargeMemoHdr.ISEMPTY) THEN BEGIN
+         CreateFinChargeMemo(IssuedFinChargeMemoHdr);
+         IssuedFinChargeMemoHdr.MODIFYALL("Invoice Exported by XML", TRUE, FALSE);
+      END;
+    END;
+
+    LOCAL PROCEDURE GenerateSveDocument@1100285500(VAR pSalesInvoiceHeader@1100285500 : Record 112;VAR pSalesInvoiceLine@1100285503 : Record 113;pCredit@1100285502 : Boolean);
+    VAR
+      lvFileName@1100285501 : Text;
+      oFile@1100285504 : File;
+      oStream@1100285505 : OutStream;
+      FileMgmt@1100285506 : Codeunit 419;
+      iStream@1100285000 : InStream;
+    BEGIN
+      //140602
+      SalesRecSetup.GET;
+      SalesRecSetup.TESTFIELD("Export Path Svefaktura");
+      SalesRecSetup.TESTFIELD(SalesRecSetup."External Doc. No. as Pmt. Ref", TRUE); // 141007
+
+      CLEAR(Svefaktura);
+      Svefaktura.SetSalesInvoice(pSalesInvoiceHeader, pSalesInvoiceLine);
+
+      xmldoc := xmldoc.XmlDocument;
+      blobTemp.Blob.CREATEOUTSTREAM(Outstreamobj);
+
+      IF pCredit THEN
+        Svefaktura.SetCredit;
+
+      Svefaktura.SetDiscount;
+
+      IF (SalesRecSetup."Svefaktura Background Export") AND (NOT FromNAS) THEN Svefaktura.SetDontMoveFiles; // IME271 Skip file move if not from NAS
+
+      Svefaktura.SETDESTINATION(Outstreamobj);
+      Svefaktura.EXPORT();
+      blobTemp.Blob.CREATEINSTREAM(Instreamobj);
+      xmldoc.Load(Instreamobj);
+      CLEAR(blobTemp.Blob);
+
+      element := xmldoc.SelectSingleNode('Invoice');
+      element.SetAttribute('xmlns', 'urn:sfti:documents:BasicInvoice:1:0');
+      //xmldoc.AppendChild(element);
+
+      lvFileName := SalesRecSetup."Export Path Svefaktura" + '\' + 'Inv_' + pSalesInvoiceHeader."No." + '_' + FORMAT(WORKDATE,0,'<year4><month,2><day,2>') + '_' + FORMAT(TIME,0,'<Standard format,2>') + '.xml';
+      IF (pCredit) THEN
+         lvFileName := SalesRecSetup."Export Path Svefaktura" + '\' + 'CrM_' + pSalesInvoiceHeader."No." + '_' + FORMAT(WORKDATE,0,'<year4><month,2><day,2>') + '_' +FORMAT(TIME,0,'<Standard format,2>') + '.xml';
+
+      IF (SalesRecSetup."Svefaktura Background Export") AND (NOT FromNAS) THEN EXIT; // IME271 Skip file creation if not from NAS
+
+      IF (GUIALLOWED) THEN BEGIN
+         // Manual run
+         blobTemp.Blob.CREATEOUTSTREAM(Outstreamobj);
+         xmldoc.Save(Outstreamobj);
+         //blobTemp.Blob.CREATEINSTREAM(iStream);
+         //DOWNLOADFROMSTREAM(iStream, 'Spara', 'c:\', 'XML|*.xml', lvFileName);
+
+         FileMgmt.BLOBExport4PS(blobTemp, lvFileName, FALSE, FALSE);
+         CLEAR(blobTemp.Blob);
+      END ELSE BEGIN
+          // NAS-run
+         oFile.CREATE(lvFileName);
+         oFile.CREATEOUTSTREAM(Outstreamobj);
+         xmldoc.Save(Outstreamobj);
+         oFile.CLOSE;
+         CLEAR(oFile);
+      END;
+    END;
+
+    PROCEDURE CreateSveSalesInvoice@1100285501(VAR pSalesInvHeader@1100285500 : Record 112);
+    BEGIN
+      // 141001 Changed creation of Invoice to go via Generic Sales Line and Generic Sales Header first.
+      SalesRecSetup.GET();
+      IF (pSalesInvHeader.FINDSET(TRUE)) THEN REPEAT
+
+         GenericSalesHeaderTEMP.DELETEALL;
+         GenericSalesLineTEMP.DELETEALL;
+         SalesInvoiceHeaderTEMP.DELETEALL;
+         SalesInvoiceHeaderTEMP.INIT;
+
+         GenericSalesHeaderTEMP.InsertSalesInvoiceHeader(pSalesInvHeader);
+         IF NOT GenericSalesHeaderTEMP.HasTextLines THEN
+           SalesReportTextManagement.CreateTextLinesForPostedInvoice(pSalesInvHeader);
+
+
+         SalesInvoiceHeaderTEMP.TRANSFERFIELDS(GenericSalesHeaderTEMP);
+         SalesInvoiceHeaderTEMP.INSERT();
+         //140602
+         SalesInvoiceLineTEMP.DELETEALL;
+         SalesInvoiceLine.SETRANGE("Document No.", pSalesInvHeader."No.");
+         IF SalesInvoiceLine.FINDSET(FALSE) THEN REPEAT
+
+            GenericSalesLineTEMP.InsertSalesInvoiceLine(SalesInvoiceLine);
+
+         UNTIL SalesInvoiceLine.NEXT = 0;
+         IF (GenericSalesLineTEMP.FINDSET(FALSE)) THEN REPEAT
+            SalesInvoiceLineTEMP.INIT;
+            SalesInvoiceLineTEMP.TRANSFERFIELDS(GenericSalesLineTEMP);
+            SalesInvoiceLineTEMP.INSERT();
+         UNTIL GenericSalesLineTEMP.NEXT = 0;
+
+         GenerateSveDocument(SalesInvoiceHeaderTEMP, SalesInvoiceLineTEMP, FALSE);
+         pSalesInvHeader."Electronic Invoice Created" := TRUE;
+         IF (FromNAS) OR (SalesRecSetup."Svefaktura Background Export" = FALSE) THEN
+            pSalesInvHeader."Invoice Exported by XML" := TRUE
+         ELSE
+            pSalesInvHeader."Invoice Exported by XML" := FALSE;
+         pSalesInvHeader.MODIFY();
+
+      UNTIL pSalesInvHeader.NEXT = 0;
+    END;
+
+    PROCEDURE CreateSveSalesCreditMemo@1100285502(VAR pSalesCrMemoHeader@1100285500 : Record 114);
+    BEGIN
+      // 141001 Changed creation of Credit Memo to go via Generic Sales Line and Generic Sales Header first.
+
+      IF (pSalesCrMemoHeader.FINDSET(TRUE)) THEN REPEAT
+
+         GenericSalesHeaderTEMP.DELETEALL; // 150319
+         GenericSalesLineTEMP.DELETEALL;   // 150319
+         SalesInvoiceHeaderTEMP.DELETEALL;
+         SalesInvoiceHeaderTEMP.INIT;
+
+         GenericSalesHeaderTEMP.InsertSalesCrMemoHeader(pSalesCrMemoHeader);
+         IF NOT GenericSalesHeaderTEMP.HasTextLines THEN
+           SalesReportTextManagement.CreateTextLinesForPostedCrMemo(pSalesCrMemoHeader);
+
+
+         SalesInvoiceHeaderTEMP.TRANSFERFIELDS(GenericSalesHeaderTEMP);
+         SalesInvoiceHeaderTEMP.INSERT();
+
+         SalesInvoiceLineTEMP.DELETEALL;
+         SalesCrMemoLine.SETRANGE("Document No.", pSalesCrMemoHeader."No.");
+
+         IF SalesCrMemoLine.FINDSET THEN REPEAT
+            GenericSalesLineTEMP.InsertSalesCrMemoLine(SalesCrMemoLine);
+         UNTIL SalesCrMemoLine.NEXT = 0;
+
+         IF (GenericSalesLineTEMP.FINDSET(FALSE)) THEN REPEAT
+
+            SalesInvoiceLineTEMP.INIT;
+            SalesInvoiceLineTEMP.TRANSFERFIELDS(GenericSalesLineTEMP);
+            SalesInvoiceLineTEMP.INSERT();
+         UNTIL GenericSalesLineTEMP.NEXT = 0;
+
+
+         //140602
+         GenerateSveDocument(SalesInvoiceHeaderTEMP, SalesInvoiceLineTEMP, TRUE);
+
+         pSalesCrMemoHeader."Electronic Credit Memo Created":= TRUE;
+         IF (FromNAS) OR (SalesRecSetup."Svefaktura Background Export" = FALSE) THEN
+            pSalesCrMemoHeader."Invoice Exported by XML" := TRUE
+         ELSE
+            pSalesCrMemoHeader."Invoice Exported by XML" := FALSE;
+         pSalesCrMemoHeader.MODIFY();
+      UNTIL pSalesCrMemoHeader.NEXT = 0;
+    END;
+
+    PROCEDURE CreateFinChargeMemo@1100285000(VAR pIssuedFinChargeMemoHeader@1100285000 : Record 304);
+    VAR
+      IssuedFinChargeMemoLine@1100285001 : Record 305;
+    BEGIN
+      // ITERO.MH ENH042 140909 ******************
+
+      IF (pIssuedFinChargeMemoHeader.FINDSET(TRUE)) THEN REPEAT
+         SalesInvoiceHeaderTEMP.DELETEALL;
+         SalesInvoiceHeaderTEMP.INIT;
+
+         SalesInvoiceHeaderTEMP."No." := pIssuedFinChargeMemoHeader."No.";
+         SalesInvoiceHeaderTEMP."Sell-to Customer No." := pIssuedFinChargeMemoHeader."Customer No.";
+         SalesInvoiceHeaderTEMP."Bill-to Customer No." := pIssuedFinChargeMemoHeader."Customer No.";
+         SalesInvoiceHeaderTEMP."Bill-to Name" := pIssuedFinChargeMemoHeader.Name;
+         SalesInvoiceHeaderTEMP."Bill-to Name 2" := pIssuedFinChargeMemoHeader."Name 2";
+         SalesInvoiceHeaderTEMP."Bill-to Address" := pIssuedFinChargeMemoHeader.Address;
+         SalesInvoiceHeaderTEMP."Bill-to Address 2" := pIssuedFinChargeMemoHeader."Address 2";
+         SalesInvoiceHeaderTEMP."Bill-to City"      := pIssuedFinChargeMemoHeader.City;
+         SalesInvoiceHeaderTEMP."Bill-to Post Code" := pIssuedFinChargeMemoHeader."Post Code";
+         SalesInvoiceHeaderTEMP."Bill-to County" := pIssuedFinChargeMemoHeader.County;
+         SalesInvoiceHeaderTEMP."Bill-to Country/Region Code" := pIssuedFinChargeMemoHeader."Country/Region Code";
+         SalesInvoiceHeaderTEMP."Currency Code" := pIssuedFinChargeMemoHeader."Currency Code";
+         SalesInvoiceHeaderTEMP."Language Code" :=  pIssuedFinChargeMemoHeader."Language Code";
+         SalesInvoiceHeaderTEMP."Bill-to Contact" := pIssuedFinChargeMemoHeader.Contact;
+         SalesInvoiceHeaderTEMP."Your Reference" := pIssuedFinChargeMemoHeader."Your Reference";
+         SalesInvoiceHeaderTEMP."Shortcut Dimension 1 Code" := pIssuedFinChargeMemoHeader."Shortcut Dimension 1 Code";
+         SalesInvoiceHeaderTEMP."Shortcut Dimension 2 Code" := pIssuedFinChargeMemoHeader."Shortcut Dimension 2 Code";
+         SalesInvoiceHeaderTEMP."VAT Registration No." := pIssuedFinChargeMemoHeader."VAT Registration No.";
+         SalesInvoiceHeaderTEMP."Posting Date" := pIssuedFinChargeMemoHeader."Posting Date";
+         SalesInvoiceHeaderTEMP."Due Date" := pIssuedFinChargeMemoHeader."Due Date";
+
+
+
+
+         SalesInvoiceHeaderTEMP.INSERT();
+
+         SalesInvoiceLineTEMP.DELETEALL;
+         IssuedFinChargeMemoLine.SETRANGE("Finance Charge Memo No.", pIssuedFinChargeMemoHeader."No.");
+
+         SalesInvoiceLineTEMP.INIT;
+         SalesInvoiceLineTEMP."Line No." := 10;
+         SalesInvoiceLineTEMP.Description := 'R„ntekostnad';
+         SalesInvoiceLineTEMP.INSERT();
+
+         IF IssuedFinChargeMemoLine.FINDSET(FALSE) THEN REPEAT
+            IF (IssuedFinChargeMemoLine.Description <> '') OR (IssuedFinChargeMemoLine.Type <> 0) OR (IssuedFinChargeMemoLine."No." <> '') THEN BEGIN
+
+               SalesInvoiceLineTEMP.INIT;
+
+               SalesInvoiceLineTEMP."Line No." := IssuedFinChargeMemoLine."Line No.";
+               SalesInvoiceLineTEMP.Description := IssuedFinChargeMemoLine.Description;
+               SalesInvoiceLineTEMP."Posting Date" := IssuedFinChargeMemoLine."Posting Date";
+               SalesInvoiceLineTEMP."Posting Date" := IssuedFinChargeMemoLine."Document Date";
+               SalesInvoiceLineTEMP."VAT %" := IssuedFinChargeMemoLine."VAT %";
+               SalesInvoiceLineTEMP."VAT Calculation Type" := IssuedFinChargeMemoLine."VAT Calculation Type";
+               SalesInvoiceLineTEMP."VAT Base Amount" := IssuedFinChargeMemoLine."VAT Amount";
+               SalesInvoiceLineTEMP.Amount := IssuedFinChargeMemoLine.Amount;
+               SalesInvoiceLineTEMP."Line Amount" := IssuedFinChargeMemoLine.Amount;
+               SalesInvoiceLineTEMP."Unit Price" := IssuedFinChargeMemoLine.Amount;
+               SalesInvoiceLineTEMP."Amount Including VAT" := IssuedFinChargeMemoLine.Amount;
+               SalesInvoiceLineTEMP.Quantity := 1;
+
+               SalesInvoiceLineTEMP."No." := IssuedFinChargeMemoLine."Document No.";
+
+               SalesInvoiceLineTEMP.INSERT();
+            END;
+         UNTIL IssuedFinChargeMemoLine.NEXT = 0;
+
+         GenerateSveDocument(SalesInvoiceHeaderTEMP, SalesInvoiceLineTEMP, FALSE);
+
+         pIssuedFinChargeMemoHeader."Elec. Fin. Charge Memo Created" := TRUE;
+         IF (FromNAS) OR (SalesRecSetup."Svefaktura Background Export" = FALSE) THEN
+            pIssuedFinChargeMemoHeader."Invoice Exported by XML" := TRUE
+         ELSE
+            pIssuedFinChargeMemoHeader."Invoice Exported by XML" := FALSE;
+         pIssuedFinChargeMemoHeader.MODIFY();
+
+      UNTIL pIssuedFinChargeMemoHeader.NEXT = 0;
+    END;
+
+    EVENT xmldoc@1100285500::NodeInserting@93(sender@1100285501 : Variant;e@1100285500 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeChangedEventArgs");
+    BEGIN
+    END;
+
+    EVENT xmldoc@1100285500::NodeInserted@94(sender@1100285501 : Variant;e@1100285500 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeChangedEventArgs");
+    BEGIN
+    END;
+
+    EVENT xmldoc@1100285500::NodeRemoving@95(sender@1100285501 : Variant;e@1100285500 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeChangedEventArgs");
+    BEGIN
+    END;
+
+    EVENT xmldoc@1100285500::NodeRemoved@96(sender@1100285501 : Variant;e@1100285500 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeChangedEventArgs");
+    BEGIN
+    END;
+
+    EVENT xmldoc@1100285500::NodeChanging@97(sender@1100285501 : Variant;e@1100285500 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeChangedEventArgs");
+    BEGIN
+    END;
+
+    EVENT xmldoc@1100285500::NodeChanged@98(sender@1100285501 : Variant;e@1100285500 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeChangedEventArgs");
+    BEGIN
+    END;
+
+    BEGIN
+    {
+      140513 new codeunit to export svefaktura ENH021
+      140702 Major update: Possible to export multiple invoices. Added new path from Sales & Rec Setup
+      140829 Added permission to modify SalesInvHeader and SCrMemoHeader
+      140909 ITERO.MH ENH-042 Added functionality to export Finance Charge Memos
+      141001 ITERO.MH Major change of creation of Invoice Header and Line
+      141006 ITERO.MH IME201 Added check of External Doc. No. as Pmt. Ref setting
+      141015 ITERO.MH IME021 Minor changes of Fin. Charge Memo export
+      150122 ITERO.MH IME271 New functionality for background export of svefaktura.
+      150319 ITERO.MH Clearing of Sales Cr. Memo TEMP variables
+    }
+    END.
+  }
+}
+

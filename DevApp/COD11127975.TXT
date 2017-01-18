@@ -1,0 +1,718 @@
+OBJECT Codeunit 11127975 SymbrioFunctions
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PSSE;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      SymbrioSetup@1100409001 : Record 11127975;
+      recGLsetup@1100409006 : Record 98;
+      recInvBuffer@1100409008 : Record 11127980;
+      recInvBufferLine@1100409011 : Record 11127981;
+      recPurchOrder@1100409009 : Record 38;
+      recPurchInvHeader@1100409013 : Record 38;
+      recPurchLine@1100409010 : Record 39;
+      recPurchReceipt@1100409015 : Record 121;
+      recPostedPurchInvHeader@1100409017 : Record 122;
+      oFile@1100409002 : File;
+      oStream@1100409003 : OutStream;
+      xmlExport@1100409004 : XMLport 11127975;
+      xmlExportMainP@1100409018 : XMLport 11127983;
+      xmlExtContr@1100409005 : XMLport 11127976;
+      xmlElement@1100409000 : XMLport 11127980;
+      xmlDim@1100409007 : XMLport 11127979;
+      xmlPurchInv@1100409016 : XMLport 11127982;
+      cuPostPurch@1100409012 : Codeunit 90;
+      cuGetReceipt@1100409014 : Codeunit 74;
+      opSpecialExport@1100285500 : ' ,Inactivate Main Job,Inactivate Single Job,Delete Main,Delete Single';
+      cuExportToSymbrio@1100285501 : Codeunit 11127979;
+
+    PROCEDURE fnMarkJobForExportToSymbrio@1100409000(VAR inJob@1100409000 : Record 11072003;inxRecJob@1100409001 : Record 11072003);
+    VAR
+      _CreateFile@1100409002 : Boolean;
+      _file@1100409003 : File;
+      _status@1100409005 : Code[1];
+      JobToRecRef@1100285501 : Record 11072003;
+      RecRef@1100285500 : RecordRef;
+      lvExtContract@1100285502 : Record 11012004;
+      ExtContractToRecRef@1100285503 : Record 11012004;
+      lvElement@1100285505 : Record 11012010;
+      ElementToRecRef@1100285504 : Record 11012010;
+      ExportToSymbrio@1100285506 : Codeunit 11127979;
+    BEGIN
+      //>>4PSSE 130814
+      //SymbrioSetup.GET();
+      //SYM921, Do not set the export flag if there is no Symbrio setup
+      IF NOT SymbrioSetup.GET THEN
+        EXIT;
+      //<<4PSSE
+
+      IF (NOT ExportToSymbrio.JobIsReadyForExport(inJob)) AND (ExportToSymbrio.JobIsReadyForExport(inxRecJob)) THEN BEGIN
+        // ************* Project has moved from ACTIVE TO inactive
+         IF (inJob."Single/Main/Sub Project" <> inJob."Single/Main/Sub Project"::"Main Project") THEN
+            opSpecialExport := opSpecialExport::"Inactivate Single Job"
+         ELSE
+            opSpecialExport := opSpecialExport::"Inactivate Main Job";
+
+         JobToRecRef := inJob;
+         JobToRecRef.SETRECFILTER;
+         RecRef.GETTABLE(JobToRecRef);
+        //IME156 added "Project No."
+         AddToSymbrioExportQueue(DATABASE::Job,RecRef,inJob."No.", '',inJob."Project Status");
+
+
+      END ELSE IF ExportToSymbrio.JobIsReadyForExport(inJob) THEN
+       // Project has either moved from INACTIVE to ACTIVE
+       // --OR--
+       // Already active but changed although still OK for Symbrio.
+
+       IF ((inJob.Description <> inxRecJob.Description) OR
+         (inJob."Global Dimension 1 Code" <> inxRecJob."Global Dimension 1 Code") OR
+         (inJob."No." <> inxRecJob."No.") OR
+         (inJob."Project Manager" <> inxRecJob."Project Manager") OR
+         (inJob."Project Type" <> inxRecJob."Project Type") OR
+         (inJob."Project Status" <> inxRecJob."Project Status") OR
+         (inJob.Address <> inxRecJob.Address) OR
+         (inJob."Post Code" <> inxRecJob."Post Code") OR
+         (inJob.City <> inxRecJob.City) OR
+         (inJob."Single/Main/Sub Project" <> inxRecJob."Single/Main/Sub Project")) THEN BEGIN
+            // SYM-048 <<
+            IF ((inJob."Single/Main/Sub Project" <> inxRecJob."Single/Main/Sub Project")) THEN BEGIN
+               IF (inxRecJob."Single/Main/Sub Project" IN [inJob."Single/Main/Sub Project"::Single, inJob."Single/Main/Sub Project"::"Sub Project"])
+                  AND (inJob."Single/Main/Sub Project" = inJob."Single/Main/Sub Project"::"Main Project") THEN BEGIN
+                  // CHANGE from Single/Sub TO Main
+                  opSpecialExport := opSpecialExport::"Inactivate Single Job";
+
+               END;
+               IF (inJob."Single/Main/Sub Project" IN [inJob."Single/Main/Sub Project"::Single, inJob."Single/Main/Sub Project"::"Sub Project"])
+                  AND (inxRecJob."Single/Main/Sub Project" = inJob."Single/Main/Sub Project"::"Main Project") THEN BEGIN
+                  // CHANGE from Main TO Single/Sub
+
+                  opSpecialExport := opSpecialExport::"Inactivate Main Job";
+               END;
+            END;
+            // SYM-048 >>
+
+      //>> IME104
+            JobToRecRef := inJob;
+            JobToRecRef.SETRECFILTER;
+            RecRef.GETTABLE(JobToRecRef);
+        //IME156 added "Project No."
+            AddToSymbrioExportQueue(DATABASE::Job,RecRef,inJob."No.", '',inJob."Project Status");
+
+            IF NOT (ExportToSymbrio.JobIsReadyForExport(inxRecJob)) AND (inJob."Single/Main/Sub Project" <> inJob."Single/Main/Sub Project"::"Main Project") THEN BEGIN   //150223 ITERO.WG
+                // Add elements to export
+                lvElement.SETRANGE("Project No.", inJob."No.");
+                IF (lvElement.FINDSET(FALSE)) THEN BEGIN
+                   AddToSymbrioExportQueue(DATABASE::"Project Element",RecRef,inJob."No.", lvElement.Element,inJob."Project Status");
+                END;
+            END;
+
+      //<< IME104
+        END;
+
+
+      //>>RFC-014, 150910
+      //--moved from INACTIVE to INACTIVE (Technical finished <-> administrative finished)
+
+      // almost ExportToSymbrio.JobIsReadyForExport...
+      IF (inJob.Description <> '')                AND (inxRecJob.Description <> '') AND
+         (inJob."Global Dimension 1 Code" <> '')  AND (inxRecJob."Global Dimension 1 Code" <> '')  AND
+         (inJob."Project Type" <> '')             AND (inxRecJob."Project Type" <> '') AND
+      //  (Technical finished -> administrative finished)
+         (((inxRecJob."Project Status" = inJob."Project Status"::"Technical Finished") AND (inJob."Project Status" = inJob."Project Status"::"Administrative Finished")) OR
+      //  (Technical finished <- administrative finished)
+         ((inJob."Project Status" = inJob."Project Status"::"Technical Finished") AND (inxRecJob."Project Status" = inJob."Project Status"::"Administrative Finished"))) AND
+         (inJob."Project Manager" <> '') THEN BEGIN
+
+         IF (inJob."Single/Main/Sub Project" <> inJob."Single/Main/Sub Project"::"Main Project") THEN
+            opSpecialExport := opSpecialExport::"Inactivate Single Job"
+         ELSE
+            opSpecialExport := opSpecialExport::"Inactivate Main Job";
+
+         JobToRecRef := inJob;
+         JobToRecRef.SETRECFILTER;
+         RecRef.GETTABLE(JobToRecRef);
+         AddToSymbrioExportQueue(DATABASE::Job,RecRef,inJob."No.", '',inJob."Project Status");
+      END;
+      //<<RFC-014, 150910
+    END;
+
+    PROCEDURE fnDeleteJob@1100285502(VAR Job@1100285500 : Record 11072003);
+    VAR
+      JobToRecRef@1100285501 : Record 11072003;
+      RecRef@1100285502 : RecordRef;
+    BEGIN
+      IF Job."Single/Main/Sub Project" = Job."Single/Main/Sub Project"::"Main Project" THEN
+         opSpecialExport := opSpecialExport::"Delete Main"
+      ELSE
+         opSpecialExport := opSpecialExport::"Delete Single";
+
+      JobToRecRef := Job;
+      JobToRecRef.SETRECFILTER;
+      RecRef.GETTABLE(JobToRecRef);
+
+      AddToSymbrioExportQueue(DATABASE::Job, RecRef, Job."No.", '',Job."Project Status");
+    END;
+
+    PROCEDURE fnDeleteExtContr@1100285503(VAR inExtContr@1100285500 : Record 11012004);
+    VAR
+      ExtContrToRecRef@1100285501 : Record 11012004;
+      RecRef@1100285502 : RecordRef;
+    BEGIN
+
+      opSpecialExport := opSpecialExport::"Delete Single";
+
+      ExtContrToRecRef := inExtContr;
+      ExtContrToRecRef.SETRECFILTER;
+      RecRef.GETTABLE(ExtContrToRecRef);
+
+      AddToSymbrioExportQueue(DATABASE::"Extension Contract", RecRef, inExtContr."Project No.", inExtContr."Contract No.",0);
+    END;
+
+    PROCEDURE fnDeleteElement@1100285504(VAR inElement@1100285500 : Record 11012010);
+    VAR
+      ElementToRecRef@1100285501 : Record 11012010;
+      RecRef@1100285502 : RecordRef;
+    BEGIN
+
+      opSpecialExport := opSpecialExport::"Delete Single";
+
+      ElementToRecRef := inElement;
+      ElementToRecRef.SETRECFILTER;
+      RecRef.GETTABLE(ElementToRecRef);
+
+      AddToSymbrioExportQueue(DATABASE::"Project Element", RecRef, inElement."Project No.", inElement.Element,0);
+    END;
+
+    PROCEDURE fnExportExtContr@1100409001(VAR inExtContr@1100409000 : Record 11012004;inxrecExtContr@1100409001 : Record 11012004);
+    VAR
+      _CreateFile@1100409002 : Boolean;
+      ExtContractToRecRef@1100285501 : Record 11012004;
+      RecRef@1100285500 : RecordRef;
+      ExportToSymbrio@1100285502 : Codeunit 11127979;
+    BEGIN
+      //>>4PSSE 130814
+      //SymbrioSetup.GET();
+      IF NOT SymbrioSetup.GET THEN
+        EXIT;
+      //<<4PSSE
+      IF (NOT ExportToSymbrio.ExtensionIsReadyForExport(inExtContr)) AND ExportToSymbrio.ExtensionIsReadyForExport(inxrecExtContr) THEN BEGIN
+        opSpecialExport := opSpecialExport::"Inactivate Single Job";
+
+        ExtContractToRecRef := inExtContr;
+        ExtContractToRecRef.SETRECFILTER;
+        RecRef.GETTABLE(ExtContractToRecRef);
+        //IME156 added "Project No."
+        AddToSymbrioExportQueue(DATABASE::"Extension Contract",RecRef,inExtContr."Project No.", inExtContr."Contract No.",0);
+
+
+      END ELSE IF ExportToSymbrio.ExtensionIsReadyForExport(inExtContr) THEN BEGIN
+
+       IF (inExtContr."Project No." <> inxrecExtContr."Project No.") OR
+         (inExtContr.Description <> inxrecExtContr.Description) OR
+         (inExtContr.Status <> inxrecExtContr.Status) OR
+         (inExtContr."Contract No." <> inxrecExtContr."Contract No.") THEN BEGIN
+      //>> IME104
+        ExtContractToRecRef := inExtContr;
+        ExtContractToRecRef.SETRECFILTER;
+        RecRef.GETTABLE(ExtContractToRecRef);
+        //IME156 added "Project No."
+        AddToSymbrioExportQueue(DATABASE::"Extension Contract",RecRef,inExtContr."Project No.", inExtContr."Contract No.",0);
+      //<< IME104
+
+       END;
+      END;
+    END;
+
+    PROCEDURE fnExportElements@1100409002(inElement@1100409000 : Record 11012010);
+    VAR
+      _Element@1100409001 : Record 11012010;
+      _PrevProj@1100409003 : Code[20];
+    BEGIN
+      //>>4PSSE 130814
+      //SymbrioSetup.GET();
+      IF NOT SymbrioSetup.GET THEN
+        EXIT;
+      //<<4PSSE
+
+      _Element.SETRANGE(Exported,FALSE);
+      IF _Element.FINDSET THEN
+        REPEAT
+          IF _PrevProj <> _Element."Project No." THEN
+            BEGIN
+              oFile.CREATE(SymbrioSetup."Path Elements" + 'ELEM' + FORMAT(WORKDATE,0,'<year4><month,2><day,2>') +
+                            FORMAT(TIME,0,'<Standard format,2>') + '.xml');
+              oFile.CREATEOUTSTREAM(oStream);
+              xmlElement.fnSetElement(_Element);
+              xmlElement.SETDESTINATION(oStream);
+              xmlElement.EXPORT;
+              oFile.CLOSE;
+            END;
+          _PrevProj := _Element."Project No.";
+        UNTIL _Element.NEXT = 0;
+    END;
+
+    PROCEDURE fnMarkForExportToSymbrio@1100285000(VAR DimensionValue@1100285000 : Record 349);
+    VAR
+      DimensionValue2@1100285001 : Record 349;
+      DimValueToRecref@1100285500 : Record 349;
+      RecRef@1100285501 : RecordRef;
+    BEGIN
+      IF NOT SymbrioSetup.GET THEN
+        EXIT;
+
+      IF DimensionValue."Dimension Code" = SymbrioSetup."Indirect Export Dim1" THEN BEGIN
+
+        //>> IME104
+        DimValueToRecref := DimensionValue;
+        DimValueToRecref.SETRECFILTER;
+        RecRef.GETTABLE(DimValueToRecref);
+        AddToSymbrioExportQueue(DATABASE::"Dimension Value",RecRef,'','',0);
+        //<< IME104
+
+        DimensionValue2.SETRANGE("Dimension Code", SymbrioSetup."Indirect Export Dim2");
+        IF DimensionValue2.FINDSET(TRUE) THEN REPEAT
+      //>> IME104
+          DimValueToRecref.RESET;
+          DimValueToRecref := DimensionValue2;
+          DimValueToRecref.SETRECFILTER;
+          RecRef.GETTABLE(DimValueToRecref);
+          AddToSymbrioExportQueue(DATABASE::"Dimension Value",RecRef,'','',0);
+      //<< IME104
+        UNTIL DimensionValue2.NEXT = 0;
+
+      END ELSE
+      IF DimensionValue."Dimension Code" = SymbrioSetup."Indirect Export Dim2" THEN BEGIN
+
+        //>> IME104
+        DimValueToRecref := DimensionValue;
+        DimValueToRecref.SETRECFILTER;
+        RecRef.GETTABLE(DimValueToRecref);
+        AddToSymbrioExportQueue(DATABASE::"Dimension Value",RecRef,'','',0);
+        //<< IME104
+
+        DimensionValue2.SETRANGE("Dimension Code", SymbrioSetup."Indirect Export Dim1");
+        IF DimensionValue2.FINDSET(TRUE) THEN REPEAT
+      //>> IME104
+          DimValueToRecref.RESET;
+          DimValueToRecref := DimensionValue2;
+          DimValueToRecref.SETRECFILTER;
+          RecRef.GETTABLE(DimValueToRecref);
+          AddToSymbrioExportQueue(DATABASE::"Dimension Value",RecRef,'','',0);
+      //<< IME104
+        UNTIL DimensionValue2.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE fnExportDim@1100409003();
+    VAR
+      _Dim@1100409000 : Record 349;
+      _Dim2@1100409001 : Record 349;
+      _DimExport@1100409002 : Record 11127977;
+    BEGIN
+      /////////////////////////////////////
+      // NOTE!!!
+      // This is an old function from EVRY and is probably not used anymore as it has
+      // been replaced with then function  fnMarkForExportToSymbrio.
+
+      {****
+      SymbrioSetup.GET();
+      oFile.CREATE(SymbrioSetup."Path Project Indirect" + 'PIND' + FORMAT(WORKDATE,0,'<year4><month,2><day,2>') +
+                    FORMAT(TIME,0,'<Standard format,2>') + '.xml');
+      oFile.CREATEOUTSTREAM(oStream);
+      XMLPORT.EXPORT(11127979,oStream);
+      oFile.CLOSE;
+      ****}
+      //>>4PSSE 130814
+      //SymbrioSetup.GET();
+      IF NOT SymbrioSetup.GET THEN
+        EXIT;
+      //<<4PSSE
+      recGLsetup.GET();
+
+      //_Dim.SETCURRENTKEY("Dimension Code",Code);
+      //_Dim.ASCENDING(TRUE);
+      //_Dim.SETRANGE("Dimension Code",recGLsetup."Global Dimension 1 Code");
+      _Dim.SETRANGE("Dimension Code",SymbrioSetup."Indirect Export Dim1");
+      _Dim.SETFILTER(CostCenterResponsible,'<>%1','');
+      IF _Dim.FINDSET THEN
+        REPEAT
+      //    _Dim2.SETCURRENTKEY("Dimension Code",Code);
+      //    _Dim2.ASCENDING(TRUE);
+          //_Dim2.SETRANGE("Dimension Code",'FUNKTION');
+          _Dim2.SETRANGE("Dimension Code",SymbrioSetup."Indirect Export Dim2");
+          IF _Dim2.FINDSET THEN
+            REPEAT
+              IF NOT _DimExport.GET(_Dim."Dimension Code",_Dim.Code,_Dim2."Dimension Code",_Dim2.Code) THEN
+                BEGIN
+                  oFile.CREATE(SymbrioSetup."Path Project Indirect" + 'PIND' + FORMAT(WORKDATE,0,'<year4><month,2><day,2>') +
+                                FORMAT(TIME,0,'<Standard format,2>') + '.xml');
+                  oFile.CREATEOUTSTREAM(oStream);
+                  xmlDim.fnSetDim(_Dim2."Dimension Code",_Dim2.Code,_Dim."Dimension Code",_Dim.Code);
+                  xmlDim.SETDESTINATION(oStream);
+                  xmlDim.EXPORT;
+                  oFile.CLOSE;
+      //        MESSAGE('Lagerst„lle: %1\Funktion %2',_Dim.Code,_Dim2.Code);
+                  _DimExport.Dim1 := _Dim."Dimension Code";
+                  _DimExport.Dim1Value := _Dim.Code;
+                  _DimExport.Dim2 := _Dim2."Dimension Code";
+                  _DimExport.Dim2Value := _Dim2.Code;
+                  _DimExport.INSERT;
+                  SLEEP(5);
+                END;
+            UNTIL _Dim2.NEXT = 0;
+        UNTIL _Dim.NEXT = 0;
+    END;
+
+    PROCEDURE fnInvoicePurchorder@1100409004(inPurchBuffer@1100409002 : Record 11127980);
+    VAR
+      _int@1100409000 : Integer;
+      _dec@1100409001 : Decimal;
+    BEGIN
+      //130703 JOSVSTO
+      //P6 - Check buffer table, if purchase order exists with OrderHeadID from buffer table, then adjust order lines and recieve.
+      //     If no purchase order exists, then create invoice.
+
+      CLEAR(recPurchInvHeader);
+      CLEAR(recPurchLine);
+      //>>130815 JOSVSTO
+      IF NOT recPostedPurchInvHeader.GET(inPurchBuffer.InvoiceHeadID) THEN
+      //<<130815 JOSVSTO
+        IF recPurchOrder.GET(recPurchOrder."Document Type"::Order,inPurchBuffer.OrderHeadID) THEN
+        //If purchase order exists, then adjust lines and recieve.
+          BEGIN
+            recInvBufferLine.SETFILTER(InvoiceHeadID,inPurchBuffer.InvoiceHeadID);
+            recInvBufferLine.SETRANGE(OrderHeadID,inPurchBuffer.OrderHeadID);
+            IF recInvBufferLine.FINDSET THEN
+              //Update purchase lines from buffer table.
+              REPEAT
+                recPurchLine.SETRANGE("Document Type",recPurchLine."Document Type"::Order);
+                recPurchLine.SETRANGE("Document No.",recInvBufferLine.OrderHeadID);
+                EVALUATE(_int,recInvBufferLine.InvoiceLineID);
+                recPurchLine.SETRANGE("Line No.",_int);
+                IF recPurchLine.FINDFIRST THEN
+                  BEGIN
+                    EVALUATE(_dec,CONVERTSTR(recInvBufferLine.Quantity,'.',','));
+                    recPurchLine.VALIDATE(Quantity,_dec);
+                    recPurchLine.VALIDATE("Qty. to Receive",_dec);
+                    //recPurchLine.VALIDATE("Extension Contract", recInvBufferLine.AccountSuffix); // 130827 GODU
+                    EVALUATE(_dec,CONVERTSTR(recInvBufferLine.NetPrice,'.',','));
+                    recPurchLine.VALIDATE("Direct Unit Cost",_dec);
+                    //>>
+                    EVALUATE(_dec,CONVERTSTR(recInvBufferLine.Quantity,'.',','));
+                    recPurchLine.VALIDATE("Qty. to Receive",_dec);
+                    //<<
+                    recPurchLine.MODIFY;
+                  END;
+              UNTIL recInvBufferLine.NEXT = 0;
+            //Check if purchase line is in buffer table, if not delete it.
+            recPurchLine.RESET;
+            recPurchLine.SETRANGE("Document Type",recPurchOrder."Document Type");
+            recPurchLine.SETRANGE("Document No.",recPurchOrder."No.");
+            IF recPurchLine.FINDSET THEN
+              REPEAT
+                //IF NOT recInvBufferLine.GET('',FORMAT(recPurchLine."Document No."),FORMAT(recPurchLine."Line No.")) THEN
+                IF NOT recInvBufferLine.GET(inPurchBuffer.InvoiceHeadID,FORMAT(recPurchLine."Document No."),
+                                            FORMAT(recPurchLine."Line No.")) THEN
+                  recPurchLine.DELETE;
+              UNTIL recPurchLine.NEXT = 0;
+            //Post and recieve order.
+            recPurchOrder.Receive := TRUE;
+            recPurchOrder.Invoice := FALSE;
+            cuPostPurch.RUN(recPurchOrder);
+
+            //Create invoice
+            recPurchInvHeader.INIT;
+            recPurchInvHeader."Document Type" := recPurchInvHeader."Document Type"::Invoice;
+            recPurchInvHeader.INSERT(TRUE);
+            recPurchInvHeader.VALIDATE("Related Purch. Order No.",recPurchOrder."No.");
+            recPurchInvHeader."Vendor Invoice No." := inPurchBuffer.SupplierInvoiceNo;
+            recPurchInvHeader.MODIFY;
+
+            //Get receipt lines (standard function)
+            recPurchReceipt.SETCURRENTKEY("Buy-from Vendor No.","Document No.","Order No.");
+            recPurchReceipt.SETRANGE("Buy-from Vendor No.",recPurchInvHeader."Buy-from Vendor No.");
+            IF recPurchInvHeader."Amounts only" THEN
+              BEGIN
+                recPurchReceipt.SETFILTER(Quantity,'0');
+                recPurchReceipt.SETFILTER("Amnt. Rcd. Not Invoiced",'<>0');
+              END
+            ELSE
+              recPurchReceipt.SETFILTER("Qty. Rcd. Not Invoiced",'<>0');
+            recPurchReceipt.SETRANGE("Currency Code",recPurchInvHeader."Currency Code");
+            IF recPurchInvHeader."Related Purch. Order No." <> '' THEN
+              recPurchReceipt.SETRANGE("Order No.",recPurchInvHeader."Related Purch. Order No.");
+            IF recPurchReceipt.FINDFIRST THEN
+              BEGIN
+                cuGetReceipt.SetPurchHeader(recPurchInvHeader);
+                cuGetReceipt.CreateInvLines(recPurchReceipt);
+              END;
+
+            //fnExportPurchInv(recPurchInvHeader,inPurchBuffer.InvoiceHeadID);
+            fnExportPurchInv(recPurchInvHeader,inPurchBuffer.SupplierInvoiceNo);      //130904 JOSVSTO
+          END
+        //If purchase order does not exist, then create invoice.
+        //Baserat p† vad? Artikelnr, projektnr? Vad kommer ifr†n symbrio som vi kan anv„nda om inte ink.order finns?
+        ELSE
+          BEGIN
+            recPurchInvHeader.INIT;
+            recPurchInvHeader."Document Type" := recPurchInvHeader."Document Type"::Invoice;
+            recPurchInvHeader.INSERT(TRUE);
+            //>>130919 ITERO.DJ
+            //recPurchInvHeader.VALIDATE("Buy-from Vendor No.",inPurchBuffer.SupplierCompanyCode);
+            recPurchInvHeader.VALIDATE("Buy-from Vendor No.", inPurchBuffer.SupplierIdentification);
+            //<<130919
+            recPurchInvHeader."Vendor Invoice No." := inPurchBuffer.SupplierInvoiceNo;
+            recPurchInvHeader.MODIFY;
+            recInvBufferLine.SETFILTER(InvoiceHeadID,inPurchBuffer.InvoiceHeadID);
+            recInvBufferLine.SETRANGE(OrderHeadID,inPurchBuffer.OrderHeadID);
+            IF recInvBufferLine.FINDSET THEN
+              REPEAT
+                _int := _int + 10000;
+                recPurchLine."Document Type" := recPurchInvHeader."Document Type";
+                recPurchLine."Document No." := recPurchInvHeader."No.";
+                recPurchLine."Line No." := _int;
+                recPurchLine.INSERT(TRUE);
+                recPurchLine.VALIDATE("Buy-from Vendor No.",inPurchBuffer.SupplierIdentification);
+                recPurchLine.VALIDATE(Type,recPurchLine.Type::Item);
+                //recPurchLine.VALIDATE("No.",recInvBufferLine.ArticleNo);
+                recPurchLine.VALIDATE(recPurchLine."Trade Item",recInvBufferLine.ArticleNo);
+                EVALUATE(_dec,CONVERTSTR(recInvBufferLine.Quantity,'.',','));
+                recPurchLine.VALIDATE(Quantity,_dec);
+                recPurchLine.VALIDATE("Qty. to Receive",_dec);
+                EVALUATE(_dec,CONVERTSTR(recInvBufferLine.NetPrice,'.',','));
+                recPurchLine.VALIDATE("Direct Unit Cost",_dec);
+                recPurchLine.MODIFY;
+              UNTIL recInvBufferLine.NEXT = 0;
+
+            //fnExportPurchInv(recPurchInvHeader,inPurchBuffer.InvoiceHeadID);
+            fnExportPurchInv(recPurchInvHeader,inPurchBuffer.SupplierInvoiceNo);      //130904 JOSVSTO
+          END;
+
+      inPurchBuffer.DELETE(TRUE);
+    END;
+
+    PROCEDURE fnBatchInvoicePurch@1100409006();
+    VAR
+      _cuSymFun@1100409000 : Codeunit 11127975;
+    BEGIN
+      //130829 JOSVSTO
+      recInvBuffer.FINDSET;
+      REPEAT
+        CLEAR(_cuSymFun);
+        _cuSymFun.fnInvoicePurchorder(recInvBuffer);
+      UNTIL recInvBuffer.NEXT = 0;
+    END;
+
+    PROCEDURE fnExportPurchInv@1100409005(inInvoice@1100409000 : Record 38;inSymbrioInvID@1100409001 : Code[20]);
+    BEGIN
+      //130720 JOSVSTO
+      {
+      SymbrioSetup.GET();
+      oFile.CREATE( SymbrioSetup."Purchase Export Path" + 'INV' + FORMAT(WORKDATE,0,'<year4><month,2><day,2>') +
+                    FORMAT(TIME,0,'<Standard format,2>') + '.xml');
+      oFile.CREATEOUTSTREAM(oStream);
+      inInvoice.SETRANGE("No.",inInvoice."No.");
+      xmlPurchInv.fnSetInvoice(inInvoice,inSymbrioInvID);
+      xmlPurchInv.SETDESTINATION(oStream);
+      xmlPurchInv.EXPORT;
+      oFile.CLOSE;
+      }
+    END;
+
+    PROCEDURE fnMarkSOForExportToSymbrio@1(VAR ServiceOrder@1000 : Record 11012823;VAR xRecServiceOrder@1001 : Record 11012823);
+    VAR
+      SymbrioSetup@1002 : Record 11127975;
+      ServiceOrderForRecRef@1004 : Record 11012823;
+      RecRef@1003 : RecordRef;
+      xRecReady@1005 : Boolean;
+      NormalRecReady@1006 : Boolean;
+    BEGIN
+      // ITERO.MH ServiceOrder For Symbrio 150504
+      IF NOT (SymbrioSetup.READPERMISSION) THEN EXIT;
+      IF NOT (SymbrioSetup.GET()) THEN EXIT;
+
+      xRecReady := cuExportToSymbrio.SOIsReadyForExport(xRecServiceOrder);
+      NormalRecReady := cuExportToSymbrio.SOIsReadyForExport(ServiceOrder);
+
+      IF (xRecReady) AND (NOT NormalRecReady) THEN BEGIN
+         // Mark for inactivation
+         fnDeleteServiceOrderInSymbrio(ServiceOrder);
+
+      END ELSE IF (NormalRecReady) AND (NOT xRecReady) THEN BEGIN
+         // It has not been activated before, just send it out
+         ServiceOrderForRecRef := ServiceOrder;
+         ServiceOrderForRecRef.SETRECFILTER();
+         RecRef.GETTABLE(ServiceOrderForRecRef);
+         AddToSymbrioExportQueue(DATABASE::"Service Order", RecRef, ServiceOrder."No.", '',0);
+
+      END ELSE IF (NormalRecReady) AND (xRecReady) THEN BEGIN
+         // It has been ready and sent out before - limit export if changes are ok.
+         IF ((ServiceOrder.Description <> xRecServiceOrder.Description) OR
+            (ServiceOrder."Global Dimension 1 Code" <> xRecServiceOrder."Global Dimension 1 Code") OR
+            (ServiceOrder."No." <> xRecServiceOrder."No.") OR
+            (ServiceOrder."Order Manager" <> xRecServiceOrder."Order Manager") OR
+            (ServiceOrder.Status <> xRecServiceOrder.Status) OR
+            (ServiceOrder.Address <> xRecServiceOrder.Address) OR
+            (ServiceOrder."Post Code" <> xRecServiceOrder."Post Code") OR
+            (ServiceOrder.City <> xRecServiceOrder.City)) THEN BEGIN
+
+            ServiceOrderForRecRef := ServiceOrder;
+            ServiceOrderForRecRef.SETRECFILTER();
+            RecRef.GETTABLE(ServiceOrderForRecRef);
+            AddToSymbrioExportQueue(DATABASE::"Service Order", RecRef, ServiceOrder."No.", '',0);
+         END;
+      END;
+    END;
+
+    PROCEDURE fnDeleteServiceOrderInSymbrio@15(VAR ServiceOrder@1000 : Record 11012823);
+    VAR
+      SymbrioSetup@1002 : Record 11127975;
+      ServiceOrderForRecRef@1004 : Record 11012823;
+      RecRef@1003 : RecordRef;
+    BEGIN
+      // ITERO.MH ServiceOrder For Symbrio 150504
+      IF NOT (SymbrioSetup.READPERMISSION) THEN EXIT;
+      IF NOT (SymbrioSetup.GET()) THEN EXIT;
+
+      opSpecialExport := opSpecialExport::"Delete Single";
+
+      ServiceOrderForRecRef := ServiceOrder;
+      ServiceOrderForRecRef.SETRECFILTER();
+      RecRef.GETTABLE(ServiceOrderForRecRef);
+      AddToSymbrioExportQueue(DATABASE::"Service Order", RecRef, ServiceOrder."No.", '',0);
+    END;
+
+    PROCEDURE AddToSymbrioExportQueue@1100285500(TableNo@1100285500 : Integer;RecRef@1100285501 : RecordRef;JobNo@1100285503 : Code[20];ElementExtConNo@1100285504 : Code[20];ProjStatus@1100285100 : Option);
+    VAR
+      SymbrioExportQueue@1100285502 : Record 11127988;
+    BEGIN
+      SymbrioExportQueue.SETRANGE("Table No.", TableNo);
+      SymbrioExportQueue.SETRANGE("Record ID", RecRef.RECORDID);
+      SymbrioExportQueue.SETRANGE("Error Occured", FALSE);
+
+      IF SymbrioExportQueue.ISEMPTY THEN BEGIN
+        SymbrioExportQueue."Table No." := TableNo;
+        SymbrioExportQueue."Job No." := JobNo;  //IME156
+        SymbrioExportQueue."Extension/Element No." := ElementExtConNo;
+        SymbrioExportQueue."Record ID" := RecRef.RECORDID;
+        // SYM-048 <<
+        SymbrioExportQueue."Special Export" := opSpecialExport;
+        opSpecialExport := 0;
+        // SYM-048 >>
+        SymbrioExportQueue."Project Status" := ProjStatus;
+        //SymbrioExportQueue.INSERT(TRUE);   //IME450
+      //>> 151010 ITERO.AC RFC014 Bug Fix - Insert a new record if RecordID exists and Special Export differs
+      END ELSE BEGIN
+        IF SymbrioExportQueue.FINDLAST THEN BEGIN
+          IF SymbrioExportQueue."Special Export" <> opSpecialExport THEN BEGIN
+            CLEAR(SymbrioExportQueue);
+            SymbrioExportQueue."Table No." := TableNo;
+            SymbrioExportQueue."Job No." := JobNo;
+            SymbrioExportQueue."Extension/Element No." := ElementExtConNo;
+            SymbrioExportQueue."Record ID" := RecRef.RECORDID;
+            SymbrioExportQueue."Special Export" := opSpecialExport;
+            SymbrioExportQueue."Project Status" := ProjStatus;
+            opSpecialExport := 0;
+            //SymbrioExportQueue.INSERT(TRUE);   //IME450
+          END;
+        END;
+      //<< 151010 ITERO.AC RFC014
+      END;
+
+      //>>IME450
+      WHILE (NOT SymbrioExportQueue.INSERT(TRUE)) DO
+        SymbrioExportQueue."Entry No." += 1;
+      //<<IME450
+    END;
+
+    PROCEDURE CleanTextFromNonPrintable@1100285501(intext@1100285500 : Text[1024]) : Text[1024];
+    VAR
+      i@1100285501 : Integer;
+      newText@1100285502 : Text[1024];
+    BEGIN
+      //SYM-997
+      //NAS exporting defect XMLs every second minute
+      //This issue is related to NON-printable characters that are in the project name.
+      //These characters will also not be shown on the screen.
+      //When you run the codeunit manual you get this error.
+
+      IF intext = '' THEN EXIT('');
+
+      IF CheckTextFromNonPrintable(intext) THEN
+        EXIT(intext);
+
+      newText := '';
+      FOR i := 1 TO STRLEN(intext) DO BEGIN
+        IF (intext[i] > 31) THEN
+          newText += FORMAT(intext[i])
+        ELSE
+        IF (intext[i] = 9) THEN  //<TAB>
+          newText += ' ';
+      END;
+
+      EXIT(newText);
+    END;
+
+    LOCAL PROCEDURE CheckTextFromNonPrintable@1100525000(VAR intext@1100525000 : Text[1024]) : Boolean;
+    VAR
+      i@1100525003 : Integer;
+      isClean@1100525001 : Boolean;
+    BEGIN
+      FOR i := 1 TO STRLEN(intext) DO
+        IF (intext[i] < 32) THEN
+           EXIT(FALSE);
+
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE SetSpecialExport@1100285100(pSpecialExport@1100285100 : ' ,Inactivate Main Job,Inactivate Single Job,Delete Main,Delete Single');
+    BEGIN
+      // 150925 ITERO.AC IME357
+      opSpecialExport := pSpecialExport;
+    END;
+
+    BEGIN
+    {
+      **** Evry ****
+      JOSV 130604 New codeunit to collect functions for Symbrio exports.
+      GODU 130813 Changed dataport for xmlPurchInv according to Specifikation_Symbrio_InvoiceInterchangeReceipt
+      130827 GODU New field for ExtContr No
+      130904 JOSV Send SupplierInvoiceNo to XML-port.
+      130908 GODU Changed C/AL local  "inSymbrioInvID" to be 20 instead of 10
+      #SYMB1#
+
+      130814 4PSSE DL, disable codeunit if no settings exists
+
+      130917 ITERO.DJ setting "Export to Symbrio" boolean to True for,Project and ExtContr when fields modified in tables to mark up for Export
+      130919 ITERO.DJ Repointing "Buy-form Vendor No" to "Supplier Identification"
+      130919 ITERO.DJ And LP. new function fnMarkForExportToSymbrio
+      140213 ITERO.LP New function AddToSymbrioExportQueue.
+      150521 ITERO.DL SYM-997 NAS exporting defect XMLs every second minute due to NON-printable characters that are in the project name.
+      140630 ITERO.DL IME156 Symbrio NAS taking 5 minutes to process
+      150203 ITERO.MH SYM-048 Added check of Main -> Single and Single -> Main and forces inactive jobs to be exported.
+      150203 ITERO.MH SYM-036 Added export of Extension Contract from Project when Status change is registred.
+      150223 ITERO.WG Added check on Main project when //Add elements to export
+      150404 ITERO.MH ServiceOrder For Symbrio, added functions: * fnMarkSOForExportToSymbrio
+                                                                 * fnDeleteServiceOrderInSymbrio
+      150910 ITERO.DL RFC014 new value in tag <Active>
+      150925 ITERO.AC IME357 New function to make it possible to set global value opSpecialExport
+      151010 ITERO.AC RFC014 Bug fix: If record exists in Export Buffer check if opSpecialExport differs
+      151112 ITERO.DL RFC014-2 timingerrors, use JobStatus at modified-time instead of current
+      160210 ITERO.DL IME450 fel vid skapande av underprojekt till huvudprojekt
+    }
+    END.
+  }
+}
+

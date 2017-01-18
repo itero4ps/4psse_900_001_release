@@ -1,0 +1,263 @@
+OBJECT Codeunit 11128506 E-Invoice Export Sales Invoice
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVNO9.00.00.44365 (10619+10615);
+  }
+  PROPERTIES
+  {
+    TableNo=112;
+    Permissions=TableData 112=rm;
+    OnRun=VAR
+            SalesSetup@1080000 : Record 311;
+            SalesInvoiceLine@1080030 : Record 113;
+            TempEInvoiceExportHeader@1080002 : TEMPORARY Record 11128514;
+            TempEInvoiceExportLine@1080018 : TEMPORARY Record 11128515;
+            EInvoiceExportCommon@1080021 : Codeunit 11128519;
+          BEGIN
+            // If there are no invoice lines, there's nothing to export
+            SalesInvoiceLine.SETRANGE("Document No.","No.");
+            SalesInvoiceLine.SETFILTER(Type,'>%1',0);
+            SalesInvoiceLine.SETFILTER("No.",'<>%1',' ');
+            IF NOT SalesInvoiceLine.FINDSET THEN
+              EXIT;
+
+            // Pre-processing data verifications
+            //CODEUNIT.RUN(CODEUNIT::"E-Invoice Check Sales Invoice",Rec);
+            "E-Invoice Check Sales Invoice"(Rec);
+
+            // Move data from the sales invoice tables to the common tables
+            FillHeaderTableData(TempEInvoiceExportHeader,Rec);
+            REPEAT
+              IF NOT IsRoundingLine(SalesInvoiceLine) THEN
+                FillLineTableData(TempEInvoiceExportLine,SalesInvoiceLine);
+            UNTIL SalesInvoiceLine.NEXT = 0;
+            EInvoiceExportCommon.SetEInvoiceCommonTables(TempEInvoiceExportHeader,TempEInvoiceExportLine);
+
+            // Create invoice root node and XML content
+            EInvoiceExportCommon.CreateDocAndRootNode;
+            EInvoiceExportCommon.AddHeaderCommonContent;
+            EInvoiceExportCommon.AddHeaderInvoiceTypeCode;
+            EInvoiceExportCommon.AddHeaderNote;
+            EInvoiceExportCommon.AddHeaderDocumentCurrencyCode;
+            EInvoiceExportCommon.AddHeaderTaxCurrencyCode;
+            EInvoiceExportCommon.AddHeaderOrderReference;
+            EInvoiceExportCommon.AddHeaderContractDocumentReference;
+            EInvoiceExportCommon.AddHeaderAccountingSupplierParty;
+            EInvoiceExportCommon.AddHeaderAccountingCustomerParty;
+            EInvoiceExportCommon.AddDelivery;
+            EInvoiceExportCommon.AddHeaderPaymentMeans;
+            EInvoiceExportCommon.AddHeaderAllowanceCharge;
+            EInvoiceExportCommon.AddHeaderTaxExchangeRate;
+            EInvoiceExportCommon.AddHeaderTaxTotal;
+            EInvoiceExportCommon.AddHeaderLegalMonetaryTotal;
+
+            // Add XML content for the invoice lines
+            TempEInvoiceExportLine.FINDSET;
+
+            REPEAT
+              EInvoiceExportCommon.CreateLineNode(TempEInvoiceExportLine);
+              EInvoiceExportCommon.AddLineNote;
+              EInvoiceExportCommon.AddLineInvCrMemoCommonContent;
+              EInvoiceExportCommon.AddLineAccountingCost;
+              EInvoiceExportCommon.AddLineOrderLineReference;
+              EInvoiceExportCommon.AddDelivery;
+              EInvoiceExportCommon.AddLineAllowanceCharge;
+              EInvoiceExportCommon.AddLineTaxTotal;
+              EInvoiceExportCommon.AddLineItem;
+              EInvoiceExportCommon.AddLinePrice;
+            UNTIL TempEInvoiceExportLine.NEXT = 0;
+
+            // Save file
+            SalesSetup.GET;
+            EInvoiceExportCommon.SaveToXML(TempEInvoiceTransferFile,SalesSetup."E-Invoice Sales Invoice Path","No.");
+            SetEInvoiceStatusCreated("No.");
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      TempEInvoiceTransferFile@1080000 : TEMPORARY Record 11128516;
+      InvalidPathErr@1080001 : TextConst 'ENU=does not contain a valid path';
+
+    PROCEDURE GetExportedFileInfo@1080000(VAR EInvoiceTransferFile@1080000 : Record 11128516);
+    BEGIN
+      EInvoiceTransferFile := TempEInvoiceTransferFile;
+    END;
+
+    LOCAL PROCEDURE FillHeaderTableData@1080008(VAR TempEInvoiceExportHeader@1080000 : TEMPORARY Record 11128514;VAR SalesInvoiceHeader@1080001 : Record 112);
+    VAR
+      GeneralLedgerSetup@1080002 : Record 98;
+      SalesCommentLine@1080003 : Record 44;
+      DocumentTools@1080011 : Codeunit 11128501;
+      EInvoiceDocumentEncode@1080004 : Codeunit 11128502;
+    BEGIN
+      // Convert the currency code to the standard code list used by E-Invoices
+      SalesInvoiceHeader."Currency Code" := EInvoiceDocumentEncode.GetEInvoiceCurrencyCode(SalesInvoiceHeader."Currency Code");
+
+      // Fill-in the fields which have the same field ID and type
+      TempEInvoiceExportHeader.INIT;
+      TempEInvoiceExportHeader.TRANSFERFIELDS(SalesInvoiceHeader,TRUE);
+      IF TempEInvoiceExportHeader."Currency Code" = '' THEN BEGIN
+        GeneralLedgerSetup.GET;
+        TempEInvoiceExportHeader."Currency Code" := GeneralLedgerSetup."LCY Code";
+      END;
+
+      // Fill-in the XML schema information
+      TempEInvoiceExportHeader."Schema Name" := 'Invoice';
+      TempEInvoiceExportHeader."Schema Location" := 'urn:oasis:names:specification:ubl:schema:xsd:Invoice-2 UBL-Invoice-2.0.xsd';
+      TempEInvoiceExportHeader.xmlns := 'urn:oasis:names:specification:ubl:schema:xsd:Invoice-2';
+      TempEInvoiceExportHeader."Customization ID" := GetCustomizationID(SalesInvoiceHeader);
+      TempEInvoiceExportHeader."Profile ID" := 'urn:www.cenbii.eu:profile:bii04:ver2.0';
+      TempEInvoiceExportHeader."Uses Common Aggregate Comp." := TRUE;
+      TempEInvoiceExportHeader."Uses Common Basic Comp." := TRUE;
+      TempEInvoiceExportHeader."Uses Common Extension Comp." := TRUE;
+
+      // Fill-in header fields related to tax amounts
+      FillHeaderTaxAmounts(TempEInvoiceExportHeader);
+
+      TempEInvoiceExportHeader."Quantity Name" := 'InvoicedQuantity';
+
+      // Update (if empty) and validate the Bill-to Country/Region Code
+      TempEInvoiceExportHeader."Bill-to Country/Region Code" :=
+        EInvoiceDocumentEncode.GetEInvoiceCountryRegionCode(TempEInvoiceExportHeader."Bill-to Country/Region Code");
+      //todo TempEInvoiceExportHeader.GLN := SalesInvoiceHeader.GLN;
+
+      // Get Giro KID
+      TempEInvoiceExportHeader."Payment ID" := DocumentTools.GetEInvoiceExportPaymentID(TempEInvoiceExportHeader);
+
+      // If there is any header-related comment, copy it over
+      IF SalesCommentLine.GET(SalesCommentLine."Document Type"::"Posted Invoice",SalesInvoiceHeader."No.",0,10000) THEN
+        TempEInvoiceExportHeader.Note := SalesCommentLine.Comment;
+    END;
+
+    LOCAL PROCEDURE FillHeaderTaxAmounts@1080032(VAR TempEInvoiceExportHeader@1080000 : TEMPORARY Record 11128514);
+    VAR
+      SalesInvoiceLine@1080001 : Record 113;
+    BEGIN
+      SalesInvoiceLine.SETRANGE("Document No.",TempEInvoiceExportHeader."No.");
+      IF SalesInvoiceLine.FINDSET THEN BEGIN
+        TempEInvoiceExportHeader."Sales Line Found" := TRUE;
+        REPEAT
+          IF IsRoundingLine(SalesInvoiceLine) THEN
+            TempEInvoiceExportHeader."Total Rounding Amount" += SalesInvoiceLine."Amount Including VAT"
+          ELSE BEGIN
+            TempEInvoiceExportHeader."Total Invoice Discount Amount" +=
+              SalesInvoiceLine."Inv. Discount Amount" + SalesInvoiceLine."Line Discount Amount";
+            TempEInvoiceExportHeader."Legal Taxable Amount" += SalesInvoiceLine.Amount;
+            TempEInvoiceExportHeader."Total Amount" += SalesInvoiceLine."Amount Including VAT";
+            TempEInvoiceExportHeader."Tax Amount" += SalesInvoiceLine."Amount Including VAT" - SalesInvoiceLine.Amount;
+          END;
+        UNTIL SalesInvoiceLine.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE FillLineTableData@1080016(VAR TempEInvoiceExportLine@1080000 : TEMPORARY Record 11128515;SalesInvoiceLine@1080001 : Record 113);
+    VAR
+      SalesCommentLine@1080002 : Record 44;
+      Id@1080003 : Integer;
+    BEGIN
+      Id := 0;
+      IF TempEInvoiceExportLine.FINDLAST THEN
+        Id := TempEInvoiceExportLine.ID + 1;
+
+      TempEInvoiceExportLine.INIT;
+      TempEInvoiceExportLine.ID := Id;
+      TempEInvoiceExportLine.TRANSFERFIELDS(SalesInvoiceLine,TRUE);
+      IF SalesCommentLine.GET(
+           SalesCommentLine."Document Type"::"Posted Invoice",SalesInvoiceLine."Document No.",SalesInvoiceLine."Line No.",10000)
+      THEN
+        TempEInvoiceExportLine.Comment := SalesCommentLine.Comment;
+      TempEInvoiceExportLine.INSERT;
+    END;
+
+    LOCAL PROCEDURE GetCustomizationID@1080004(SalesInvoiceHeader@1080002 : Record 112) : Text[250];
+    VAR
+      ResponsibilityCenter@1080004 : Record 5714;
+      CompanyInformation@1080005 : Record 79;
+      Customer@1080001 : Record 18;
+      CountryCode@1080003 : Code[10];
+      CustomizationID@1080000 : Text[250];
+    BEGIN
+      CustomizationID :=
+        'urn:www.cenbii.eu:transaction:biitrns010:ver2.0:extended:' +
+        'urn:www.peppol.eu:bis:peppol4a:ver2.0';
+
+      IF Customer.GET(SalesInvoiceHeader."Bill-to Customer No.") THEN BEGIN
+        IF ResponsibilityCenter.GET(SalesInvoiceHeader."Responsibility Center") THEN
+          CountryCode := ResponsibilityCenter."Country/Region Code"
+        ELSE BEGIN
+          CompanyInformation.GET;
+          CountryCode := CompanyInformation."Country/Region Code";
+        END;
+
+        IF Customer."Country/Region Code" = CountryCode THEN
+          CustomizationID += ':extended:urn:www.difi.no:ehf:faktura:ver2.0';
+      END;
+
+      EXIT(CustomizationID);
+    END;
+
+    LOCAL PROCEDURE IsRoundingLine@1080006(SalesInvoiceLine@1080000 : Record 113) : Boolean;
+    VAR
+      Customer@1080001 : Record 18;
+      CustomerPostingGroup@1080002 : Record 92;
+    BEGIN
+      IF SalesInvoiceLine.Type = SalesInvoiceLine.Type::"G/L Account" THEN BEGIN
+        Customer.GET(SalesInvoiceLine."Bill-to Customer No.");
+        CustomerPostingGroup.SETFILTER(Code,Customer."Customer Posting Group");
+        IF CustomerPostingGroup.FINDFIRST THEN
+          IF SalesInvoiceLine."No." = CustomerPostingGroup."Invoice Rounding Account" THEN
+            EXIT(TRUE);
+      END;
+      EXIT(FALSE);
+    END;
+
+    LOCAL PROCEDURE SetEInvoiceStatusCreated@1080005(DocumentNo@1080001 : Code[20]);
+    VAR
+      SalesInvoiceHeader@1080000 : Record 112;
+    BEGIN
+      SalesInvoiceHeader.GET(DocumentNo);
+      SalesInvoiceHeader."E-Invoice Created" := TRUE;
+      SalesInvoiceHeader.MODIFY;
+    END;
+
+    PROCEDURE "E-Invoice Check Sales Invoice"@1080030(SalesInvoiceHeader@1100285500 : Record 112);
+    VAR
+      CompanyInfo@1080002 : Record 79;
+      SalesSetup@1080000 : Record 311;
+      FileManagement@1080001 : Codeunit 419;
+      EInvoiceCheckCommon@1080003 : Codeunit 11128519;
+    BEGIN
+      //Codeunit 10615 E-Invoice Check Sales Invoice
+      CompanyInfo.GET;
+      CompanyInfo.TESTFIELD(Name);
+      CompanyInfo.TESTFIELD(Address);
+      CompanyInfo.TESTFIELD(City);
+      CompanyInfo.TESTFIELD("Post Code");
+      CompanyInfo.TESTFIELD("Country/Region Code");
+      CompanyInfo.TESTFIELD("VAT Registration No.");
+      CompanyInfo.TESTFIELD("SWIFT Code");
+      IF CompanyInfo.IBAN = '' THEN
+        CompanyInfo.TESTFIELD("Bank Account No.");
+      CompanyInfo.TESTFIELD("Bank Branch No.");
+      // If it's RTC, is there a location for storing the file? If not, don't create the e-invoice
+      SalesSetup.GET;
+      SalesSetup.TESTFIELD("E-Invoice Sales Invoice Path");
+      IF NOT FileManagement.DirectoryExistsOnDotNetClient(SalesSetup."E-Invoice Sales Invoice Path") THEN
+        SalesSetup.FIELDERROR("E-Invoice Sales Invoice Path",InvalidPathErr);
+      WITH SalesInvoiceHeader DO
+        EInvoiceCheckCommon.CheckCurrencyCode("Currency Code","No.","Posting Date");
+    END;
+
+    BEGIN
+    {
+      cod10619+cod10615
+    }
+    END.
+  }
+}
+

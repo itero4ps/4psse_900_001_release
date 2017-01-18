@@ -4,7 +4,7 @@ OBJECT Codeunit 13 Gen. Jnl.-Post Batch
   {
     Date=;
     Time=;
-    Version List=NAVW19.00.00.45243,4PS9.00;
+    Version List=NAVW19.00.00.45243,4PS9.00,4PSSE;
   }
   PROPERTIES
   {
@@ -21,7 +21,7 @@ OBJECT Codeunit 13 Gen. Jnl.-Post Batch
   {
     VAR
       Text000@1000 : TextConst 'ENU=cannot exceed %1 characters';
-      PostingStateMsg@1001 : TextConst '@@@=This is a message for dialog window. Parameters do not require translation.;ENU=Journal Batch Name    #1##########\\Posting @2@@@@@@@@@@@@@\#3#############';
+      PostingStateMsg@1001 : TextConst '@@@=This is a message for dialog window. Parameters do not require translation.;ENU=Journal Batch Name    #1##########\Posting @2@@@@@@@@@@@@@\#3#############';
       CheckingLinesMsg@1003 : TextConst 'ENU=Checking lines';
       CheckingBalanceMsg@1004 : TextConst 'ENU=Checking balance';
       UpdatingBalLinesMsg@1005 : TextConst 'ENU=Updating bal. lines';
@@ -125,6 +125,12 @@ OBJECT Codeunit 13 Gen. Jnl.-Post Batch
       gBlnNoCommit@1210190005 : Boolean;
       ReadGLSetup@1100485000 : Boolean;
       StartLineNo2@1210190013 : Integer;
+      "-EVRY-"@1100285002 : Integer;
+      FA@1100285001 : Record 5600;
+      FAMain@1100285000 : Record 5600;
+      Text100@1100285005 : TextConst 'ENU=%1 is not within your range of allowed posting dates';
+      "*ITERO*"@1100285003 : Integer;
+      Currency@1100285004 : Record 4;
 
     LOCAL PROCEDURE Code@7();
     VAR
@@ -144,6 +150,8 @@ OBJECT Codeunit 13 Gen. Jnl.-Post Batch
       lvNoSeriesRec@1210190001 : Record 308;
       GenJnlLineForPostProjOrServ@1100528400 : Record 81;
       lvICPosting@1100485000 : Boolean;
+      DimMgt@1100285001 : Codeunit 408;
+      prevDimSetID@1100285000 : Integer;
     BEGIN
       WITH GenJnlLine DO BEGIN
         SETRANGE("Journal Template Name","Journal Template Name");
@@ -178,6 +186,23 @@ OBJECT Codeunit 13 Gen. Jnl.-Post Batch
 
         Window.OPEN(PostingStateMsg);
         Window.UPDATE(1,"Journal Batch Name");
+
+        //>>150121
+        DimMgt.SetCompany("Receiving Company"); //**4PS.n
+        DimMgt.SetDimensionValueChainsBool(TRUE);
+        IF "Shortcut Dimension 1 Code" <> '' THEN BEGIN
+          prevDimSetID := "Dimension Set ID";
+          DimMgt.ValidateShortcutDimValues(1,"Shortcut Dimension 1 Code","Dimension Set ID");
+          IF "Dimension Set ID" <> prevDimSetID THEN
+            MODIFY(FALSE);
+        END;
+        IF "Shortcut Dimension 2 Code" <> '' THEN BEGIN
+          prevDimSetID := "Dimension Set ID";
+          DimMgt.ValidateShortcutDimValues(2,"Shortcut Dimension 2 Code","Dimension Set ID");
+          IF "Dimension Set ID" <> prevDimSetID THEN
+            MODIFY(FALSE);
+        END;
+        //<<150121
 
         // Check lines
         LineCount := 0;
@@ -1526,7 +1551,11 @@ OBJECT Codeunit 13 Gen. Jnl.-Post Batch
         IF lvPost THEN
           JobJnlPostLine.RunWithCheck(JobJnlLine);
         JobJnlPostLine.SetOriginSalaryApplication(FALSE);
-
+        //>> 140324 ITERO.SB Handle periodic periods for project lines
+        IF "Periodic Template Code"<>'' THEN BEGIN
+          PostPeriodicProject(TRUE);
+        END;
+        //<<
         IF ("Receiving Company" <> '') THEN
           DimValRec.CHANGECOMPANY(COMPANYNAME);
 
@@ -1591,6 +1620,11 @@ OBJECT Codeunit 13 Gen. Jnl.-Post Batch
         ServJnlLine."Cost Component" := "Cost Component";
 
         ServJnlPostLine.RunWithCheck(ServJnlLine);
+        //>> 140324 ITERO.SB Handle periodic periods for Service lines
+        IF "Periodic Template Code"<>'' THEN BEGIN
+          PostPeriodicService;
+        END;
+        //<<
 
         IF ("Receiving Company" <> '') THEN
           DimValRec.CHANGECOMPANY(COMPANYNAME);
@@ -1639,6 +1673,22 @@ OBJECT Codeunit 13 Gen. Jnl.-Post Batch
               //C018452.en
               PlantSetup.TESTFIELD("Cost Component Depreciation");
               GenJnlLine."Cost Component Plant" := PlantSetup."Cost Component Depreciation";
+
+              //>> LAHE 130425
+              IF GenJnlLine."Plant No." = '' THEN BEGIN
+                FA := lRecFixedAsset;
+                IF (FA."Main Asset/Component" = FA."Main Asset/Component"::Component)
+                  AND (FA."Plant No." = '')
+                THEN BEGIN
+                  FAMain.GET(FA."Component of Main Asset"); // delib error
+                  FAMain.CALCFIELDS("Plant Type", "Plant No.");
+                  IF FAMain."Plant No." <> '' THEN BEGIN
+                    GenJnlLine."Plant Type" := FAMain."Plant Type";
+                    GenJnlLine."Plant No." := FAMain."Plant No.";
+                  END;
+                END;
+              END;
+              //<< LAHE 130425
             END;
 
         IF (GenJnlLine."Plant Type" = '') OR (GenJnlLine."Receiving Company" <> '') THEN
@@ -2582,9 +2632,373 @@ OBJECT Codeunit 13 Gen. Jnl.-Post Batch
       END;
     END;
 
+    LOCAL PROCEDURE "***ITERO**"@1100285002();
+    BEGIN
+    END;
+
+    PROCEDURE PostPeriodicService@1100285001();
+    VAR
+      PeriodicTemplate@1100285009 : Record 11128015;
+      PerPostDate@1100285008 : Date;
+      PeriodicCount@1100285007 : Integer;
+      CalcDateExpr@1100285006 : Code[10];
+      PerDiffSum@1100285005 : Decimal;
+      PerDiff@1100285004 : Decimal;
+      PerDiffSumAddCur@1100285003 : Decimal;
+      PerDiffAddCur@1100285002 : Decimal;
+      DimMgt@1000 : Codeunit 408;
+    BEGIN
+      // 140324 ITERO.SB Handle periodic periods when posting service
+      WITH GenJnlLine DO BEGIN
+        PeriodicTemplate.GET(GenJnlLine."Periodic Template Code");
+        PeriodicTemplate.TESTFIELD("No. of Periods");
+        PeriodicTemplate.TESTFIELD(Interval);
+        PeriodicTemplate.TESTFIELD("Temp. G/L Acc.");
+
+        IF ("Receiving Company" <> '') THEN
+          DimValRec.CHANGECOMPANY("Receiving Company");
+
+        DimMgt.GetDimValueRec(2, "Shortcut Dimension 2 Code", DimValRec, TRUE, "Job No.");
+
+        ServJnlLine.INIT;
+        ServJnlLine."Service Contract No." := "Service Contract No.";
+        ServJnlLine."Service Order No." := "Service Order No.";
+        ServJnlLine."Service Location No." := "Service Location No.";
+        ServJnlLine."Document No." := GenJnlLine5."Document No.";
+        ServJnlLine."G/L Account" := "Account No.";
+        ServJnlLine."Posting Date" := "Posting Date";
+        ServJnlLine."Shortcut Dimension 1 Code" := "Shortcut Dimension 1 Code";
+        ServJnlLine."Shortcut Dimension 2 Code" := "Shortcut Dimension 2 Code";
+        ServJnlLine.Description := PeriodicTemplate.Description;//Description;
+        ServJnlLine."Description 2" := "Description 2";  //**4PS01.n
+        ServJnlLine.Quantity := Quantity;
+        ServJnlLine."Unit of Measure Code" := "Unit of Measure Code";
+        ServJnlLine."Currency Code" := "Currency Code"; // dp00116.n
+        IF DimValRec."Cost Type" = DimValRec."Cost Type"::Revenue THEN BEGIN
+          IF Quantity = 0 THEN
+            ServJnlLine.VALIDATE("Sales Price (LCY)", "VAT Base Amount (LCY)")
+          ELSE
+            ServJnlLine.VALIDATE("Sales Price (LCY)", "VAT Base Amount (LCY)"/Quantity);
+          ServJnlLine.VALIDATE("Total Revenue (LCY)", ROUND("VAT Base Amount (LCY)"));
+        END ELSE BEGIN
+          IF Quantity = 0 THEN
+            ServJnlLine.VALIDATE("Unit Cost (LCY)", -"VAT Base Amount (LCY)")
+          ELSE
+            ServJnlLine.VALIDATE("Unit Cost (LCY)", -"VAT Base Amount (LCY)" / Quantity);
+          ServJnlLine.VALIDATE("Total Cost (LCY)", -ROUND("VAT Base Amount (LCY)"));
+        END;
+        ServJnlLine."Employee No." := "Employee No.";
+        ServJnlLine."Wage Component" := "Wage Component";
+        ServJnlLine."Source Code" := "Source Code";
+        ServJnlLine."Reason Code" := "Reason Code";
+        ServJnlLine."Item No." := "Item No.";
+        ServJnlLine."Basic Item" := "Basic Item";
+        ServJnlLine."Trade Item" := "Trade Item";
+        ServJnlLine."Vendor (Trade Item)" := "Vendor (Trade Item)";
+        ServJnlLine.Manufacturer := Manufacturer;
+        ServJnlLine."Project No." := "Job No.";
+        ServJnlLine."Additional Cost" := "Additional Cost (Service)";  //db, 24-11-05
+        ServJnlLine."Cost Component" := "Cost Component";
+
+        ServJnlPostLine.RunWithCheck(ServJnlLine);
+
+      END;
+
+      WITH GenJnlLine DO BEGIN
+        CLEAR(PerDiff);
+        CLEAR(PerDiffSum);
+        FOR PeriodicCount := 1 TO PeriodicTemplate."No. of Periods" DO
+        BEGIN
+          IF PeriodicCount = 1 THEN
+            IF GenJnlLine."Periodic Starting Date" = 0D THEN
+              PerPostDate := GenJnlLine."Posting Date"
+            ELSE
+              PerPostDate := GenJnlLine."Periodic Starting Date"
+          ELSE
+            PerPostDate := CALCDATE(PeriodicTemplate.Interval, PerPostDate);
+
+          IF GenJnlCheckLine.DateNotAllowed(PerPostDate) THEN
+            ERROR(Text100,PerPostDate);
+
+          PerDiffSum := PerDiffSum +
+                        ROUND("VAT Base Amount (LCY)" / PeriodicTemplate."No. of Periods",
+                              GLSetup."Amount Rounding Precision");
+
+          PerDiffSumAddCur := PerDiffSumAddCur +
+                        ROUND("Source Currency Amount" / PeriodicTemplate."No. of Periods",
+                              Currency."Amount Rounding Precision");
+          //IF "Periodic Count" = "Periodic Template"."No. of Periods" THEN
+          IF PeriodicCount = PeriodicTemplate."No. of Periods" THEN BEGIN
+            PerDiff := "VAT Base Amount (LCY)" - PerDiffSum;
+            PerDiffAddCur := "Source Currency Amount" - PerDiffSumAddCur;
+          END;
+          //S„tt in 3 rader med 100 p† varje..
+          IF ("Receiving Company" <> '') THEN
+            DimValRec.CHANGECOMPANY("Receiving Company");
+
+          DimMgt.GetDimValueRec(2, "Shortcut Dimension 2 Code", DimValRec, TRUE, "Job No.");
+
+          ServJnlLine.INIT;
+          ServJnlLine."Service Contract No." := "Service Contract No.";
+          ServJnlLine."Service Order No." := "Service Order No.";
+          ServJnlLine."Service Location No." := "Service Location No.";
+          ServJnlLine."Document No." := GenJnlLine5."Document No.";
+          ServJnlLine."G/L Account" := "Account No.";
+          ServJnlLine."Posting Date" := PerPostDate;//"Posting Date";
+          ServJnlLine."Shortcut Dimension 1 Code" := "Shortcut Dimension 1 Code";
+          ServJnlLine."Shortcut Dimension 2 Code" := "Shortcut Dimension 2 Code";
+          ServJnlLine.Description := PeriodicTemplate.Description;//Description;
+          ServJnlLine."Description 2" := "Description 2";  //**4PS01.n
+          ServJnlLine.Quantity := Quantity;
+          ServJnlLine."Unit of Measure Code" := "Unit of Measure Code";
+          ServJnlLine."Currency Code" := "Currency Code"; // dp00116.n
+          IF DimValRec."Cost Type" = DimValRec."Cost Type"::Revenue THEN BEGIN
+            IF Quantity = 0 THEN
+              ServJnlLine.VALIDATE("Sales Price (LCY)", -"VAT Base Amount (LCY)"/ PeriodicTemplate."No. of Periods")
+            ELSE
+              ServJnlLine.VALIDATE("Sales Price (LCY)", -("VAT Base Amount (LCY)"/Quantity)/ PeriodicTemplate."No. of Periods");
+            ServJnlLine.VALIDATE("Total Revenue (LCY)", -ROUND(("VAT Base Amount (LCY)"/ PeriodicTemplate."No. of Periods")+PerDiff));
+          END ELSE BEGIN
+            IF Quantity = 0 THEN
+              ServJnlLine.VALIDATE("Unit Cost (LCY)", "VAT Base Amount (LCY)"/ PeriodicTemplate."No. of Periods")
+            ELSE
+              ServJnlLine.VALIDATE("Unit Cost (LCY)", ("VAT Base Amount (LCY)" / Quantity)/ PeriodicTemplate."No. of Periods");
+            ServJnlLine.VALIDATE("Total Cost (LCY)", ROUND(("VAT Base Amount (LCY)"/ PeriodicTemplate."No. of Periods")+PerDiff));
+          END;
+          ServJnlLine."Employee No." := "Employee No.";
+          ServJnlLine."Wage Component" := "Wage Component";
+          ServJnlLine."Source Code" := "Source Code";
+          ServJnlLine."Reason Code" := "Reason Code";
+          ServJnlLine."Item No." := "Item No.";
+          ServJnlLine."Basic Item" := "Basic Item";
+          ServJnlLine."Trade Item" := "Trade Item";
+          ServJnlLine."Vendor (Trade Item)" := "Vendor (Trade Item)";
+          ServJnlLine.Manufacturer := Manufacturer;
+          ServJnlLine."Project No." := "Job No.";
+          ServJnlLine."Additional Cost" := "Additional Cost (Service)";  //db, 24-11-05
+          ServJnlLine."Cost Component" := "Cost Component";
+
+          ServJnlPostLine.RunWithCheck(ServJnlLine);
+
+          GenJnlLine3."Posting Date":=PerPostDate;
+
+          IF PeriodicCount < PeriodicTemplate."No. of Periods" THEN
+            PostSurcharge(GenJnlLine3,1);
+
+        END;
+      END;
+      GenJnlLine.VALIDATE(GenJnlLine."Periodic Template Code",'');
+    END;
+
+    PROCEDURE PostPeriodicProject@1100285000(lvPost@1100285000 : Boolean);
+    VAR
+      PeriodicTemplate@1100285010 : Record 11128015;
+      PerPostDate@1100285009 : Date;
+      PeriodicCount@1100285008 : Integer;
+      CalcDateExpr@1100285007 : Code[10];
+      PerDiffSum@1100285006 : Decimal;
+      PerDiff@1100285005 : Decimal;
+      PerDiffSumAddCur@1100285004 : Decimal;
+      PerDiffAddCur@1100285003 : Decimal;
+      PostingDatePre@1100285011 : Date;
+      DimMgt@1000 : Codeunit 408;
+    BEGIN
+      // 140324 ITERO.SB Handle periodic periods when posting project
+
+      WITH GenJnlLine DO BEGIN
+        PeriodicTemplate.GET(GenJnlLine."Periodic Template Code");
+        PeriodicTemplate.TESTFIELD("No. of Periods");
+        PeriodicTemplate.TESTFIELD(Interval);
+        PeriodicTemplate.TESTFIELD("Temp. G/L Acc.");
+
+        IF ("Receiving Company" <> '') THEN
+          DimValRec.CHANGECOMPANY("Receiving Company");
+
+        DimMgt.GetDimValueRec(2, "Shortcut Dimension 2 Code", DimValRec, TRUE, "Job No.");
+
+        // Post project entries
+        JobJnlLine.INIT;
+        JobJnlLine."Posting Date" := "Posting Date";
+        JobJnlLine."Document Date" := "Document Date";
+        JobJnlLine."Job No." := "Job No.";
+        JobJnlLine."No." := "Account No.";
+        JobJnlLine.Description := PeriodicTemplate.Description;//Description;
+        JobJnlLine."Description 2" := "Description 2";  //**4PS01.n
+        JobJnlLine."Posting Group" := "Posting Group";
+        JobJnlLine."Shortcut Dimension 1 Code" := "Shortcut Dimension 1 Code";
+        JobJnlLine."Shortcut Dimension 2 Code" := "Shortcut Dimension 2 Code";
+        JobJnlLine."Gen. Bus. Posting Group" := "Gen. Bus. Posting Group";
+        JobJnlLine."Gen. Prod. Posting Group" := "Gen. Prod. Posting Group";
+        JobJnlLine."Document No." := "Document No.";
+        JobJnlLine."External Document No." := "External Document No.";
+        JobJnlLine.Type := JobJnlLine.Type::"G/L Account";
+        JobJnlLine.Quantity := Quantity;
+        JobJnlLine."Unit of Measure Code" := "Unit of Measure Code";
+        IF DimValRec."Cost Type" = DimValRec."Cost Type"::Revenue THEN BEGIN
+          JobJnlLine."Entry Type" := JobJnlLine."Entry Type"::Sale;
+          IF Quantity = 0 THEN
+            JobJnlLine."Unit Price (LCY)" := "VAT Base Amount (LCY)"
+          ELSE
+            JobJnlLine."Unit Price (LCY)" := "VAT Base Amount (LCY)"/Quantity;
+          JobJnlLine."Total Price (LCY)" := ROUND("VAT Base Amount (LCY)");
+          JobJnlLine."Source Currency Total Price" := ROUND("Source Curr. VAT Base Amount");
+        END ELSE BEGIN
+          JobJnlLine."Entry Type" := JobJnlLine."Entry Type"::Usage;
+          IF Quantity = 0 THEN
+            JobJnlLine."Direct Unit Cost (LCY)" := -"VAT Base Amount (LCY)"
+          ELSE
+            JobJnlLine."Direct Unit Cost (LCY)" := -"VAT Base Amount (LCY)"/Quantity;
+          JobJnlLine."Unit Cost (LCY)" := JobJnlLine."Direct Unit Cost (LCY)";
+          JobJnlLine."Total Cost (LCY)" := -ROUND("VAT Base Amount (LCY)");
+          JobJnlLine."Source Currency Total Cost" := -ROUND("Source Curr. VAT Base Amount");
+        END;
+        JobJnlLine."Reason Code" := "Reason Code";
+        JobJnlLine."Source Code" := "Source Code";
+        //JobJnlLine."Post Job Entry Only" := TRUE; //Removed in NAV2009
+        JobJnlLine."Posting No. Series" := "Posting No. Series";
+        JobJnlLine."Source Currency Code" := "Currency Code";
+        JobJnlLine."Employee No." := "Employee No.";
+        JobJnlLine."Wage Component" := "Wage Component";
+        JobJnlLine.Element := Element;
+        JobJnlLine."Extension Contract" := "Extension Contract";
+        JobJnlLine."Item No." := "Item No.";
+        JobJnlLine."Basic Item" := "Basic Item";
+        JobJnlLine."Trade Item" := "Trade Item";
+        JobJnlLine."Vendor (Trade Item)" := "Vendor (Trade Item)";
+        JobJnlLine.Manufacturer := Manufacturer;
+        JobJnlLine."Service Order No." := "Service Order No.";
+        JobJnlLine."Service Contract No." := "Service Contract No.";
+        JobJnlLine."Service Location No." := "Service Location No.";
+        JobJnlLine."Rental Unit" := "Rental Unit";
+        JobJnlLine."Purchase Action" := "Purchase Action";
+        JobJnlLine."Project Interest" := "Project Interest"; //jth 09-11-2004
+        JobJnlLine."Cost Component" := "Cost Component";
+
+        JobJnlPostLine.SetOriginSalaryApplication("Origin Salary Application");
+        IF lvPost THEN
+          JobJnlPostLine.RunWithCheck(JobJnlLine);
+        JobJnlPostLine.SetOriginSalaryApplication(FALSE);
+      END;
+
+      WITH GenJnlLine DO BEGIN
+
+        CLEAR(PerDiff);
+        CLEAR(PerDiffSum);
+        FOR PeriodicCount := 1 TO PeriodicTemplate."No. of Periods" DO
+        BEGIN
+          IF PeriodicCount = 1 THEN
+            IF GenJnlLine."Periodic Starting Date" = 0D THEN
+              PerPostDate := GenJnlLine."Posting Date"
+            ELSE
+              PerPostDate := GenJnlLine."Periodic Starting Date"
+          ELSE
+            PerPostDate := CALCDATE(PeriodicTemplate.Interval, PerPostDate);
+
+          IF GenJnlCheckLine.DateNotAllowed(PerPostDate) THEN
+            ERROR(Text100,PerPostDate);
+
+          PerDiffSum := PerDiffSum +
+                        ROUND("VAT Base Amount (LCY)" / PeriodicTemplate."No. of Periods",
+                              GLSetup."Amount Rounding Precision");
+
+          PerDiffSumAddCur := PerDiffSumAddCur +
+                        ROUND("Source Currency Amount" / PeriodicTemplate."No. of Periods",
+                              Currency."Amount Rounding Precision");
+          //IF "Periodic Count" = "Periodic Template"."No. of Periods" THEN
+          IF PeriodicCount = PeriodicTemplate."No. of Periods" THEN BEGIN
+            PerDiff := "VAT Base Amount (LCY)" - PerDiffSum;
+            PerDiffAddCur := "Source Currency Amount" - PerDiffSumAddCur;
+          END;
+
+          IF ("Receiving Company" <> '') THEN
+            DimValRec.CHANGECOMPANY("Receiving Company");
+
+          DimMgt.GetDimValueRec(2, "Shortcut Dimension 2 Code", DimValRec, TRUE, "Job No.");
+
+          // Post project entries
+          JobJnlLine.INIT;
+          JobJnlLine."Posting Date" := PerPostDate;//"Posting Date";
+          JobJnlLine."Document Date" := "Document Date";
+          JobJnlLine."Job No." := "Job No.";
+          JobJnlLine."No." := "Account No.";
+          JobJnlLine.Description := PeriodicTemplate.Description;//Description;
+          JobJnlLine."Description 2" := "Description 2";  //**4PS01.n
+          JobJnlLine."Posting Group" := "Posting Group";
+          JobJnlLine."Shortcut Dimension 1 Code" := "Shortcut Dimension 1 Code";
+          JobJnlLine."Shortcut Dimension 2 Code" := "Shortcut Dimension 2 Code";
+          JobJnlLine."Gen. Bus. Posting Group" := "Gen. Bus. Posting Group";
+          JobJnlLine."Gen. Prod. Posting Group" := "Gen. Prod. Posting Group";
+          JobJnlLine."Document No." := "Document No.";
+          JobJnlLine."External Document No." := "External Document No.";
+          JobJnlLine.Type := JobJnlLine.Type::"G/L Account";
+          JobJnlLine.Quantity := Quantity;
+          JobJnlLine."Unit of Measure Code" := "Unit of Measure Code";
+          IF DimValRec."Cost Type" = DimValRec."Cost Type"::Revenue THEN BEGIN
+            JobJnlLine."Entry Type" := JobJnlLine."Entry Type"::Sale;
+            IF Quantity = 0 THEN
+              JobJnlLine."Unit Price (LCY)" := -"VAT Base Amount (LCY)"/ PeriodicTemplate."No. of Periods"
+            ELSE
+              JobJnlLine."Unit Price (LCY)" := -("VAT Base Amount (LCY)"/Quantity)/ PeriodicTemplate."No. of Periods";
+            JobJnlLine."Total Price (LCY)" := -ROUND(("VAT Base Amount (LCY)"/ PeriodicTemplate."No. of Periods")+PerDiff);
+            JobJnlLine."Source Currency Total Price" := -ROUND(("Source Curr. VAT Base Amount"/ PeriodicTemplate."No. of Periods")
+            +PerDiff);
+          END ELSE BEGIN
+            JobJnlLine."Entry Type" := JobJnlLine."Entry Type"::Usage;
+            IF Quantity = 0 THEN
+              JobJnlLine."Direct Unit Cost (LCY)" := "VAT Base Amount (LCY)"/ PeriodicTemplate."No. of Periods"
+            ELSE
+              JobJnlLine."Direct Unit Cost (LCY)" := ("VAT Base Amount (LCY)"/Quantity)/ PeriodicTemplate."No. of Periods";
+            JobJnlLine."Unit Cost (LCY)" := JobJnlLine."Direct Unit Cost (LCY)";/// PeriodicTemplate."No. of Periods";
+            JobJnlLine."Total Cost (LCY)" := ROUND(("VAT Base Amount (LCY)"/ PeriodicTemplate."No. of Periods")+PerDiff);
+            JobJnlLine."Source Currency Total Cost" := ROUND(("Source Curr. VAT Base Amount"/ PeriodicTemplate."No. of Periods")+PerDiff
+      );
+          END;
+          JobJnlLine."Reason Code" := "Reason Code";
+          JobJnlLine."Source Code" := "Source Code";
+          //JobJnlLine."Post Job Entry Only" := TRUE; //Removed in NAV2009
+          JobJnlLine."Posting No. Series" := "Posting No. Series";
+          JobJnlLine."Source Currency Code" := "Currency Code";
+          JobJnlLine."Employee No." := "Employee No.";
+          JobJnlLine."Wage Component" := "Wage Component";
+          JobJnlLine.Element := Element;
+          JobJnlLine."Extension Contract" := "Extension Contract";
+          JobJnlLine."Item No." := "Item No.";
+          JobJnlLine."Basic Item" := "Basic Item";
+          JobJnlLine."Trade Item" := "Trade Item";
+          JobJnlLine."Vendor (Trade Item)" := "Vendor (Trade Item)";
+          JobJnlLine.Manufacturer := Manufacturer;
+          JobJnlLine."Service Order No." := "Service Order No.";
+          JobJnlLine."Service Contract No." := "Service Contract No.";
+          JobJnlLine."Service Location No." := "Service Location No.";
+          JobJnlLine."Rental Unit" := "Rental Unit";
+          JobJnlLine."Purchase Action" := "Purchase Action";
+          JobJnlLine."Project Interest" := "Project Interest"; //jth 09-11-2004
+          JobJnlLine."Cost Component" := "Cost Component";
+
+          JobJnlPostLine.SetOriginSalaryApplication("Origin Salary Application");
+          IF lvPost THEN
+            JobJnlPostLine.RunWithCheck(JobJnlLine);
+
+          JobJnlPostLine.SetOriginSalaryApplication(FALSE);
+
+          GenJnlLine3."Posting Date":=PerPostDate;
+
+          IF PeriodicCount < PeriodicTemplate."No. of Periods" THEN
+            PostSurcharge(GenJnlLine3,0);
+
+        END;
+      END;
+      GenJnlLine.VALIDATE(GenJnlLine."Periodic Template Code",'');
+    END;
+
     BEGIN
     {
       13-03-2008, call 11414, Use "Compl. WIP Acc. Labor" in stead of "Cost Acc. (f.comm.) Labor"
+
+      -EVRY-
+      LAHE 130425 Use "plant no." of main asset
+      -ITERO-
+      140324 ITERO.SB Handle periodic periods when posting project/service
     }
     END.
   }

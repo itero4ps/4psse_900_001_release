@@ -4,7 +4,7 @@ OBJECT Codeunit 1207 Pmt Export Mgt Vend Ledg Entry
   {
     Date=;
     Time=;
-    Version List=NAVW19.00;
+    Version List=NAVW19.00,NAVDK9,4PSSE.DK;
   }
   PROPERTIES
   {
@@ -19,6 +19,8 @@ OBJECT Codeunit 1207 Pmt Export Mgt Vend Ledg Entry
       ExportAgainQst@1002 : TextConst 'ENU=One or more of the selected lines has already been exported. Do you want to export it again?';
       ProgressMsg@1001 : TextConst 'ENU=Processing line no. #1######.';
       PaymentExportMgt@1003 : Codeunit 1210;
+      GLSetup@1100285500 : Record 98;
+      gotGLSetup@1100285501 : Boolean;
 
     PROCEDURE ExportVendorPaymentFileYN@23(VAR VendorLedgerEntry@1000 : Record 25);
     BEGIN
@@ -92,6 +94,9 @@ OBJECT Codeunit 1207 Pmt Export Mgt Vend Ledg Entry
       DataExch@1001 : Record 1220;
       Window@1003 : Dialog;
       LineNo@1002 : Integer;
+      LineAmount@1060006 : Decimal;
+      TransferDate@1060005 : Date;
+      TotalAmount@1060004 : Decimal;
     BEGIN
       VendorLedgerEntry2.COPY(VendorLedgerEntry);
       PaymentExportMgt.CreateDataExch(DataExch,VendorLedgerEntry2."Bal. Account No.");
@@ -99,18 +104,25 @@ OBJECT Codeunit 1207 Pmt Export Mgt Vend Ledg Entry
       REPEAT
         LineNo += 1;
         Window.UPDATE(1,LineNo);
-        CreateVendLedgerDataExchLine(DataExch."Entry No.",VendorLedgerEntry2,LineNo);
+        CreateVendLedgerDataExchLine(DataExch."Entry No.",VendorLedgerEntry2,LineNo,LineAmount,TransferDate);
+        TotalAmount += LineAmount;
       UNTIL VendorLedgerEntry2.NEXT = 0;
       Window.CLOSE;
-      PaymentExportMgt.ExportToFile(DataExch."Entry No.")
+      GetGLSetup;  //4PSSE.DK
+      IF GLSetup."Danish localization active" THEN
+        ExportDataFromBuffer(VendorLedgerEntry."Bal. Account No.",DataExch."Entry No.",LineNo,TotalAmount,TransferDate)  //NAVDK
+      ELSE
+        PaymentExportMgt.ExportToFile(DataExch."Entry No.")
     END;
 
-    LOCAL PROCEDURE CreateVendLedgerDataExchLine@18(DataExchEntryNo@1000 : Integer;VendorLedgerEntry@1001 : Record 25;LineNo@1002 : Integer);
+    LOCAL PROCEDURE CreateVendLedgerDataExchLine@18(DataExchEntryNo@1000 : Integer;VendorLedgerEntry@1001 : Record 25;LineNo@1002 : Integer;VAR PmtExportLineAmount@1060001 : Decimal;VAR PmtExportTransferDate@1060000 : Date);
     VAR
       PaymentExportData@1003 : Record 1226;
     BEGIN
       WITH VendorLedgerEntry DO BEGIN
         PreparePaymentExportDataVLE(PaymentExportData,VendorLedgerEntry,DataExchEntryNo,LineNo);
+        PmtExportLineAmount := PaymentExportData.Amount;
+        PmtExportTransferDate := PaymentExportData."Transfer Date";
         PaymentExportMgt.CreatePaymentLines(PaymentExportData);
       END;
     END;
@@ -157,7 +169,7 @@ OBJECT Codeunit 1207 Pmt Export Mgt Vend Ledg Entry
           "Recipient Bank City" := COPYSTR(VendorBankAccount."Post Code" + VendorBankAccount.City,1,35);
           "Recipient Bank BIC" := VendorBankAccount."SWIFT Code";
         END ELSE
-          IF VendorLedgerEntry."Creditor No." <> '' THEN BEGIN
+          IF (VendorLedgerEntry."Creditor No." <> '') OR (VendorLedgerEntry."Giro Acc. No." <> '') THEN BEGIN
             VendorLedgerEntry.CALCFIELDS("Amount (LCY)");
             Amount := VendorLedgerEntry."Amount (LCY)";
             "Currency Code" := GeneralLedgerSetup."LCY Code";
@@ -177,8 +189,36 @@ OBJECT Codeunit 1207 Pmt Export Mgt Vend Ledg Entry
         IF PaymentMethod.GET(VendorLedgerEntry."Payment Method Code") THEN
           "Data Exch. Line Def Code" := PaymentMethod."Pmt. Export Line Definition";
         "Recipient Creditor No." := VendorLedgerEntry."Creditor No.";
+        "Recipient Giro Acc. No." := VendorLedgerEntry."Giro Acc. No.";
         INSERT(TRUE);
       END;
+    END;
+
+    LOCAL PROCEDURE ExportDataFromBuffer@1060002(BalAccountNo@1060001 : Code[20];DataExchEntryNo@1060004 : Integer;LineCount@1060006 : Integer;TotalAmount@1060007 : Decimal;TransferDate@1060008 : Date);
+    VAR
+      BankAccount@1060000 : Record 270;
+      BankExportImportSetup@1060002 : Record 1200;
+      DataExchDef@1060003 : Record 1222;
+      TempPaymentExportData@1060005 : TEMPORARY Record 1226;
+      DataExch@1060009 : Record 1220;
+    BEGIN
+      GetGLSetup;  //4PSSE.DK
+      IF NOT GLSetup."Danish localization active" THEN EXIT;
+      BankAccount.GET(BalAccountNo);
+      BankExportImportSetup.GET(BankAccount."Payment Export Format");
+      DataExchDef.GET(BankExportImportSetup."Data Exch. Def. Code");
+      IF DataExchDef."Reading/Writing Codeunit" = CODEUNIT::"Export BankData Fixed Width" THEN BEGIN
+        TempPaymentExportData.INIT;
+        TempPaymentExportData."Data Exch Entry No." := DataExchEntryNo;
+        TempPaymentExportData."Line No." := LineCount;
+        TempPaymentExportData.Amount := TotalAmount;
+        TempPaymentExportData."Transfer Date" := TransferDate;
+        TempPaymentExportData.INSERT;
+        CODEUNIT.RUN(DataExchDef."Reading/Writing Codeunit",TempPaymentExportData);
+        DataExch.GET(DataExchEntryNo);
+        CODEUNIT.RUN(DataExchDef."Ext. Data Handling Codeunit",DataExch);
+      END ELSE
+        PaymentExportMgt.ExportToFile(DataExchEntryNo);
     END;
 
     PROCEDURE EnableExportToServerTempFile@27(SilentServerMode@1000 : Boolean;ServerFileExtension@1001 : Text[3]);
@@ -202,6 +242,14 @@ OBJECT Codeunit 1207 Pmt Export Mgt Vend Ledg Entry
           CODEUNIT.RUN(CODEUNIT::"Vend. Entry-Edit",VendorLedgerEntry2);
         UNTIL NEXT = 0;
       END;
+    END;
+
+    LOCAL PROCEDURE GetGLSetup@1100285500();
+    BEGIN
+      //4PSSE.DK
+      IF NOT gotGLSetup THEN
+        GLSetup.GET;
+      gotGLSetup := TRUE;
     END;
 
     BEGIN

@@ -1,0 +1,279 @@
+OBJECT Report 11128020 Report back from Bank Giro
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVSE6.00.01 (11210),4PSSE;
+  }
+  PROPERTIES
+  {
+    CaptionML=ENU=Report back from Bank Giro;
+    ShowPrintStatus=No;
+    ProcessingOnly=Yes;
+    OnPreReport=BEGIN
+                  IF FileName = '' THEN
+                    ERROR(BA001);
+                  IF ISSERVICETIER THEN
+                      UploadFile(FileName);
+                  CLEAR(TxtFile);
+                  TxtFile.TEXTMODE := TRUE;
+                  TxtFile.OPEN(FileName);
+                END;
+
+    OnPostReport=BEGIN
+                   Window.OPEN('@1@@@@@@@@@@@@@@@@@@@@@@@@@');
+                   WHILE TxtFile.LEN <> TxtFile.POS DO BEGIN
+                     Window.UPDATE(1,ROUND((TxtFile.POS/TxtFile.LEN*10000),1.0));
+                     TxtFile.READ(TxtLine);
+                     LineType := COPYSTR(TxtLine,1,2);
+                     CASE LineType OF
+                       '11':
+                         BEGIN // Opening Line
+                           PostingDate := Txt2Date(TxtLine,41,6);
+                         END;
+                       '54',   // Transaction,   54:girering till PlusGirokonto  //IME348
+                       '14','16':
+                         BEGIN // Transaction,   16:kreditfakturor, 14:betalningspost
+                           xGenJournalLine := GenJournalLine;
+                           CLEAR(VendorLedgerEntry); //DL130925
+                           GenJournalLine.INIT;
+                           GenJournalLine."Line No." += 10000;
+                           GenJournalLine.SetUpNewLine(xGenJournalLine,0,FALSE);
+                           GenJournalLine.VALIDATE("Posting Date",PostingDate);
+                           GenJournalLine.VALIDATE("Account Type",GenJournalLine."Account Type"::Vendor);
+                           DocumentNo := COPYSTR(TxtLine,68,20);
+                   //>>IME348
+                           //IF LineType = '14' THEN BEGIN
+                           IF LineType IN ['14','54'] THEN BEGIN
+                   //<<IME348
+                             IF InvioceExists(DocumentNo) THEN BEGIN
+                               GenJournalLine.VALIDATE("Account No.",VendorLedgerEntry."Vendor No.");
+                               GenJournalLine.VALIDATE("Applies-to Doc. No.",VendorLedgerEntry."Document No.");
+                             END ELSE BEGIN
+                               GenJournalLine.VALIDATE("Account No.", ''); //DL130925
+                               GenJournalLine.VALIDATE("Applies-to Doc. No.", '');
+                             END;
+                             GenJournalLine.VALIDATE(Amount,Txt2Dec(TxtLine,38,12));
+                             GenJournalLine.VALIDATE(Description,GenJournalLine."Applies-to Doc. No." + ' ' + BA002);
+                           END ELSE BEGIN
+                             IF CreditMemoExists(DocumentNo) THEN BEGIN
+                               GenJournalLine.VALIDATE("Account No.",VendorLedgerEntry."Vendor No.");
+                               GenJournalLine.VALIDATE("Applies-to Doc. Type",GenJournalLine."Applies-to Doc. Type"::"Credit Memo"); //ITERO.DL 150311
+                               GenJournalLine.VALIDATE("Applies-to Doc. No.",VendorLedgerEntry."Document No.");
+                             END ELSE BEGIN
+                               GenJournalLine.VALIDATE("Account No.", ''); //DL130925
+                               GenJournalLine.VALIDATE("Applies-to Doc. No.", '');
+                               GenJournalLine."Applies-to Doc. Type" := GenJournalLine."Applies-to Doc. Type"::"Credit Memo"; //130925
+                             END;
+                             GenJournalLine.VALIDATE(Amount,-Txt2Dec(TxtLine,38,12));
+                             GenJournalLine.VALIDATE(Description,GenJournalLine."Applies-to Doc. No." + ' ' + BA003);
+                           END;
+                           IF GenJournalLine."Applies-to Doc. No." = '' THEN
+                             GenJournalLine.VALIDATE(Description, BA004 + ' ' + DocumentNo);
+                           GenJournalLine.INSERT;
+                         END;
+                       '29':
+                         BEGIN // End line
+                           xGenJournalLine := GenJournalLine;
+                           GenJournalLine.INIT;
+                           GenJournalLine."Line No." += 10000;
+                           GenJournalLine.SetUpNewLine(xGenJournalLine,0,FALSE);
+                           GenJournalLine.VALIDATE("Posting Date",PostingDate);
+                           GenJournalLine.VALIDATE("Account Type",GenJournalLine."Account Type"::"G/L Account");
+                           GenJournalLine.VALIDATE("Account No.",BankAccountNo);
+                           GenJournalLine.VALIDATE(Amount,-Txt2Dec(TxtLine,21,12));
+                           GenJournalLine.INSERT;
+                         END;
+                     END;
+                   END;
+                   TxtFile.CLOSE;
+                 END;
+
+  }
+  DATASET
+  {
+  }
+  REQUESTPAGE
+  {
+    PROPERTIES
+    {
+      SaveValues=Yes;
+    }
+    CONTROLS
+    {
+      { 1900000001;0;Container;
+                  ContainerType=ContentArea }
+
+      { 1900000002;1;Group  ;
+                  CaptionML=ENU=Options }
+
+      { 1070000;2;Field     ;
+                  AssistEdit=Yes;
+                  CaptionML=ENU=File Name;
+                  SourceExpr=FileName;
+                  OnAssistEdit=BEGIN
+                                 UploadFile(FileName);
+                               END;
+                                }
+
+      { 1070002;2;Field     ;
+                  CaptionML=ENU=Account Type;
+                  OptionCaptionML=ENU=G/L Account,,,Bank Account;
+                  SourceExpr=AccountType;
+                  OnValidate=BEGIN
+                               CLEAR(BankAccountNo);
+                             END;
+                              }
+
+      { 1070004;2;Field     ;
+                  CaptionML=ENU=Account No;
+                  SourceExpr=BankAccountNo;
+                  OnValidate=BEGIN
+                               IF BankAccountNo = '' THEN
+                                 EXIT;
+                               CASE AccountType OF
+                                 AccountType::"G/L Account":
+                                   BEGIN
+                                     GLAccount.GET(BankAccountNo);
+                                   END;
+                                 AccountType::"Bank Account":
+                                   BEGIN
+                                     BankAccount.GET(BankAccountNo);
+                                   END;
+                               END;
+                             END;
+
+                  OnLookup=BEGIN
+                             CASE AccountType OF
+                               AccountType::"G/L Account":
+                                 BEGIN
+                                   IF PAGE.RUNMODAL(0,GLAccount) = ACTION::LookupOK THEN
+                                     BankAccountNo := GLAccount."No.";
+                                 END;
+                               AccountType::"Bank Account":
+                                 BEGIN
+                                   IF PAGE.RUNMODAL(0,BankAccount) = ACTION::LookupOK THEN
+                                     BankAccountNo := BankAccount."No.";
+                                 END;
+                             END;
+                           END;
+                            }
+
+    }
+  }
+  LABELS
+  {
+  }
+  CODE
+  {
+    VAR
+      FileName@1070013 : Text[250];
+      TxtFile@1070012 : File;
+      TxtLine@1070011 : Text[1000];
+      GenJournalLine@1070010 : Record 81;
+      xGenJournalLine@1070009 : Record 81;
+      VendorLedgerEntry@1070008 : Record 25;
+      PostingDate@1070007 : Date;
+      DocumentNo@1070006 : Code[20];
+      LineType@1070005 : Code[10];
+      Window@1070004 : Dialog;
+      AccountType@1070003 : 'G/L Account,Customer,Vendor,Bank Account,Fixed Asset';
+      BankAccountNo@1070002 : Code[20];
+      GLAccount@1070001 : Record 15;
+      BankAccount@1070000 : Record 270;
+      BA001@1070018 : TextConst 'ENU=File Name must not be blank';
+      BA002@1070017 : TextConst 'ENU=Inv. Payment Vendor';
+      BA003@1070016 : TextConst 'ENU=Cr. Memo Reduction Vendor';
+      BA004@1070015 : TextConst 'ENU="Wrong reference. Doc. No.: "';
+      BA005@1070014 : TextConst 'ENU=The Decimal Value "%1" is wrong.';
+      BA09@1070020 : TextConst 'ENU=Import from file';
+      BA10@1070019 : TextConst 'ENU=Text Files|*.txt|All Files|*.*';
+
+    PROCEDURE SetGenJournal@1070001(InGenJournalLine@1070000 : Record 81);
+    BEGIN
+      GenJournalLine := InGenJournalLine;
+    END;
+
+    PROCEDURE InvioceExists@1070002(InDocumentNo@1070001 : Code[20]) : Boolean;
+    BEGIN
+      VendorLedgerEntry.SETCURRENTKEY("Document No.");
+      VendorLedgerEntry.SETRANGE(Open,TRUE);
+      VendorLedgerEntry.SETRANGE("Document No.",InDocumentNo);
+      //>>150520
+      //EXIT(VendorLedgerEntry.FIND('-'));
+      IF VendorLedgerEntry.FIND('-') THEN
+        EXIT(TRUE);
+
+      VendorLedgerEntry.SETFILTER("Document No.",InDocumentNo+'?');
+      IF VendorLedgerEntry.FIND('-') AND (VendorLedgerEntry.COUNT = 1) AND (STRLEN(InDocumentNo)=13) THEN
+        EXIT(TRUE);
+
+      EXIT(FALSE);
+      //<<150520
+    END;
+
+    PROCEDURE CreditMemoExists@1070003(InDocumentNo@1070001 : Code[20]) : Boolean;
+    BEGIN
+      VendorLedgerEntry.SETCURRENTKEY("Document No.");
+      VendorLedgerEntry.SETRANGE(Open,TRUE);
+      VendorLedgerEntry.SETRANGE("Document No.",InDocumentNo);
+      //>>150520
+      //EXIT(VendorLedgerEntry.FIND('-'));
+      IF VendorLedgerEntry.FIND('-') THEN
+        EXIT(TRUE);
+
+      VendorLedgerEntry.SETFILTER("Document No.",InDocumentNo+'?');
+      IF VendorLedgerEntry.FIND('-') AND (VendorLedgerEntry.COUNT = 1) AND (STRLEN(InDocumentNo)=13) THEN
+        EXIT(TRUE);
+
+      EXIT(FALSE);
+      //<<150520
+    END;
+
+    PROCEDURE Txt2Date@1070004(InText@1070000 : Text[250];StartPos@1070005 : Integer;Length@1070004 : Integer) : Date;
+    BEGIN
+      InText := COPYSTR(InText,StartPos,Length);
+      EXIT(DMY2DATE(Txt2Int(InText,5,2),Txt2Int(InText,3,2),2000 + Txt2Int(InText,1,2)));
+    END;
+
+    PROCEDURE Txt2Int@1070005(InText@1070000 : Text[250];StartPos@1070001 : Integer;Length@1070002 : Integer) OutInt : Integer;
+    BEGIN
+      IF NOT EVALUATE(OutInt,COPYSTR(InText,StartPos,Length)) THEN
+        ERROR(BA005,COPYSTR(InText,StartPos,Length));
+    END;
+
+    PROCEDURE Txt2Dec@1070006(InText@1070002 : Text[250];StartPos@1070001 : Integer;Length@1070000 : Integer) OutDec : Decimal;
+    BEGIN
+      IF NOT EVALUATE(OutDec,COPYSTR(InText,StartPos,Length)) THEN
+        ERROR(BA005,COPYSTR(InText,StartPos,Length));
+      OutDec := OutDec/100;
+    END;
+
+    PROCEDURE UploadFile@1070000(VAR PFileName@1070001 : Text[1024]);
+    VAR
+      RBMgt@1070002 : Codeunit 419;
+      NewFileName@1070000 : Text[1024];
+    BEGIN
+      IF NOT ISSERVICETIER THEN
+        NewFileName := RBMgt.OpenFileDialog(BA09,PFileName,BA10)
+      ELSE
+        IF NOT(UPLOAD(BA09,'',BA10,PFileName,NewFileName)) THEN
+          NewFileName := '';
+
+      IF NewFileName <> '' THEN
+        PFileName := NewFileName;
+    END;
+
+    BEGIN
+    {
+      150520 ITERO.DL due to migration errors the invoice doc.number is 1 char to long; extend search with 1 char
+      150916 ITERO.DL IME348 PlusGiro payments not matched
+    }
+    END.
+  }
+  RDLDATA
+  {
+  }
+}
+

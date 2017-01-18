@@ -202,6 +202,7 @@ OBJECT Codeunit 11012046 Close Project/Service
       Text087@1100525017 : TextConst 'ENU=Provisions';
       Text088@1100525019 : TextConst 'ENU=Base Service Order %1 is not Administrative Finished';
       gvIgnorePlant@1100525002 : Boolean;
+      TextSYM077@1100285500 : TextConst 'ENU=%1 %2 must no be %3';
       Text089@1100528608 : TextConst 'ENU=Service Order %1 not fully (Cost/Revenue) transfered to Project';
       Text090@1100529101 : TextConst 'ENU=%1 %2 not finished or cancelled';
       Text091@1100529103 : TextConst 'ENU=%1 %2 not finished';
@@ -316,6 +317,12 @@ OBJECT Codeunit 11012046 Close Project/Service
       lvYear@1100525005 : Integer;
       lvweek@1100525004 : Integer;
       lvEmployee@1100525003 : Text[30];
+      lSymbrioSetup@1100285502 : Record 11127975;
+      lVendorLedgerEntry@1100285505 : Record 25;
+      lPurchInvHeader@1100285503 : Record 122;
+      lPurchInvLine@1100285500 : Record 123;
+      lPurchCrMemoHdr@1100285504 : Record 124;
+      lPurchCrMemoLine@1100285501 : Record 125;
     BEGIN
       IF gvType = gvType::Project THEN BEGIN
         Window.OPEN(Text001 + Text007 + Text008);
@@ -917,6 +924,46 @@ OBJECT Codeunit 11012046 Close Project/Service
         END;
       END;
 
+
+      //>>SYM077
+      //check posted purchase documents are not on hold
+      IF lSymbrioSetup.GET AND lSymbrioSetup.READPERMISSION THEN BEGIN
+        IF (gvType = gvType::Project) AND (lSymbrioSetup."Path Invoice Import" <> '') THEN BEGIN
+          ErrorTxt := '';
+          lVendorLedgerEntry.SETFILTER("On Hold",'<>%1','');
+          lVendorLedgerEntry.SETRANGE(Open,TRUE);
+          lVendorLedgerEntry.SETFILTER("Document Type",'%1|%2',lVendorLedgerEntry."Document Type"::Invoice,lVendorLedgerEntry."Document Type"::"Credit Memo");
+          IF lVendorLedgerEntry.FINDSET(FALSE) THEN
+          REPEAT
+            CASE lVendorLedgerEntry."Document Type" OF
+              lVendorLedgerEntry."Document Type"::Invoice:
+                BEGIN
+                  lPurchInvLine.SETRANGE("Document No.",lVendorLedgerEntry."Document No.");
+                  IF lPurchInvLine.FINDSET(FALSE) THEN
+                  REPEAT
+                    IF (lPurchInvLine."Job No." = gvProj) AND (lPurchInvHeader.GET(lVendorLedgerEntry."Document No.")) THEN BEGIN
+                      ErrorTxt := STRSUBSTNO(TextSYM077, lPurchInvHeader.TABLECAPTION, lPurchInvHeader."No.",lVendorLedgerEntry.FIELDCAPTION(lVendorLedgerEntry."On Hold"));
+                      AddError(ErrorTxt, ' ');
+                    END;
+                  UNTIL (lPurchInvLine.NEXT=0) OR (ErrorTxt <> '');
+                END;
+              lVendorLedgerEntry."Document Type"::"Credit Memo":
+                BEGIN
+                  lPurchCrMemoLine.SETRANGE("Document No.",lVendorLedgerEntry."Document No.");
+                  IF lPurchCrMemoLine.FINDSET(FALSE) THEN
+                  REPEAT
+                    IF (lPurchCrMemoLine."Job No." = gvProj) AND (lPurchCrMemoHdr.GET(lVendorLedgerEntry."Document No.")) THEN BEGIN
+                      ErrorTxt := STRSUBSTNO(TextSYM077, lPurchCrMemoHdr.TABLECAPTION, lPurchCrMemoHdr."No.",lVendorLedgerEntry.FIELDCAPTION(lVendorLedgerEntry."On Hold"));
+                      AddError(ErrorTxt, ' ');
+                    END;
+                  UNTIL (lPurchCrMemoLine.NEXT=0) OR (ErrorTxt <> '');
+                END;
+            END;
+          UNTIL (lVendorLedgerEntry.NEXT=0) OR (ErrorTxt <> '');
+
+        END;
+      END;
+      //<<SYM077
       Window.UPDATE(3,'');
     END;
 
@@ -2187,6 +2234,7 @@ OBJECT Codeunit 11012046 Close Project/Service
     PROCEDURE FillServJnlLine@1210190006();
     VAR
       ServiceLedgerEntry@1100525000 : Record 11012819;
+      ServiceContractCtrlPeriod@1100528600 : Record 11071746;
     BEGIN
       IF gPreview THEN
         EXIT;
@@ -2225,6 +2273,14 @@ OBJECT Codeunit 11012046 Close Project/Service
 
         "Precl. Service Control Year" := gvControlYear;
         "Additional Cost" := GenJnlLineRec."Additional Cost (Service)";
+
+        CASE gvType OF
+          gvType::"Service Contract":
+            IF ServiceContractCtrlPeriod.GET(gvContr, gvContractControlPeriodCode) THEN
+              "Service Control Period Date" := ServiceContractCtrlPeriod."Ending Date";
+          gvType::"Service Order":
+            "Service Control Period Date" := ServOrderRec."Service Control Period Date";
+        END;
       END;
 
       PostServJnlLine.RunWithCheck(ServJnlLineRec);
@@ -2533,6 +2589,7 @@ OBJECT Codeunit 11012046 Close Project/Service
       lvInstallmentTotal@1100525000 : Decimal;
       lUnitPriceProdMot@1100525001 : Record 11020425;
       RAW_OK@1100409000 : Boolean;
+      lvWithheldtot@1100285000 : Decimal;
     BEGIN
       //check whether all unit price production motivations are invoiced
       lUnitPriceProdMot.RESET;
@@ -2544,7 +2601,6 @@ OBJECT Codeunit 11012046 Close Project/Service
           lUnitPriceProdMot.FIELDCAPTION(Invoiced));
         AddError(ErrorTxt, ' ');
       END;
-
       CASE ProjRec."Settlement Method" OF
         ProjRec."Settlement Method"::"Fixed Price":
         BEGIN
@@ -2566,7 +2622,8 @@ OBJECT Codeunit 11012046 Close Project/Service
                 CheckDiffAmounts :=
                   (ExtensionRec.GET(gvProj, ProjInstRec."Extension Contract")) AND
                   (ExtensionRec.Status <> ExtensionRec.Status::Expired);
-              IF CheckDiffAmounts AND (ProjInstRec."Invoiced Price (LCY)" <> ProjInstRec."Installment Amount (LCY)") THEN BEGIN
+              //131126 IME-072 ITERO.SB Changed calculation (Installment amout - withheld amount)
+              IF CheckDiffAmounts AND (ProjInstRec."Invoiced Price (LCY)" <> ((ProjInstRec."Installment Amount (LCY)")-(ProjInstRec."Withheld Amount"))) THEN BEGIN
                 ErrorTxt := STRSUBSTNO(Text023,
                                        ProjInstRec."Installment No.",
                                        ProjInstRec."Installment Amount (LCY)",
@@ -2579,7 +2636,6 @@ OBJECT Codeunit 11012046 Close Project/Service
             UNTIL ProjInstRec.NEXT = 0;
             Window.UPDATE(4,0);
           END;
-
           //Check invoicing Contract Amount
           LineCount := 1;
           ProjCustRec.SETRANGE("Project No.",gvProj);
@@ -2589,22 +2645,22 @@ OBJECT Codeunit 11012046 Close Project/Service
             REPEAT
               ProjCustRec.CALCFIELDS("Total Extension Contract");
               lvInstallmentTotal := 0;
-
               CLEAR(ProjInstRec);
               ProjInstRec.SETRANGE("Project No.",gvProj);
               ProjInstRec.SETRANGE(Principal,ProjCustRec.Principal);
               ProjInstRec.SETRANGE("Interest Installment", ProjInstRec."Interest Installment"::" ");
               IF ProjInstRec.FINDFIRST THEN
                 REPEAT
+                  //>> 131126 IME-072 ITERO.SB Changed calculation
                   lvInstallmentTotal += ProjInstRec."Installment Amount (LCY)";
+                  lvWithheldtot += ProjInstRec."Withheld Amount";
                 UNTIL ProjInstRec.NEXT = 0;
-
+              lvInstallmentTotal:=lvInstallmentTotal-lvWithheldtot;
               CLEAR(PlotRec);
               PlotRec.SETRANGE("Project No.",gvProj);
               PlotRec.SETRANGE(Principal,ProjCustRec.Principal);
               IF PlotRec.FINDFIRST THEN
                 PlotRec.CALCFIELDS("Option Total");
-
               TotContrDec := ProjCustRec."Contract Amount (LCY)" + ProjCustRec."Plot Price" +
                 ProjCustRec."Total Extension Contract" + PlotRec."Option Total";
               IF lvInstallmentTotal <> TotContrDec THEN BEGIN
@@ -2648,7 +2704,6 @@ OBJECT Codeunit 11012046 Close Project/Service
             Window.UPDATE(4,0);
           END;
         END;
-
         ProjRec."Settlement Method"::"Cost Plus":
         BEGIN
           //Check Cost Plus Entry
@@ -2676,12 +2731,9 @@ OBJECT Codeunit 11012046 Close Project/Service
             UNTIL ProjCostPlusRec.NEXT = 0;
             Window.UPDATE(4,0);
           END;
-
           CheckProjEntryCostPlusCreated('');
-
         END;
       END;
-
       //Check Extension Contract
       ExtensionRec.SETRANGE("Project No.",gvProj);
       ExtensionRec.SETFILTER(
@@ -4298,6 +4350,8 @@ OBJECT Codeunit 11012046 Close Project/Service
       4PS08 JD 26-09-2009, Call 16066, after discussion with Jim we decide that surcharge must be booked according vend.post.grp
 
       4PS09 JD 02-06-2010, Call 16501, the surcharge for Service must also be booked according vend.post.grp
+      131126 ITERO.SB IME-072 Changed calculation of tot.amount to handle withheld prec. final installment
+      150820 ITERO.DL SYM077
     }
     END.
   }

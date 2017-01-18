@@ -1,0 +1,758 @@
+OBJECT Report 11128531 Remittance - export (BBS)
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVNO7.00 (15000060),4PSSE.NO;
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 25=rimd;
+    CaptionML=ENU=Remittance - export (BBS);
+    ProcessingOnly=Yes;
+    OnPreReport=BEGIN
+                  GenLedgSetup.GET;
+                  GenLedgSetup.TESTFIELD("LCY Code");
+                END;
+
+  }
+  DATASET
+  {
+    { 7024;    ;DataItem;                    ;
+               DataItemTable=Table81;
+               DataItemTableView=SORTING(Journal Template Name,Journal Batch Name,Line No.);
+               MaxIteration=1;
+               OnPreDataItem=VAR
+                               StoreJournalRec@1081000 : Record 81;
+                               RemPmtOrderExport@1080000 : Report 11128532;
+                               Done@1081004 : Boolean;
+                               NextSelection@1081005 : Boolean;
+                               LastLine@1081006 : Boolean;
+                               VendBalance@1081007 : Decimal;
+                               FirstPaymOrder@1081008 : Boolean;
+                             BEGIN
+                               RemAgreement.LOCKTABLE; // Ensure update of RemAgreement."Latest BBS PaymOrderno.".
+
+                               DateNow := TODAY; // Current date and time.
+                               TimeNow := TIME;
+                               NextLineNo(TRUE);
+                               VendBalance := 0; // Use to check that vendor balance is not negative.
+                               NextSelection := TRUE;  // See explanation below...
+                               RemAgreement.GET(RemAgreementCode); // Check if the code is valid.
+
+                               // Select lines from current journals:
+                               JournalRec.RESET; // Make sure the primary key is active and all the filters are deleted.
+                               JournalRec.SETCURRENTKEY(
+                                 "Journal Template Name","Journal Batch Name","Remittance Agreement Code","Remittance Type","Remittance Account Code");
+                               JournalRec.SETRANGE("Journal Template Name",CurrentJournalLine."Journal Template Name");
+                               JournalRec.SETRANGE("Journal Batch Name",CurrentJournalLine."Journal Batch Name");
+                               JournalRec.SETRANGE("Remittance Agreement Code",RemAgreementCode); // Only one PaymOrder at the time is processed.
+
+                               IF NOT JournalRec.FIND('-') THEN
+                                 ERROR(Text000);
+                               CreatePaymOrderHead;
+
+                               RecordType10;
+                               // Go thorugh the lines:
+                               // 1. Start with the first one and set the filter to select all related lines.
+                               // 2. Go over each line.
+                               // 2. Each line is deleted after being processed.
+                               // 3. If there are more then 14 lines, then go over them several times.
+                               // 4. When the selected lines are processed, the filter is deleted and the first of the remaining
+                               //    journal lines is processed (back to 1.)
+                               // 5. Done when all the lines are processed.
+                               JournalRec.FIND('-');  // Start with the first line, the new key applied.
+                               StoreJournalRec.INIT;
+                               StoreJournalRec."Remittance Type" := -1; // "undefined"
+                               FirstPaymOrder := TRUE;
+                               REPEAT
+                                 IF NextSelection THEN BEGIN  // Continue with next selection:
+                                   // Select journal lines for the payment transaction
+                                   JournalRec.SETRANGE("Remittance Type",JournalRec."Remittance Type");
+                                   JournalRec.SETRANGE("Remittance Account Code",JournalRec."Remittance Account Code");
+                                   JournalRec.SETRANGE("Posting Date",JournalRec."Posting Date");
+                                   JournalRec.SETRANGE("Account No.",JournalRec."Account No.");
+                                   JournalRec.SETRANGE(Urgent,JournalRec.Urgent);
+                                   JournalRec.SETRANGE("Futures Contract No.",JournalRec."Futures Contract No.");
+                                   JournalRec.SETRANGE("Futures Contract Exch. Rate",JournalRec."Futures Contract Exch. Rate");
+                                   JournalRec.SETRANGE("Currency Code",JournalRec."Currency Code");
+                                   JournalRec.SETRANGE("Currency Factor",JournalRec."Currency Factor");
+                                   JournalRec.SETRANGE("Agreed Exch. Rate",JournalRec."Agreed Exch. Rate");
+                                   JournalRec.SETRANGE("Agreed With",JournalRec."Agreed With");
+                                   IF JournalRec.KID = '' THEN
+                                     JournalRec.SETFILTER(KID,'=%1','')
+                                   ELSE
+                                     JournalRec.SETFILTER(KID,'<>%1','');
+                                   JournalRec.FIND('-');
+
+                                   // The sum of the payments in a transaction must be known before payments are processed.
+                                   TransAmount := 0;
+                                   REPEAT
+                                     TransAmount := TransAmount + JournalRec."Amount (LCY)";
+                                   UNTIL JournalRec.NEXT = 0;
+                                   JournalRec.FIND('-');
+
+                                   // Init data related to the current account/agreement.
+                                   // All the selected lines are attached to the same account
+                                   RemAccount.GET(JournalRec."Remittance Account Code");
+                                   // Check - should not happen:
+                                   IF RemAccount."Remittance Agreement Code" <> RemAgreement.Code THEN
+                                     ERROR(Text001);
+                                   IF RemAccount.Type = RemAccount.Type::Foreign THEN BEGIN
+                                     JournalRec.TESTFIELD("Payment Type Code Abroad");
+                                     JournalRec.TESTFIELD("Specification (Norges Bank)");
+                                   END;
+                                   RemAccount.TESTFIELD("Bank Account No.");
+
+                                   // Check if the account is changed. If so, the new PaymOrder is created.
+                                   // Create Recordtype88 (closed PaymOrder) for previous paymenyt PaymOrder (if any), and the new
+                                   // Recordtype20 (new PaymOrder) for the new PaymOrder:
+                                   IF StoreJournalRec."Remittance Account Code" <> JournalRec."Remittance Account Code" THEN BEGIN
+                                     IF NOT FirstPaymOrder THEN // Close previous one
+                                       RecordType88;
+
+                                     // Recordtype20 for the first/next PaymOrder
+                                     RecordType20;
+                                     FirstPaymOrder := FALSE;
+                                   END;
+                                 END;
+
+                                 JournalRec.TESTFIELD("Account Type",JournalRec."Account Type"::Vendor);
+                                 JournalRec.TESTFIELD("Waiting Journal Reference",0); // The journal line is a settlement and can not be exported!
+                                 Vendor.GET(JournalRec."Account No.");
+
+                                 RecordType30(JournalRec);
+                                 RecordType31;
+                                 IF JournalRec.KID = '' THEN BEGIN
+                                   // Payment with notice
+                                   RecordType40;
+                                   RecordType41;
+                                 END;
+
+                                 REPEAT
+                                   CODEUNIT.RUN(CODEUNIT::"Remitt. journal - Check line",JournalRec);
+                                   VendBalance := VendBalance + JournalRec.Amount;  // Counts vendor balance for future checks.
+                                   // Moved to Waiting journal by PAYFOR23(), since own ref. is used.
+                                   MoveToWaitingJournal(JournalRec);  // Move journal lines to Waiting journal.
+
+                                   IF JournalRec.KID = '' THEN
+                                     RecordType49(JournalRec) // Payment with notice
+                                   ELSE
+                                     RecordType50(JournalRec); // Payment with KID
+
+                                   RemTools.MarkEntry(JournalRec,Text002,PaymOrder.ID);  // Mark the posts waiting for remitt. settlement.
+
+                                   // Delete the journal lines that were just processed.
+                                   JournalRec.DELETE(TRUE);
+
+                                   StoreJournalRec := JournalRec;
+                                   // Find the first of the remaining lines in the filter. -
+                                   LastLine := NOT JournalRec.FIND('-');
+
+                                   // Stop if all the lines in a transaction are processed, or the number of messages is 21:
+                                 UNTIL LastLine OR ((SpecificationCounter MOD 21 = 0) AND (JournalRec.KID = ''));
+                                 TransAmount := 0; // Following transaction will be a notice, without amount.
+
+                                 // Are all invoices processed?
+                                 // If so, the next invoice is selected.
+                                 // Otherwise, the vendor has more then 14 lines. Back to repeat-loop -
+                                 // - export all invoices.
+                                 IF LastLine THEN BEGIN
+                                   // New transaction. Check amount:
+                                   // Check the balance for closed vendors:
+                                   IF VendBalance < 0 THEN BEGIN
+                                     // Notification for vendor with and without currency:
+                                     IF JournalRec."Currency Code" = '' THEN
+                                       ERROR(
+                                         Text003,
+                                         JournalRec."Posting Date",JournalRec."Account No.",VendBalance);
+
+                                     ERROR(
+                                       Text004,
+                                       JournalRec."Posting Date",JournalRec."Account No.",
+                                       VendBalance,JournalRec."Currency Code",JournalRec."Currency Factor");
+                                   END;
+                                   VendBalance := 0;  // Reset for next vendor.
+                                 END;
+                                 IF LastLine THEN BEGIN
+                                   // All selected invoices are processed. Continue with the following selection:
+                                   // Delete the limitations for vendor. Continue with the vendor following the
+                                   // one just processed.
+                                   JournalRec.SETRANGE("Remittance Type");
+                                   JournalRec.SETRANGE("Remittance Account Code");
+                                   JournalRec.SETRANGE("Posting Date");
+                                   JournalRec.SETRANGE("Account No.");
+                                   JournalRec.SETRANGE(Urgent);
+                                   JournalRec.SETRANGE("Futures Contract No.");
+                                   JournalRec.SETRANGE("Futures Contract Exch. Rate");
+                                   JournalRec.SETRANGE("Currency Code");
+                                   JournalRec.SETRANGE("Currency Factor");
+                                   JournalRec.SETRANGE("Agreed Exch. Rate");
+                                   JournalRec.SETRANGE("Agreed With");
+                                   JournalRec.SETRANGE(KID);
+                                   StoreJournalRec := JournalRec;
+                                   Done := NOT JournalRec.FIND('-');  // Are there more jorunal lines?
+                                   NextSelection := TRUE;  // All the selected ones are processed. Select next transaction.
+                                 END ELSE BEGIN  // Not all invoices are processed.
+                                   Done := FALSE;  // Continue with the next one, among the selected ones.
+                                   NextSelection := FALSE;  // Not all the selected ones are processed yet. The next transaction is NOT selected.
+                                 END;
+                               UNTIL Done;  // IF stop=True, all invoices are processed.
+
+                               RecordType88;
+                               RecordType89;
+
+                               IF RemAgreement."Return File Is Not In Use" THEN
+                                 RemTools.SettlePaymOrdWithoutReturnFile(PaymOrder,JournalRec);
+
+                               // Export data:
+                               RemPmtOrderExport.SetPmtOrder(PaymOrder);
+                               RemPmtOrderExport.SetFilename(CurrentFilename);
+                               LineRec.RESET;
+                               LineRec.SETRANGE("Payment Order No.",PaymOrder.ID);
+                               RemPmtOrderExport.SETTABLEVIEW(LineRec);
+                               RemPmtOrderExport.RUNMODAL;
+                             END;
+                              }
+
+  }
+  REQUESTPAGE
+  {
+    PROPERTIES
+    {
+      SaveValues=Yes;
+      OnOpenPage=BEGIN
+                   // Selected the contract specified in the first line of the journal
+                   RemAgreement.GET(CurrentJournalLine."Remittance Agreement Code");
+                   RemAgreementCode := RemAgreement.Code;
+                   CurrentFilename := RemAgreement."Payment File Name"
+                 END;
+
+    }
+    CONTROLS
+    {
+      { 1900000001;0;Container;
+                  ContainerType=ContentArea }
+
+      { 1900000002;1;Group  ;
+                  CaptionML=ENU=Options }
+
+      { 13  ;2   ;Field     ;
+                  CaptionML=ENU=Remittance agreement code;
+                  SourceExpr=RemAgreementCode;
+                  TableRelation="Remittance Agreement";
+                  OnValidate=BEGIN
+                               RemAgreement.GET(RemAgreementCode);
+                               CurrentFilename := RemAgreement."Payment File Name"
+                             END;
+                              }
+
+      { 1   ;2   ;Field     ;
+                  CaptionML=ENU=Payment order note;
+                  SourceExpr=CurrentRemark }
+
+      { 8   ;2   ;Field     ;
+                  CaptionML=ENU=Filename;
+                  SourceExpr=CurrentFilename;
+                  OnAssistEdit=BEGIN
+                                 CurrentFilename := FileMgt.SaveFileDialog(Text014,CurrentFilename,Text015);
+                               END;
+                                }
+
+    }
+  }
+  LABELS
+  {
+  }
+  CODE
+  {
+    VAR
+      Text000@1080033 : TextConst 'ENU=There are no payments to export.\Export aborted.';
+      Text001@1080034 : TextConst 'ENU=Account and remittance agreement are different.';
+      Text002@1080035 : TextConst 'ENU=REM';
+      Text003@1080036 : TextConst '@@@=Parameter 1 - date, 2 - account number, 3 - decimal amount.;ENU=Payment amount cannot be negative.\Balance for vendor %2 %3  is %1.';
+      Text004@1080037 : TextConst '@@@=Parameter 1 - decimal amount, 2 - account number, 3 - date, 4 - currency code, 5 - decimal amount.;ENU=Payment amount cannot be negative.\Balance for vendor %2 %3 is %1, currency %4 exch. rate %5.';
+      Text013@1080046 : TextConst 'ENU=Line %1 is not 80 chars long.\%2';
+      JournalRec@1080047 : Record 81;
+      RemAccount@1080048 : Record 11128506;
+      RemAgreement@1080049 : Record 11128503;
+      PaymOrder@1080050 : Record 11128504;
+      LineRec@1080051 : Record 11128505;
+      CurrentJournalLine@1080052 : Record 81;
+      WaitingJournal@1080053 : Record 11128507;
+      Vendor@1080054 : Record 23;
+      GenLedgSetup@1080055 : Record 98;
+      RemTools@1080056 : Codeunit 11128515;
+      FileMgt@1080002 : Codeunit 419;
+      BBSOwnRefNo@1080057 : Integer;
+      SpecificationCounter@1080058 : Integer;
+      SpecificationLineNo@1080059 : Integer;
+      TransNo@1080060 : Code[7];
+      TransType@1080061 : Text[2];
+      TransFirstPayment@1080062 : Date;
+      TransAmount@1080063 : Decimal;
+      PaymOrderNoOfRec@1080064 : Integer;
+      PaymOrderNoOfTrans@1080065 : Integer;
+      PaymOrderAmount@1080066 : Decimal;
+      PaymOrderFirstPayment@1080067 : Date;
+      PaymOrderLastPayment@1080068 : Date;
+      ShipNoOfTrans@1080069 : Integer;
+      ShipNoOfRec@1080070 : Integer;
+      ShipAmount@1080072 : Decimal;
+      DateNow@1080073 : Date;
+      TimeNow@1080074 : Time;
+      StoreNextno@1080075 : Integer;
+      CurrentRemark@1080076 : Text[50];
+      CurrentFilename@1080078 : Text[250];
+      RemAgreementCode@1080079 : Code[10];
+      Text014@1080001 : TextConst 'ENU=Remittance - export (BBS)';
+      Text015@1080000 : TextConst 'ENU=Text Files (*.txt)|*.txt|All Files (*.*)|*.*';
+
+    PROCEDURE CreatePaymOrderHead@1080004();
+    VAR
+      NextID@1080000 : Integer;
+    BEGIN
+      // Create PaymOrder for import.
+      // Select ID. Find next:
+      PaymOrder.LOCKTABLE;
+      IF PaymOrder.FINDLAST THEN
+        NextID := PaymOrder.ID + 1
+      ELSE
+        NextID := 1;
+
+      // Insert new PaymOrder. Remaining data are set later:
+      PaymOrder.INIT;
+      PaymOrder.ID := NextID;
+      PaymOrder.Date := DateNow;
+      PaymOrder.Time := TimeNow;
+      PaymOrder.Type := PaymOrder.Type::Export;
+      PaymOrder.Comment := CurrentRemark;
+      PaymOrder.INSERT;
+    END;
+
+    PROCEDURE RecordType10@2();
+    VAR
+      CustomerUnitID@1080001 : Text[8];
+      ShipmentNo@1080002 : Text[7];
+    BEGIN
+      // Start record for shipment
+      // Initialize new shipment:
+      ShipNoOfTrans := 0;
+      ShipNoOfRec := 1;
+      ShipAmount := 0;
+      TransNo := '0000001';
+
+      CustomerUnitID := RemTools.FormatNumStr(RemAgreement."BBS Customer Unit ID",8);
+      ShipmentNo := RemTools.FormatNum(PaymOrder.ID,7,FALSE);
+
+      InitLine(LineRec);
+      LineRec.Data :=
+        'NY000010' +
+        CustomerUnitID +
+        ShipmentNo +
+        '00008080' +
+        Fill0(49);
+      InsertLine(LineRec);
+    END;
+
+    PROCEDURE RecordType20@15();
+    VAR
+      AgreementID@1080001 : Text[9];
+      PaymOrderNo@1080002 : Text[7];
+      PaymOrderAccount@1080003 : Text[11];
+    BEGIN
+      // Start record for PaymOrder
+      ShipNoOfRec := ShipNoOfRec + 1;
+      // Initialize new PaymOrder:
+      PaymOrderNoOfTrans := 0;
+      PaymOrderNoOfRec := 1;
+      PaymOrderFirstPayment := 99991231D;
+      PaymOrderLastPayment := 00000101D;
+      PaymOrderAmount := 0;
+
+      AgreementID := RemTools.FormatNumStr(RemAccount."BBS Agreement ID",9);
+      PaymOrderNo := RemTools.FormatNum(RemTools.NextBBSPaymOrderNo(RemAgreement),7,FALSE);
+      PaymOrderAccount := RemTools.FormatAccountNo(RemAccount."Bank Account No.");
+
+      InitLine(LineRec);
+      LineRec.Data :=
+        'NY040020' +
+        AgreementID +
+        PaymOrderNo +
+        PaymOrderAccount +
+        Fill0(45);
+      InsertLine(LineRec);
+    END;
+
+    PROCEDURE RecordType30@16(JournalRec@1080000 : Record 81);
+    VAR
+      DueDate@1080001 : Text[6];
+      CreditAccount@1080002 : Text[30];
+      SumAmount@1080003 : Text[17];
+    BEGIN
+      // Transaction record - payment entry 1
+      ShipNoOfRec := ShipNoOfRec + 1;
+      ShipNoOfTrans := ShipNoOfTrans + 1;
+      PaymOrderNoOfRec := PaymOrderNoOfRec + 1;
+      PaymOrderNoOfTrans := PaymOrderNoOfTrans + 1;
+      TransFirstPayment := 99991231D;
+
+      // Note: Trans type is used globaly in following records
+      IF JournalRec.KID = '' THEN
+        TransType := '03' // Transfer with notice to beneficiary
+      ELSE
+        TransType := '16'; // transfer with KID and bottom specification to beneficiary
+      TransNo := INCSTR(TransNo); // Used globaly in all underlying records.
+      DueDate := FormatDate(JournalRec."Posting Date");
+
+      // Update first/last payment date for recordtype 88:
+      IF JournalRec."Posting Date" < PaymOrderFirstPayment THEN
+        PaymOrderFirstPayment := JournalRec."Posting Date";
+      IF JournalRec."Posting Date" > PaymOrderLastPayment THEN
+        PaymOrderLastPayment := JournalRec."Posting Date";
+      IF JournalRec."Posting Date" < TransFirstPayment THEN
+        TransFirstPayment := JournalRec."Posting Date";
+
+      // Delete everything except 0..9, and set leading zeros for 7-digits post-giro numbers:
+      CreditAccount := '00000000000' + RemTools.FormatAccountNo(Vendor."Recipient Bank Account No.");
+      CreditAccount := COPYSTR(CreditAccount,STRLEN(CreditAccount) - 10);  // Last 11 chars.
+      // TransAmount is calculated at the begining (when processing of the PaymOrder started):
+      SumAmount := RemTools.FormatNum(TransAmount,17,TRUE);
+      // Update info to Recordtype 88 and 89:
+      PaymOrderAmount := PaymOrderAmount + TransAmount;
+      ShipAmount := ShipAmount + TransAmount;
+
+      InitLine(LineRec);
+      LineRec.Data :=
+        'NY04' + TransType + '30' +
+        TransNo +
+        DueDate +
+        CreditAccount +
+        SumAmount +
+        Fill(25) + // KID: allways specified in bottom specification
+        Fill0(6);
+      InsertLine(LineRec);
+    END;
+
+    PROCEDURE RecordType31@21();
+    VAR
+      ShortName@1080001 : Text[10];
+      BBSOwnRef@1080002 : Text[25];
+    BEGIN
+      // Transaction record - Amount entry 2
+      ShipNoOfRec := ShipNoOfRec + 1;
+      PaymOrderNoOfRec := PaymOrderNoOfRec + 1;
+
+      ShortName := PADSTR(Vendor.Name,10);
+      // Own ref. is the first Waiting journal line in the transaction - the reference field:
+      BBSOwnRefNo := NextWaitingJournalRef;
+      BBSOwnRef := RemTools.FormatNum(BBSOwnRefNo,25,FALSE);
+
+      InitLine(LineRec);
+      LineRec.Data :=
+        'NY04' + TransType + '31' +
+        TransNo +
+        ShortName +
+        BBSOwnRef +
+        Fill(25) +
+        Fill0(5);
+      InsertLine(LineRec);
+    END;
+
+    PROCEDURE RecordType40@14();
+    VAR
+      RecipientName@1080001 : Text[30];
+      RecipientPostNo@1080002 : Text[4];
+      RecipientPlace@1080003 : Text[25];
+    BEGIN
+      // Name/Adress record - Adress entry 1
+      ShipNoOfRec := ShipNoOfRec + 1;
+      PaymOrderNoOfRec := PaymOrderNoOfRec + 1;
+      SpecificationCounter := 0;
+      SpecificationLineNo := 0;
+
+      // Note: Transtype is in this case always '03'.
+      RecipientName := PADSTR(Vendor.Name,30);
+      RecipientPostNo := PADSTR(Vendor."Post Code",4);
+      RecipientPlace := PADSTR(Vendor.City,25);
+
+      InitLine(LineRec);
+      LineRec.Data :=
+        'NY04' + TransType + '40' +
+        TransNo +
+        RecipientName +
+        RecipientPostNo +
+        Fill(3) +
+        RecipientPlace +
+        Fill0(3);
+      InsertLine(LineRec);
+    END;
+
+    PROCEDURE RecordType41@7();
+    VAR
+      RecipientAdr1@1080001 : Text[30];
+      RecipientAdr2@1080002 : Text[30];
+      RecipientCountryCode@1080003 : Text[3];
+    BEGIN
+      // Name /Adress record - Adress entry 2
+      ShipNoOfRec := ShipNoOfRec + 1;
+      PaymOrderNoOfRec := PaymOrderNoOfRec + 1;
+
+      RecipientAdr1 := PADSTR(Vendor.Address,30);
+      RecipientAdr2 := PADSTR(Vendor."Address 2",30);
+      RecipientCountryCode := PADSTR(RecipientCountryCode,3);
+
+      InitLine(LineRec);
+      LineRec.Data :=
+        'NY04' + TransType + '41' +
+        TransNo +
+        RecipientAdr1 +
+        RecipientAdr2 +
+        RecipientCountryCode +
+        Fill0(2);
+      InsertLine(LineRec);
+    END;
+
+    PROCEDURE RecordType49@18(JournalRec@1080000 : Record 81);
+    VAR
+      LineNo@1080001 : Integer;
+      MessageLineNo@1080002 : Text[3];
+      Message@1080003 : Text[80];
+      Message1@1080004 : Text[40];
+      Message2@1080005 : Text[40];
+      Message2Check@1080006 : Code[40];
+    BEGIN
+      // Specification record.
+      // Note: Transtype id in this case always '03'.
+      // Save to specification record for every recipient ref. that is specified.
+      FOR LineNo := 1 TO 3 DO BEGIN
+        CASE LineNo OF
+          1:
+            Message := JournalRec."Recipient Ref. 1";
+          2:
+            Message := JournalRec."Recipient Ref. 2";
+          3:
+            Message := JournalRec."Recipient Ref. 3";
+        END;
+        IF Message <> '' THEN BEGIN
+          SpecificationCounter := SpecificationCounter + 1;
+          SpecificationLineNo := SpecificationLineNo + 1;
+
+          Message := PADSTR(Message,80,' ');
+          Message1 := COPYSTR(Message,1,40);
+          Message2 := COPYSTR(Message,41,40);
+          MessageLineNo := RemTools.FormatNum(SpecificationLineNo,3,FALSE);
+
+          // Column 1. Holds only text.
+          ShipNoOfRec := ShipNoOfRec + 1;
+          PaymOrderNoOfRec := PaymOrderNoOfRec + 1;
+          InitLine(LineRec);
+          LineRec.Data :=
+            'NY04' + TransType + '49' +
+            TransNo +
+            MessageLineNo +
+            '1' +
+            Message1 +
+            Fill(21);
+          InsertLine(LineRec);
+
+          // Column 2. Text only if the message is more then 40 chars. long.
+          Message2Check := Message2; // Message2Check is code 40. it is empty if message2 is SP's only.
+          IF Message2Check <> '' THEN BEGIN
+            ShipNoOfRec := ShipNoOfRec + 1;
+            PaymOrderNoOfRec := PaymOrderNoOfRec + 1;
+            InitLine(LineRec);
+            LineRec.Data :=
+              'NY04' + TransType + '49' +
+              TransNo +
+              MessageLineNo +
+              '2' +
+              Message2 +
+              Fill0(21);
+            InsertLine(LineRec);
+          END;
+        END;
+      END;
+    END;
+
+    PROCEDURE RecordType50@17(JournalRec@1080000 : Record 81);
+    VAR
+      UnderSpecTransType@1080001 : Text[2];
+      KID@1080002 : Text[100];
+      PaymentAmount@1080003 : Text[17];
+    BEGIN
+      // Bottom specification of combined shipments and credit memo
+      ShipNoOfRec := ShipNoOfRec + 1;
+      PaymOrderNoOfRec := PaymOrderNoOfRec + 1;
+
+      IF JournalRec.Amount < 0 THEN // Credit memo payment
+        UnderSpecTransType := '17'
+      ELSE
+        UnderSpecTransType := '16';
+      // Format KID with leading zeros:
+      KID := Fill(25) + JournalRec.KID;
+      KID := COPYSTR(KID,STRLEN(KID) - 24,25); // Last 25 chars.
+      PaymentAmount := RemTools.FormatNum(JournalRec.Amount,17,TRUE);
+
+      InitLine(LineRec);
+      LineRec.Data :=
+        'NY04' + UnderSpecTransType + '50' +
+        TransNo +
+        KID +
+        PaymentAmount +
+        Fill0(23);
+      InsertLine(LineRec);
+    END;
+
+    PROCEDURE RecordType88@19();
+    VAR
+      NumberOfTrans@1080001 : Text[8];
+      NumberOfRec@1080002 : Text[8];
+      FirstPayment@1080003 : Text[6];
+      LastPayment@1080004 : Text[6];
+      SumAmount@1080005 : Text[17];
+    BEGIN
+      // End record for PaymOrder
+      ShipNoOfRec := ShipNoOfRec + 1;
+      PaymOrderNoOfRec := PaymOrderNoOfRec + 1;
+
+      // Note: Field 7: Sum Amount is already calculated for Recordtype 30.
+      NumberOfTrans := RemTools.FormatNum(PaymOrderNoOfTrans,8,FALSE);
+      NumberOfRec := RemTools.FormatNum(PaymOrderNoOfRec,8,FALSE);
+      FirstPayment := FormatDate(PaymOrderFirstPayment);
+      LastPayment := FormatDate(PaymOrderLastPayment);
+      SumAmount := RemTools.FormatNum(PaymOrderAmount,17,TRUE);
+
+      InitLine(LineRec);
+      LineRec.Data :=
+        'NY040088' +
+        NumberOfTrans +
+        NumberOfRec +
+        SumAmount +
+        FirstPayment +
+        LastPayment +
+        Fill0(27);
+      InsertLine(LineRec);
+    END;
+
+    PROCEDURE RecordType89@20();
+    VAR
+      SumAmount@1080001 : Text[17];
+      NumberOfTrans@1080002 : Text[8];
+      NumberOfRec@1080003 : Text[8];
+      FirstPayment@1080004 : Text[6];
+    BEGIN
+      // End record for shipment
+      ShipNoOfRec := ShipNoOfRec + 1;
+
+      SumAmount := RemTools.FormatNum(ShipAmount,17,TRUE);
+      NumberOfTrans := RemTools.FormatNum(ShipNoOfTrans,8,FALSE);
+      NumberOfRec := RemTools.FormatNum(ShipNoOfRec,8,FALSE);
+      FirstPayment := FormatDate(TransFirstPayment);
+
+      InitLine(LineRec);
+      LineRec.Data :=
+        'NY040089' +
+        NumberOfTrans +
+        NumberOfRec +
+        SumAmount +
+        FirstPayment +
+        Fill0(33);
+      InsertLine(LineRec);
+    END;
+
+    PROCEDURE MoveToWaitingJournal@13(JournalLine@1080000 : Record 81);
+    BEGIN
+      WaitingJournal.INIT;
+      WaitingJournal.TRANSFERFIELDS(JournalLine);
+      WaitingJournal."Payment Order ID - Sent" := PaymOrder.ID;
+      WaitingJournal."Remittance Status" := WaitingJournal."Remittance Status"::Sent;
+      WaitingJournal.Reference := NextWaitingJournalRef;
+      WaitingJournal."BBS Referance" := BBSOwnRefNo;
+      WaitingJournal.VALIDATE("Remittance Account Code",RemAccount.Code);
+      WaitingJournal.INSERT(TRUE);
+      WaitingJournal.CopyLineDimensions(JournalLine);
+    END;
+
+    PROCEDURE Fill@3(NumberOfChars@1000000000 : Integer) : Text[250];
+    BEGIN
+      // Return string with SpaceCount space.
+      EXIT(PADSTR('',NumberOfChars,' '));
+    END;
+
+    PROCEDURE Fill0@5(NumberOfChars@1080000 : Integer) : Text[250];
+    BEGIN
+      // Return string with SpaceCount zeros.
+      EXIT(PADSTR('',NumberOfChars,'0'));
+    END;
+
+    PROCEDURE NextLineNo@8(Init@1080000 : Boolean) : Integer;
+    BEGIN
+      // Select and return next line no.
+      // PARAMETERS:
+      // init=True. LineNo. (starts with 1), starting with the next call made with False as parameter.
+      // init=False. Returns next line no.
+      // RETURNS: Next lineno., =0 if init=True.
+
+      IF Init THEN
+        StoreNextno := 0 // This no. is not in use.
+      ELSE
+        StoreNextno := StoreNextno + 1;
+      EXIT(StoreNextno);
+    END;
+
+    PROCEDURE Check@1(LineNo@1080000 : Integer;Data@1080001 : Text[100]);
+    BEGIN
+      // Additional check. This error should not occur in a customer-system
+      IF STRLEN(Data) <> 80 THEN
+        MESSAGE(Text013,LineNo,Data);
+    END;
+
+    PROCEDURE InitLine@9(VAR LineRec@1080000 : Record 11128505);
+    BEGIN
+      // prepare (data) line for use.
+      LineRec.INIT;
+      LineRec."Payment Order No." := PaymOrder.ID;
+      LineRec."Line No" := NextLineNo(FALSE);
+    END;
+
+    PROCEDURE InsertLine@10(LineRec@1080000 : Record 11128505);
+    BEGIN
+      // Insert line into the file.
+      Check(LineRec."Line No",LineRec.Data);  // My own check, just in case...!
+      LineRec.Data := UPPERCASE(LineRec.Data);
+      LineRec.INSERT;
+    END;
+
+    PROCEDURE SetJournalLine@11(JournalLine@1000000000 : Record 81);
+    BEGIN
+      // Transfer current lines from journal routine (for ex. journal window):
+      CurrentJournalLine := JournalLine;
+    END;
+
+    LOCAL PROCEDURE NextWaitingJournalRef@6() : Integer;
+    VAR
+      WaitingJournal@1080000 : Record 11128507;
+    BEGIN
+      WaitingJournal.LOCKTABLE;  // Serial no. depends on the existing Waiting journal.
+      WaitingJournal.INIT;
+      IF WaitingJournal.FINDLAST THEN
+        EXIT(WaitingJournal.Reference + 1);
+
+      EXIT(1);
+    END;
+
+    PROCEDURE FormatDate@1080008(Date@1080000 : Date) : Text[6];
+    BEGIN
+      EXIT(FORMAT(Date,0,'<Day,2><Month,2><Year,2>'));
+    END;
+
+    BEGIN
+    END.
+  }
+  RDLDATA
+  {
+  }
+}
+

@@ -1,0 +1,884 @@
+OBJECT Codeunit 12013614 Create Quote from Req
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=EXF350003;
+  }
+  PROPERTIES
+  {
+    TableNo=12013608;
+    OnRun=VAR
+            PurchHeader@1100285007 : Record 38;
+            DocHead@1100285006 : Record 12013608;
+            DocLine@1100285003 : Record 12013609;
+            DocLineDim@1100285004 : Record 12013611;
+            DocLineApp@1100285005 : Record 12013610;
+            QuoteDocNo@1100285000 : Code[20];
+            DimCodeTab@1100285002 : ARRAY [8] OF Code[20];
+            DimValueTab@1100285001 : ARRAY [8] OF Code[20];
+          BEGIN
+            DocHead := Rec;
+            AppSetUp.GET(COMPANYNAME, 0);
+            CheckReports;
+
+            UpdateDocHead(DocHead);
+            DocHead.MODIFY(FALSE);
+            QuoteDocNo := '';
+            CreateQuote(QuoteDocNo,DimCodeTab,DimValueTab,DocHead,PurchHeader);
+
+            UpdateQouteDocument(DimCodeTab,DimValueTab,PurchHeader,DocHead);
+
+            IF DocHead.GET(ID) THEN BEGIN
+              DocLine.SETRANGE("Document ID", DocHead.ID);
+              IF DocLine.FINDSET THEN BEGIN
+                REPEAT
+                  DocLineDim.RESET;
+                  DocLineDim.SETCURRENTKEY("Document Line ID");
+                  DocLineDim.SETRANGE("Document Line ID", DocLine.ID);
+                  IF NOT DocLineDim.ISEMPTY THEN
+                    DocLineDim.DELETEALL;
+
+                  DocLineApp.RESET;
+                  DocLineApp.SETCURRENTKEY("Document Line ID");
+                  DocLineApp.SETRANGE("Document Line ID", DocLine.ID);
+                  IF NOT DocLineApp.ISEMPTY THEN
+                    DocLineApp.DELETEALL;
+                UNTIL DocLine.NEXT = 0;
+                DocLine.DELETEALL;
+                DocHead.DELETE;
+              END;
+            END;
+
+            PrintPQDoc(QuoteDocNo);   // contains commit
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      AppSetUp@1100285007 : Record 12013601;
+      EXF01@1100285022 : TextConst 'ENU=Could not create html image!';
+      EXF02@1100285023 : TextConst 'ENU=Vendor %1 does not exist!';
+      EXF09@1100285002 : TextConst 'ENU=Value %1 does not exist in table %2. Document %3 %4.';
+      EXF50@1100285024 : TextConst 'ENU=Requisition Report ID missing in Approval Setup!';
+      EXF51@1100285025 : TextConst 'ENU=Order Report ID missing in Approval Setup!';
+      ExDimMgt@1100285015 : Codeunit 12013605;
+
+    PROCEDURE CreateQuote@1100285002(VAR QuoteDocNo@1100285006 : Code[20];VAR DimCodeTab@1100285018 : ARRAY [8] OF Code[20];VAR DimValueTab@1100285017 : ARRAY [8] OF Code[20];VAR DocHead@1100285001 : Record 12013608;VAR PurchHeader@1100285027 : Record 38);
+    VAR
+      ExUserComp@1100285003 : Record 12013641;
+      DocHeadQuote@1100285000 : Record 12013608;
+      ExLocation@1100285007 : Record 12013613;
+      ExDocPurchMapping@1100285010 : Record 12013617;
+      Field@1100285014 : Record 2000000041;
+      Location@1100285020 : Record 14;
+      Vend@1100285021 : Record 23;
+      DocLine2@1100285022 : Record 12013609;
+      GLSetup@1100285024 : Record 98;
+      DocLine@1100285025 : Record 12013609;
+      DocLineDim@1100285026 : Record 12013611;
+      PurchLine@1100285028 : Record 39;
+      ImportMgt@1100285015 : Codeunit 12013604;
+      ExFlow@1100285023 : Codeunit 12013601;
+      LineIsTextLine@1100285002 : Boolean;
+      TempNo@1100285004 : Code[20];
+      FldRef@1100285008 : FieldRef;
+      RecRef@1100285009 : RecordRef;
+      MapToFldRef@1100285012 : FieldRef;
+      MapToRecRef@1100285011 : RecordRef;
+      RecRefRel@1100285019 : RecordRef;
+      FldRefRel@1100285016 : FieldRef;
+      TempStrLen@1100285013 : Integer;
+      TempLineNo@1100285005 : Integer;
+    BEGIN
+      IF NOT Vend.GET(DocHead."Vendor No.") THEN
+        ERROR(EXF02,DocHead."Vendor No.");
+
+      PurchHeader.INIT;
+      PurchHeader."Document Type" := PurchHeader."Document Type"::Quote;
+      PurchHeader."No." := '';
+      PurchHeader.VALIDATE("Posting Date",WORKDATE);
+      PurchHeader.VALIDATE("Buy-from Vendor No.",DocHead."Vendor No.");
+      PurchHeader.INSERT(TRUE);
+
+      QuoteDocNo := PurchHeader."No.";
+
+      IF DocHead."Currency Code" <> '' THEN
+        PurchHeader.VALIDATE("Currency Code",DocHead."Currency Code")
+      ELSE
+        IF AppSetUp."Set blank Curr to LCY (REQ)" THEN BEGIN
+          GLSetup.GET;
+          IF GLSetup."LCY Code" <> '' THEN
+            PurchHeader.VALIDATE("Currency Code",GLSetup."LCY Code");
+        END;
+
+      PurchHeader.VALIDATE("Payment Terms Code");
+      PurchHeader.Approve := TRUE;
+      PurchHeader."New Line" := TRUE;
+      PurchHeader."Document Date" := WORKDATE;
+      PurchHeader."Requisition No." := PurchHeader."No.";
+
+      PurchHeader."Order Date" := DocHead."Create Date";
+      PurchHeader."Vendor Order No." := DocHead."Vendor Document No.";
+      PurchHeader."Shortcut Dimension 1 Code" := DocHead."Project No.";
+      PurchHeader.VALIDATE("Expected Receipt Date",DocHead."Expected Receipt Date");
+
+      IF DocHead."Ex Location ID" = 0 THEN BEGIN
+        IF ExUserComp.GET(DocHead."Company Name",DocHead.Initiator) THEN
+          IF ExUserComp."Location Code (Requisition)" <> '' THEN
+            PurchHeader.VALIDATE("Location Code",ExUserComp."Location Code (Requisition)");
+      END
+      ELSE BEGIN
+        ExLocation.GET(DocHead."Ex Location ID");
+        //344788
+        IF Location.GET(ExLocation.Code) THEN BEGIN
+          PurchHeader."Location Code" := ExLocation.Code;
+          PurchHeader."Inbound Whse. Handling Time" := Location."Inbound Whse. Handling Time";
+        END;
+        //344788
+
+        PurchHeader."Ship-to Code" := ExLocation.Code;
+        PurchHeader."Ship-to Name" := ExLocation.Name;
+        PurchHeader."Ship-to Name 2" := ExLocation."Name 2";
+        PurchHeader."Ship-to Address" := ExLocation.Address;
+        PurchHeader."Ship-to Address 2" := ExLocation."Address 2";
+        PurchHeader."Ship-to City" := ExLocation.City;
+        PurchHeader."Ship-to Contact" := ExLocation.Contact;
+        PurchHeader."Ship-to Post Code" := ExLocation."Post Code";
+        PurchHeader."Ship-to County" := ExLocation.County;
+        PurchHeader."Ship-to Country/Region Code" := ExLocation."Country/Region Code";
+      END;
+
+      //344734
+      PurchHeader."New Line":= FALSE;
+      //344734
+
+      PurchHeader.MODIFY(TRUE);
+
+      ExDocPurchMapping.RESET;
+      IF ExDocPurchMapping.FINDSET THEN BEGIN
+        RecRef.GETTABLE(DocHead);
+        MapToRecRef.GETTABLE(PurchHeader);
+        REPEAT
+          FldRef := RecRef.FIELD(ExDocPurchMapping."Field No.");
+          IF FORMAT(FldRef.VALUE) <> '' THEN BEGIN
+            MapToFldRef := MapToRecRef.FIELD(ExDocPurchMapping."Map to Field No.");
+
+            Field.SETRANGE(TableNo, DATABASE::"Purchase Header");
+            Field.SETRANGE("No.",ExDocPurchMapping."Map to Field No.");
+            Field.FINDFIRST;
+
+            IF Field.RelationTableNo <> 0 THEN BEGIN
+              RecRefRel.OPEN(Field.RelationTableNo);
+
+              IF Field.RelationFieldNo <> 0 THEN
+                FldRefRel := RecRefRel.FIELD(Field.RelationFieldNo)
+              ELSE
+                FldRefRel := RecRefRel.FIELD(1);
+
+              FldRefRel.SETRANGE(COPYSTR(FORMAT(FldRef.VALUE),1,Field.Len));
+              IF NOT RecRefRel.FINDFIRST THEN
+                ERROR(STRSUBSTNO(EXF09,COPYSTR(FORMAT(FldRef.VALUE),1,Field.Len),RecRefRel.CAPTION,DocHead."Document Type",
+                      DocHead."Document No."));
+            END;
+            MapToFldRef.VALUE := COPYSTR(FORMAT(FldRef.VALUE),1,Field.Len);
+          END;
+        UNTIL ExDocPurchMapping.NEXT = 0;
+        MapToRecRef.MODIFY;
+
+        PurchHeader.GET(PurchHeader."Document Type",PurchHeader."No.");
+      END;
+
+      DocLine.RESET;
+      DocLine.SETCURRENTKEY("Document ID");
+      DocLine.SETRANGE("Document ID", DocHead.ID);
+      IF DocLine.FINDSET THEN BEGIN
+        TempLineNo := 10000;
+        REPEAT
+          PurchLine.INIT;
+          PurchLine.SuspendStatusCheck(TRUE);
+          PurchLine."Document Type" := PurchHeader."Document Type";
+          PurchLine."Document No." := PurchHeader."No.";
+          PurchLine."Line No." := TempLineNo;
+          TempLineNo := TempLineNo + 10000;
+          PurchLine."Buy-from Vendor No." := PurchHeader."Buy-from Vendor No.";
+
+          LineIsTextLine := LineIsBlank(DocLine);
+          PurchLine.Approve := NOT LineIsTextLine;
+          PurchLine.INSERT(FALSE);
+
+          PurchLine.Type := DocLine."Line Type";
+
+          IF LineIsTextLine THEN
+            PurchLine.Type := PurchLine.Type::" ";
+
+          IF PurchLine.Type <> PurchLine.Type::" " THEN BEGIN
+            DocLineDim.RESET;
+            DocLineDim.SETCURRENTKEY("Document Line ID");
+            DocLineDim.SETRANGE("Document Line ID", DocLine.ID);
+            DocLineDim.SETFILTER("Dimension Code", '%1|%2|%3|%4','G_LACCOUNT','ITEM','CHARGE','FIXEDASSET');
+            IF DocLineDim.FINDFIRST THEN
+              PurchLine.VALIDATE("No.", DocLineDim."Dimension Value");
+
+            IF PurchLine."No." = '' THEN BEGIN
+              TempNo := FindNoMapping(DocLine,PurchLine."Buy-from Vendor No.");
+              IF TempNo <> '' THEN
+                PurchLine.VALIDATE("No.", TempNo);
+            END;
+          END;
+
+          IF DocLine.Description <> '' THEN BEGIN
+            TempStrLen := MAXSTRLEN(PurchLine.Description);
+
+            IF STRLEN(DocLine.Description) > TempStrLen THEN BEGIN
+              IF FORMAT(DocLine.Description[TempStrLen]) <> ' ' THEN
+                REPEAT
+                  TempStrLen := TempStrLen - 1;
+                UNTIL (FORMAT(DocLine.Description[TempStrLen]) = ' ') OR (TempStrLen = 1);
+
+              IF TempStrLen = 1 THEN
+                TempStrLen := MAXSTRLEN(PurchLine.Description);
+
+              PurchLine.Description := COPYSTR(DocLine.Description, 1, TempStrLen);
+              PurchLine."Description 2" := COPYSTR(DocLine.Description,TempStrLen + 1,
+                                                                       MAXSTRLEN(PurchLine.Description));
+            END
+            ELSE
+              PurchLine.Description := DocLine.Description;
+          END;
+
+          IF PurchLine.Type <> PurchLine.Type::" " THEN BEGIN
+            IF PurchLine."Gen. Prod. Posting Group" = '' THEN
+              PurchLine.VALIDATE("Gen. Prod. Posting Group", AppSetUp."Std. Prod. Posting Group");
+
+            IF PurchLine."VAT Prod. Posting Group" = '' THEN
+              PurchLine.VALIDATE("VAT Prod. Posting Group", AppSetUp."Std. VAT Prod. Posting Group");
+
+            PurchLine.VALIDATE(Quantity,DocLine.Quantity);
+
+            IF PurchLine.Approve THEN
+              PurchLine."First Approver" := DocHead.Initiator;
+
+            DocLineDim.RESET;
+            DocLineDim.SETCURRENTKEY("Document Line ID");
+
+            DocLineDim.SETRANGE("Document Line ID", DocLine.ID);
+            DocLineDim.SETRANGE("Dimension Code", 'PERCODE');
+            IF DocLineDim.FINDFIRST THEN
+              PurchLine."Periodic Template Code" := DocLineDim."Dimension Value";
+
+            DocLineDim.SETRANGE("Dimension Code", 'PERDATE');
+            IF DocLineDim.FINDFIRST THEN
+              PurchLine."Periodic Starting Date" := DateField(DocLineDim."Dimension Value");
+
+            DocLineDim.SETRANGE("Dimension Code", 'JOB');
+            IF DocLineDim.FINDFIRST THEN
+              PurchLine.VALIDATE("Job No.", DocLineDim."Dimension Value");
+
+            //344703
+            DocLineDim.SETRANGE("Dimension Code", 'INV_CODE');
+            IF DocLineDim.FINDFIRST THEN
+              PurchLine.VALIDATE("Invoicing Code", DocLineDim."Dimension Value");
+
+            DocLineDim.SETRANGE("Dimension Code", 'JOBTASK');
+            IF DocLineDim.FINDFIRST THEN
+              PurchLine.VALIDATE("Job Task No.", DocLineDim."Dimension Value");
+
+            DocLineDim.SETRANGE("Dimension Code", 'CUSTOMERINV');
+            IF DocLineDim.FINDFIRST THEN
+              EVALUATE(PurchLine."Invoice to Customer", DocLineDim."Dimension Value");
+
+            DocLineDim.SETRANGE("Dimension Code", 'AMOUNTINV');
+            IF DocLineDim.FINDFIRST THEN
+              ImportMgt.TransformNumber(DocLineDim."Dimension Value",PurchLine."Invoicing Amount");
+
+            DocLineDim.SETRANGE("Dimension Code", 'INVDATE');
+            IF DocLineDim.FINDFIRST THEN
+              PurchLine.VALIDATE("Start Date for Invoicing", DateField(DocLineDim."Dimension Value"));
+            //344703
+
+            PurchLine.VALIDATE("Direct Unit Cost", DocLine."Direct Unit Cost");
+            PurchLine.VALIDATE("Line Discount %", DocLine."Line Discount %");
+          END;
+
+          PurchLine.MODIFY(FALSE);
+
+          IF PurchLine.Approve THEN BEGIN
+            ExFlow.CreateDocumentLine(PurchLine,FALSE,FALSE);
+
+            IF DocLine2.RetrieveRecord(DocLine2,DocLine."Company Name",PurchLine."Document Type",PurchLine."Document No.",
+                                    PurchLine."Line No.") THEN BEGIN
+              DocLine2."Requisition No." := PurchHeader."No.";
+              DocLine2."Direct Unit Cost" := PurchLine."Direct Unit Cost";
+              DocLine2."Periodic Template Code" := PurchLine."Periodic Template Code";
+              DocLine2."Periodic Starting Date" := PurchLine."Periodic Starting Date";
+              DocLine2."Job No." := PurchLine."Job No.";
+              DocLine2.MODIFY(TRUE);
+            END;
+          END;
+
+          IF PurchLine.Quantity <> 0 THEN
+            ExDimMgt.CreateQuoteCopyDimension(DocLine,PurchLine,DimCodeTab,DimValueTab);
+        UNTIL DocLine.NEXT = 0;
+      END;
+
+      IF DocHeadQuote.RetrieveRecord(DocHeadQuote,COMPANYNAME, PurchHeader."Document Type", PurchHeader."No.") THEN
+        MoveAttachedFile(DocHeadQuote,DocHead,PurchHeader);
+    END;
+
+    PROCEDURE CreatePdfImage@1100285005(VAR _AppSetup@1100285002 : Record 12013601;_QuoteDocNo@1100285003 : Code[20];_RootFolder@1100285001 : Text[1024];_FileName@1100285007 : Text[1024]);
+    VAR
+      _PurchHeader@1100285006 : Record 38;
+      _ExPDF@1100285005 : Codeunit 12013613;
+      _FileMgt@1100285000 : Codeunit 12013602;
+      _ExFlowFileMgtNAV2009@1100285004 : Codeunit 12013619;
+    BEGIN
+      _PurchHeader.GET(_PurchHeader."Document Type"::Quote,_QuoteDocNo);
+
+      IF (_AppSetup."Pdf-printer" = _AppSetup."Pdf-printer"::"Standard NAV (RTC only)") OR
+         (_ExFlowFileMgtNAV2009.IsRunFromServiceTier AND (NOT GUIALLOWED)) THEN BEGIN // Web service
+        _PurchHeader.SETRECFILTER;
+        _FileMgt.SaveReportAsPDF(_AppSetup."Requisition Report",
+                                 _RootFolder+_FileName,
+                                 _PurchHeader,_RootFolder)
+      END
+      ELSE
+        _ExPDF.PrintAsPdf(_AppSetup."Requisition Report",
+                         _RootFolder,
+                         _FileName,
+                         _PurchHeader, AppSetUp.Watermark);
+    END;
+
+    PROCEDURE CreateHtmlImage@1100285004(_AppSetup@1100285000 : Record 12013601;_QuoteDocNo@1100285004 : Code[20];_RootFolder@1100285001 : Text[1024];_FileName@1100285003 : Text[1024]);
+    VAR
+      _PurchHeader@1100285010 : Record 38;
+    BEGIN
+      _PurchHeader.GET(_PurchHeader."Document Type"::Quote,_QuoteDocNo);
+
+      _PurchHeader.SETRECFILTER;
+      IF NOT REPORT.SAVEASHTML(_AppSetup."Requisition Report", _RootFolder + _FileName, FALSE, _PurchHeader) THEN
+        ERROR(EXF01);
+    END;
+
+    PROCEDURE UpdateQouteDocument@1100285001(VAR _DimCodeTab@1100285005 : ARRAY [8] OF Code[20];VAR _DimValueTab@1100285004 : ARRAY [8] OF Code[20];VAR _PurchHeader@1100285008 : Record 38;VAR _DocHead@1100285009 : Record 12013608);
+    VAR
+      _DocHeadQuote@1100285000 : Record 12013608;
+      _TempPurchLine@1100285002 : TEMPORARY Record 39;
+      _ReqRule@1100285001 : Record 12013621;
+      _DocLine@1100285007 : Record 12013609;
+      _DocLineApprover@1100285006 : Record 12013610;
+      _PurchLine@1100285015 : Record 39;
+      _TotalPurchLine@1100285011 : Record 39;
+      _TotalPurchLineLCY@1100285010 : Record 39;
+      _DocLine2@1100285016 : Record 12013609;
+      _PurchPost@1100285014 : Codeunit 90;
+      _ExFlow@1100285017 : Codeunit 12013601;
+      _ExFlowSEMgt@1100285021 : Codeunit 12013598;
+      _TempLineNo@1100285003 : Integer;
+      _VATAmount@1100285013 : Decimal;
+      _VATAmountText@1100285012 : Text[30];
+    BEGIN
+      IF NOT _DocHeadQuote.RetrieveRecord(_DocHeadQuote,COMPANYNAME,_PurchHeader."Document Type",_PurchHeader."No.") THEN
+        EXIT;
+
+      _DocHeadQuote.Initiator := _DocHead.Initiator;
+      _DocHeadQuote."Vendor Document No." := _DocHead."Vendor Document No.";
+
+      _DocHeadQuote."Admin Comment" := _DocHead."Admin Comment";
+      _DocHeadQuote."Predefind Posting No." := _PurchHeader."No.";
+
+      _PurchPost.GetPurchLines(_PurchHeader,_TempPurchLine,0);
+      CLEAR(_PurchPost);
+      _PurchPost.SumPurchLinesTemp(
+        _PurchHeader,_TempPurchLine,0,_TotalPurchLine,_TotalPurchLineLCY,_VATAmount,_VATAmountText);
+
+      _DocHeadQuote."Net Amount" := _TotalPurchLine.Amount;
+      _DocHeadQuote."VAT Amount" := _TotalPurchLine."Amount Including VAT" - _TotalPurchLine.Amount;
+      _DocHeadQuote."Gross Amount" := _DocHeadQuote."Net Amount" + _DocHeadQuote."VAT Amount";
+      _PurchHeader."Gross Invoice Amount ExFlow" := ABS(_DocHeadQuote."Net Amount") + ABS(_DocHeadQuote."VAT Amount");
+      _PurchHeader."Import VAT Amount" := ABS(_DocHeadQuote."VAT Amount");
+
+      _ExFlowSEMgt.UpdateSWEBASE(_PurchHeader);
+
+      _DocHeadQuote."Due Date" := _DocHeadQuote."Expected Receipt Date";
+      _PurchHeader."Due Date" := _DocHeadQuote."Due Date";
+
+      _DocHeadQuote."Ex Location ID" := _DocHead."Ex Location ID";
+      _DocHeadQuote."Created By" := _DocHead."Created By";
+      _DocHeadQuote."Created Date" := _DocHead."Created Date";
+
+      //348849
+      IF _ReqRule.FindTemplate(_PurchHeader,_ReqRule,_DimCodeTab,_DimValueTab,_DocHeadQuote."Created By",
+                               _DocHeadQuote."Net Amount") THEN BEGIN
+      //348849
+        _DocHeadQuote."Assigned Receipt Group" := _ReqRule."Assigned Receipt Group";
+        IF _ReqRule."Assigned Purchasing Group" <> '' THEN BEGIN
+          IF _DocHeadQuote."Assigned Receipt Group" = '' THEN
+            _DocHeadQuote."Assigned Receipt Group" := _DocHeadQuote.Initiator;
+
+          _DocHeadQuote.Initiator := _ReqRule."Assigned Purchasing Group";
+        END;
+
+        _PurchHeader.Status := _ReqRule.Status;
+
+        IF _ReqRule."Set Created by as First Approv" AND
+           (_DocHeadQuote."Created By" <> '') THEN BEGIN
+          _DocLine.SETRANGE("Document ID", _DocHeadQuote.ID);
+          IF _DocLine.FINDSET THEN BEGIN
+            REPEAT
+              _DocLineApprover.SETCURRENTKEY("Company Name","Document Type","Document No.","Line No.","Approver Order");
+              _DocLineApprover.SETRANGE("Document Line ID", _DocLine.ID);
+              IF _DocLineApprover.FINDFIRST THEN
+                _TempLineNo := ROUND(_DocLineApprover."Approver Order" / 2,1);
+              IF _TempLineNo = 0 THEN
+                _TempLineNo := 10000;
+
+              _DocLineApprover.INIT;
+              _DocLineApprover.ID := 0;
+              _DocLineApprover."Document Line ID" := _DocLine.ID;
+              _DocLineApprover."Document ID" := _DocLine."Document ID";
+              _DocLineApprover."Company Name" := _DocLine."Company Name";
+              _DocLineApprover."Document Type" := _DocLine."Document Type";
+              _DocLineApprover."Document No." := _DocLine."Document No.";
+              _DocLineApprover."Line No." := _DocLine."Line No.";
+              _DocLineApprover."Approver Order" := _TempLineNo;
+              _DocLineApprover.VALIDATE(Approver, _DocHeadQuote."Created By");
+              _DocLineApprover.INSERT(TRUE);
+
+              _PurchLine.GET(_DocLine."Document Type",_DocLine."Document No.",_DocLine."Line No.");
+              _PurchLine."Approval Flow Modified" := TRUE;
+              _PurchLine.MODIFY;
+            UNTIL _DocLine.NEXT = 0;
+          END;
+        END;
+      END;
+
+      _PurchHeader.MODIFY;
+
+      IF _PurchHeader.Status = _PurchHeader.Status::Open THEN
+        _DocHeadQuote.Status := _DocHeadQuote.Status::Inactive
+      ELSE BEGIN
+        _DocHeadQuote.MODIFY;
+
+        _DocLine.RESET;
+        _DocLine.SETRANGE("Document ID", _DocHeadQuote.ID);
+        IF _DocLine.FINDFIRST THEN
+          _DocLine.SetDocumentStatus(_DocLine);
+
+        _DocHeadQuote.GET(_DocLine."Document ID");
+      END;
+
+      _DocHeadQuote."Text Field 1" := _DocHead."Text Field 1";
+      _DocHeadQuote."Text Field 2" := _DocHead."Text Field 2";
+      _DocHeadQuote."Date Field 1" := _DocHead."Date Field 1";
+      _DocHeadQuote."Date Field 2" := _DocHead."Date Field 2";
+      _DocHeadQuote."Text Field 3" := _DocHead."Text Field 3";
+      _DocHeadQuote."Text Field 4" := _DocHead."Text Field 4";
+      _DocHeadQuote."Text Field 5" := _DocHead."Text Field 5";
+      _DocHeadQuote."Text Field 6" := _DocHead."Text Field 6";
+      _DocHeadQuote."Text Field 7" := _DocHead."Text Field 7";
+      _DocHeadQuote."Text Field 8" := _DocHead."Text Field 8";
+      _DocHeadQuote."Text Field 9" := _DocHead."Text Field 9";
+      _DocHeadQuote."Text Field 10" := _DocHead."Text Field 10";
+      _DocHeadQuote."Date Field 3" := _DocHead."Date Field 3";
+      _DocHeadQuote."Date Field 4" := _DocHead."Date Field 4";
+      _DocHeadQuote."Decimal Field 1" := _DocHead."Decimal Field 1";
+      _DocHeadQuote."Decimal Field 2" := _DocHead."Decimal Field 2";
+      _DocHeadQuote."Decimal Field 3" := _DocHead."Decimal Field 3";
+      _DocHeadQuote."Decimal Field 4" := _DocHead."Decimal Field 4";
+      _DocHeadQuote."Approver Comments" := _DocHead."Approver Comments";
+
+      _DocHeadQuote.MODIFY(FALSE);
+
+      _DocLine2.RESET;
+      _DocLine2.SETCURRENTKEY("Document No.");
+      _DocLine2.SETRANGE("Company Name", COMPANYNAME);
+      _DocLine2.SETRANGE("Document Type", _PurchHeader."Document Type");
+      _DocLine2.SETRANGE("Document No.", _PurchHeader."No.");
+      IF _DocLine2.FINDSET THEN
+        REPEAT
+          _PurchLine.GET(_DocLine2."Document Type",_DocLine2."Document No.",_DocLine2."Line No.");
+          _ExFlow.CreateApprovers(_DocLine2, _PurchLine,'',FALSE, '','',FALSE);
+        UNTIL _DocLine2.NEXT = 0;
+    END;
+
+    PROCEDURE UpdateRequisition@1100285009();
+    VAR
+      Vend@1100285000 : Record 23;
+      DocHead@1100285001 : Record 12013608;
+    BEGIN
+      AppSetUp.GET(COMPANYNAME,0);
+
+      DocHead.RESET;
+      DocHead.SETCURRENTKEY("Company Name","Document Type","Document No.");
+      DocHead.SETRANGE("Company Name", COMPANYNAME);
+      DocHead.SETRANGE("Document Type" ,DocHead."Document Type"::Requisition);
+      IF DocHead.FINDSET(TRUE,FALSE) THEN
+        REPEAT
+          IF DocHead."Vendor No." = '' THEN
+            BEGIN
+              Vend.RESET;
+              Vend.SETRANGE(Name, DocHead."Vendor Name");
+              IF Vend.FINDFIRST THEN
+                BEGIN
+                  DocHead."Vendor No." := Vend."No.";
+                  DocHead.MODIFY(FALSE);
+                END;
+            END;
+        UNTIL DocHead.NEXT = 0;
+    END;
+
+    PROCEDURE DateField@1100285003(InField@1100285003 : Text[128]) : Date;
+    VAR
+      Year@1100285002 : Integer;
+      Month@1100285001 : Integer;
+      Day@1100285000 : Integer;
+    BEGIN
+      InField := DELCHR(InField,'=','-');
+      IF NOT EVALUATE(Year,COPYSTR(InField,1,4)) THEN
+        EXIT(0D);
+
+      IF NOT EVALUATE(Month,COPYSTR(InField,5,2)) THEN
+        EXIT(0D);
+
+      IF NOT EVALUATE(Day,COPYSTR(InField,7,2)) THEN
+        EXIT(0D);
+
+      IF (Month IN [1..12]) AND (Day IN [1..31]) THEN
+        EXIT(DMY2DATE(Day,Month,Year))
+      ELSE
+        EXIT(0D);
+    END;
+
+    PROCEDURE UpdateDocHead@1100285007(VAR DocHead@1100285000 : Record 12013608);
+    VAR
+      Vend@1100285001 : Record 23;
+    BEGIN
+      IF DocHead."Vendor No." = '' THEN
+        BEGIN
+          Vend.RESET;
+          IF Vend.SETCURRENTKEY(Name) THEN;
+          Vend.SETRANGE(Name, DocHead."Vendor Name");
+          IF Vend.FINDFIRST THEN
+            DocHead."Vendor No." := Vend."No.";
+        END;
+    END;
+
+    PROCEDURE MoveAttachedFile@1100285012(_DocHeadQuote@1100285002 : Record 12013608;_DocHead@1100285011 : Record 12013608;VAR _PurchHeader@1100285013 : Record 38);
+    VAR
+      AttachedFiles@1100285000 : Record 12013643;
+      AttachedFiles2@1100285001 : Record 12013643;
+      ExFlow@1100285010 : Codeunit 12013601;
+      ExFlowFileMgt@1100285012 : Codeunit 12013602;
+      OldFileName@1100285004 : Text[1024];
+      NewFileName@1100285005 : Text[1024];
+      FromFolder@1100285006 : Text[1024];
+      ToFolder@1100285007 : Text[1024];
+      TempFileName@1100285008 : Text[1024];
+      TempStrPos@1100285009 : Integer;
+      LastStrPos@1100285003 : Integer;
+    BEGIN
+      AppSetUp.GET(COMPANYNAME, 0);
+
+      AttachedFiles.RESET;
+      AttachedFiles.SETCURRENTKEY("Document No.");
+      AttachedFiles.SETRANGE("Company Name", COMPANYNAME);
+      AttachedFiles.SETRANGE("Document Type", _DocHead."Document Type");
+      AttachedFiles.SETRANGE("Document No.", _DocHead."Document No.");
+      IF AttachedFiles.FINDSET(TRUE) THEN BEGIN
+        REPEAT
+          TempStrPos := 0;
+          TempFileName := AttachedFiles."Attached File";
+          FromFolder := '';
+          REPEAT
+            TempStrPos := STRPOS(TempFileName, '\');
+
+            FromFolder := FromFolder + COPYSTR(TempFileName,1,TempStrPos);
+
+            IF TempStrPos <> 0 THEN BEGIN
+              TempFileName := COPYSTR(TempFileName,TempStrPos+1);
+
+              LastStrPos := TempStrPos;
+            END
+            ELSE
+              OldFileName := TempFileName;
+          UNTIL TempStrPos = 0;
+
+          NewFileName := OldFileName;
+          IF COPYSTR(AppSetUp."Path to connected Att. Files",STRLEN(AppSetUp."Path to connected Att. Files"),1) <> '\' THEN
+            AppSetUp."Path to connected Att. Files" := AppSetUp."Path to connected Att. Files" + '\';
+
+          FromFolder := AppSetUp."Path to connected Att. Files" + FromFolder;
+
+          ToFolder := AppSetUp."Path to connected Att. Files" + FORMAT(_DocHeadQuote.ID);
+          IF COPYSTR(ToFolder,STRLEN(ToFolder),1) <> '\' THEN
+            ToFolder := ToFolder + '\';
+
+          IF ExFlowFileMgt.FileExist(FromFolder,OldFileName) THEN BEGIN
+            AttachedFiles2.GET(AttachedFiles."Company Name",AttachedFiles."Entry No.");
+            AttachedFiles2."Document Type" := _PurchHeader."Document Type";
+            AttachedFiles2."Document No." := _PurchHeader."No.";
+            AttachedFiles2.Attached := TRUE;
+            AttachedFiles2."Document ID" := _DocHeadQuote.ID;
+            AttachedFiles2."Attached File" := FORMAT(_DocHeadQuote.ID) + '\' + NewFileName;
+            AttachedFiles2.MODIFY;
+
+            ExFlow.CopyAttachedFile(OldFileName, NewFileName, FromFolder, ToFolder, AppSetUp."Path to connected Att. Files");
+          END;
+        UNTIL AttachedFiles.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE CheckReports@1100285031();
+    VAR
+      Obj@1100285000 : Record 2000000001;
+    BEGIN
+      AppSetUp.GET(COMPANYNAME, 0);
+
+      IF AppSetUp.Requisition THEN
+        BEGIN
+          Obj.RESET;
+          Obj.SETRANGE(Type, Obj.Type::Report);
+          Obj.SETRANGE(ID, AppSetUp."Requisition Report");
+          IF NOT Obj.FIND('-') THEN
+            ERROR(EXF50);
+
+          Obj.SETRANGE(ID, AppSetUp."Order Report");
+          IF NOT Obj.FIND('-') THEN
+              ERROR(EXF51);
+        END
+      ELSE
+        IF AppSetUp."Purchase Order" THEN
+          BEGIN
+            Obj.RESET;
+            Obj.SETRANGE(Type, Obj.Type::Report);
+            Obj.SETRANGE(ID, AppSetUp."Requisition Report");
+            Obj.SETRANGE(ID, AppSetUp."Order Report");
+            IF NOT Obj.FIND('-') THEN
+              ERROR(EXF51);
+          END;
+    END;
+
+    PROCEDURE LineIsBlank@1100285006(DocLine@1100285000 : Record 12013609) : Boolean;
+    BEGIN
+      WITH DocLine DO BEGIN
+        IF "Direct Unit Cost" <> 0 THEN
+          EXIT(FALSE);
+
+        IF Amount <> 0 THEN
+          EXIT(FALSE);
+
+        IF "No." <> '' THEN
+          EXIT(FALSE);
+      END;
+
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE FindNoMapping@1100285011(_DocLine@1100285002 : Record 12013609;_VendorNo@1100285004 : Code[20]) TempNo : Code[20];
+    VAR
+      DimToGLMapping@1100285001 : Record 12013646;
+      Column@1100285000 : Record 12013661;
+      Vendor@1100285003 : Record 23;
+      DocLineDim@1100285005 : Record 12013611;
+    BEGIN
+      TempNo := '';
+
+      DocLineDim.RESET;
+      DocLineDim.SETCURRENTKEY("Document Line ID");
+      DocLineDim.SETRANGE("Document Line ID", _DocLine.ID);
+      IF DocLineDim.FINDSET THEN
+        REPEAT
+          Column.GET(COMPANYNAME,DocLineDim."Column ID");
+          IF Column.Dimension THEN BEGIN
+            DimToGLMapping.RESET;
+            DimToGLMapping.SETRANGE("Dimension Code", DocLineDim."Dimension Code");
+            DimToGLMapping.SETRANGE("Dimension Value Code", DocLineDim."Dimension Value");
+            DimToGLMapping.SETFILTER("G/L Account No.", '<>%1', '');
+            IF DimToGLMapping.FINDFIRST THEN
+              TempNo := DimToGLMapping."G/L Account No.";
+          END;
+        UNTIL (DocLineDim.NEXT = 0) OR (TempNo <> '');
+
+      //348838
+      IF TempNo = '' THEN BEGIN
+        IF _VendorNo <> '' THEN
+          IF Vendor.GET(_VendorNo) THEN
+            TempNo := Vendor."Predefined Account";
+      END;
+      //348838
+
+      IF TempNo = '' THEN BEGIN
+        DimToGLMapping.RESET;
+        DimToGLMapping.SETFILTER("Dimension Code", '%1', '');
+        DimToGLMapping.SETFILTER("Dimension Value Code", '%1', '');
+        DimToGLMapping.SETFILTER("G/L Account No.", '<>%1', '');
+        IF DimToGLMapping.FINDFIRST THEN
+          TempNo := DimToGLMapping."G/L Account No.";
+      END;
+
+      EXIT(TempNo);
+    END;
+
+    PROCEDURE PrintPQDoc@1100285008(_QuoteDocNo@1100285000 : Code[20]);
+    VAR
+      _DocHead2@1100285002 : Record 12013608;
+      _ExDoc2@1100285004 : Record 12013612;
+      _PurchHeader@1100285007 : Record 38;
+      _ExFlow@1100285005 : Codeunit 12013601;
+      _ExFlowFileMgt@1100285006 : Codeunit 12013602;
+      _TempImageName@1100285001 : Text[1024];
+      _SubFolder@1100285003 : Text[1024];
+    BEGIN
+      AppSetUp.GET(COMPANYNAME,0);
+
+      CheckReports;
+
+      _SubFolder := _ExFlow.DayMap(WORKDATE);
+
+      IF AppSetUp."Write to Pdf-printer" THEN
+        _TempImageName := _SubFolder + 'Quote-' + _QuoteDocNo + '.PDF'
+      ELSE
+        _TempImageName := _SubFolder + 'Quote-' + _QuoteDocNo + '.htm';
+
+      IF _DocHead2.RetrieveRecord(_DocHead2,COMPANYNAME, _PurchHeader."Document Type"::Quote, _QuoteDocNo) THEN BEGIN
+        _DocHead2."Image Name" := _TempImageName;
+        _DocHead2.MODIFY(FALSE);
+
+        _ExDoc2.RESET;
+        _ExDoc2.SETCURRENTKEY("Document No.");
+        _ExDoc2.SETRANGE("Company Name", _DocHead2."Company Name");
+        _ExDoc2.SETRANGE("Document Type", _DocHead2."Document Type");
+        _ExDoc2.SETRANGE("Document No.", _DocHead2."Document No.");
+        IF _ExDoc2.FIND('-') THEN BEGIN
+          _ExDoc2."Image Name" := _DocHead2."Image Name";
+          _ExDoc2.MODIFY;
+        END
+        ELSE BEGIN
+          _ExDoc2.INIT;
+          _ExDoc2."Entry No." := 0;
+          _ExDoc2."Company Name" := _DocHead2."Company Name";
+          _ExDoc2."Document Type" := _DocHead2."Document Type";
+          _ExDoc2."Document No." := _DocHead2."Document No.";
+          _ExDoc2."Image Name" := _DocHead2."Image Name";
+          _ExDoc2.INSERT;
+        END;
+      END;
+
+      IF NOT _ExFlowFileMgt.FolderExist(AppSetUp."Path to Used Invoices" + _SubFolder) THEN
+        _ExFlowFileMgt.NewFolder(AppSetUp."Path to Used Invoices" + _SubFolder, AppSetUp."Path to Used Invoices");
+
+      COMMIT;
+      IF AppSetUp."Write to Pdf-printer" THEN
+        CreatePdfImage(AppSetUp,_QuoteDocNo,AppSetUp."Path to Used Invoices",_TempImageName)
+      ELSE
+        CreateHtmlImage(AppSetUp,_QuoteDocNo,AppSetUp."Path to Used Invoices",_TempImageName);
+    END;
+
+    PROCEDURE SplitDocument@1100285000();
+    VAR
+      DocHead@1100285009 : Record 12013608;
+      NewDocHead@1100285008 : Record 12013608;
+      TempDocHead@1100285001 : TEMPORARY Record 12013608;
+      DocLine@1100285007 : Record 12013609;
+      DocLine2@1100285006 : Record 12013609;
+      TempDocLine@1100285000 : TEMPORARY Record 12013609;
+      DocLineApp@1100285005 : Record 12013610;
+      DocLineApp2@1100285004 : Record 12013610;
+      DocLineDim@1100285003 : Record 12013611;
+      DocLineDim2@1100285002 : Record 12013611;
+      First@1100285010 : Boolean;
+    BEGIN
+      TempDocHead.RESET;
+      TempDocHead.DELETEALL;
+      TempDocLine.RESET;
+      TempDocLine.DELETEALL;
+
+      DocHead.RESET;
+      DocHead.SETCURRENTKEY("Company Name","Document Type","Document No.");
+      DocHead.SETRANGE("Company Name", COMPANYNAME);
+      DocHead.SETRANGE("Document Type", DocHead."Document Type"::Requisition);
+      IF DocHead.FINDSET(TRUE) THEN BEGIN
+        REPEAT
+          First := TRUE;
+          DocLine.RESET;
+          DocLine.SETCURRENTKEY("Document ID");
+          DocLine.SETRANGE("Document ID", DocHead.ID);
+          IF DocLine.FINDSET THEN
+            REPEAT
+              IF NOT First THEN BEGIN
+                TempDocLine.INIT;
+                TempDocLine.TRANSFERFIELDS(DocLine);
+                TempDocLine.INSERT;
+
+                TempDocHead.RESET;
+                TempDocHead.SETRANGE(ID, DocHead.ID);
+                IF NOT TempDocHead.FIND('-') THEN BEGIN
+                  TempDocHead.INIT;
+                  TempDocHead.TRANSFERFIELDS(DocHead);
+                  TempDocHead.INSERT;
+                END;
+              END
+              ELSE
+                First := FALSE;
+            UNTIL DocLine.NEXT = 0;
+        UNTIL DocHead.NEXT = 0;
+
+        TempDocHead.RESET;
+        IF TempDocHead.FIND('-') THEN
+          REPEAT
+            DocHead.GET(TempDocHead.ID);
+
+            TempDocLine.RESET;
+            TempDocLine.SETRANGE("Document ID", TempDocHead.ID);
+            TempDocLine.FIND('-');
+            REPEAT
+              NewDocHead.INIT;
+              NewDocHead.TRANSFERFIELDS(DocHead);
+              NewDocHead.ID := 0;
+              NewDocHead."Document No." := COPYSTR(FORMAT(CREATEGUID),2,MAXSTRLEN(NewDocHead."Document No."));
+              NewDocHead.INSERT;
+
+              DocLine2.GET(TempDocLine.ID);
+              DocLine2."Line No." := 10000;
+              DocLine2."Document ID" := NewDocHead.ID;
+              DocLine2."Document No." := NewDocHead."Document No.";
+              DocLine2."Requisition No." := NewDocHead."Document No.";
+              DocLine2.MODIFY;
+
+              DocLineApp.RESET;
+              DocLineApp.SETCURRENTKEY("Document Line ID");
+              DocLineApp.SETRANGE("Document Line ID", TempDocLine.ID);
+              IF DocLineApp.FINDSET(TRUE,TRUE) THEN
+                REPEAT
+                  DocLineApp2.GET(DocLineApp.ID);
+                  DocLineApp2."Document No." := DocLine2."Document No.";
+                  DocLineApp2."Line No." := DocLine2."Line No.";
+                  DocLineApp2.MODIFY;
+                UNTIL DocLineApp.NEXT = 0;
+
+              DocLineDim.RESET;
+              DocLineDim.SETCURRENTKEY("Document Line ID");
+              DocLineDim.SETRANGE("Document Line ID", TempDocLine.ID);
+              IF DocLineDim.FINDSET(TRUE,TRUE) THEN
+                REPEAT
+                  DocLineDim2.GET(DocLineDim.ID);
+                  DocLineDim2."Document No." := DocLine2."Document No.";
+                  DocLineDim2."Line No." := DocLine2."Line No.";
+                  DocLineDim2.MODIFY;
+                UNTIL DocLineDim.NEXT = 0;
+            UNTIL TempDocLine.NEXT = 0;
+          UNTIL TempDocHead.NEXT = 0;
+      END;
+    END;
+
+    BEGIN
+    {
+      EXF3.36.008 Removed add new Vendor functionality (and use of Vendor "Name Key") in func create quote.
+    }
+    END.
+  }
+}
+

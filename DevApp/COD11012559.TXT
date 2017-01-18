@@ -57,6 +57,16 @@ OBJECT Codeunit 11012559 Post Exit Order
       MainDeprBookCode@1100530000 : Code[10];
       Text012@1100409002 : TextConst 'ENU=%1 is %2, no FA founded for posted plant numbers, in %3 ''%4'', %5 ''%6'', %7 ''%8''.';
       Text013@1100409003 : TextConst 'ENU=%1 is %2, founded FA quantity %3 not enough, in %4 ''%5'', %6 ''%7'', %8 ''%9''.';
+      EVRY001@1100285000 : TextConst 'ENU=Journal %1 %2 is not empty';
+      "-EVRY-"@1100285009 : Integer;
+      FAComp@1100285008 : Record 5600;
+      FACompDeprBook@1100285007 : Record 5612;
+      FA@1100285006 : Record 5600;
+      GenJnlTemplate@1100285005 : Record 80;
+      GenJnlBatch@1100285004 : Record 232;
+      GenJnlLine@1100285003 : Record 81;
+      NoSeriesMgt@1100285002 : Codeunit 396;
+      GenJnlPostLine@1100285001 : Codeunit 12;
       Text014@1100525000 : TextConst 'ENU=Do you agree with this?';
       Text015@1100525002 : TextConst 'ENU="Posting %1 ''%2'' not allowed/blocked, alredy lines present in FA G/L Journal  ''%3-%4'' "';
 
@@ -195,6 +205,23 @@ OBJECT Codeunit 11012559 Post Exit Order
             IF Bulk THEN
               TESTFIELD("No.", '0');  //* If not External then Plant No. filled not allowed for Bulk
           END;
+          //>> LAHE 130422
+          IF PlantNoRec.GET("Plant Type","No.") THEN
+            IF FA.GET(PlantNoRec."Fixed Asset") THEN
+              IF FA."Main Asset/Component" = FA."Main Asset/Component"::"Main Asset" THEN BEGIN
+                FAComp.RESET;
+                FAComp.SETRANGE("Component of Main Asset",FA."No.");
+                IF FAComp.FINDSET THEN REPEAT
+                  FACompDeprBook.RESET;
+                  FACompDeprBook.SETRANGE("FA No.",FAComp."No.");
+                  IF FACompDeprBook.FINDSET THEN REPEAT
+                    FACompDeprBook.CALCFIELDS("Book Value");
+                    IF FACompDeprBook."Book Value" <> 0 THEN
+                      DisposeFAComponent(FAComp."No.",-FACompDeprBook."Book Value");
+                  UNTIL FACompDeprBook.NEXT = 0;
+                UNTIL FAComp.NEXT = 0;
+              END;
+          //<< LAHE 130422
         END;
         IF DoExternal THEN
           TESTFIELD("Vendor No.")
@@ -328,6 +355,8 @@ OBJECT Codeunit 11012559 Post Exit Order
       lOrgFA_Quantity@1100525001 : Decimal;
       QtyOtherLines@1210190006 : Decimal;
       lCodFA_Dispose@1100485001 : Code[20];
+      "---EVRY---"@1100285001 : Integer;
+      _deprValue@1100285000 : Decimal;
     BEGIN
       WITH OrderLineRec DO BEGIN
         IF (NOT PlantSetup."Integration Fixed Assets") OR (NOT PlantRec."Integration Fixed Assets") THEN
@@ -338,6 +367,21 @@ OBJECT Codeunit 11012559 Post Exit Order
               EXIT;
           END;
         END;
+
+        //>> LAHE 130520 (main component no ledger entries)
+        IF PlantNoRec.GET("Plant Type","No.") THEN
+          IF FA.GET(PlantNoRec."Fixed Asset") THEN BEGIN
+            FADeprBook.RESET;
+            FADeprBook.SETRANGE("FA No.",FA."No.");
+            IF FADeprBook.FINDSET THEN REPEAT
+              FADeprBook.CALCFIELDS("Book Value");
+              _deprValue += FADeprBook."Book Value";
+            UNTIL FADeprBook.NEXT = 0;
+            IF _deprValue = 0 THEN
+              EXIT
+          END;
+        //<< LAHE 130520
+
         IF (Amount < 0) THEN
           FIELDERROR(Amount);
 
@@ -1288,6 +1332,60 @@ OBJECT Codeunit 11012559 Post Exit Order
       END;
     END;
 
+    PROCEDURE "---EVRY---"@1100409000();
+    BEGIN
+    END;
+
+    PROCEDURE DisposeFAComponent@1100409002(_no@1100409002 : Code[20];_amount@1100409001 : Decimal);
+    VAR
+      _docNo@1100409000 : Code[20];
+    BEGIN
+      // LAHE 130424
+      FASetup.TESTFIELD("Auto Journal Template Name");
+      FASetup.TESTFIELD("Auto Journal Batch Name");
+
+      GenJnlLine."Journal Template Name" := FASetup."Auto Journal Template Name";
+      GenJnlLine."Journal Batch Name" := FASetup."Auto Journal Batch Name";
+      GenJnlLine.SETRECFILTER;
+      GenJnlLine.SETRANGE("Line No.");
+      IF GenJnlLine.FINDSET THEN BEGIN
+        IF (GenJnlLine.COUNT = 1) AND GenJnlLine.EmptyLine THEN
+          GenJnlLine.DELETE
+        ELSE
+          ERROR(EVRY001);
+      END;
+
+      GenJnlTemplate.GET(GenJnlLine."Journal Template Name");
+      GenJnlBatch.GET(GenJnlLine."Journal Template Name",GenJnlLine."Journal Batch Name");
+      IF GenJnlBatch."No. Series" <> '' THEN
+        _docNo := NoSeriesMgt.GetNextNo(GenJnlBatch."No. Series",WORKDATE,TRUE);
+      GenJnlLine."Line No." := 10000;
+      GenJnlLine."Account Type" := GenJnlLine."Account Type"::"Fixed Asset";
+      NewJournalLine;
+      GenJnlLine.VALIDATE("Posting Date",OrderRec."Exit-date"); //WORKDATE);
+      GenJnlLine."Document No." := _docNo;
+      GenJnlLine.VALIDATE("Account No.",_no);
+      GenJnlLine."FA Posting Type" := GenJnlLine."FA Posting Type"::Disposal;
+      GenJnlLine.VALIDATE(Amount,_amount);
+      GenJnlPostLine.RUN(GenJnlLine);
+    END;
+
+    PROCEDURE NewJournalLine@1000000003();
+    BEGIN
+      // LAHE 130424
+      WITH GenJnlLine DO BEGIN
+        "Source Code" := GenJnlTemplate."Source Code";
+        "Reason Code" := GenJnlBatch."Reason Code";
+        "Posting No. Series" := GenJnlBatch."Posting No. Series";
+        "Bal. Account Type" := GenJnlBatch."Bal. Account Type";
+        IF ("Account Type" IN ["Account Type"::Customer,"Account Type"::Vendor,"Account Type"::"Fixed Asset"]) AND
+           ("Bal. Account Type" IN ["Bal. Account Type"::Customer,"Bal. Account Type"::Vendor,"Bal. Account Type"::"Fixed Asset"])
+        THEN
+          "Account Type" := "Account Type"::"G/L Account";
+        VALIDATE("Bal. Account No.",GenJnlBatch."Bal. Account No.");
+      END;
+    END;
+
     LOCAL PROCEDURE ConfirmNegStock@1100525000(ExitOrder@1100525001 : Record 11012559) : Boolean;
     VAR
       ExitOrderLine@1100525000 : Record 11012560;
@@ -1356,6 +1454,11 @@ OBJECT Codeunit 11012559 Post Exit Order
     END;
 
     BEGIN
+    {
+      -EVRY-
+      LAHE 130424 "Journal Template Name", "Journal Batch Name" (Plant Disposal Posting)
+      LAHE 130520 Nothing to post on Main Asset
+    }
     END.
   }
 }

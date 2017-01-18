@@ -1,0 +1,1186 @@
+OBJECT Codeunit 12013593 Exflow Workflow Management
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=EXF350003,4PS;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      EXF001@1100285003 : TextConst 'ENU=Line Type %1 is not allowed in Exflow Documents';
+      EXF003@1100285005 : TextConst 'ENU=Automatically matched by system';
+      TempProposalsBuffer@1100285001 : TEMPORARY Record 12013615;
+      UseBuffer@1100285004 : Boolean;
+      ExFlowSetup@1100285000 : Record 12013601;
+      ExDimMgt@1100285002 : Codeunit 12013605;
+      RestoreImage@1100285006 : Integer;
+      DeletedPath@1100285007 : TextConst 'ENU=DeletedFiles';
+
+    PROCEDURE CreateProposals@1100285013(VAR ExfPurchDocLine@1100285002 : Record 12013588;CalledFromUpdateMode@1100285006 : Boolean;ChangedByDimension@1100285007 : Boolean;PerformManuallyChangedCheck@1100285014 : Boolean;PerformDeletion@1100285015 : Boolean);
+    VAR
+      Proposals@1100285001 : Record 12013615;
+      TemplateRule@1100285000 : Record 12013645;
+      ExfPurchDocHead@1100285018 : Record 12013587;
+      ExfPurchDocLine2@1100285005 : Record 12013588;
+      PurchLine@1100285011 : Record 39;
+      DimCodeArray@1100285004 : ARRAY [8] OF Code[20];
+      DimValueArray@1100285003 : ARRAY [8] OF Code[20];
+      TempCode@1100285013 : Code[10];
+      NextLineNo@1100285008 : Integer;
+      AmtToCheckAgainstRule@1100285009 : Decimal;
+      Found@1100285010 : Boolean;
+      TempFound@1100285012 : Boolean;
+    BEGIN
+      IF PerformManuallyChangedCheck THEN
+        IF ProposalChangedByUser(ExfPurchDocLine,TRUE) THEN
+          EXIT;
+
+      IF ExfPurchDocLine."No." = '' THEN
+        EXIT;
+
+      ExFlowSetup.GET(COMPANYNAME, 0);
+
+      IF NOT ExfPurchDocLine.Approval THEN BEGIN
+        Proposals.RESET;
+        Proposals.LOCKTABLE;
+        Proposals.SETRANGE("Entry No.", ExfPurchDocLine."Inbound Document No.");
+        Proposals.SETRANGE("Line No." , ExfPurchDocLine."Line No.");
+        Proposals.DELETEALL;
+
+        ExfPurchDocLine."Applied Template Rule" := '';
+
+        EXIT;
+      END;
+
+      ExfPurchDocHead.GET(ExfPurchDocLine."Inbound Document No.");
+
+      AmtToCheckAgainstRule := ExfPurchDocLine."Line Amount";
+
+      IF ExFlowSetup."Copy Approval Flow Matched PO" <> ExFlowSetup."Copy Approval Flow Matched PO"::Never THEN
+        IF CopyApprovalFlowFromPO(ExfPurchDocLine,NextLineNo,PerformDeletion) THEN
+          IF ExFlowSetup."Copy Approval Flow Matched PO" = ExFlowSetup."Copy Approval Flow Matched PO"::Only THEN
+            EXIT;
+
+      CLEAR(DimCodeArray);
+      CLEAR(DimValueArray);
+      ExDimMgt.GetDimFromExFPurchLine(ExfPurchDocLine,DimCodeArray,DimValueArray,TempFound,TempCode,TempCode);
+
+      PurchLine.TRANSFERFIELDS(ExfPurchDocLine);
+      PurchLine."Document Type" := PurchLine."Document Type"::Order;
+      PurchLine."Document No." := ExfPurchDocLine."Order No.";
+
+      CLEAR(TemplateRule);
+      IF ExfPurchDocLine."Template Rule" <> '' THEN BEGIN
+        Found := TRUE;
+        IF NOT TemplateRule.GET(COMPANYNAME,ExfPurchDocLine."Template Rule") THEN
+          Found := TemplateRule.FindTemplate(PurchLine, TemplateRule, DimCodeArray, DimValueArray, 2, ExfPurchDocLine."Purchaser Code");
+      END
+      ELSE
+        Found := TemplateRule.FindTemplate(PurchLine, TemplateRule, DimCodeArray, DimValueArray, 2, ExfPurchDocLine."Purchaser Code");
+
+      IF Found THEN BEGIN
+        IF TemplateRule."Total Invoice Amount" THEN BEGIN
+          //348846
+          AmtToCheckAgainstRule := ExfPurchDocHead."Document Amount";
+          //348846
+          IF AmtToCheckAgainstRule = 0 THEN BEGIN
+            AmtToCheckAgainstRule := 0;
+
+            ExfPurchDocLine2.RESET;
+            ExfPurchDocLine2.SETRANGE("Inbound Document No.",ExfPurchDocLine."Inbound Document No.");
+            IF ExfPurchDocLine2.FINDSET THEN
+              REPEAT
+                // 348823
+                IF ExfPurchDocLine2."Line No." = ExfPurchDocLine."Line No." THEN
+                  AmtToCheckAgainstRule := AmtToCheckAgainstRule + ExfPurchDocLine.Amount
+                //348823
+                ELSE
+                  // to make sure only non-VAT amounts are counted
+                  AmtToCheckAgainstRule := AmtToCheckAgainstRule + ExfPurchDocLine2.Amount;
+              UNTIL ExfPurchDocLine2.NEXT = 0;
+          END;
+        END;
+
+        IF (ExfPurchDocHead."Currency Factor" <> 1) AND (ExfPurchDocHead."Currency Factor" <> 0) THEN
+          AmtToCheckAgainstRule := AmtToCheckAgainstRule / ExfPurchDocHead."Currency Factor";
+      END;
+
+      IF PerformDeletion THEN BEGIN
+        Proposals.RESET;
+        Proposals.LOCKTABLE;
+        Proposals.SETRANGE("Entry No.", ExfPurchDocLine."Inbound Document No.");
+        Proposals.SETRANGE("Line No." , ExfPurchDocLine."Line No.");
+        Proposals.DELETEALL;
+      END;
+
+      InsertAppInProposal(ExfPurchDocLine,
+                          TemplateRule,
+                          AmtToCheckAgainstRule,ChangedByDimension,NextLineNo,Found);
+
+      IF Found THEN
+        ExfPurchDocLine."Applied Template Rule" := TemplateRule.Code
+      ELSE
+        ExfPurchDocLine."Applied Template Rule" := '';
+
+      IF NOT CalledFromUpdateMode THEN
+        ExfPurchDocLine.MODIFY;
+    END;
+
+    PROCEDURE ProposalChangedByUser@1100285009(ExfPurchDocLine@1100285000 : Record 12013588;FilterOnLine@1100285004 : Boolean) : Boolean;
+    VAR
+      Proposals@1100285001 : Record 12013615;
+    BEGIN
+      Proposals.RESET;
+      Proposals.SETCURRENTKEY(Changed);
+      Proposals.SETRANGE("Entry No.", ExfPurchDocLine."Inbound Document No.");
+      IF FilterOnLine THEN
+        Proposals.SETRANGE("Line No." , ExfPurchDocLine."Line No.");
+      Proposals.SETRANGE(Changed, TRUE);
+      EXIT(NOT Proposals.ISEMPTY);
+    END;
+
+    PROCEDURE InsertAppInProposal@1100285021(VAR ExPurchDocLine@1100285007 : Record 12013588;TempRule@1100285002 : Record 12013645;MaxAmount@1100285005 : Decimal;ChangedByDimension@1100285006 : Boolean;VAR NextLineNo@1100285003 : Integer;FoundTemplateRule@1100285010 : Boolean);
+    VAR
+      TemplateRuleLine@1100285001 : Record 12013603;
+      Proposals@1100285000 : Record 12013615;
+      ExUserGroup@1100285004 : Record 12013606;
+      TempApprover@1100285008 : Code[50];
+      CreateLine@1100285009 : Boolean;
+    BEGIN
+      ExFlowSetup.GET(COMPANYNAME,0);
+
+      IF NextLineNo = 0 THEN
+        NextLineNo := 10000;
+
+      IF ExPurchDocLine."First Approver" <> '' THEN BEGIN
+        IF ExFlowSetup."Copy First Approver to Flow" IN [ExFlowSetup."Copy First Approver to Flow"::"All Documents",
+                                                         ExFlowSetup."Copy First Approver to Flow"::"Invoices Only"]
+        THEN BEGIN
+          ExUserGroup.GET(COMPANYNAME,ExPurchDocLine."First Approver");
+          IF NOT ExUserGroup.Blocked THEN BEGIN
+            IF UseBuffer THEN BEGIN
+              TempProposalsBuffer.INIT;
+              TempProposalsBuffer."Entry No." := ExPurchDocLine."Inbound Document No.";
+              TempProposalsBuffer."Line No." := ExPurchDocLine."Line No.";
+              TempProposalsBuffer."Approver Order" := NextLineNo;
+              TempProposalsBuffer.Approver := ExPurchDocLine."First Approver";
+              TempProposalsBuffer."Group Name" := ExUserGroup.Name;
+              TempProposalsBuffer.INSERT;
+            END
+            ELSE BEGIN
+              Proposals.INIT;
+              Proposals."Entry No." := ExPurchDocLine."Inbound Document No.";
+              Proposals."Line No." := ExPurchDocLine."Line No.";
+              Proposals."Approver Order" := NextLineNo;
+              Proposals.Approver := ExPurchDocLine."First Approver";
+              Proposals."Group Name" := ExUserGroup.Name;
+              Proposals.INSERT;
+            END;
+
+            NextLineNo := NextLineNo + 10000;
+
+            TempApprover := ExPurchDocLine."First Approver";
+          END;
+        END;
+      END;
+
+      MaxAmount := ABS(MaxAmount);
+
+      IF FoundTemplateRule THEN BEGIN
+        TemplateRuleLine.RESET;
+        TemplateRuleLine.SETRANGE("Company Name",COMPANYNAME);
+        TemplateRuleLine.SETRANGE(Code,TempRule.Code);
+        IF MaxAmount >= 0 THEN
+          TemplateRuleLine.SETFILTER("Over Amount",'<=%1', MaxAmount);
+        IF ExFlowSetup."Activate Not Over" THEN
+          TemplateRuleLine.SETFILTER("Not Over Amount",'>%1|0', MaxAmount);
+        TemplateRuleLine.SETFILTER("Approver Group", '<>%1', '');
+        IF TemplateRuleLine.FINDSET THEN BEGIN
+          InsertDimFromUser(TemplateRuleLine."Approver Group",ExPurchDocLine,ChangedByDimension);
+
+          REPEAT
+            CreateLine := TRUE;
+            IF TempApprover <> '' THEN BEGIN
+              IF TemplateRuleLine."Approver Group" = TempApprover THEN
+                CreateLine := FALSE;
+              TempApprover := '';
+            END;
+
+            IF CreateLine THEN BEGIN
+              ExUserGroup.GET(COMPANYNAME,TemplateRuleLine."Approver Group");
+              IF NOT ExUserGroup.Blocked THEN BEGIN
+                IF UseBuffer THEN BEGIN
+                  TempProposalsBuffer.INIT;
+                  TempProposalsBuffer."Entry No." := ExPurchDocLine."Inbound Document No.";
+                  TempProposalsBuffer."Line No." := ExPurchDocLine."Line No.";
+                  TempProposalsBuffer."Approver Order" := NextLineNo;
+                  TempProposalsBuffer.Approver := TemplateRuleLine."Approver Group";
+                  TempProposalsBuffer."Group Name" := ExUserGroup.Name;
+                  TempProposalsBuffer.INSERT;
+                END
+                ELSE BEGIN
+                  Proposals.INIT;
+                  Proposals."Entry No." := ExPurchDocLine."Inbound Document No.";
+                  Proposals."Line No." := ExPurchDocLine."Line No.";
+                  Proposals."Approver Order" := NextLineNo;
+                  Proposals.Approver := TemplateRuleLine."Approver Group";
+                  Proposals."Group Name" := ExUserGroup.Name;
+                  Proposals.INSERT;
+                END;
+
+                NextLineNo := NextLineNo + 10000;
+              END;
+            END;
+          UNTIL TemplateRuleLine.NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE ShowProposals@1100285015(ExfPurchDocLine@1100285000 : Record 12013588);
+    VAR
+      Proposals@1100285001 : Record 12013615;
+      AppProposalsForm@1100285002 : Page 12013615;
+    BEGIN
+      Proposals.RESET;
+      Proposals.FILTERGROUP(2);
+      Proposals.SETRANGE("Entry No.",ExfPurchDocLine."Inbound Document No.");
+      Proposals.SETRANGE("Line No.",ExfPurchDocLine."Line No.");
+      AppProposalsForm.SETTABLEVIEW(Proposals);
+      AppProposalsForm.RUN;
+      Proposals.FILTERGROUP(0);
+    END;
+
+    PROCEDURE LineTypeAllowed@1100285029(LineType@1100285000 : ' ,G/L Account,Item,,Fixed Asset,Charge (Item)';ShowError@1100285001 : Boolean) : Boolean;
+    VAR
+      Col@1100285002 : Integer;
+    BEGIN
+      CASE LineType OF
+        LineType::"G/L Account":
+          Col := GetColumnID('G_LACCOUNT');
+
+        LineType::Item:
+          Col := GetColumnID('ITEM');
+
+        LineType::"Fixed Asset":
+          Col := GetColumnID('FIXEDASSET');
+
+        LineType::"Charge (Item)":
+          Col := GetColumnID('CHARGE');
+      END;
+
+      IF Col = 0 THEN
+        BEGIN
+          IF ShowError THEN
+            MESSAGE(EXF001,LineType);
+
+          EXIT(FALSE);
+        END
+      ELSE
+        EXIT(TRUE);
+    END;
+
+    PROCEDURE GetColumnID@1100285019(DimCode@1100285000 : Code[20]) : Integer;
+    VAR
+      Column@1100285001 : Record 12013661;
+    BEGIN
+      Column.RESET;
+      Column.SETCURRENTKEY("Company Name", Code);
+      Column.SETRANGE("Company Name",COMPANYNAME);
+      Column.SETRANGE(Code, DimCode);
+
+      IF Column.FIND('-') THEN
+        EXIT(Column.ID)
+      ELSE
+        EXIT(0);
+    END;
+
+    PROCEDURE CreateExfDocHead@1100285002(VAR PurchHeader@1100285000 : Record 38;ExFlowPurchDocHeader@1100285002 : Record 12013587;ImageName@1100285005 : Text[250]);
+    VAR
+      ExfDocHead@1100285001 : Record 12013608;
+      ExDocHead2@1100285004 : Record 12013612;
+      ExfImpPurchImpHead@1100285006 : Record 12013650;
+      RecordLink@1100285008 : Record 2000000068;
+      ExFlow@1100285003 : Codeunit 12013601;
+      RecRef@1100285007 : RecordRef;
+    BEGIN
+      ExFlow.CreateDocument(PurchHeader);
+      IF NOT ExfDocHead.RetrieveRecord(ExfDocHead,COMPANYNAME,PurchHeader."Document Type",PurchHeader."No.") THEN
+        EXIT;
+
+      ExfDocHead."Admin Comment" := ExFlowPurchDocHeader."Admin Comment";
+      ExfDocHead."Project No." := ExFlowPurchDocHeader."Job No.";
+      ExfDocHead."Image Name" := ImageName;
+      ExfDocHead."Text Field 1" := ExFlowPurchDocHeader."Order No. (Import)";
+      ExfDocHead.MODIFY;
+
+      IF ExfDocHead.HASLINKS THEN BEGIN
+        ExfDocHead.COPYLINKS(ExFlowPurchDocHeader);
+        RecRef.GETTABLE(ExfDocHead);
+        RecordLink.SETRANGE("Record ID", RecRef.RECORDID);
+        RecordLink.MODIFYALL(Company,''); // Ex Doc is non-company specific
+      END;
+
+      ExDocHead2.RESET;
+      ExDocHead2.SETCURRENTKEY("Document No.");
+      ExDocHead2.SETRANGE("Company Name", ExfDocHead."Company Name");
+      ExDocHead2.SETRANGE("Document Type", ExfDocHead."Document Type");
+      ExDocHead2.SETRANGE("Document No.", ExfDocHead."Document No.");
+      IF ExDocHead2.FINDFIRST THEN BEGIN
+        ExDocHead2."Image Name" := ExfDocHead."Image Name";
+        ExDocHead2."Import Document No." := ExFlowPurchDocHeader."Import Document No.";
+
+        IF ExfImpPurchImpHead.GET(ExFlowPurchDocHeader."Import Document No.") THEN BEGIN
+          ExDocHead2."XML File Name" := ExfImpPurchImpHead."XML File Name";
+          ExfDocHead."Batch No." := ExfImpPurchImpHead."Batch No.";
+        END;
+
+        ExDocHead2."Vendor Document No. 2" := ExFlowPurchDocHeader."Vendor Document No. 2";
+        ExDocHead2.MODIFY;
+      END;
+    END;
+
+    PROCEDURE CreateExfDocLine@1100285005(PurchLine@1100285000 : Record 39);
+    VAR
+      ExFlow@1100285001 : Codeunit 12013601;
+    BEGIN
+      ExFlow.CreateDocumentLine(PurchLine,FALSE,FALSE);
+    END;
+
+    PROCEDURE AutoApprove@1100285017(VAR DocHead@1100285000 : Record 12013608);
+    VAR
+      DocLine@1100285001 : Record 12013609;
+      DocLineApp@1100285002 : Record 12013610;
+      PurchLine@1100285004 : Record 39;
+      ExFlowSetup@1100285005 : Record 12013601;
+      UpdatePurchLine@1100285003 : Codeunit 12013609;
+    BEGIN
+      PurchLine.RESET;
+      PurchLine.SETRANGE("Document Type",DocHead."Document Type");
+      PurchLine.SETRANGE("Document No.",DocHead."Document No.");
+      PurchLine.SETRANGE(History,TRUE);
+      PurchLine.SETRANGE(Approve,TRUE);
+      IF NOT PurchLine.FIND('-') THEN
+        EXIT;
+
+      PurchLine.SETRANGE(History,FALSE);
+      IF NOT PurchLine.FIND('-') THEN
+        BEGIN
+          UpdatePurchLine.SetStatusReadyForPosting(DocHead,FALSE);
+        END;
+
+      ExFlowSetup.GET(COMPANYNAME,0);
+
+      PurchLine.SETRANGE(History,TRUE);
+      IF PurchLine.FINDSET THEN
+        REPEAT
+          DocLine.RetrieveRecord(DocLine,COMPANYNAME,PurchLine."Document Type",PurchLine."Document No.",PurchLine."Line No.");
+          DocLine.Flowstatus := DocLine.Flowstatus::Approved;
+          DocLine.MODIFY(FALSE);
+
+          DocLineApp.RESET;
+          DocLineApp.SETCURRENTKEY("Document Line ID");
+          DocLineApp.SETRANGE("Document Line ID", DocLine.ID);
+          IF DocLineApp.FINDSET(TRUE) THEN
+            REPEAT
+              DocLineApp.Flowstatus := DocLineApp.Flowstatus::Approved;
+              DocLineApp."Approval Date" := CREATEDATETIME(WORKDATE,TIME);
+              //348867
+              IF ExFlowSetup."Auto Approval User" <> '' THEN
+                DocLineApp."Approved By" := ExFlowSetup."Auto Approval User"
+              ELSE
+              //348867
+                DocLineApp."Approved By" := USERID;
+              DocLineApp.Comment := EXF003;
+              DocLineApp."Auto Approved" := TRUE;
+              DocLineApp.MODIFY(FALSE);
+            UNTIL DocLineApp.NEXT = 0;
+        UNTIL PurchLine.NEXT = 0;
+    END;
+
+    PROCEDURE SaveImageToFileSys@1100285000(BlobNo@1100285000 : Integer;PurchHead@1100285004 : Record 38;ExfPurchDocHead@1100285007 : Record 12013587;VAR NewImageName@1100285009 : Text[250]);
+    VAR
+      ExfBlob@1100285001 : Record 12013591;
+      ExPurchHeaderArchive@1100285010 : Record 12013650;
+      ExflowFileMgt@1100285002 : Codeunit 12013602;
+      Folder@1100285005 : Text[170];
+      SubFolder@1100285003 : Text[30];
+      ImageName@1100285006 : Text[240];
+      OriginalFileName@1100285008 : Text[1024];
+    BEGIN
+      ExFlowSetup.GET(COMPANYNAME,0);
+      ExFlowSetup.TESTFIELD("Path to Used Invoices");
+      IF ExfBlob.GET(BlobNo) THEN BEGIN
+        Folder := ExFlowSetup."Path to Used Invoices";
+        SubFolder := DayMap(WORKDATE);
+        IF NOT ExflowFileMgt.FolderExist(Folder + SubFolder) THEN
+          ExflowFileMgt.NewFolder(Folder + SubFolder,Folder);
+
+        OriginalFileName := ExflowFileMgt.Path(ExfPurchDocHead."Image File Name");
+        IF OriginalFileName <> '' THEN
+          OriginalFileName := COPYSTR(ExfPurchDocHead."Image File Name", STRLEN(OriginalFileName) + 1);
+
+        OriginalFileName := DELSTR(OriginalFileName,STRLEN(OriginalFileName) - STRLEN(ExfBlob."File Extension"));
+
+        ImageName := COPYSTR(DELCHR(PurchHead."Pay-to Vendor No." + '-' + PurchHead."No." + '-' + OriginalFileName,'=','@$%&<>/?'),1,
+                     MAXSTRLEN(ImageName)-STRLEN(ExfBlob."File Extension"));
+
+        ImageName := ImageName + '.' + ExfBlob."File Extension";
+
+        NewImageName := SubFolder + ImageName;
+
+        ExfBlob.ExportBLOB(Folder + SubFolder + ImageName,FALSE);
+        ExfBlob.DELETE;
+
+        IF ExFlowSetup."Path to Image Copy" <> '' THEN BEGIN
+          IF ExflowFileMgt.FileExist(ExFlowSetup."Path to Image Copy",OriginalFileName + '.' + ExfBlob."File Extension") THEN
+            ExflowFileMgt.Delete(ExFlowSetup."Path to Image Copy",OriginalFileName + '.' + ExfBlob."File Extension");
+        END;
+
+        IF ExPurchHeaderArchive.GET(ExfPurchDocHead."Import Document No.") THEN BEGIN
+          IF ExPurchHeaderArchive."XML File".HASVALUE THEN BEGIN
+            OriginalFileName := ExflowFileMgt.Path(ExPurchHeaderArchive."XML File Name");
+            IF OriginalFileName <> '' THEN
+              OriginalFileName := COPYSTR(ExPurchHeaderArchive."XML File Name", STRLEN(OriginalFileName) + 1);
+
+            ImageName := COPYSTR(DELCHR(PurchHead."Pay-to Vendor No." + '-' + PurchHead."No." + '-' + OriginalFileName,'=','@$%&<>/?'),1
+      ,
+                         MAXSTRLEN(ImageName)-STRLEN(ExPurchHeaderArchive."XML File Extension"));
+
+            ExPurchHeaderArchive.ExportBLOB(Folder + SubFolder + ImageName,FALSE);
+            ExPurchHeaderArchive."XML File Name" := SubFolder + ImageName;
+            CLEAR(ExPurchHeaderArchive."XML File");
+            ExPurchHeaderArchive.MODIFY;
+          END;
+        END;
+      END;
+    END;
+
+    PROCEDURE RestoreImageToFileSys@1100285001(ExfPurchDocHead@1100285004 : Record 12013587;pRestore@1100285000 : Boolean);
+    VAR
+      ExfBlob@1100285001 : Record 12013591;
+      ExImportManager@1100285005 : Codeunit 12013604;
+      TempFileName@1100285003 : Text[1024];
+      TempTime@1100285006 : Integer;
+    BEGIN
+      IF pRestore THEN BEGIN
+        IF ExfBlob.GET(ExfPurchDocHead."Image Buffer ID") THEN BEGIN
+          ExImportManager.TransformInteger(FORMAT(ExfPurchDocHead."Time Created"),TempTime);
+          TempFileName := FORMAT(TempTime) + '_' + ExfPurchDocHead."Image File Name";
+          ExfBlob.ExportBLOB(TempFileName,FALSE);
+          ExfBlob.DELETE;
+        END;
+      END ELSE BEGIN
+        IF ExfBlob.GET(ExfPurchDocHead."Image Buffer ID") THEN BEGIN
+          ExfBlob.DELETE;
+        END;
+      END;
+    END;
+
+    PROCEDURE SetRestoreImageToFileSys@1100285007(pRestoreImage@1100285000 : Integer);
+    BEGIN
+      RestoreImage := pRestoreImage;
+    END;
+
+    PROCEDURE GetRestoreImageToFileSys@1100285008(VAR vRestoreImage@1100285000 : Integer);
+    BEGIN
+      vRestoreImage := RestoreImage;
+    END;
+
+    PROCEDURE DayMap@1000000018(InDate@1000000000 : Date) : Text[128];
+    VAR
+      Year@1000000003 : Integer;
+      Week@1000000009 : Integer;
+      Temp@1000000008 : Text[30];
+      TxtYear@1000000011 : Text[4];
+      TxtWeek@1000000012 : Text[2];
+    BEGIN
+      Week := DATE2DWY(InDate, 2);
+      Year := DATE2DWY(InDate, 3);
+      TxtYear := FORMAT(Year);
+
+      IF STRLEN(TxtYear) = 2 THEN
+        TxtYear := '20' + TxtYear;
+
+      TxtWeek := FORMAT(Week);
+
+      IF STRLEN(TxtWeek) = 1 THEN
+        TxtWeek := '0' + TxtWeek;
+
+      Temp := TxtYear + '\' + TxtWeek + '\';
+      EXIT(Temp);
+    END;
+
+    PROCEDURE PrePostUpdateApprovers@1100285010(recExfPurchDocHEad@1100285000 : Record 12013587);
+    VAR
+      ExfPurchDocLine@1100285001 : Record 12013588;
+      Proposals@1100285003 : Record 12013615;
+      ManuallyChangedExists@1100285002 : Boolean;
+    BEGIN
+      ExfPurchDocLine.RESET;
+      ExfPurchDocLine.SETRANGE("Inbound Document No.",recExfPurchDocHEad."Inbound Document No.");
+      IF ExfPurchDocLine.FINDSET(TRUE) THEN BEGIN
+        ManuallyChangedExists := ProposalChangedByUser(ExfPurchDocLine,FALSE);
+
+        UseBuffer := NOT ManuallyChangedExists;
+
+        TempProposalsBuffer.RESET;
+        TempProposalsBuffer.DELETEALL;
+
+        REPEAT
+          CreateProposals(ExfPurchDocLine,FALSE,FALSE,ManuallyChangedExists,NOT UseBuffer);
+        UNTIL ExfPurchDocLine.NEXT = 0;
+
+        IF UseBuffer THEN BEGIN
+          Proposals.RESET;
+          Proposals.LOCKTABLE;
+          Proposals.SETRANGE("Entry No.", ExfPurchDocLine."Inbound Document No.");
+          Proposals.DELETEALL;
+
+          TempProposalsBuffer.RESET;
+          IF TempProposalsBuffer.FINDSET THEN
+            REPEAT
+              Proposals.INIT;
+              Proposals.TRANSFERFIELDS(TempProposalsBuffer);
+              Proposals.INSERT;
+            UNTIL TempProposalsBuffer.NEXT = 0;
+        END;
+
+        UseBuffer := FALSE;
+      END;
+    END;
+
+    PROCEDURE PurchPriceOK@1100285014(ExfPurchDocLine@1100285009 : Record 12013588) : Boolean;
+    VAR
+      AppSetup@1100285001 : Record 12013601;
+      ExfPurchDocHead@1100285000 : Record 12013587;
+      ExfPurchDocLine2@1100285002 : Record 12013588;
+      OrderAmt@1100285003 : Decimal;
+      LineDiff@1100285007 : Decimal;
+      LineDiffPrc@1100285008 : Decimal;
+      TotAmt@1100285004 : Decimal;
+      ExFlowVend@1100285005 : Record 12013595;
+    BEGIN
+      AppSetup.GET(COMPANYNAME,0);
+      WITH ExfPurchDocLine DO BEGIN
+        IF "Exflow-Created Entry" = "Exflow-Created Entry"::DiffLine THEN BEGIN
+          ExfPurchDocLine2.RESET;
+          ExfPurchDocLine2.SETCURRENTKEY("Exflow-Created Entry");
+          ExfPurchDocLine2.SETRANGE("Inbound Document No.", "Inbound Document No.");
+          ExfPurchDocLine2.SETRANGE("Exflow-Created Entry", ExfPurchDocLine2."Exflow-Created Entry"::DiffLine);
+          ExfPurchDocLine2.CALCSUMS(Amount);
+          TotAmt := Amount;
+
+          IF ExFlowVend.GET(ExfPurchDocLine."Buy-from Vendor No.") THEN
+            IF ExFlowVend."Specific Diff Setting" THEN BEGIN
+              AppSetup."Max Diff. Amt" := ExFlowVend."Max Diff. Amt";
+              AppSetup."Max Diff. %" := ExFlowVend."Max Diff. %";
+            END;
+
+          IF AppSetup."Max Diff. Amt" < ABS(TotAmt) THEN
+            EXIT(FALSE);
+
+          ExfPurchDocHead.GET(ExfPurchDocLine."Inbound Document No.");
+
+          LineDiffPrc := ABS(TotAmt / ExfPurchDocHead."Document Amount") * 100;
+          IF AppSetup."Max Diff. %" < LineDiffPrc THEN
+            EXIT(FALSE);
+
+          EXIT(TRUE);
+        END
+        ELSE BEGIN
+          IF (AppSetup."Order Applies-to" = AppSetup."Order Applies-to"::"Order not used") OR ("Order No." = '') THEN
+            EXIT(TRUE);
+
+          OrderAmt :=  "Direct Unit Cost (Order)" * Quantity * ((100 - "Line Discount % (Order)")/100);
+          LineDiff := ROUND(ABS("Line Amount"-OrderAmt),0.01);
+
+          IF LineDiff = 0 THEN
+            EXIT(TRUE);
+
+          IF ("Line Amount") <> 0 THEN
+            LineDiffPrc := ROUND(((LineDiff * 100)/"Line Amount"),0.01);
+
+          IF ExFlowVend.GET(ExfPurchDocLine."Buy-from Vendor No.") THEN
+            IF ExFlowVend."Specific Line Diff Setting" THEN BEGIN
+              AppSetup."In LCY" := ExFlowVend."In LCY";
+              AppSetup."In Discount" := ExFlowVend."In Discount";
+            END;
+
+          IF LineDiff > AppSetup."In LCY" THEN
+              EXIT(FALSE);
+          IF LineDiffPrc >  AppSetup."In Discount" THEN
+            EXIT(FALSE);
+
+          EXIT(TRUE);
+        END;
+      END;
+    END;
+
+    PROCEDURE ContractPriceOK@1100285026(ExfPurchDocLine@1100285009 : Record 12013588) : Boolean;
+    VAR
+      AppSetup@1100285001 : Record 12013601;
+      ExContract@1100285000 : Record 12013633;
+      ExfPurchDocHeader@1100285004 : Record 12013587;
+      ExfPurchDocLine2@1100285002 : Record 12013588;
+      PurchHeader@1100285005 : Record 38;
+      PurchLine@1100285003 : Record 39;
+      CurrExchRate@1100285007 : Record 330;
+      MatchedAmount@1100285006 : Decimal;
+    BEGIN
+      AppSetup.GET(COMPANYNAME,0);
+      WITH ExfPurchDocLine DO BEGIN
+        IF ("Contract No." = 0) THEN
+          EXIT(TRUE);
+
+        ExContract.GET("Contract No.");
+        IF NOT ExContract."Auto Approve" THEN
+          EXIT(FALSE);
+
+        ExContract.CALCFIELDS("Posted Amount");
+        MatchedAmount := ExContract."Posted Amount";
+
+        ExfPurchDocLine2.RESET;
+        ExfPurchDocLine2.SETCURRENTKEY("Contract No.");
+        ExfPurchDocLine2.SETRANGE("Contract No.", "Contract No.");
+        IF ExfPurchDocLine2.FINDSET THEN
+          REPEAT
+            IF ExfPurchDocLine2."Currency Code" <> '' THEN BEGIN
+              IF ExfPurchDocHeader."Inbound Document No." <> ExfPurchDocLine2."Inbound Document No." THEN
+                ExfPurchDocHeader.GET(ExfPurchDocLine2."Inbound Document No.");
+
+                ExfPurchDocLine2."Line Amount" := CurrExchRate.ExchangeAmtFCYToLCY(0,ExfPurchDocHeader."Job No.", // 4PS
+                ExfPurchDocHeader."Posting Date",ExfPurchDocLine2."Currency Code",
+                ExfPurchDocLine2."Line Amount",ExfPurchDocHeader."Currency Factor",FALSE); // 4PS
+            END;
+
+            CASE ExfPurchDocLine2."Document Type" OF
+              ExfPurchDocLine2."Document Type"::Invoice: MatchedAmount := MatchedAmount + ExfPurchDocLine2."Line Amount";
+              ExfPurchDocLine2."Document Type"::"Credit Memo": MatchedAmount := MatchedAmount - ExfPurchDocLine2."Line Amount";
+            END;
+          UNTIL ExfPurchDocLine2.NEXT = 0;
+
+        PurchLine.RESET;
+        PurchLine.SETCURRENTKEY("Contract No.");
+        PurchLine.SETFILTER("Document Type",'%1|%2',PurchLine."Document Type"::Invoice,PurchLine."Document Type"::"Credit Memo");
+        PurchLine.SETRANGE("Contract No.", "Contract No.");
+        IF PurchLine.FINDSET THEN
+          REPEAT
+            IF PurchLine."Currency Code" <> '' THEN BEGIN
+              PurchHeader.GET(PurchLine."Document Type",PurchLine."Document No.");
+
+              PurchLine."Line Amount" := CurrExchRate.ExchangeAmtFCYToLCY(0,PurchHeader."Job No.", // 4PS
+                PurchHeader."Posting Date",PurchHeader."Currency Code",
+                PurchLine."Line Amount",PurchHeader."Currency Factor",FALSE); // 4PS
+            END;
+
+            CASE PurchLine."Document Type" OF
+              PurchLine."Document Type"::Invoice: MatchedAmount := MatchedAmount + PurchLine."Line Amount";
+              PurchLine."Document Type"::"Credit Memo": MatchedAmount := MatchedAmount - PurchLine."Line Amount";
+            END;
+          UNTIL PurchLine.NEXT = 0;
+
+        IF ExContract."Contract Amount (LCY)" >= MatchedAmount THEN
+          EXIT(TRUE)
+        ELSE
+          EXIT(FALSE);
+      END;
+    END;
+
+    PROCEDURE AutoApproveMiscCharges@1100285011(ExfPurchDocHead@1100285002 : Record 12013587) : Integer;
+    VAR
+      ExfPurchDocLine@1100285001 : Record 12013588;
+      CurrExchRate@1100285003 : Record 330;
+      ExFlowVend@1100285004 : Record 12013595;
+      MiscAmt@1100285000 : Decimal;
+      MaxMiscAmt@1100285005 : Decimal;
+    BEGIN
+      ExFlowSetup.GET(COMPANYNAME,0);
+      IF NOT ExFlowVend.GET(ExfPurchDocHead."Buy-from Vendor No.") THEN
+        CLEAR(ExFlowVend);
+
+      IF ExFlowVend."Specific Max Misc. Setting" THEN
+        MaxMiscAmt := ExFlowVend."Max Misc. Charges (LCY)"
+      ELSE
+        MaxMiscAmt := ExFlowSetup."Max Misc. Charges (LCY)";
+
+      IF MaxMiscAmt = 0 THEN
+        EXIT(0);
+
+      // Returns true if Doc is Connected to order with misc chages < allowed setting
+      ExfPurchDocLine.RESET;
+      ExfPurchDocLine.SETCURRENTKEY("Order No.");
+      ExfPurchDocLine.SETRANGE("Inbound Document No.",ExfPurchDocHead."Inbound Document No.");
+      ExfPurchDocLine.SETFILTER("Order No.",'<>%1','');
+
+      // Not connected to order
+      IF ExfPurchDocLine.ISEMPTY THEN
+        EXIT(0);
+
+      // Calc misc Charges
+      MiscAmt := 0;
+      ExfPurchDocLine.SETFILTER("Order No.",'%1','');
+      IF ExfPurchDocLine.FINDSET THEN
+        REPEAT
+          MiscAmt := MiscAmt +  ExfPurchDocLine."Line Amount";
+        UNTIL ExfPurchDocLine.NEXT = 0;
+
+      // Misc Amt to LCY
+      IF ExfPurchDocHead."Currency Code" <> '' THEN
+         MiscAmt := CurrExchRate.ExchangeAmtFCYToLCY(0,ExfPurchDocHead."Job No.", // 4PS
+          ExfPurchDocHead."Posting Date",ExfPurchDocHead."Currency Code",
+          MiscAmt,ExfPurchDocHead."Currency Factor",FALSE); // 4PS
+
+      IF MiscAmt > MaxMiscAmt THEN
+        EXIT(1)
+      ELSE
+        EXIT(2);
+    END;
+
+    PROCEDURE CheckAutoApprovalAmt@1100285012(ExfPurchDocLine@1100285001 : Record 12013588) : Boolean;
+    VAR
+      ExfPurchDocHead@1100285002 : Record 12013587;
+      CurrExchRate@1100285000 : Record 330;
+    BEGIN
+      ExFlowSetup.GET(COMPANYNAME,0);
+      IF (ExFlowSetup."Min. Doc. Approval Amt. (LCY)" = 0) AND
+         (ExFlowSetup."Min. Approval Amount (LCY)" = 0) THEN
+        EXIT(FALSE);
+
+      ExfPurchDocHead.GET(ExfPurchDocLine."Inbound Document No.");
+
+      IF NOT ExFlowSetup."Approve VAT lines" THEN BEGIN
+        // Minimum Document Amount
+        //348864
+        IF ExfPurchDocHead."Currency Code" <> '' THEN
+           ExfPurchDocHead."Document Amount" := CurrExchRate.ExchangeAmtFCYToLCY(0,ExfPurchDocHead."Job No.", // 4PS
+            ExfPurchDocHead."Posting Date",ExfPurchDocHead."Currency Code",
+            ExfPurchDocHead."Document Amount",ExfPurchDocHead."Currency Factor",FALSE); // 4PS
+        //348864
+
+        IF ExFlowSetup."Min. Doc. Approval Amt. (LCY)" > ExfPurchDocHead."Document Amount" THEN
+          EXIT(TRUE);
+
+        // Minimum Line Amount
+        //348864
+        IF ExfPurchDocHead."Currency Code" <> '' THEN
+          ExfPurchDocLine."Line Amount" := CurrExchRate.ExchangeAmtFCYToLCY(0,ExfPurchDocHead."Job No.", // 4PS
+            ExfPurchDocHead."Posting Date",ExfPurchDocHead."Currency Code",
+            ExfPurchDocLine."Line Amount",ExfPurchDocHead."Currency Factor",FALSE); // FALSE
+        //348864
+
+        IF ExFlowSetup."Min. Approval Amount (LCY)" > ABS(ExfPurchDocLine."Line Amount") THEN
+          EXIT(TRUE);
+      END
+      ELSE BEGIN
+        // Minimum document amount
+        //348864
+        IF ExfPurchDocHead."Currency Code" <> '' THEN
+          ExfPurchDocHead."Document Amount Including VAT" := CurrExchRate.ExchangeAmtFCYToLCY(0,ExfPurchDocHead."Job No.", // 4PS
+            ExfPurchDocHead."Posting Date",ExfPurchDocHead."Currency Code",
+            ExfPurchDocHead."Document Amount Including VAT",ExfPurchDocHead."Currency Factor",FALSE); // 4PS
+        //348864
+
+        IF ExFlowSetup."Min. Doc. Approval Amt. (LCY)" > ExfPurchDocHead."Document Amount Including VAT" THEN
+          EXIT(TRUE);
+
+        // Minimum Line amount
+        //348864
+        IF ExfPurchDocHead."Currency Code" <> '' THEN
+          ExfPurchDocLine."Amount Including VAT" := CurrExchRate.ExchangeAmtFCYToLCY(0,ExfPurchDocHead."Job No.", // 4PS
+            ExfPurchDocHead."Posting Date",ExfPurchDocHead."Currency Code",
+            ExfPurchDocLine."Amount Including VAT",ExfPurchDocHead."Currency Factor",FALSE); // 4PS
+        //348864
+
+        IF ExFlowSetup."Min. Approval Amount (LCY)" > ABS(ExfPurchDocLine."Amount Including VAT") THEN
+          EXIT(TRUE);
+      END;
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE CheckAutoApprovalOrder@1100285016(ExfPurchDocLine@1100285001 : Record 12013588) : Boolean;
+    VAR
+      ExfPurchDocHead@1100285002 : Record 12013587;
+    BEGIN
+      ExFlowSetup.GET(COMPANYNAME,0);
+
+      ExfPurchDocHead.GET(ExfPurchDocLine."Inbound Document No.");
+
+      // Order Matching
+      IF (ExFlowSetup."Order Applies-to" <> ExFlowSetup."Order Applies-to"::"Order not used") AND
+         (ExFlowSetup."Approval Only on Variation") THEN BEGIN
+
+        // 348820
+        IF ExFlowSetup."Always approval for Cust Inv" THEN
+          IF ExfPurchDocLine."Invoice to Customer" THEN
+            EXIT(FALSE);
+        // 348820
+
+        IF (ExfPurchDocLine."Order No." <> '') THEN
+          EXIT(PurchPriceOK(ExfPurchDocLine))
+        ELSE
+          // 348826
+          IF ExfPurchDocLine."Contract No." <> 0 THEN
+            EXIT(ContractPriceOK(ExfPurchDocLine))
+          ELSE
+          // 348826
+            EXIT(AutoApproveMiscCharges(ExfPurchDocHead) = 2);
+      END;
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE InsertDimFromUser@1100285020(Approver@1100285000 : Code[50];VAR ExPurchDocLine@1100285003 : Record 12013588;ChangedByDimension@1100285001 : Boolean);
+    VAR
+      TempDimNo@1100285002 : Integer;
+      EXUserGroup@1100285005 : Record 12013606;
+    BEGIN
+      IF ChangedByDimension THEN
+        EXIT;
+
+      IF Approver <> '' THEN
+        IF EXUserGroup.GET(COMPANYNAME,Approver) THEN BEGIN
+          IF EXUserGroup."Dimension Value" <> '' THEN BEGIN
+            TempDimNo := EXUserGroup.FindDimension;
+            IF TempDimNo = 1 THEN
+              ExPurchDocLine."Shortcut Dimension 1 Code" := EXUserGroup."Dimension Value";
+            IF TempDimNo = 2 THEN
+              ExPurchDocLine."Shortcut Dimension 2 Code" := EXUserGroup."Dimension Value";
+
+            ExDimMgt.SaveDocDim(ExPurchDocLine,TempDimNo,EXUserGroup."Dimension Value");
+          END;
+        END;
+    END;
+
+    PROCEDURE CopyApprovalFlowFromPO@1100285022(VAR ExfPurchDocLine@1100285000 : Record 12013588;VAR NextLineNo@1100285004 : Integer;PerformDeletion@1100285003 : Boolean) : Boolean;
+    VAR
+      DocLineApp@1100285002 : Record 12013610;
+      Proposals@1100285001 : Record 12013615;
+    BEGIN
+      IF NextLineNo = 0 THEN
+        NextLineNo := 10000;
+
+      IF PerformDeletion THEN BEGIN
+        Proposals.RESET;
+        Proposals.LOCKTABLE;
+        Proposals.SETRANGE("Entry No.", ExfPurchDocLine."Inbound Document No.");
+        Proposals.SETRANGE("Line No." , ExfPurchDocLine."Line No.");
+        Proposals.DELETEALL;
+      END;
+
+      // Check if Approved as Order
+      DocLineApp.RESET;
+      DocLineApp.SETCURRENTKEY("Document No.");
+      DocLineApp.SETRANGE("Company Name", COMPANYNAME);
+      DocLineApp.SETRANGE("Document Type", 1);
+      DocLineApp.SETRANGE("Document No.", ExfPurchDocLine."Order No.");
+      DocLineApp.SETRANGE("Line No.", ExfPurchDocLine."Order Line No.");
+      IF DocLineApp.FINDSET THEN
+        BEGIN
+          InsertDimFromUser(DocLineApp.Approver,ExfPurchDocLine,FALSE);
+
+          REPEAT
+            IF UseBuffer THEN BEGIN
+              TempProposalsBuffer.INIT;
+              TempProposalsBuffer."Entry No." := ExfPurchDocLine."Inbound Document No.";
+              TempProposalsBuffer."Line No." := ExfPurchDocLine."Line No.";
+              TempProposalsBuffer."Approver Order" := NextLineNo;
+              TempProposalsBuffer.VALIDATE(Approver, DocLineApp.Approver);
+              TempProposalsBuffer."Copied from Purchase Order" := TRUE;
+              TempProposalsBuffer.INSERT;
+            END
+            ELSE BEGIN
+              Proposals.INIT;
+              Proposals."Entry No." := ExfPurchDocLine."Inbound Document No.";
+              Proposals."Line No." := ExfPurchDocLine."Line No.";
+              Proposals."Approver Order" := NextLineNo;
+              Proposals.VALIDATE(Approver, DocLineApp.Approver);
+              Proposals."Copied from Purchase Order" := TRUE;
+              Proposals.INSERT;
+            END;
+
+            NextLineNo := NextLineNo + 10000;
+          UNTIL DocLineApp.NEXT = 0;
+
+         EXIT(TRUE);
+      END;
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE UpdateMatchedOrderInfo@1100285023(VAR ExfPurchDocLine@1100285000 : Record 12013588);
+    VAR
+      PurchOrderLine@1100285001 : Record 39;
+      PurchOrderHeader@1100285004 : Record 38;
+      ExFPurchHeader@1100285005 : Record 12013587;
+      CurrExchRate@1100285006 : Record 330;
+      ExDoc@1100285003 : Record 12013608;
+      TempDocType@1100285002 : Integer;
+    BEGIN
+      ExFlowSetup.GET(COMPANYNAME,0);
+
+      IF (ExfPurchDocLine."Order No." = '') OR (ExfPurchDocLine."Order Line No." = 0) THEN
+        EXIT;
+
+      CASE ExfPurchDocLine."Document Type" OF
+        ExfPurchDocLine."Document Type"::Invoice: TempDocType := PurchOrderLine."Document Type"::Order;
+        ExfPurchDocLine."Document Type"::"Credit Memo": TempDocType := PurchOrderLine."Document Type"::"Return Order";
+      END;
+
+      IF NOT PurchOrderLine.GET(TempDocType,ExfPurchDocLine."Order No.",ExfPurchDocLine."Order Line No.") THEN
+        EXIT;
+
+      ExfPurchDocLine."Quantity Received (Order)" := PurchOrderLine."Quantity Received";
+      ExfPurchDocLine."Quantity Invoiced (Order)" := PurchOrderLine."Quantity Invoiced";
+      ExfPurchDocLine."Line Discount % (Order)" := PurchOrderLine."Line Discount %";
+      ExfPurchDocLine."Potential UOM Mismatch" := (ExfPurchDocLine."Quantity Received (Order)" -
+                                                   ExfPurchDocLine."Quantity Invoiced (Order)")
+                                                   <> ExfPurchDocLine.Quantity;
+
+      //348830
+      IF PurchOrderLine."Currency Code" <> ExfPurchDocLine."Currency Code" THEN BEGIN
+        IF PurchOrderLine."Currency Code" <> '' THEN BEGIN
+          IF (PurchOrderHeader."Document Type" <> PurchOrderLine."Document Type") OR
+             (PurchOrderHeader."No." <> PurchOrderLine."Document No.") THEN
+            PurchOrderHeader.GET(PurchOrderLine."Document Type",PurchOrderLine."Document No.");
+
+          PurchOrderLine."Direct Unit Cost" := CurrExchRate.ExchangeAmtFCYToLCY(0,PurchOrderHeader."Job No.", // 4PS
+            PurchOrderHeader."Posting Date",PurchOrderLine."Currency Code",
+            PurchOrderLine."Direct Unit Cost",PurchOrderHeader."Currency Factor",FALSE); // 4PS
+        END;
+
+        IF ExfPurchDocLine."Currency Code" <> '' THEN BEGIN
+          IF ExFPurchHeader."Inbound Document No." <> ExfPurchDocLine."Inbound Document No." THEN
+            ExFPurchHeader.GET(ExfPurchDocLine."Inbound Document No.");
+
+          PurchOrderLine."Direct Unit Cost" := CurrExchRate.ExchangeAmtLCYToFCY(0,ExFPurchHeader."Job No.", // 4PS
+            ExFPurchHeader."Posting Date",ExFPurchHeader."Currency Code",
+            PurchOrderLine."Direct Unit Cost",ExFPurchHeader."Currency Factor",FALSE); // 4PS
+        END;
+      END;
+
+      ExfPurchDocLine."Direct Unit Cost (Order)" := PurchOrderLine."Direct Unit Cost";
+      //348830
+
+      //348880
+      IF PurchOrderLine.Approve AND (ExfPurchDocLine."First Approver" = '') THEN BEGIN
+        IF (ExDoc."Document Type" <> PurchOrderLine."Document Type") OR
+           (ExDoc."Document No." <> PurchOrderLine."Document No.") THEN BEGIN
+          IF ExDoc.RetrieveRecord(ExDoc,COMPANYNAME,PurchOrderLine."Document Type",PurchOrderLine."Document No.") THEN
+            ExfPurchDocLine."First Approver" := ExDoc."Created By";
+        END
+        ELSE
+          ExfPurchDocLine."First Approver" := ExDoc."Created By";
+      END;
+      //348880
+    END;
+
+    PROCEDURE RestoreDeletedPDFandXML@1100285024(ExfPurchDocHead@1100285000 : Record 12013587);
+    VAR
+      ExFBlob@1100285001 : Record 12013591;
+      ExJnlBatch@1100285008 : Record 12013590;
+      ExFlowSetup@1100285009 : Record 12013601;
+      ExfImpPurchArchHead@1100285010 : Record 12013650;
+      ExFlowFileMgt@1100285003 : Codeunit 12013602;
+      ExFlow@1100285007 : Codeunit 12013601;
+      ExImportManager@1100285012 : Codeunit 12013604;
+      TempPath@1100285004 : Text[1024];
+      TempFileName@1100285005 : Text[1024];
+      ToPath@1100285006 : Text[1024];
+      ToMap@1100285002 : Text[30];
+      RootPath@1100285011 : Text[1024];
+      TempTime@1100285013 : Integer;
+    BEGIN
+      WITH ExfPurchDocHead DO BEGIN
+        ExFlowSetup.GET(COMPANYNAME,0);
+        ToMap := ExFlow.DayMap(WORKDATE);
+
+        IF ExFBlob.GET(ExfPurchDocHead."Image Buffer ID") THEN BEGIN
+          ToPath := ExFlowFileMgt.Path("Image File Name");
+          RootPath := ToPath;
+          TempFileName := COPYSTR("Image File Name",STRLEN(ToPath)+1);
+          ExImportManager.TransformInteger(FORMAT(ExfPurchDocHead."Time Created"),TempTime);
+          TempFileName := FORMAT(TempTime) + '_' + TempFileName;
+
+          ToPath := ToPath + DeletedPath + '\';
+          ToPath := ToPath + ToMap;
+
+          IF NOT ExFlowFileMgt.FolderExist(ToPath) THEN
+            ExFlowFileMgt.NewFolder(ToPath,RootPath);
+
+          ExFBlob.ExportBLOB(ToPath+TempFileName,FALSE);
+        END;
+        IF ExfImpPurchArchHead.GET(ExfPurchDocHead."Import Document No.") THEN
+          IF ExfImpPurchArchHead."XML File Name" <> '' THEN BEGIN
+            IF ExfImpPurchArchHead."XML File".HASVALUE THEN BEGIN
+              TempPath := ExFlowFileMgt.Path(ExfImpPurchArchHead."XML File Name");
+              TempFileName := COPYSTR(ExfImpPurchArchHead."XML File Name",STRLEN(TempPath)+1);
+              TempPath := ExFlowSetup."Path to Used Invoices" + TempPath;
+
+              ToPath := ExFlowFileMgt.Path("Image File Name");
+
+              IF ToPath = '' THEN BEGIN
+                ExJnlBatch.GET(ExfPurchDocHead."Journal Template Name",ExfPurchDocHead."Journal Batch Name");
+                IF ExJnlBatch."OCR Import Folder" <> '' THEN
+                  ToPath := ExJnlBatch."OCR Import Folder"
+                ELSE
+                  ToPath := ExFlowSetup."Path to New OCR-files";
+              END;
+
+              RootPath := ToPath;
+              ToPath := ToPath + DeletedPath + '\';
+              ToPath := ToPath + ToMap;
+
+              ExfImpPurchArchHead.ExportBLOB(ToPath+TempFileName,FALSE);
+            END;
+          END;
+
+        //344706
+        IF (ExfPurchDocHead."Image File Name" <> '') AND (ExFlowSetup."Path to Image Copy" <> '') THEN BEGIN
+          TempFileName := ExFlowFileMgt.Path(ExfPurchDocHead."Image File Name");
+          //344741
+          IF ExFBlob."No." <> 0 THEN BEGIN
+            IF TempFileName <> '' THEN
+              TempFileName := COPYSTR(ExfPurchDocHead."Image File Name", STRLEN(TempFileName) + 1);
+            TempFileName := DELSTR(TempFileName,STRLEN(TempFileName) - STRLEN(ExFBlob."File Extension"));
+          END;
+
+          IF ExFlowFileMgt.FileExist(ExFlowSetup."Path to Image Copy",TempFileName + '.' + ExFBlob."File Extension") THEN
+            ExFlowFileMgt.Delete(ExFlowSetup."Path to Image Copy",TempFileName + '.' + ExFBlob."File Extension");
+        END;
+        //344706
+      END;
+    END;
+
+    PROCEDURE TransformDateToText@1100285004(InDate@1100285000 : Date) OutDateTxt : Text[30];
+    VAR
+      YYYY@1100285001 : Text[30];
+      MM@1100285002 : Text[30];
+      DD@1100285003 : Text[30];
+    BEGIN
+      YYYY := FORMAT(DATE2DMY(InDate,3));
+      IF STRLEN(YYYY) = 2 THEN
+        YYYY := '20' + YYYY;
+
+      MM := FORMAT(DATE2DMY(InDate,2));
+      IF STRLEN(MM) = 1 THEN
+        MM := '0' + MM;
+
+      DD := FORMAT(DATE2DMY(InDate,1));
+      IF STRLEN(DD) = 1 THEN
+        DD := '0' + DD;
+
+      OutDateTxt := YYYY+MM+DD;
+    END;
+
+    PROCEDURE CheckAutoApprovalOrderAppr@1100285025(ExfPurchDocLine@1100285000 : Record 12013588) : Boolean;
+    VAR
+      ExDocLine@1100285001 : Record 12013609;
+      PurchLine@1100285002 : Record 39;
+      ExFlowVend@1100285003 : Record 12013595;
+      PurchHeader@1100285007 : Record 38;
+      ExFImpHeader@1100285008 : Record 12013587;
+      POAmountLCY@1100285004 : Decimal;
+      InvLineAmountLCY@1100285006 : Decimal;
+      TempPrice@1100285009 : Decimal;
+      CurrExchRate@1100285005 : Record 330;
+    BEGIN
+      // Function that allows an invoice to be approved if the order it is connected to was approved
+
+      IF ExfPurchDocLine."Order Line No." = 0 THEN
+        EXIT(FALSE);
+
+      WITH ExfPurchDocLine DO BEGIN
+        ExDocLine.RESET;
+        ExDocLine.SETCURRENTKEY("Document No.");
+        ExDocLine.SETRANGE("Company Name", COMPANYNAME);
+        ExDocLine.SETRANGE("Document Type", ExDocLine."Document Type"::Order);
+        ExDocLine.SETRANGE("Document No.", "Order No.");
+        ExDocLine.SETRANGE("Line No.", "Order Line No.");
+        ExDocLine.SETRANGE(Flowstatus, ExDocLine.Flowstatus::Approved);
+        IF ExDocLine.FINDFIRST THEN BEGIN
+          PurchLine.GET(PurchLine."Document Type"::Order,"Order No.","Order Line No.");
+
+          ExFlowSetup.GET(COMPANYNAME,0);
+
+          POAmountLCY := PurchLine."PO Approved Amount";
+          IF PurchLine."Currency Code" <> '' THEN BEGIN
+            PurchHeader.GET(PurchLine."Document Type",PurchLine."Document No.");
+            IF PurchHeader."Currency Factor" = 0 THEN
+              PurchHeader."Currency Factor" := 1;
+
+            POAmountLCY :=
+                CurrExchRate.ExchangeAmtFCYToLCY(0,PurchHeader."Job No.", // 4PS
+                  PurchHeader."Posting Date",PurchLine."Currency Code",
+                  POAmountLCY,PurchHeader."Currency Factor",FALSE); // 4PS
+          END;
+
+          InvLineAmountLCY := ExfPurchDocLine."Line Amount";
+          IF ExfPurchDocLine."Currency Code" <> '' THEN BEGIN
+            ExFImpHeader.GET(ExfPurchDocLine."Inbound Document No.");
+            IF ExFImpHeader."Currency Factor" = 0 THEN
+              ExFImpHeader."Currency Factor" := 1;
+
+            InvLineAmountLCY :=
+                CurrExchRate.ExchangeAmtFCYToLCY(0,ExFImpHeader."Job No.", // 4PS
+                  ExFImpHeader."Posting Date",ExfPurchDocLine."Currency Code",
+                  InvLineAmountLCY,ExFImpHeader."Currency Factor",FALSE); // 4PS
+          END;
+
+          TempPrice := POAmountLCY * (1 + ExFlowSetup."In Discount" / 100);
+          IF TempPrice > (POAmountLCY + ExFlowSetup."In LCY") THEN
+            TempPrice := POAmountLCY + ExFlowSetup."In LCY";
+
+          IF ExFlowVend.GET(ExfPurchDocLine."Buy-from Vendor No.") THEN
+            IF ExFlowVend."Specific Line Diff Setting" THEN BEGIN
+              TempPrice := POAmountLCY * (1 + ExFlowVend."In Discount" / 100);
+              IF TempPrice > (POAmountLCY + ExFlowVend."In LCY") THEN
+                TempPrice := POAmountLCY + ExFlowVend."In LCY";
+            END;
+
+          IF TempPrice < InvLineAmountLCY THEN
+            EXIT(FALSE)
+          ELSE
+            EXIT(TRUE);
+        END
+        ELSE
+          EXIT(FALSE);
+      END;
+    END;
+
+    PROCEDURE HeaderLineDiffExists@1100285006(ExfPurchDocHead@1100285001 : Record 12013587;ToleranceAmt@1100285002 : Decimal) : Boolean;
+    VAR
+      ExfPurchDocLine@1100285000 : Record 12013588;
+      TotLineAmount@1100285003 : Decimal;
+      MaxValue@1100285004 : Decimal;
+      MinValue@1100285005 : Decimal;
+    BEGIN
+      // 348807
+      TotLineAmount := 0;
+      ExfPurchDocLine.RESET;
+      ExfPurchDocLine.SETRANGE("Inbound Document No.", ExfPurchDocHead."Inbound Document No.");
+      ExfPurchDocLine.CALCSUMS("Line Amount");
+      TotLineAmount := ExfPurchDocLine."Line Amount";
+
+      MaxValue := ExfPurchDocHead."Document Amount" + ToleranceAmt;
+      MinValue := ExfPurchDocHead."Document Amount" - ToleranceAmt;
+
+      IF (TotLineAmount >= MinValue) AND (TotLineAmount <= MaxValue) THEN
+        EXIT(FALSE)
+      ELSE
+        EXIT(TRUE);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

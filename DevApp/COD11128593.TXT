@@ -1,0 +1,334 @@
+OBJECT Codeunit 11128593 Match FIK Bank Rec. Lines
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVDK8.00 (13653);
+  }
+  PROPERTIES
+  {
+    TableNo=273;
+    OnRun=VAR
+            TempBankAccReconciliation@1000 : TEMPORARY Record 273;
+          BEGIN
+            TempBankAccReconciliation.COPY(Rec);
+            Code(TempBankAccReconciliation);
+            Rec := TempBankAccReconciliation;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      MatchSummaryMsg@1060020 : TextConst 'ENU=%1 payment lines out of %2 have been applied.\\';
+      ProgressBarMsg@1060022 : TextConst 'ENU=Please wait while the operation is being completed.';
+      FIKDescriptionPartialTxt@1060003 : TextConst 'ENU=Partial Amount';
+      FIKDescriptionExtraTxt@1060004 : TextConst 'ENU=Excess Amount';
+      FIKDescriptionDuplicateTxt@1060006 : TextConst 'ENU=Duplicate FIK Number';
+      FIKDescriptionNoMatchTxt@1060001 : TextConst 'ENU=No Matching FIK Number';
+      FIKDescriptionFullMatchTxt@1060007 : TextConst 'ENU=Matching Amount';
+      FIKDescriptionIsPaidTxt@1060008 : TextConst 'ENU=Invoice Already Paid';
+      MatchPartialTxt@1060002 : TextConst 'ENU=%1 payment lines are partially paid.\';
+      MatchExtraTxt@1060005 : TextConst 'ENU=%1 payment lines have excess amounts.\';
+      MatchFullyTxt@1060011 : TextConst 'ENU=%1 payment lines are fully applied.\';
+      MatchDuplicateTxt@1060000 : TextConst 'ENU=%1 payment lines are duplicates.\';
+      MatchIsPaidTxt@1060009 : TextConst 'ENU=%1 payment lines are already paid.\';
+      MatchDetailsTxt@1060010 : TextConst 'ENU=Details:\';
+
+    PROCEDURE Code@1060068(VAR TempBankAccReconciliation@1060002 : TEMPORARY Record 273);
+    VAR
+      TempBankStatementMatchingBuffer@1060001 : TEMPORARY Record 1250;
+      BankAccReconciliationLine@1060004 : Record 274;
+      AppliedPaymentEntry@1060003 : Record 1294;
+      Window@1060000 : Dialog;
+    BEGIN
+      BankAccReconciliationLine.SETRANGE("Statement No.",TempBankAccReconciliation."Statement No.");
+      BankAccReconciliationLine.SETRANGE("Bank Account No.",TempBankAccReconciliation."Bank Account No.");
+      IF BankAccReconciliationLine.ISEMPTY THEN
+        EXIT;
+
+      Window.OPEN(ProgressBarMsg);
+      FindMatchingCustEntries(TempBankStatementMatchingBuffer,BankAccReconciliationLine);
+      UpdateReconciliationLines(BankAccReconciliationLine,TempBankStatementMatchingBuffer);
+      SaveOneToOneMatching(TempBankStatementMatchingBuffer,AppliedPaymentEntry,TempBankAccReconciliation);
+
+      Window.CLOSE;
+      ShowMatchSummary(TempBankStatementMatchingBuffer);
+    END;
+
+    LOCAL PROCEDURE FindMatchingCustEntries@1060000(VAR TempBankStatementMatchingBuffer@1060003 : TEMPORARY Record 1250;VAR BankAccReconciliationLine@1060005 : Record 274);
+    VAR
+      CustLedgerEntry@1060006 : Record 21;
+      MatchStatusValue@1060000 : Option;
+    BEGIN
+      BankAccReconciliationLine.SETFILTER("Payment Reference",'<>%1','');
+
+      IF BankAccReconciliationLine.FINDSET THEN
+        REPEAT
+          CustLedgerEntry.RESET;
+          CustLedgerEntry.SETRANGE("Applies-to ID",'');
+          CustLedgerEntry.SETRANGE("Document No.",BankAccReconciliationLine."Payment Reference");
+          CustLedgerEntry.SETAUTOCALCFIELDS("Remaining Amt. (LCY)");
+          WITH TempBankStatementMatchingBuffer DO
+            IF CustLedgerEntry.FINDFIRST AND
+               (CustLedgerEntry.COUNT = 1) AND (BankAccReconciliationLine."Transaction Date" >= CustLedgerEntry."Posting Date")
+            THEN
+              CASE TRUE OF
+                CustLedgerEntry."Remaining Amt. (LCY)" = 0:
+                  MatchStatusValue := "Match Status"::IsPaid;
+                BankAccReconciliationLine."Statement Amount" > CustLedgerEntry."Remaining Amt. (LCY)":
+                  MatchStatusValue := "Match Status"::Extra;
+                BankAccReconciliationLine."Statement Amount" < CustLedgerEntry."Remaining Amt. (LCY)":
+                  MatchStatusValue := "Match Status"::Partial;
+                BankAccReconciliationLine."Statement Amount" = CustLedgerEntry."Remaining Amt. (LCY)":
+                  MatchStatusValue := "Match Status"::Fully;
+              END
+            ELSE
+              MatchStatusValue := "Match Status"::NoMatch;
+
+          AddMatchCandidate(TempBankStatementMatchingBuffer,BankAccReconciliationLine,CustLedgerEntry,MatchStatusValue);
+        UNTIL BankAccReconciliationLine.NEXT = 0;
+
+      BankAccReconciliationLine.RESET;
+    END;
+
+    LOCAL PROCEDURE AddMatchCandidate@1060008(VAR TempBankStatementMatchingBuffer@1060006 : TEMPORARY Record 1250;VAR BankAccReconciliationLine@1060008 : Record 274;CustLedgerEntry@1060009 : Record 21;MatchOption@1060000 : Option);
+    BEGIN
+      WITH TempBankStatementMatchingBuffer DO
+        CASE TRUE OF
+          MatchOption = "Match Status"::NoMatch:
+            AddMatchCandidateWithDescription(BankAccReconciliationLine."Statement Line No.",0,0,
+              "Account Type"::"G/L Account",'',BankAccReconciliationLine.Description,MatchOption);
+          MatchOption = "Match Status"::IsPaid:
+            AddMatchCandidateWithDescription(BankAccReconciliationLine."Statement Line No.",0,0,
+              "Account Type"::Customer,CustLedgerEntry."Customer No.",BankAccReconciliationLine.Description,MatchOption);
+          IsDuplicate(TempBankStatementMatchingBuffer,BankAccReconciliationLine.Description):
+            AddMatchCandidateWithDescription(BankAccReconciliationLine."Statement Line No.",CustLedgerEntry."Entry No.",50,
+              "Account Type"::Customer,CustLedgerEntry."Customer No.",BankAccReconciliationLine.Description,"Match Status"::Duplicate)
+          ELSE
+            AddMatchCandidateWithDescription(BankAccReconciliationLine."Statement Line No.",CustLedgerEntry."Entry No.",50,
+              "Account Type"::Customer,CustLedgerEntry."Customer No.",BankAccReconciliationLine.Description,MatchOption);
+        END;
+    END;
+
+    LOCAL PROCEDURE IsDuplicate@1060014(VAR TempBankStatementMatchingBuffer@1060002 : TEMPORARY Record 1250;DupDescription@1060001 : Text) : Boolean;
+    BEGIN
+      WITH TempBankStatementMatchingBuffer DO BEGIN
+        RESET;
+        SETFILTER(Description,DupDescription);
+        IF FINDSET THEN BEGIN
+          REPEAT
+            "Match Status" := "Match Status"::Duplicate;
+            MODIFY;
+          UNTIL NEXT = 0;
+          RESET;
+          EXIT(TRUE);
+        END;
+        RESET;
+      END;
+
+      EXIT(FALSE);
+    END;
+
+    LOCAL PROCEDURE ShowMatchSummary@1060009(VAR TempBankStatementMatchingBuffer@1060000 : TEMPORARY Record 1250);
+    VAR
+      FinalText@1060002 : Text;
+      MatchStatisticText@1060004 : Text;
+      TotalCount@1060005 : Integer;
+      MatchedCount@1060006 : Integer;
+      MatchStatistic@1060007 : ARRAY [6] OF Integer;
+    BEGIN
+      WITH TempBankStatementMatchingBuffer DO BEGIN
+        TotalCount := COUNT;
+
+        GetMatchDetails(TempBankStatementMatchingBuffer,MatchStatistic);
+        MatchedCount :=
+          MatchStatistic["Match Status"::Fully] +
+          MatchStatistic["Match Status"::Partial] +
+          MatchStatistic["Match Status"::Extra] +
+          MatchStatistic["Match Status"::Duplicate] +
+          MatchStatistic["Match Status"::IsPaid];
+
+        IF MatchStatistic["Match Status"::Fully] > 0 THEN
+          MatchStatisticText := MatchStatisticText +
+            STRSUBSTNO(MatchFullyTxt,MatchStatistic["Match Status"::Fully]);
+        IF MatchStatistic["Match Status"::Partial] > 0 THEN
+          MatchStatisticText := MatchStatisticText +
+            STRSUBSTNO(MatchPartialTxt,MatchStatistic["Match Status"::Partial]);
+        IF MatchStatistic["Match Status"::Extra] > 0 THEN
+          MatchStatisticText := MatchStatisticText +
+            STRSUBSTNO(MatchExtraTxt,MatchStatistic["Match Status"::Extra]);
+        IF MatchStatistic["Match Status"::Duplicate] > 0 THEN
+          MatchStatisticText := MatchStatisticText +
+            STRSUBSTNO(MatchDuplicateTxt,MatchStatistic["Match Status"::Duplicate]);
+        IF MatchStatistic["Match Status"::IsPaid] > 0 THEN
+          MatchStatisticText := MatchStatisticText +
+            STRSUBSTNO(MatchIsPaidTxt,MatchStatistic["Match Status"::IsPaid]);
+
+        IF MatchStatisticText <> '' THEN
+          MatchStatisticText := MatchDetailsTxt + MatchStatisticText;
+
+        FinalText := STRSUBSTNO(MatchSummaryMsg,MatchedCount,TotalCount) + MatchStatisticText;
+        MESSAGE(FinalText);
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdateReconciliationLines@1060005(VAR BankAccReconciliationLine@1060000 : Record 274;VAR TempBankStatementMatchingBuffer@1060001 : TEMPORARY Record 1250);
+    VAR
+      PaymentMatchingDetails@1060002 : Record 1299;
+    BEGIN
+      BankAccReconciliationLine.RESET;
+      BankAccReconciliationLine.SETFILTER("Payment Reference",'<>%1','');
+      IF BankAccReconciliationLine.FINDSET(TRUE) THEN
+        REPEAT
+          TempBankStatementMatchingBuffer.SETFILTER(Description,BankAccReconciliationLine.Description);
+          IF TempBankStatementMatchingBuffer.FINDFIRST THEN BEGIN
+            BankAccReconciliationLine."Transaction Text" := GetUpdatedFIKDescription(TempBankStatementMatchingBuffer);
+            PaymentMatchingDetails.CreatePaymentMatchingDetail(BankAccReconciliationLine,BankAccReconciliationLine."Transaction Text");
+            BankAccReconciliationLine.MODIFY;
+          END;
+        UNTIL BankAccReconciliationLine.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE GetMatchConfidence@1060001(TempBankStatementMatchingBuffer@1060000 : TEMPORARY Record 1250) : Integer;
+    VAR
+      BankAccReconciliationLine@1060001 : Record 274;
+    BEGIN
+      WITH TempBankStatementMatchingBuffer DO
+        CASE "Match Status" OF
+          "Match Status"::Fully:
+            EXIT(BankAccReconciliationLine."Match Confidence"::High);
+          "Match Status"::Partial,
+          "Match Status"::Duplicate,
+          "Match Status"::Extra:
+            EXIT(BankAccReconciliationLine."Match Confidence"::Medium);
+          "Match Status"::IsPaid:
+            EXIT(BankAccReconciliationLine."Match Confidence"::Low);
+          ELSE
+            EXIT(BankAccReconciliationLine."Match Confidence"::None);
+        END;
+    END;
+
+    LOCAL PROCEDURE GetUpdatedFIKDescription@1060064(TempBankStatementMatchingBuffer@1060001 : TEMPORARY Record 1250) : Text[50];
+    VAR
+      StatusText@1060000 : Text;
+    BEGIN
+      WITH TempBankStatementMatchingBuffer DO BEGIN
+        CASE "Match Status" OF
+          "Match Status"::Fully:
+            StatusText := FIKDescriptionFullMatchTxt;
+          "Match Status"::Partial:
+            StatusText := FIKDescriptionPartialTxt;
+          "Match Status"::Extra:
+            StatusText := FIKDescriptionExtraTxt;
+          "Match Status"::NoMatch:
+            StatusText := FIKDescriptionNoMatchTxt;
+          "Match Status"::IsPaid:
+            StatusText := FIKDescriptionIsPaidTxt;
+          "Match Status"::Duplicate:
+            StatusText := FIKDescriptionDuplicateTxt;
+          ELSE
+            EXIT(Description);
+        END;
+
+        EXIT(STRSUBSTNO('%1 - %2',StatusText,Description));
+      END;
+    END;
+
+    LOCAL PROCEDURE GetMatchDetails@1060065(VAR TempBankStatementMatchingBuffer@1060000 : TEMPORARY Record 1250;VAR MatchStatistic@1060001 : ARRAY [6] OF Integer);
+    BEGIN
+      WITH TempBankStatementMatchingBuffer DO BEGIN
+        RESET;
+        IF FINDSET(TRUE) THEN
+          REPEAT
+            IF "Match Status" <> "Match Status"::NoMatch THEN
+              MatchStatistic["Match Status"] += 1;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE SaveOneToOneMatching@28(VAR TempBankStatementMatchingBuffer@1000 : TEMPORARY Record 1250;VAR AppliedPaymentEntry@1001 : Record 1294;VAR BankAccReconciliation@1002 : Record 273);
+    BEGIN
+      WITH TempBankStatementMatchingBuffer DO BEGIN
+        RESET;
+        SETCURRENTKEY(Quality);
+
+        IF FINDSET THEN
+          REPEAT
+            IF "Match Status" <> "Match Status"::NoMatch THEN
+              ApplyRecord(AppliedPaymentEntry,TempBankStatementMatchingBuffer,BankAccReconciliation);
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE ApplyRecord@30(VAR AppliedPaymentEntry@1000 : Record 1294;VAR TempBankStatementMatchingBuffer@1003 : TEMPORARY Record 1250;VAR BankAccReconciliation@1001 : Record 273);
+    VAR
+      BankAccReconciliationLine@1004 : Record 274;
+      StatementAmount@1002 : Decimal;
+    BEGIN
+      IF StatementLineAlreadyApplied(AppliedPaymentEntry,TempBankStatementMatchingBuffer,BankAccReconciliation) THEN
+        EXIT;
+
+      BankAccReconciliationLine.GET(
+        BankAccReconciliation."Statement Type",
+        BankAccReconciliation."Bank Account No.",
+        BankAccReconciliation."Statement No.",
+        TempBankStatementMatchingBuffer."Line No.");
+      StatementAmount := BankAccReconciliationLine."Statement Amount";
+
+      AppliedPaymentEntry.INIT;
+      AppliedPaymentEntry.VALIDATE("Statement Type",AppliedPaymentEntry."Statement Type"::"Payment Application");
+      AppliedPaymentEntry.VALIDATE("Bank Account No.",BankAccReconciliation."Bank Account No.");
+      AppliedPaymentEntry.VALIDATE("Statement No.",BankAccReconciliation."Statement No.");
+      AppliedPaymentEntry.VALIDATE("Statement Line No.",TempBankStatementMatchingBuffer."Line No.");
+      AppliedPaymentEntry.VALIDATE("Account Type",TempBankStatementMatchingBuffer."Account Type");
+      AppliedPaymentEntry.VALIDATE("Account No.",TempBankStatementMatchingBuffer."Account No.");
+      AppliedPaymentEntry.VALIDATE("Match Confidence",GetMatchConfidence(TempBankStatementMatchingBuffer));
+      AppliedPaymentEntry."Applies-to Entry No." := TempBankStatementMatchingBuffer."Entry No.";
+      IF (AppliedPaymentEntry.SuggestAmtToApply <> 0) AND (TempBankStatementMatchingBuffer."Entry No." <> 0) THEN
+        AppliedPaymentEntry.VALIDATE("Applies-to Entry No.")
+      ELSE BEGIN
+        AppliedPaymentEntry."Applies-to Entry No." := 0;
+        AppliedPaymentEntry.VALIDATE("Applied Amount",StatementAmount);
+      END;
+      AppliedPaymentEntry.INSERT(TRUE);
+    END;
+
+    LOCAL PROCEDURE StatementLineAlreadyApplied@4(AppliedPaymentEntry@1000 : Record 1294;TempBankStatementMatchingBuffer@1001 : TEMPORARY Record 1250;TempBankAccReconciliation@1002 : TEMPORARY Record 273) : Boolean;
+    BEGIN
+      SetFilterToBankAccReconciliation(AppliedPaymentEntry,TempBankAccReconciliation);
+      AppliedPaymentEntry.SETRANGE("Statement Line No.",TempBankStatementMatchingBuffer."Line No.");
+      IF NOT AppliedPaymentEntry.ISEMPTY THEN
+        EXIT(TRUE);
+      EXIT(FALSE);
+    END;
+
+    LOCAL PROCEDURE SetFilterToBankAccReconciliation@13(VAR AppliedPaymentEntry@1000 : Record 1294;TempBankAccReconciliation@1001 : TEMPORARY Record 273);
+    BEGIN
+      AppliedPaymentEntry.RESET;
+      AppliedPaymentEntry.SETRANGE("Statement No.",TempBankAccReconciliation."Statement No.");
+      AppliedPaymentEntry.SETRANGE("Statement Type",AppliedPaymentEntry."Statement Type"::"Payment Application");
+      AppliedPaymentEntry.SETRANGE("Bank Account No.",TempBankAccReconciliation."Bank Account No.");
+    END;
+
+    PROCEDURE GetBankStatementMatchingBuffer@29(VAR TempBankStatementMatchingBuffer2@1000 : TEMPORARY Record 1250;StatementLineNo@1060001 : Integer);
+    VAR
+      CustLedgerEntry@1060000 : Record 21;
+    BEGIN
+      CustLedgerEntry.SETAUTOCALCFIELDS("Remaining Amt. (LCY)");
+      IF CustLedgerEntry.FINDSET THEN
+        REPEAT
+          IF (CustLedgerEntry."Document Type" = CustLedgerEntry."Document Type"::Invoice) AND
+             (CustLedgerEntry."Remaining Amt. (LCY)" > 0)
+          THEN
+            TempBankStatementMatchingBuffer2.AddMatchCandidate(StatementLineNo,CustLedgerEntry."Entry No.",5,
+              TempBankStatementMatchingBuffer2."Account Type"::Customer,CustLedgerEntry."Customer No.");
+        UNTIL CustLedgerEntry.NEXT = 0;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

@@ -122,6 +122,13 @@ OBJECT Codeunit 11012027 Post Invoice Approval
       BalanceAccountInvLineDimSetId@1100525001 : Integer;
       DCSetupRead@1100528400 : Boolean;
       Text047@1100409001 : TextConst 'ENU=must not be greater than %1';
+      GetGLSetup@1100285000 : Record 98;
+      LastLineRetrieved@1100285002 : Boolean;
+      RoundingLineInserted@1100285001 : Boolean;
+      TotalApprovLine@1100285004 : Record 11012032;
+      InvAppLine@1100285003 : Record 11012032;
+      VendPostingGr@1100285005 : Record 93;
+      RoundingLineNo@1100285006 : Integer;
 
     PROCEDURE Post@1(Rec@11012000 : Record 11012032;Print@11012001 : Boolean);
     BEGIN
@@ -167,6 +174,7 @@ OBJECT Codeunit 11012027 Post Invoice Approval
       ConsentUserSetup@1100525001 : Record 11012229;
       ConsentManCU@1100525000 : Codeunit 11012132;
       OnHoldCode@1100525002 : Code[3];
+      ApprovalsBridge4PSConstruct@1100528200 : Codeunit 11125348;
     BEGIN
       GLSetup.GET;
       IF NOT BatchRun THEN
@@ -257,6 +265,9 @@ OBJECT Codeunit 11012027 Post Invoice Approval
       CheckApprovalLine();
       "Invoice Counter" := "Invoice Counter" + 1;
       IF gDocTypeOpt = gDocTypeOpt::"Purchase Invoice" THEN BEGIN
+        //>>140124 Apply Rounding for invoice
+        PrePostRoundingOff(InvHeaderRec);
+        //<<
         InvHeaderRec.CALCFIELDS("Balance Due");
         ApprovLineRec.CALCFIELDS(Balance);
         IF CheckInvoiceMargin(InvHeaderRec, ApprovLineRec, 0) THEN BEGIN
@@ -295,6 +306,9 @@ OBJECT Codeunit 11012027 Post Invoice Approval
         END;
         //kk.en
       END ELSE BEGIN
+        //>>140124 Apply Rounding for cr.memo
+        PrePostRoundingOffCredit(CredHeaderRec);
+        //<<
         CredHeaderRec.CALCFIELDS("Balance Due");
         ApprovLineRec.CALCFIELDS(Balance);
         IF CheckCreditMemoMargin(CredHeaderRec, ApprovLineRec) THEN BEGIN
@@ -340,14 +354,11 @@ OBJECT Codeunit 11012027 Post Invoice Approval
       END;
       // C007965 en
 
-      //**4PS.sn DC  DP00589
-      IF IsDocumentCaptureActive THEN
-        IF ConsentUserSetup.READPERMISSION THEN BEGIN
-          IF gDocTypeOpt = gDocTypeOpt::"Purchase Invoice" THEN
-            ConsentManCU.PostPurchaseApprovalIDYNDC(2,InvHeaderRec."No.")
-          ELSE
-            ConsentManCU.PostPurchaseApprovalIDYNDC(4,CredHeaderRec."No.");
-        END;
+      //**4PS.sn DC
+      IF gDocTypeOpt = gDocTypeOpt::"Purchase Invoice" THEN
+        ApprovalsBridge4PSConstruct.SendPurchDocApprovalRequest(InvHeaderRec)
+      ELSE
+        ApprovalsBridge4PSConstruct.SendPurchDocApprovalRequest(CredHeaderRec);
       //**4PS.en DC
 
       IF ConsentUserSetup.READPERMISSION THEN
@@ -1846,6 +1857,10 @@ OBJECT Codeunit 11012027 Post Invoice Approval
       GenJnlLine.Manufacturer := ApprovLineRec.Manufacturer;
       GenJnlLine."Vendor (Trade Item)" := ApprovLineRec."Vendor (Trade Item)";
       GenJnlLine."Purchase Action" := ApprovLineRec."Purchase Action";
+      // 4PSSE Itero.BSL 2013-09-18 BEGIN
+      GenJnlLine."Periodic Template Code" := ApprovLineRec."Periodic Template Code";
+      GenJnlLine."Periodic Starting Date" := ApprovLineRec."Periodic Starting Date";
+      // 4PSSE Itero.BSL 2013-09-18 END
       IF ApprovLineRec.Type = ApprovLineRec.Type::"Fixed Asset" THEN
         FillGenJnlLineForFixedAsset();
 
@@ -2771,6 +2786,10 @@ OBJECT Codeunit 11012027 Post Invoice Approval
           lvGenJnlLineRec2."Shortcut Dimension 2 Code");
       END;
       // Call C015476 en
+      // 4PSSE Itero.BSL 2013-09-18 BEGIN
+      lvGenJnlLineRec2."Periodic Template Code" := '';
+      lvGenJnlLineRec2."Periodic Starting Date" := 0D;
+      // 4PSSE Itero.BSL 2013-09-18 END
 
       GenJnlPostLine.RunWithCheck(lvGenJnlLineRec2);
     END;
@@ -3125,10 +3144,674 @@ OBJECT Codeunit 11012027 Post Invoice Approval
       EXIT(DocumentCaptureSetup."Document Nos." <> '');
     END;
 
+    PROCEDURE PrePostRoundingOff@1100288000(pPurchInvHeader@1100288000 : Record 122);
+    VAR
+      InvApprovalLine@1100288001 : Record 11012032;
+      BiggestLineNo@1100288002 : Integer;
+    BEGIN
+      //140124 Apply Rounding
+      PurchSetup.GET;
+      IF NOT PurchSetup."Approval Invoice Rounding" THEN
+        EXIT;
+
+      GetGLSetup.GET;
+      WITH pPurchInvHeader DO
+        IF "Currency Code" = '' THEN
+          Currency.InitRoundingPrecision
+        ELSE BEGIN
+          Currency.GET("Currency Code");
+          Currency.TESTFIELD("Amount Rounding Precision");
+        END;
+
+      RoundingLineInserted := FALSE;
+      LastLineRetrieved := FALSE;
+      CLEAR(TotalApprovLine);
+
+      InvApprovalLine.SETRANGE("Journal Template Name",pPurchInvHeader."Journal Template");
+      InvApprovalLine.SETRANGE("Document Type",InvApprovalLine."Document Type"::"Purchase Invoice");
+      InvApprovalLine.SETRANGE("Document No.",pPurchInvHeader."No.");
+      IF InvApprovalLine.FINDLAST THEN
+        BiggestLineNo := InvApprovalLine."Line No.";
+      IF InvApprovalLine.FIND('-') THEN
+      REPEAT
+        IF RoundingLineInserted THEN
+          LastLineRetrieved := TRUE
+        ELSE BEGIN
+          TotalApprovLine.Amount += InvApprovalLine.Amount; //Including VAT";
+          InvAppLine.GET(InvApprovalLine."Journal Template Name",InvApprovalLine."Document Type",
+          InvApprovalLine."Document No.",InvApprovalLine."Line No.");
+
+          IF InvApprovalLine.NEXT = 0 THEN
+            LastLineRetrieved := TRUE;
+
+          IF LastLineRetrieved THEN BEGIN
+            InvAppLine."Line No." := BiggestLineNo;
+            InvoiceRounding(pPurchInvHeader);
+            IF InvAppLine."Line No." <> BiggestLineNo THEN BEGIN
+              GLAcc.GET(InvAppLine."Account No.");
+              InvAppLine.Description := GLAcc.Name;
+              InvAppLine.INSERT;
+            END;
+          END;
+        END;
+      UNTIL LastLineRetrieved;
+      CLEAR(TotalApprovLine);
+    END;
+
+    LOCAL PROCEDURE InvoiceRounding@12(pPurchInvHeader@1100285000 : Record 122);
+    VAR
+      InvoiceRoundingAmount@1001 : Decimal;
+      NextLineNo@1002 : Integer;
+      SavedStatusCheckSuspended@1100409000 : Boolean;
+    BEGIN
+      //140124 Apply Rounding
+      //>> 140328 ITERO.SB Changed rounding calc.
+      Currency.TESTFIELD("Invoice Rounding Precision");
+      pPurchInvHeader.CALCFIELDS("Balance Due");
+      IF pPurchInvHeader."Balance Due"=TotalApprovLine.Amount THEN
+        EXIT;
+      //>> 140424 ITERO.SB New calc. of invoice rounding amount
+      InvoiceRoundingAmount :=
+        -ROUND(
+          TotalApprovLine.Amount// Including VAT"             line
+          -pPurchInvHeader."Balance Due",// Including VAT",          head
+          Currency."Amount Rounding Precision",
+          Currency.InvoiceRoundingDirection);
+      //<<
+
+      IF InvoiceRoundingAmount = 0 THEN
+        EXIT;
+
+      IF InvoiceRoundingAmount > Currency."Invoice Rounding Precision" THEN
+        EXIT;
+
+      IF InvoiceRoundingAmount*-1 > Currency."Invoice Rounding Precision" THEN
+        EXIT;
+      //<<
+      //IF InvoiceRoundingAmount <> 0 THEN BEGIN
+        VendPostingGr.GET(pPurchInvHeader."Vendor Posting Group");
+        VendPostingGr.TESTFIELD("Invoice Rounding Account");
+        WITH InvAppLine DO BEGIN
+          INIT;
+          NextLineNo := "Line No." + 10000;
+          "System-Created Entry" := TRUE;
+          "Line No." := NextLineNo;
+          VALIDATE(Type,Type::"Account (G/L)");
+          VALIDATE("Account No.",VendPostingGr."Invoice Rounding Account");
+          VALIDATE(Quantity,1);
+          InvAppLine.VALIDATE("Posting Date",TODAY);
+          IF InvHeaderRec."Prices Including VAT" THEN
+            VALIDATE("Unit Cost",InvoiceRoundingAmount)
+          ELSE
+            VALIDATE(
+              "Unit Cost",
+              ROUND(
+                InvoiceRoundingAmount /
+                (1 + (1 - pPurchInvHeader."VAT Base Discount %" / 100) * "VAT %" / 100),
+                Currency."Amount Rounding Precision"));
+          VALIDATE(Amount,InvoiceRoundingAmount);
+          "Line No." := NextLineNo;
+      //    DocDim2.SETRANGE("Table ID",DATABASE::"Purchase Line");
+      //    DocDim2.SETRANGE("Document Type",DocDim."Document Type"::Invoice);
+      //    DocDim2.SETRANGE("Document No.",pPurchInvHeader."No.");
+      //    DocDim2.SETRANGE("Line No.","Line No.");
+      //    IF DocDim2.FINDSET THEN
+      //      REPEAT
+      //        TempDocDim := DocDim2;
+      //        TempDocDim.INSERT;
+      //      UNTIL DocDim2.NEXT = 0;
+          LastLineRetrieved := FALSE;
+          RoundingLineInserted := TRUE;
+          RoundingLineNo := "Line No.";
+         END;
+      //END;
+    END;
+
+    PROCEDURE PrePostRoundingOffCredit@1100285001(pCreMemoHeader@1100288000 : Record 124);
+    VAR
+      InvApprovalLine@1100288001 : Record 11012032;
+      BiggestLineNo@1100288002 : Integer;
+    BEGIN
+      //140124 Apply Rounding for cr.memo
+      PurchSetup.GET;
+      IF NOT PurchSetup."Approval Invoice Rounding" THEN
+        EXIT;
+
+
+      GetGLSetup.GET;
+      WITH pCreMemoHeader DO
+        IF "Currency Code" = '' THEN
+          Currency.InitRoundingPrecision
+        ELSE BEGIN
+          Currency.GET("Currency Code");
+          Currency.TESTFIELD("Amount Rounding Precision");
+        END;
+
+      RoundingLineInserted := FALSE;
+      LastLineRetrieved := FALSE;
+      CLEAR(TotalApprovLine);
+
+      InvApprovalLine.SETRANGE("Journal Template Name",pCreMemoHeader."Journal Template");
+      InvApprovalLine.SETRANGE("Document Type",InvApprovalLine."Document Type"::"Credit Memo");
+      InvApprovalLine.SETRANGE("Document No.",pCreMemoHeader."No.");
+      IF InvApprovalLine.FINDLAST THEN
+        BiggestLineNo := InvApprovalLine."Line No.";
+      IF InvApprovalLine.FIND('-') THEN
+      REPEAT
+        IF RoundingLineInserted THEN
+          LastLineRetrieved := TRUE
+        ELSE BEGIN
+          TotalApprovLine.Amount += InvApprovalLine.Amount;
+          TotalApprovLine."Amount Including VAT" += InvApprovalLine."Amount Including VAT";
+          InvAppLine.GET(InvApprovalLine."Journal Template Name",InvApprovalLine."Document Type",
+          InvApprovalLine."Document No.",InvApprovalLine."Line No.");
+
+          IF InvApprovalLine.NEXT = 0 THEN
+            LastLineRetrieved := TRUE;
+
+          IF LastLineRetrieved THEN BEGIN
+            InvAppLine."Line No." := BiggestLineNo;
+            pCreMemoHeader.CALCFIELDS("Balance Due");
+            InvoiceRoundingCredit(pCreMemoHeader);
+            IF InvAppLine."Line No." <> BiggestLineNo THEN BEGIN
+              GLAcc.GET(InvAppLine."Account No.");
+              InvAppLine.Description := GLAcc.Name;
+              InvAppLine.INSERT;
+            END;
+          END;
+        END;
+      UNTIL LastLineRetrieved;
+      CLEAR(TotalApprovLine);
+    END;
+
+    LOCAL PROCEDURE InvoiceRoundingCredit@1100285000(pCreMemoHeader@1100285000 : Record 124);
+    VAR
+      InvoiceRoundingAmount@1001 : Decimal;
+      NextLineNo@1002 : Integer;
+      SavedStatusCheckSuspended@1100409000 : Boolean;
+    BEGIN
+      //140124 Apply Rounding for cr.memo
+      //>> 140328 ITERO.SB
+      pCreMemoHeader.CALCFIELDS("Balance Due");
+      IF pCreMemoHeader."Balance Due"=TotalApprovLine.Amount THEN
+        EXIT;
+      //<<
+      Currency.TESTFIELD("Invoice Rounding Precision");
+      //>> 140424 ITERO.SB New calc. of invoice rounding amount
+      InvoiceRoundingAmount :=
+        -ROUND(
+          TotalApprovLine.Amount// Including VAT"
+          -pCreMemoHeader."Balance Due",// Including VAT",          head
+          Currency."Amount Rounding Precision",
+            Currency.InvoiceRoundingDirection);
+
+      IF InvoiceRoundingAmount = 0 THEN
+        EXIT;
+
+      IF InvoiceRoundingAmount > Currency."Invoice Rounding Precision" THEN
+        EXIT;
+
+      IF InvoiceRoundingAmount*-1 > Currency."Invoice Rounding Precision" THEN
+        EXIT;
+
+
+      VendPostingGr.GET(CredHeaderRec."Vendor Posting Group");
+      VendPostingGr.TESTFIELD("Invoice Rounding Account");
+      WITH InvAppLine DO BEGIN
+        INIT;
+        NextLineNo := "Line No." + 10000;
+        "System-Created Entry" := TRUE;
+        "Line No." := NextLineNo;
+        VALIDATE(Type,Type::"Account (G/L)");
+        VALIDATE("Account No.",VendPostingGr."Invoice Rounding Account");
+        VALIDATE(Quantity,1);
+        InvAppLine.VALIDATE("Posting Date",TODAY);
+        IF CredHeaderRec."Prices Including VAT" THEN
+          VALIDATE("Unit Cost",InvoiceRoundingAmount)
+        ELSE
+          VALIDATE(
+            "Unit Cost",
+            ROUND(
+              InvoiceRoundingAmount /
+              (1 + (1 - CredHeaderRec."VAT Base Discount %" / 100) * "VAT %" / 100),
+              Currency."Amount Rounding Precision"));
+        VALIDATE(Amount,InvoiceRoundingAmount);
+        "Line No." := NextLineNo;
+      {
+        DocDim2.SETRANGE("Table ID",DATABASE::"Purchase Line");
+        DocDim2.SETRANGE("Document Type",DocDim."Document Type"::"Credit Memo");
+        DocDim2.SETRANGE("Document No.",pCreMemoHeader."No.");
+        DocDim2.SETRANGE("Line No.","Line No.");
+        IF DocDim2.FINDSET THEN
+          REPEAT
+            TempDocDim := DocDim2;
+            TempDocDim.INSERT;
+          UNTIL DocDim2.NEXT = 0;
+      }
+        LastLineRetrieved := FALSE;
+        RoundingLineInserted := TRUE;
+        RoundingLineNo := "Line No.";
+       END;
+    END;
+
+    PROCEDURE PostPeriodicService@1100285002();
+    VAR
+      PeriodicTemplate@1100285008 : Record 11128015;
+      PerPostDate@1100285007 : Date;
+      PeriodicCount@1100285006 : Integer;
+      CalcDateExpr@1100285005 : Code[10];
+      PerDiffSum@1100285004 : Decimal;
+      PerDiff@1100285003 : Decimal;
+      PerDiffSumAddCur@1100285002 : Decimal;
+      PerDiffAddCur@1100285001 : Decimal;
+    BEGIN
+      // 140326 ITERO.SB
+      PeriodicTemplate.GET(ApprovLineRec."Periodic Template Code");
+      PeriodicTemplate.TESTFIELD("No. of Periods");
+      PeriodicTemplate.TESTFIELD(Interval);
+      PeriodicTemplate.TESTFIELD("Temp. G/L Acc.");
+
+      ServJnlLine.INIT;
+      ServJnlLine."Service Contract No." := ApprovLineRec."Service Contract No.";
+      ServJnlLine."Service Order No." := ApprovLineRec."Service Order No.";
+      ServJnlLine."Service Location No." := ApprovLineRec."Service Location No.";
+      //ServJnlLine.Installation := ApprovLineRec."Service Installation";
+      //ServJnlLine."Installation Part" := ApprovLineRec."Service Installation Part";
+      IF ApprovLineRec."Document Type" = ApprovLineRec."Document Type"::"Credit Memo" THEN
+        ServJnlLine."Document Type" := ServJnlLine."Document Type"::"Purchase Credit Memo"
+      ELSE
+        ServJnlLine."Document Type" := ServJnlLine."Document Type"::"Purchase Invoice";
+      ServJnlLine."Document No." := GenJnlLine."Document No.";
+      ServJnlLine."G/L Account" := ApprovLineRec."Account No.";
+      ServJnlLine."Posting Date" := ApprovLineRec."Posting Date";
+      ServJnlLine."Shortcut Dimension 1 Code" := ApprovLineRec."Shortcut Dimension 1 Code";
+      ServJnlLine."Shortcut Dimension 2 Code" := ApprovLineRec."Shortcut Dimension 2 Code";
+      ServJnlLine."Cost Component" := ApprovLineRec."Cost Component";
+      ServJnlLine.Description := PeriodicTemplate.Description;//ApprovLineRec.Description;
+      ServJnlLine."Description 2" := ApprovLineRec."Description 2";  //**4PS02.n
+      IF ApprovLineRec."Document Type" = ApprovLineRec."Document Type"::"Purchase Invoice" THEN BEGIN
+        ServJnlLine.Quantity := ApprovLineRec.Quantity;
+        ServJnlLine."Vendor No." := InvHeaderRec."Buy-from Vendor No.";
+      END ELSE BEGIN
+        ServJnlLine.Quantity := ApprovLineRec.Quantity * -1;
+        ServJnlLine."Vendor No." := CredHeaderRec."Buy-from Vendor No.";
+      END;
+      ServJnlLine."Unit of Measure Code" := ApprovLineRec."Unit of Measure Code";
+      ServJnlLine.VALIDATE("Unit Cost (LCY)", -PriceInLCY(ApprovLineRec.Price));
+      IF AmountsOnly THEN BEGIN
+        IF ApprovLineRec."Document Type" = ApprovLineRec."Document Type"::"Purchase Invoice" THEN
+          ServJnlLine.VALIDATE("Total Cost (LCY)", -PriceInLCY(ApprovLineRec.Amount))
+        ELSE
+          ServJnlLine.VALIDATE("Total Cost (LCY)", PriceInLCY(ApprovLineRec.Amount))
+      END ELSE
+        ServJnlLine.VALIDATE("Total Cost (LCY)", -ServJnlLine."Unit Cost (LCY)" * ServJnlLine.Quantity);
+      ServJnlLine."Reason Code" := GenJnlLine."Reason Code";
+      ServJnlLine."Source Code" := GenJnlLine."Source Code";
+      ServJnlLine."Item No." := ApprovLineRec."Item No.";
+      ServJnlLine."Basic Item" := ApprovLineRec."Basic Item";
+      ServJnlLine."Trade Item" := ApprovLineRec."Trade Item";
+      ServJnlLine."Vendor (Trade Item)" := ApprovLineRec."Vendor (Trade Item)";
+      ServJnlLine.Manufacturer := ApprovLineRec.Manufacturer;
+      ServJnlLine."Project No." := ApprovLineRec."Project No.";
+      ServJnlLine."Additional Cost" := ApprovLineRec."Additional Cost (Service)";  //db, 24-11-05
+      ServJnlLine."Sales Price Purch. Order" := ApprovLineRec."Sales Price";
+      ServJnlLine."Cost Plus Entry Created" := ApprovLineRec."Cost Plus Entry Created";
+      IF (ApprovLineRec."Receipt No." <> '') THEN
+        IF PurchRcptLine.GET(ApprovLineRec."Receipt No.",ApprovLineRec."Receipt Line No.") THEN
+          ServJnlLine."Execution Date" := PurchRcptLine."Posting Date";
+      IF ServJnlLine."Execution Date" = 0D THEN
+        ServJnlLine."Execution Date" := ServJnlLine."Posting Date";
+      ServJnlLine."Removal Contribution" := ApprovLineRec."Removal Contribution";  //db, 07-12-10: M22790
+      //M29056 sn
+      ServJnlLine."Tariff No." := ApprovLineRec."Tariff No.";
+      IF ApprovLineRec."Document Type" = ApprovLineRec."Document Type"::"Purchase Invoice" THEN BEGIN
+        ServJnlLine."Country/Region Code" := InvHeaderRec."Country/Region of Origin";
+        ServJnlLine."Country/Region of Origin/Dest." := InvHeaderRec."Country/Region of Destination";
+      END ELSE BEGIN
+        ServJnlLine."Country/Region Code" := CredHeaderRec."Country/Region of Origin";
+        ServJnlLine."Country/Region of Origin/Dest." := CredHeaderRec."Country/Region of Destination";
+      END;
+      //M29056 en
+
+      ServJnlPostLine.RunWithCheck(ServJnlLine);
+      ///Slut f”rsta raden
+
+      CLEAR(PerDiff);
+      CLEAR(PerDiffSum);
+      FOR PeriodicCount := 1 TO PeriodicTemplate."No. of Periods" DO
+      BEGIN
+        IF PeriodicCount = 1 THEN
+          IF ApprovLineRec."Periodic Starting Date" = 0D THEN
+            PerPostDate := GenJnlLine."Posting Date"
+          ELSE
+            PerPostDate := ApprovLineRec."Periodic Starting Date"
+        ELSE
+          PerPostDate := CALCDATE(PeriodicTemplate.Interval, PerPostDate);
+
+        //IF GenJnlCheckLine.DateNotAllowed(PerPostDate) THEN
+          //ERROR(Text100,PerPostDate);
+
+        PerDiffSum := PerDiffSum +
+                      ROUND(PriceInLCY(ApprovLineRec.Amount) / PeriodicTemplate."No. of Periods",
+                            GLSetup."Amount Rounding Precision");
+
+        //PerDiffSumAddCur := PerDiffSumAddCur +
+          //            ROUND("Source Currency Amount" / PeriodicTemplate."No. of Periods",
+            //                Currency."Amount Rounding Precision");
+        //IF "Periodic Count" = "Periodic Template"."No. of Periods" THEN
+        IF PeriodicCount = PeriodicTemplate."No. of Periods" THEN BEGIN
+          PerDiff := PriceInLCY(ApprovLineRec.Amount) - PerDiffSum;
+          //PerDiffAddCur := "Source Currency Amount" - PerDiffSumAddCur;
+        END;
+        //S„tt in 3 rader med 100 p† varje..
+        ServJnlLine.INIT;
+        ServJnlLine."Service Contract No." := ApprovLineRec."Service Contract No.";
+        ServJnlLine."Service Order No." := ApprovLineRec."Service Order No.";
+        ServJnlLine."Service Location No." := ApprovLineRec."Service Location No.";
+      //  ServJnlLine.Installation := ApprovLineRec."Service Installation";
+      //  ServJnlLine."Installation Part" := ApprovLineRec."Service Installation Part";
+        IF ApprovLineRec."Document Type" = ApprovLineRec."Document Type"::"Credit Memo" THEN
+          ServJnlLine."Document Type" := ServJnlLine."Document Type"::"Purchase Credit Memo"
+        ELSE
+          ServJnlLine."Document Type" := ServJnlLine."Document Type"::"Purchase Invoice";
+        ServJnlLine."Document No." := GenJnlLine."Document No.";
+        ServJnlLine."G/L Account" := ApprovLineRec."Account No.";
+        ServJnlLine."Posting Date" := PerPostDate;//ApprovLineRec."Posting Date";
+        ServJnlLine."Shortcut Dimension 1 Code" := ApprovLineRec."Shortcut Dimension 1 Code";
+        ServJnlLine."Shortcut Dimension 2 Code" := ApprovLineRec."Shortcut Dimension 2 Code";
+        ServJnlLine."Cost Component" := ApprovLineRec."Cost Component";
+        ServJnlLine.Description := PeriodicTemplate.Description;//ApprovLineRec.Description;
+        ServJnlLine."Description 2" := ApprovLineRec."Description 2";  //**4PS02.n
+        IF ApprovLineRec."Document Type" = ApprovLineRec."Document Type"::"Purchase Invoice" THEN BEGIN
+          ServJnlLine.Quantity := ApprovLineRec.Quantity;
+          ServJnlLine."Vendor No." := InvHeaderRec."Buy-from Vendor No.";
+        END ELSE BEGIN
+          ServJnlLine.Quantity := ApprovLineRec.Quantity * -1;
+          ServJnlLine."Vendor No." := CredHeaderRec."Buy-from Vendor No.";
+        END;
+        ServJnlLine."Unit of Measure Code" := ApprovLineRec."Unit of Measure Code";
+        ServJnlLine.VALIDATE("Unit Cost (LCY)", PriceInLCY(ApprovLineRec.Price)/PeriodicTemplate."No. of Periods");
+        IF AmountsOnly THEN BEGIN
+          IF ApprovLineRec."Document Type" = ApprovLineRec."Document Type"::"Purchase Invoice" THEN
+            ServJnlLine.VALIDATE("Total Cost (LCY)", (PriceInLCY(ApprovLineRec.Amount)/PeriodicTemplate."No. of Periods")+PerDiff)
+          ELSE
+            ServJnlLine.VALIDATE("Total Cost (LCY)", (-PriceInLCY(ApprovLineRec.Amount)/PeriodicTemplate."No. of Periods")+PerDiff)
+        END ELSE
+          ServJnlLine.VALIDATE("Total Cost (LCY)", (ServJnlLine."Unit Cost (LCY)" * ServJnlLine.Quantity)+PerDiff);
+        ServJnlLine."Reason Code" := GenJnlLine."Reason Code";
+        ServJnlLine."Source Code" := GenJnlLine."Source Code";
+        ServJnlLine."Item No." := ApprovLineRec."Item No.";
+        ServJnlLine."Basic Item" := ApprovLineRec."Basic Item";
+        ServJnlLine."Trade Item" := ApprovLineRec."Trade Item";
+        ServJnlLine."Vendor (Trade Item)" := ApprovLineRec."Vendor (Trade Item)";
+        ServJnlLine.Manufacturer := ApprovLineRec.Manufacturer;
+        ServJnlLine."Project No." := ApprovLineRec."Project No.";
+        ServJnlLine."Additional Cost" := ApprovLineRec."Additional Cost (Service)";  //db, 24-11-05
+        ServJnlLine."Sales Price Purch. Order" := ApprovLineRec."Sales Price";
+        ServJnlLine."Cost Plus Entry Created" := ApprovLineRec."Cost Plus Entry Created";
+        IF (ApprovLineRec."Receipt No." <> '') THEN
+          IF PurchRcptLine.GET(ApprovLineRec."Receipt No.",ApprovLineRec."Receipt Line No.") THEN
+            ServJnlLine."Execution Date" := PurchRcptLine."Posting Date";
+        IF ServJnlLine."Execution Date" = 0D THEN
+          ServJnlLine."Execution Date" := ServJnlLine."Posting Date";
+        ServJnlLine."Removal Contribution" := ApprovLineRec."Removal Contribution";  //db, 07-12-10: M22790
+        //M29056 sn
+        ServJnlLine."Tariff No." := ApprovLineRec."Tariff No.";
+        IF ApprovLineRec."Document Type" = ApprovLineRec."Document Type"::"Purchase Invoice" THEN BEGIN
+          ServJnlLine."Country/Region Code" := InvHeaderRec."Country/Region of Origin";
+          ServJnlLine."Country/Region of Origin/Dest." := InvHeaderRec."Country/Region of Destination";
+        END ELSE BEGIN
+          ServJnlLine."Country/Region Code" := CredHeaderRec."Country/Region of Origin";
+          ServJnlLine."Country/Region of Origin/Dest." := CredHeaderRec."Country/Region of Destination";
+        END;
+        //M29056 en
+
+        ServJnlPostLine.RunWithCheck(ServJnlLine);
+        IF PeriodicCount < PeriodicTemplate."No. of Periods" THEN
+          PostSurcharge(1);
+      END;
+      ApprovLineRec.VALIDATE(ApprovLineRec."Periodic Template Code",'');
+    END;
+
+    PROCEDURE PostPeriodicProject@1100285003(UseAccountNo@1100285010 : Boolean);
+    VAR
+      PeriodicTemplate@1100285007 : Record 11128015;
+      PerPostDate@1100285006 : Date;
+      PeriodicCount@1100285005 : Integer;
+      CalcDateExpr@1100285004 : Code[10];
+      PerDiffSum@1100285003 : Decimal;
+      PerDiff@1100285002 : Decimal;
+      PerDiffSumAddCur@1100285001 : Decimal;
+      PerDiffAddCur@1100285000 : Decimal;
+    BEGIN
+      // 140326 ITERO.SB
+      PeriodicTemplate.GET(ApprovLineRec."Periodic Template Code");
+      PeriodicTemplate.TESTFIELD("No. of Periods");
+      PeriodicTemplate.TESTFIELD(Interval);
+      PeriodicTemplate.TESTFIELD("Temp. G/L Acc.");
+
+
+      JobJnlLine.INIT;
+      JobJnlLine."Posting Date" := GenJnlLine."Posting Date";
+      JobJnlLine."Document Date" := GenJnlLine."Document Date";
+      JobJnlLine."Reason Code" := GenJnlLine."Reason Code";
+      JobJnlLine."Job No." := GenJnlLine."Job No.";
+      JobJnlLine.Element := GenJnlLine.Element;
+      JobJnlLine."Plot No." := GenJnlLine."Plot No.";
+      JobJnlLine."Extension Contract" := GenJnlLine."Extension Contract";
+      JobJnlLine."Employee No." := GenJnlLine."Employee No.";
+      JobJnlLine."Wage Component" := GenJnlLine."Wage Component";
+
+      IF UseAccountNo THEN
+        JobJnlLine."No." := GenJnlLine."Account No."
+      ELSE
+        JobJnlLine."No." := GenJnlLine."Bal. Account No.";
+
+      IF PreRegisteredWIP AND (JobJnlLine."No." = '') THEN
+        JobJnlLine."No." := GenJnlLine."Account No.";
+
+      JobJnlLine.Description := PeriodicTemplate.Description;//GenJnlLine.Description;
+      JobJnlLine."Description 2" := GenJnlLine."Description 2";  //**4PS02.n
+      JobJnlLine."Posting Group" := GenJnlLine."Posting Group";
+      JobJnlLine."Shortcut Dimension 1 Code" := GenJnlLine."Shortcut Dimension 1 Code";
+      JobJnlLine."Shortcut Dimension 2 Code" := GenJnlLine."Shortcut Dimension 2 Code";
+      JobJnlLine."Cost Component" := GenJnlLine."Cost Component";
+      JobJnlLine."Gen. Bus. Posting Group" := GenJnlLine."Gen. Bus. Posting Group";
+      JobJnlLine."Gen. Prod. Posting Group" := GenJnlLine."Gen. Prod. Posting Group";
+      JobJnlLine."Entry Type" := JobJnlLine."Entry Type"::Usage;
+      JobJnlLine."Document No." := GenJnlLine."Document No.";
+      JobJnlLine."External Document No." := GenJnlLine."External Document No.";
+      JobJnlLine.Type := JobJnlLine.Type::"G/L Account";
+      IF ApprovLineRec."Document Type" = ApprovLineRec."Document Type"::"Purchase Invoice" THEN BEGIN
+        JobJnlLine.Quantity := ApprovLineRec.Quantity;
+        JobJnlLine.Vendor := InvHeaderRec."Buy-from Vendor No.";
+      END ELSE BEGIN
+        JobJnlLine.Quantity := ApprovLineRec.Quantity * -1;
+        JobJnlLine.Vendor := CredHeaderRec."Buy-from Vendor No.";
+      END;
+      JobJnlLine."Unit of Measure Code" := ApprovLineRec."Unit of Measure Code";
+      JobJnlLine."Direct Unit Cost (LCY)" := -PriceInLCY(ApprovLineRec.Price);
+      IF AmountsOnly THEN BEGIN
+        IF ApprovLineRec."Document Type" = ApprovLineRec."Document Type"::"Purchase Invoice" THEN
+          JobJnlLine."Total Cost (LCY)" := -PriceInLCY(ApprovLineRec.Amount)
+        ELSE
+          JobJnlLine."Total Cost (LCY)" := PriceInLCY(ApprovLineRec.Amount)
+      END ELSE
+        JobJnlLine."Total Cost (LCY)" := JobJnlLine."Direct Unit Cost (LCY)" * JobJnlLine.Quantity;
+      JobJnlLine."Source Code" := GenJnlLine."Source Code";
+      //JobJnlLine."Post Job Entry Only" := FALSE; //Removed in NAV2009
+      JobJnlLine."Posting No. Series" := GenJnlLine."Posting No. Series";
+
+      JobJnlLine."Service Order No." := GenJnlLine."Service Order No.";
+      //JobJnlLine."Service Installation" := GenJnlLine."Service Installation";
+      //JobJnlLine."Service Installation Part" := GenJnlLine."Service Installation Part";
+      JobJnlLine."Service Location No." := GenJnlLine."Service Location No.";
+      JobJnlLine."Service Contract No." := GenJnlLine."Service Contract No.";
+      JobJnlLine."Rental Unit" := GenJnlLine."Rental Unit";
+      JobJnlLine."Item No." := GenJnlLine."Item No.";
+      JobJnlLine."Basic Item" := GenJnlLine."Basic Item";
+      JobJnlLine."Trade Item":= GenJnlLine."Trade Item";
+      JobJnlLine.Manufacturer := GenJnlLine.Manufacturer;
+      JobJnlLine."Vendor (Trade Item)" := GenJnlLine."Vendor (Trade Item)";
+      JobJnlLine."Purchase Action" := GenJnlLine."Purchase Action";
+      JobJnlLine."Sales Price Purch. Order" := ApprovLineRec."Sales Price";
+      JobJnlLine."Cost Plus Entry Created" := ApprovLineRec."Cost Plus Entry Created";
+      //IF (ApprovLineRec."Employee No." <> '') AND (ApprovLineRec."Receipt No." <> '') THEN  //*10927.o
+      IF (ApprovLineRec."Receipt No." <> '') THEN  //*10927.n
+        IF PurchRcptLine.GET(ApprovLineRec."Receipt No.",ApprovLineRec."Receipt Line No.") THEN
+          JobJnlLine."Execution Date" := PurchRcptLine."Posting Date";
+      IF JobJnlLine."Execution Date" = 0D THEN  //*10927.n
+        JobJnlLine."Execution Date" := JobJnlLine."Posting Date";  //*10927.n
+      JobJnlLine."Removal Contribution" := ApprovLineRec."Removal Contribution";  //db, 07-12-10: M22790
+       //M29056 sn
+      JobJnlLine."Tariff No." := ApprovLineRec."Tariff No.";
+      IF ApprovLineRec."Document Type" = ApprovLineRec."Document Type"::"Purchase Invoice" THEN BEGIN
+        JobJnlLine."Country/Region Code" := InvHeaderRec."Country/Region of Origin";
+        JobJnlLine."Country/Region of Origin/Dest." := InvHeaderRec."Country/Region of Destination";
+      END ELSE BEGIN
+        JobJnlLine."Country/Region Code" := CredHeaderRec."Country/Region of Origin";
+        JobJnlLine."Country/Region of Origin/Dest." := CredHeaderRec."Country/Region of Destination";
+      END;
+      //M29056 en
+      JobJnlLine."FSC Type Code" := ApprovLineRec."FSC Type Code";  //DP00129
+      JobJnlLine.Comment := GetCommentForProjEntry(ApprovLineRec, MAXSTRLEN(JobJnlLine.Comment));  //*34602.n
+      JobJnlPostLine.RunWithCheck(JobJnlLine);
+
+      CLEAR(PerDiff);
+      CLEAR(PerDiffSum);
+      FOR PeriodicCount := 1 TO PeriodicTemplate."No. of Periods" DO
+      BEGIN
+        IF PeriodicCount = 1 THEN
+          IF ApprovLineRec."Periodic Starting Date" = 0D THEN
+            PerPostDate := GenJnlLine."Posting Date"
+          ELSE
+            PerPostDate := ApprovLineRec."Periodic Starting Date"
+        ELSE
+          PerPostDate := CALCDATE(PeriodicTemplate.Interval, PerPostDate);
+
+        //IF GenJnlCheckLine.DateNotAllowed(PerPostDate) THEN
+          //ERROR(Text100,PerPostDate);
+
+        PerDiffSum := PerDiffSum +
+                      ROUND(PriceInLCY(ApprovLineRec.Amount) / PeriodicTemplate."No. of Periods",
+                            GLSetup."Amount Rounding Precision");
+
+        //PerDiffSumAddCur := PerDiffSumAddCur +
+          //            ROUND("Source Currency Amount" / PeriodicTemplate."No. of Periods",
+            //                Currency."Amount Rounding Precision");
+        //IF "Periodic Count" = "Periodic Template"."No. of Periods" THEN
+        IF PeriodicCount = PeriodicTemplate."No. of Periods" THEN BEGIN
+          PerDiff := PriceInLCY(ApprovLineRec.Amount) - PerDiffSum;
+          //PerDiffAddCur := "Source Currency Amount" - PerDiffSumAddCur;
+        END;
+
+        //en rad f”r varje period
+        JobJnlLine.INIT;
+        JobJnlLine."Posting Date" := PerPostDate;//GenJnlLine."Posting Date";
+        JobJnlLine."Document Date" := GenJnlLine."Document Date";
+        JobJnlLine."Reason Code" := GenJnlLine."Reason Code";
+        JobJnlLine."Job No." := GenJnlLine."Job No.";
+        JobJnlLine.Element := GenJnlLine.Element;
+        JobJnlLine."Plot No." := GenJnlLine."Plot No.";
+        JobJnlLine."Extension Contract" := GenJnlLine."Extension Contract";
+        JobJnlLine."Employee No." := GenJnlLine."Employee No.";
+        JobJnlLine."Wage Component" := GenJnlLine."Wage Component";
+
+        IF UseAccountNo THEN
+          JobJnlLine."No." := GenJnlLine."Account No."
+        ELSE
+          JobJnlLine."No." := GenJnlLine."Bal. Account No.";
+
+        IF PreRegisteredWIP AND (JobJnlLine."No." = '') THEN
+          JobJnlLine."No." := GenJnlLine."Account No.";
+
+        JobJnlLine.Description := PeriodicTemplate.Description;//GenJnlLine.Description;
+        JobJnlLine."Description 2" := GenJnlLine."Description 2";  //**4PS02.n
+        JobJnlLine."Posting Group" := GenJnlLine."Posting Group";
+        JobJnlLine."Shortcut Dimension 1 Code" := GenJnlLine."Shortcut Dimension 1 Code";
+        JobJnlLine."Shortcut Dimension 2 Code" := GenJnlLine."Shortcut Dimension 2 Code";
+        JobJnlLine."Cost Component" := GenJnlLine."Cost Component";
+        JobJnlLine."Gen. Bus. Posting Group" := GenJnlLine."Gen. Bus. Posting Group";
+        JobJnlLine."Gen. Prod. Posting Group" := GenJnlLine."Gen. Prod. Posting Group";
+        JobJnlLine."Entry Type" := JobJnlLine."Entry Type"::Usage;
+        JobJnlLine."Document No." := GenJnlLine."Document No.";
+        JobJnlLine."External Document No." := GenJnlLine."External Document No.";
+        JobJnlLine.Type := JobJnlLine.Type::"G/L Account";
+        IF ApprovLineRec."Document Type" = ApprovLineRec."Document Type"::"Purchase Invoice" THEN BEGIN
+          JobJnlLine.Quantity := ApprovLineRec.Quantity;
+          JobJnlLine.Vendor := InvHeaderRec."Buy-from Vendor No.";
+        END ELSE BEGIN
+          JobJnlLine.Quantity := ApprovLineRec.Quantity * -1;
+          JobJnlLine.Vendor := CredHeaderRec."Buy-from Vendor No.";
+        END;
+        JobJnlLine."Unit of Measure Code" := ApprovLineRec."Unit of Measure Code";
+        JobJnlLine."Direct Unit Cost (LCY)" := PriceInLCY(ApprovLineRec.Price)/PeriodicTemplate."No. of Periods";
+        IF AmountsOnly THEN BEGIN
+          IF ApprovLineRec."Document Type" = ApprovLineRec."Document Type"::"Purchase Invoice" THEN
+            JobJnlLine."Total Cost (LCY)" := (PriceInLCY(ApprovLineRec.Amount)/PeriodicTemplate."No. of Periods")+PerDiff
+          ELSE
+            JobJnlLine."Total Cost (LCY)" := (-PriceInLCY(ApprovLineRec.Amount)/PeriodicTemplate."No. of Periods")+PerDiff
+        END ELSE
+            JobJnlLine."Total Cost (LCY)" := (JobJnlLine."Direct Unit Cost (LCY)" * JobJnlLine.Quantity)+PerDiff;
+        JobJnlLine."Source Code" := GenJnlLine."Source Code";
+        //JobJnlLine."Post Job Entry Only" := FALSE; //Removed in NAV2009
+        JobJnlLine."Posting No. Series" := GenJnlLine."Posting No. Series";
+
+        JobJnlLine."Service Order No." := GenJnlLine."Service Order No.";
+      //  JobJnlLine."Service Installation" := GenJnlLine."Service Installation";
+      //  JobJnlLine."Service Installation Part" := GenJnlLine."Service Installation Part";
+        JobJnlLine."Service Location No." := GenJnlLine."Service Location No.";
+        JobJnlLine."Service Contract No." := GenJnlLine."Service Contract No.";
+        JobJnlLine."Rental Unit" := GenJnlLine."Rental Unit";
+        JobJnlLine."Item No." := GenJnlLine."Item No.";
+        JobJnlLine."Basic Item" := GenJnlLine."Basic Item";
+        JobJnlLine."Trade Item":= GenJnlLine."Trade Item";
+        JobJnlLine.Manufacturer := GenJnlLine.Manufacturer;
+        JobJnlLine."Vendor (Trade Item)" := GenJnlLine."Vendor (Trade Item)";
+        JobJnlLine."Purchase Action" := GenJnlLine."Purchase Action";
+        JobJnlLine."Sales Price Purch. Order" := ApprovLineRec."Sales Price";
+        JobJnlLine."Cost Plus Entry Created" := ApprovLineRec."Cost Plus Entry Created";
+        //IF (ApprovLineRec."Employee No." <> '') AND (ApprovLineRec."Receipt No." <> '') THEN  //*10927.o
+        IF (ApprovLineRec."Receipt No." <> '') THEN  //*10927.n
+          IF PurchRcptLine.GET(ApprovLineRec."Receipt No.",ApprovLineRec."Receipt Line No.") THEN
+            JobJnlLine."Execution Date" := PurchRcptLine."Posting Date";
+        IF JobJnlLine."Execution Date" = 0D THEN  //*10927.n
+          JobJnlLine."Execution Date" := JobJnlLine."Posting Date";  //*10927.n
+        JobJnlLine."Removal Contribution" := ApprovLineRec."Removal Contribution";  //db, 07-12-10: M22790
+         //M29056 sn
+        JobJnlLine."Tariff No." := ApprovLineRec."Tariff No.";
+        IF ApprovLineRec."Document Type" = ApprovLineRec."Document Type"::"Purchase Invoice" THEN BEGIN
+          JobJnlLine."Country/Region Code" := InvHeaderRec."Country/Region of Origin";
+          JobJnlLine."Country/Region of Origin/Dest." := InvHeaderRec."Country/Region of Destination";
+        END ELSE BEGIN
+          JobJnlLine."Country/Region Code" := CredHeaderRec."Country/Region of Origin";
+          JobJnlLine."Country/Region of Origin/Dest." := CredHeaderRec."Country/Region of Destination";
+        END;
+        //M29056 en
+        JobJnlLine."FSC Type Code" := ApprovLineRec."FSC Type Code";  //DP00129
+        JobJnlLine.Comment := GetCommentForProjEntry(ApprovLineRec, MAXSTRLEN(JobJnlLine.Comment));  //*34602.n
+        JobJnlPostLine.RunWithCheck(JobJnlLine);
+
+      IF PeriodicCount < PeriodicTemplate."No. of Periods" THEN
+        PostSurcharge(0);
+      END;
+
+      ApprovLineRec.VALIDATE(ApprovLineRec."Periodic Template Code",'');
+    END;
+
     BEGIN
     {
       4PS05 KK, 19 november 2010, On hold when no contract returned or when no letter of credit returned.
       //C004829  Item tracking for approval. Copied from C90 and modified for approval
+      4PSSE Itero.BSL Periodic Template
+      140124 ITERO.SB Apply Rounding
+      140218 ITERO.DL altered "Invoice Rounding" to "Approval Invoice Rounding"
+
+      ITERO.DL, 140219, removed CONS13, V13
+      140303 ITERO.DL, changed InvoiceRounding-calculation
+      140326 ITERO.SB Handle periodic periods when posting project/service
+      140328 ITERO.SB Changed rounding calculation
+      140424 ITERO.SB New calc. of invoice rounding amount (Inv + CreMemo.)
     }
     END.
   }

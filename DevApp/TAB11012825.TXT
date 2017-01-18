@@ -810,6 +810,7 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
                                                                   "Unit Price Line Code" := ServiceUnitPriceLine.Code;
                                                                   "Unit Price Index Date" := ServiceUnitPriceLine."Index Date";
                                                                   Description := ServiceUnitPriceLine.Description;
+                                                                  "Unit of Measure" := ServiceUnitPriceLine."Unit of Measure";  //4PSSE, DL, 140204
                                                                 END;
                                                               END;
 
@@ -874,6 +875,14 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
     { 1500;   ;Department Filter   ;Code20        ;FieldClass=FlowFilter;
                                                    TableRelation="Dimension Value".Code WHERE (Global Dimension No.=CONST(1));
                                                    CaptionML=ENU=Department Filter }
+    { 11128270;;Price History Found;Boolean       ;CaptionML=ENU=Price History (Customer) Found;
+                                                   Description=ITERO }
+    { 11128271;;Price History Vendor No.;Code20   ;CaptionML=ENU=Price History (Customer) Vendor No.;
+                                                   Description=ITERO }
+    { 11128272;;Price History PriceList;Code20    ;CaptionML=ENU=Customer price list;
+                                                   Description=ITERO }
+    { 11128273;;Total Cost Price (LCY);Decimal    ;CaptionML=ENU=Total Cost Price (LCY);
+                                                   Description=ITERO }
   }
   KEYS
   {
@@ -937,6 +946,8 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
       Text011@1100528600 : TextConst 'ENU=not found';
       SkipDetermineChargeable@1100525002 : Boolean;
       RoundOption@1100525004 : 'Price,Amount';
+      "-- ITERO --"@1100285000 : Integer;
+      UseManualPriceList@1100285001 : Code[20];
       OverruleServiceContractNo@1100528601 : Code[20];
 
     PROCEDURE GetServOrder@1210190012(lvInit@1210190000 : Boolean);
@@ -1318,6 +1329,8 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
       lvDiscType@1100525004 : 'Purchase,Sales';
       DummyDat@1100525006 : Date;
       SaveField@1100525007 : Integer;
+      ProjSetup@1100285000 : Record 315;
+      lvSaveCostPrice@1100285001 : Decimal;
     BEGIN
       //db, 28-12-09: M16871
       ServiceOrderCostPlusEntry := Rec; //call T000440
@@ -1325,10 +1338,25 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
       lvRefDate := ValidateCu.GetRefDateServOrder(ServOrderRec);
       lvRefPrio := ValidateCu.GetRefPrioServContract(ServContractRec, lvDiscType::Purchase);
 
+      //>> 150905 ITERO.AC Check project settings and keep existing cost price if any
+      ProjSetup.GET;
+      lvSaveCostPrice := 0;
+      IF (ProjSetup."Copy Price Item from Entry") AND ("Cost Price (LCY)" <> 0) THEN BEGIN
+        lvSaveCostPrice := "Cost Price (LCY)";
+      END;
+      //<< 150905 ITERO.AC
+
+      ValidateCu.SetPriceListCode('');  // Itero ANCA 150807 Added Price List Code To Service Order
+      ValidateCu.SetDontUseSingleGTIN(TRUE); // 160116 ITERO.AC (Same as IME420)
+
       ValidateCu.ValidateItem(LTypeArtOpt, "Trade Item", "Item No.", Manufacturer, "Vendor (Trade Item)",
         "Basic Item", "Cost Object", Description, "Unit of Measure", "Cost Price (LCY)", "Purchase Discount % (Item)", DummyDat,
         "Gross Price (LCY)", "Description 2", "Cost Component",
          lvDiscRef1, lvDiscRef2, lvRefDate, lvRefPrio);
+      //>> 150905 ITERO.AC
+      IF lvSaveCostPrice <> 0 THEN
+        "Cost Price (LCY)" := lvSaveCostPrice;
+      //<< 150905 ITERO.AC
 
       //call T000440.sn
       IF CostObjectFixed AND (ServiceOrderCostPlusEntry."Cost Object" <> '') THEN BEGIN
@@ -1359,9 +1387,53 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
       lvDiscRef2@1100525001 : Code[20];
       lvRefPrio@1100525000 : Code[10];
       lvDiscType@1100525004 : 'Purchase,Sales';
+      lvCustPriceListFromPrio@1100285000 : Code[20];
     BEGIN
       //db, 28-12-09: M16871
       IF NOT CustRec.GET("Bill-to Customer No.") THEN CustRec.INIT;   //db, 08-12-10: M23704
+      //>> Itero AC 150807 Price Calulation when Customer Price List is Selected
+      IF NOT UseCostPrice(CustRec) THEN BEGIN
+        ValidateCu.SetQuantity(Quantity);
+        lvRefDate := ValidateCu.GetRefDateServOrder(ServOrderRec);
+        ValidateCu.GetRefDiscServOrder(ServOrderRec, lvDiscRef1, lvDiscRef2, lvDiscType::Sales);
+        IF lvDiscRef1 <> '' THEN BEGIN
+          lvRefPrio := '01~';  // ITERO.AC: Betyder Rabattvilkorsgrupp (Kund) i Serviceorder
+        END ELSE BEGIN
+          lvRefPrio := ValidateCu.GetRefPrioServContract(ServContractRec, lvDiscType::Sales);
+        END;
+        IF UseManualPriceList = '' THEN BEGIN
+          ValidateCu.SetPriceListCode(ServOrderRec."Price List Code");
+        END ELSE BEGIN
+          ValidateCu.SetPriceListCode(UseManualPriceList);
+        END;
+        ValidateCu.GetSalesDiscount(CustRec."No.", "Item No.", "Basic Item", "Trade Item",
+          Manufacturer, "Vendor (Trade Item)", "Basic Price (LCY)", "Sales Discount % (Item)", "Gross Price (LCY)", lvRefDate, '',
+          lvDiscRef1, lvDiscRef2, lvRefPrio);
+        //>> 150905 ITERO.AC Search for alternative Customer Price List
+        IF NOT ValidateCu.GetPriceHistFound() THEN BEGIN
+          lvCustPriceListFromPrio := GetCustPriceListFromPriority("Trade Item", lvRefDate, lvDiscRef1);
+          IF lvCustPriceListFromPrio <> '' THEN BEGIN
+            ValidateCu.SetPriceListCode(lvCustPriceListFromPrio);
+            ValidateCu.GetSalesDiscount(CustRec."No.", "Item No.", "Basic Item", "Trade Item",
+              Manufacturer, "Vendor (Trade Item)", "Basic Price (LCY)", "Sales Discount % (Item)", "Gross Price (LCY)", lvRefDate, '',
+              lvDiscRef1, lvDiscRef2, lvRefPrio);
+          END;
+        END;
+        //<< 150905 ITERO.AC
+        "Price History Found" := ValidateCu.GetPriceHistFound();
+        "Price History Vendor No." := ValidateCu.GetPriceHistVendorNo();
+        "Gross Price (LCY)" :=  ValidateCu.GetLatestCustGrossPrice();
+        IF ("Price History Found") AND (UseManualPriceList = '')  THEN BEGIN
+          IF lvCustPriceListFromPrio = '' THEN
+            "Price History PriceList" := ServOrderRec."Price List Code"
+          ELSE
+            "Price History PriceList" := lvCustPriceListFromPrio;
+        END;
+        VALIDATE("Sales Discount % (Item)");
+        GetSalesDiscount;
+        EXIT;
+      END;
+      //<< ITERO.AC 150807
       IF ItemPriceCPEisGrossMin(CustRec) THEN BEGIN
         ValidateCu.SetQuantity(Quantity);
         lvRefDate := ValidateCu.GetRefDateServOrder(ServOrderRec);
@@ -3190,6 +3262,9 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
 
         CostPlusRec."Surcharge %" := CostPlusRec.GetSurcharge;
         CostPlusRec."Sales Price (LCY)" := CostPlusRec."Basic Price (LCY)" * (1 + CostPlusRec."Surcharge %"/100);
+        //>> 160222 ITERO.SB Calculate sales price
+        CostPlusRec.CalculateSalesPriceFromLCY;
+        //<<
         IF "Sales Price Purch. Order" <> 0 THEN BEGIN
           CostPlusRec.VALIDATE("Sales Price (LCY)", "Sales Price Purch. Order");
           CostPlusRec."Basic Price Found at" := FIELDCAPTION("Sales Price Purch. Order");
@@ -3269,7 +3344,9 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
         //mg.en, 14-06-11: M26765
 
         CostPlusRec.VALIDATE(Text, Text);
-
+        //Itero.PR 151111
+        CostPlusRec."Total Cost Price (LCY)" := CostPlusRec.Quantity * CostPlusRec."Cost Price (LCY)";
+        //Itero 151111
         CostPlusRec.MODIFY;
         CostPlusRec.DetermineRemovalContribution(FALSE);
       END;
@@ -3859,6 +3936,57 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
       END;
     END;
 
+    LOCAL PROCEDURE "--- ITERO ---"@1();
+    BEGIN
+    END;
+
+    PROCEDURE UseCostPrice@1100285000(_customer@1100285000 : Record 18) : Boolean;
+    BEGIN
+      //>> ITERO.AC 150807
+      IF (ServOrderRec."Price List Code" <> '' ) OR (UseManualPriceList <> '') THEN BEGIN
+        EXIT((_customer."Item Price Cost Plus Project" = _customer."Item Price Cost Plus Project"::CostPrice));
+      END ELSE BEGIN
+        EXIT(TRUE);
+      END;
+    END;
+
+    PROCEDURE SetManualPriceList@1100285001(_UseManualPl@1100285000 : Code[20]);
+    BEGIN
+      // ITERO.AC 150904 This flag is used to handle process flow in FindSalesPrice
+      UseManualPriceList := _UseManualPl;
+    END;
+
+    PROCEDURE GetCustPriceListFromPriority@1100285005(lvTradeItem@1100285000 : Code[20];lvRefDate@1100285003 : Date;VAR lvDiscRef1@1100285004 : Code[20]) : Code[20];
+    VAR
+      lvCustPlPriority@1100285001 : Record 11128278;
+      lvPriceHistRec@1100285002 : Record 11012315;
+    BEGIN
+      // ITERO.AC 150905. This function tries to find an alternative Trade Item Vendor by a loop through the table "Customer Price List priority"
+      // and for each alternative price list: search if current article code exists in "Price History Trade Item"
+
+      CLEAR(lvCustPlPriority);
+      lvCustPlPriority.SETCURRENTKEY(Priority,"Price List Code");
+
+      IF lvCustPlPriority.FINDSET THEN BEGIN
+        REPEAT
+
+          lvPriceHistRec.SETCURRENTKEY("Item Code", "Starting Date", "Price List Code");
+          lvPriceHistRec.SETRANGE("Item Code", lvTradeItem);
+          lvPriceHistRec.SETRANGE("Starting Date", 0D, lvRefDate);
+          lvPriceHistRec.SETRANGE("Price List Code", lvCustPlPriority."Price List Code");
+
+          IF lvPriceHistRec.FINDLAST THEN BEGIN
+            IF lvCustPlPriority."Sales Discount Term Group 1" <> '' THEN
+               lvDiscRef1 := lvCustPlPriority."Sales Discount Term Group 1";
+            EXIT(lvPriceHistRec."Price List Code");
+          END;
+
+        UNTIL lvCustPlPriority.NEXT=0;
+      END;
+
+      EXIT('');
+    END;
+
     PROCEDURE DuplicateLine@1100528605();
     VAR
       ServiceOrderCostPlusEntry@1100528600 : Record 11012825;
@@ -3920,6 +4048,14 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
           Collective List No.,Base Service Order No.,Service Order No.,Cost Object
 
       4PS, 11-12-13, C008689, In case of Credit Memo the Cost Price will not be set to negative
+      130122 ITERO.SB Filter on indexdate added
+      140204 4PSSE.DL take "Unit of Measure" from pricelist and "Unit Price Line Code"
+      150807 ITERO.AC Added columns for PriceHistory and modified functions FindCostPrice And FindSalesPrice
+      150904 ITERO.AC Added UseManualPriceList in order to flow control in FindSalesPrice
+      150905 ITERO.AC Modified function FindSalesPrice and added a new function GetVendorFromCustPriceListPriority (Support for Customer Price List priority)
+      151111 ITERO.PR New field: 11128273 Cost Price (LCY) Total sj„lvkostnad
+      160116 ITERO.AC Set variable DontUseSingleGTIN in CodeUnit ValidateItems to avoid mixup of GTIN Code in Item Relation (Same as IME420)
+      160222 ITERO.SB Calculate sales price
     }
     END.
   }

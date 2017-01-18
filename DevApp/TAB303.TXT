@@ -4,7 +4,7 @@ OBJECT Table 303 Finance Charge Memo Line
   {
     Date=;
     Time=;
-    Version List=NAVW19.00,4PS9.00;
+    Version List=NAVW19.00,NAVSE9.FI9.DK9.NO9,4PS9.00,4PSSE;
   }
   PROPERTIES
   {
@@ -43,7 +43,19 @@ OBJECT Table 303 Finance Charge Memo Line
                                                                   FinChrgMemoLine := Rec;
                                                                   INIT;
                                                                   Type := FinChrgMemoLine.Type;
+                                                                  "Account Code DK" := FinChrgMemoLine."Account Code DK";  //NAVDK
+                                                                  "Account Code NO" := FinChrgMemoLine."Account Code NO";  //NAVNO
                                                                   GetFinChrgMemoHeader;
+                                                                  //NAVDK
+                                                                  IF (Type <> Type::" ") AND ("Account Code DK" = '') THEN
+                                                                    "Account Code DK" := FinChrgMemoHeader."Account Code DK"
+                                                                  ELSE
+                                                                    "Account Code DK" := '';
+                                                                  //NAVNO
+                                                                  IF (Type <> Type::" ") AND ("Account Code NO" = '') THEN
+                                                                    "Account Code NO" := FinChrgMemoHeader."Account Code NO"
+                                                                  ELSE
+                                                                    "Account Code NO" := '';
                                                                 END;
                                                               END;
 
@@ -122,17 +134,7 @@ OBJECT Table 303 Finance Charge Memo Line
                                                               END;
 
                                                    OnLookup=BEGIN
-                                                              IF Type <> Type::"Customer Ledger Entry" THEN
-                                                                EXIT;
-                                                              SetCustLedgEntryView;
-                                                              IF "Document Type" <> 0 THEN
-                                                                CustLedgEntry.SETRANGE("Document Type","Document Type");
-                                                              IF "Document No." <> '' THEN
-                                                                CustLedgEntry.SETRANGE("Document No.","Document No.");
-                                                              IF CustLedgEntry.FINDFIRST THEN;
-                                                              CustLedgEntry.SETRANGE("Document Type");
-                                                              CustLedgEntry.SETRANGE("Document No.");
-                                                              LookupCustLedgEntry;
+                                                              LookupDocNo;
                                                             END;
 
                                                    CaptionML=ENU=Document No. }
@@ -303,13 +305,35 @@ OBJECT Table 303 Finance Charge Memo Line
                                                    CaptionML=ENU=VAT Clause Code }
     { 101 ;   ;System-Created Entry;Boolean       ;CaptionML=ENU=System-Created Entry;
                                                    Editable=No }
+    { 11128040;;Multiple Interest Rates Entry;Boolean;
+                                                   CaptionML=ENU=Multiple Interest Rates Entry;
+                                                   Description=NAVSE,NAVFI }
+    { 11128501;;Account Code NO    ;Text30        ;OnValidate=BEGIN
+                                                                IF (Type = Type::" ") AND ("Account Code NO" <> '') THEN
+                                                                  ERROR(Text13600, FIELDCAPTION("Account Code NO"), FIELDCAPTION(Type), Type);
+                                                              END;
+
+                                                   CaptionML=ENU=Account Code NO;
+                                                   Description=NAVNO }
+    { 11128570;;Account Code DK    ;Text30        ;OnValidate=BEGIN
+                                                                IF (Type = Type::" ") AND ("Account Code DK" <> '') THEN
+                                                                  ERROR(Text13600, FIELDCAPTION("Account Code DK"), FIELDCAPTION(Type), Type);
+                                                              END;
+
+                                                   CaptionML=ENU=Account Code DK;
+                                                   Description=NAVDK }
   }
   KEYS
   {
     {    ;Finance Charge Memo No.,Line No.        ;SumIndexFields=Amount,VAT Amount,Remaining Amount;
                                                    MaintainSIFTIndex=No;
                                                    Clustered=Yes }
-    {    ;Finance Charge Memo No.,Type            ;SumIndexFields=Amount,VAT Amount,Remaining Amount;
+    {    ;Finance Charge Memo No.,Type,Multiple Interest Rates Entry;
+                                                   SumIndexFields=Amount,VAT Amount,Remaining Amount;
+                                                   MaintainSQLIndex=No;
+                                                   MaintainSIFTIndex=No }
+    {    ;Finance Charge Memo No.,Multiple Interest Rates Entry;
+                                                   SumIndexFields=Amount,VAT Amount,Remaining Amount;
                                                    MaintainSQLIndex=No;
                                                    MaintainSIFTIndex=No }
   }
@@ -345,14 +369,34 @@ OBJECT Table 303 Finance Charge Memo Line
       Text004@1011 : TextConst 'ENU=There is no open %1 with %2 %3.';
       CustLedgEntry2@1024 : Record 21;
       ClosedatDate@1025 : Date;
+      Text3010590@1040030 : TextConst 'ENU=There is not enough space to insert lines with additional interest rates';
+      Text13600@1101100000 : TextConst 'ENU=You cannot enter %1 if %2 is "%3".';
+      Checking@1040031 : Boolean;
+      NrOfDays@1040032 : Integer;
+      NrOfLinesToInsert@1080003 : Integer;
+      Text3010591@1040033 : TextConst 'ENU=Create interest rate with start date prior to %1';
+      NrOfLines@1040000 : Integer;
 
     LOCAL PROCEDURE CalcFinChrg@6();
     VAR
       DtldCLE@1001 : Record 379;
       IssuedReminderHeader@1003 : Record 297;
+      LineFee@1004 : Decimal;
+      FinChrgInterestRates@1100285001 : Record 11128040;
+      ExtraFinChrgMemoLine@1080010 : Record 303;
       InterestStartDate@1000 : Date;
       BaseAmount@1002 : Decimal;
-      LineFee@1004 : Decimal;
+      UseDueDate@1100285012 : Date;
+      UseCalcDate@1100285011 : Date;
+      CurrInterestRateStartDate@1100285010 : Date;
+      LineSpacing@1100285009 : Integer;
+      NextLineNo@1100285008 : Integer;
+      UseInterestRate@1100285007 : Decimal;
+      LastRateFound@1100285006 : Boolean;
+      CumAmount@1100285005 : Decimal;
+      SumBaseAmount@1100285004 : Decimal;
+      InsertedLines@1100285003 : Boolean;
+      UseInterestPeriod@1100285002 : Integer;
     BEGIN
       GetFinChrgMemoHeader;
       Amount := 0;
@@ -361,15 +405,66 @@ OBJECT Table 303 Finance Charge Memo Line
       "Gen. Prod. Posting Group" := '';
       "VAT Prod. Posting Group" := '';
       "Interest Rate" := 0;
+
+      FinChrgMemoLine := Rec;
+      FinChrgMemoLine.SETRANGE("Finance Charge Memo No.", "Finance Charge Memo No.");
+      FinChrgMemoLine.SETRANGE("Multiple Interest Rates Entry", TRUE);
+      FinChrgMemoLine.SETRANGE("Entry No.", "Entry No.");
+      FinChrgMemoLine.DELETEALL;
+
       CustLedgEntry.GET("Entry No.");
       IF CustLedgEntry."On Hold" <> '' THEN
         EXIT;
 
-      "Interest Rate" := FinChrgTerms."Interest Rate";
+      //"Interest Rate" := FinChrgTerms."Interest Rate";
+      UseDueDate := CustLedgEntry."Due Date";
+      UseInterestRate := FinChrgTerms."Interest Rate";
+      UseCalcDate := 0D;
+      NrOfLinesToInsert := 0;
+
+      FinChrgInterestRates.INIT;
+      FinChrgInterestRates.SETRANGE("Fin. Charge Terms Code", FinChrgMemoHeader."Fin. Charge Terms Code");
+      FinChrgInterestRates."Fin. Charge Terms Code" := FinChrgMemoHeader."Fin. Charge Terms Code";
+      IF FinChrgTerms."Interest Calculation Method" = FinChrgTerms."Interest Calculation Method"::"Average Daily Balance" THEN
+        FinChrgInterestRates."Start Date" := CALCDATE('<+1D>',CustLedgEntry."Due Date")
+      ELSE
+        FinChrgInterestRates."Start Date" := FinChrgMemoHeader."Document Date";
+      NrOfLinesToInsert := 0;
+      NrOfLines := 0;
+      LastRateFound := FALSE;
+      IF FinChrgInterestRates.FIND('=<') THEN BEGIN
+        UseInterestRate := FinChrgInterestRates."Interest Rate";
+        IF FinChrgTerms."Interest Calculation Method" = FinChrgTerms."Interest Calculation Method"::"Average Daily Balance" THEN
+          REPEAT
+            IF FinChrgInterestRates."Start Date" <= FinChrgMemoHeader."Document Date" THEN BEGIN
+              NrOfLines := NrOfLines + 1;
+              UseInterestRate := FinChrgInterestRates."Interest Rate";
+              IF CALCDATE(FinChrgTerms."Grace Period","Due Date") < FinChrgMemoHeader."Document Date" THEN
+                NrOfLinesToInsert := NrOfLinesToInsert + 1
+            END ELSE
+              LastRateFound := TRUE;
+          UNTIL LastRateFound OR (FinChrgInterestRates.NEXT = 0);
+      IF UseCalcDate = 0D THEN BEGIN
+          FinChrgInterestRates.NEXT(-1);
+          UseCalcDate := FinChrgInterestRates."Start Date";
+      END;
+      END ELSE
+        IF FinChrgInterestRates.COUNT > 0 THEN
+          ERROR(Text3010591,FinChrgInterestRates."Start Date");
+      IF (UseCalcDate = 0D) OR (UseCalcDate < FinChrgMemoHeader."Document Date") THEN
+        UseCalcDate := FinChrgMemoHeader."Document Date";
+      "Interest Rate" := UseInterestRate;
+
       CASE FinChrgTerms."Interest Calculation Method" OF
         FinChrgTerms."Interest Calculation Method"::"Average Daily Balance":
           BEGIN
-            FinChrgTerms.TESTFIELD("Interest Period (Days)");
+
+            //FinChrgTerms.TESTFIELD("Interest Period (Days)");
+            IF NrOfLinesToInsert = 0 THEN
+              FinChrgTerms.TESTFIELD("Interest Period (Days)")
+            ELSE
+              FinChrgInterestRates.TESTFIELD("Interest Period (Days)");
+
             ReminderEntry.SETCURRENTKEY("Customer Entry No.");
             ReminderEntry.SETRANGE("Customer Entry No.","Entry No.");
             ReminderEntry.SETRANGE(Type,ReminderEntry.Type::"Finance Charge Memo");
@@ -383,29 +478,80 @@ OBJECT Table 303 Finance Charge Memo Line
                 InterestCalcDate := ReminderEntry."Document Date";
             CalcInterest := FALSE;
             FinChrgMemoLine3.DELETEALL;
-            IF CALCDATE(FinChrgTerms."Grace Period","Due Date") < FinChrgMemoHeader."Document Date" THEN BEGIN
-              CalcInterest := TRUE;
-              IF CustLedgEntry."Calculate Interest" THEN BEGIN
-                ClosedatDate := CalcClosedatDate;
-                IF ClosedatDate <= CALCDATE(FinChrgTerms."Grace Period","Due Date") THEN
-                  CalcInterest := FALSE;
-              END;
-              DtldCLE.SETCURRENTKEY("Cust. Ledger Entry No.","Entry Type","Posting Date");
-              DtldCLE.SETRANGE("Cust. Ledger Entry No.",CustLedgEntry."Entry No.");
-              DtldCLE.SETFILTER("Entry Type",'%1|%2',
-                DtldCLE."Entry Type"::"Initial Entry",
-                DtldCLE."Entry Type"::Application);
-              DtldCLE.SETRANGE("Posting Date",0D,FinChrgMemoHeader."Document Date");
-              IF DtldCLE.FIND('-') THEN
+            IF CALCDATE(FinChrgTerms."Grace Period","Due Date") < FinChrgMemoHeader."Document Date" THEN
+              IF NrOfLines = 0 THEN
+                CumulateDetailedEntries(Amount,UseDueDate,UseCalcDate,
+                  UseInterestRate,FinChrgTerms."Interest Period (Days)",BaseAmount)
+              ELSE
+                CumulateDetailedEntries(Amount,UseDueDate,UseCalcDate,
+                  UseInterestRate,FinChrgInterestRates."Interest Period (Days)",BaseAmount);
+            NrOfDays := UseCalcDate - UseDueDate;
+
+            IF (NrOfLinesToInsert > 0) AND
+               (FinChrgTerms."Interest Calculation Method" = FinChrgTerms."Interest Calculation Method"::"Average Daily Balance")
+            THEN BEGIN
+              NrOfDays := 0;
+              ExtraFinChrgMemoLine.RESET;
+              ExtraFinChrgMemoLine.SETRANGE("Finance Charge Memo No.","Finance Charge Memo No.");
+              ExtraFinChrgMemoLine := Rec;
+              IF ExtraFinChrgMemoLine.FIND('>') THEN BEGIN
+                LineSpacing :=
+                  (ExtraFinChrgMemoLine."Line No." - "Line No.") DIV
+                  (1 + NrOfLinesToInsert);
+                IF LineSpacing = 0 THEN
+                  ERROR(Text3010590);
+              END ELSE
+                LineSpacing := 10000;
+              NextLineNo := "Line No." + LineSpacing;
+              FinChrgInterestRates.INIT;
+              FinChrgInterestRates.SETRANGE("Fin. Charge Terms Code",FinChrgMemoHeader."Fin. Charge Terms Code");
+              FinChrgInterestRates."Fin. Charge Terms Code" := FinChrgMemoHeader."Fin. Charge Terms Code";
+              FinChrgInterestRates."Start Date" := CALCDATE('<+1D>',CustLedgEntry."Due Date");
+              IF FinChrgInterestRates.FIND('=<') THEN BEGIN
                 REPEAT
-                  IF DtldCLE."Entry Type" = DtldCLE."Entry Type"::"Initial Entry" THEN
-                    InterestStartDate := CustLedgEntry."Due Date"
-                  ELSE
-                    InterestStartDate := DtldCLE."Posting Date";
-                  IF InterestCalcDate > InterestStartDate THEN
-                    InterestStartDate := InterestCalcDate;
-                  Amount := Amount + DtldCLE.Amount * (FinChrgMemoHeader."Document Date" - InterestStartDate);
-                UNTIL DtldCLE.NEXT = 0;
+                  CalcInterest := FALSE;
+                  FinChrgInterestRates.TESTFIELD("Interest Period (Days)");
+                  UseDueDate := CALCDATE('<-1D>',FinChrgInterestRates."Start Date");
+                  CurrInterestRateStartDate := FinChrgInterestRates."Start Date";
+                  UseInterestRate := FinChrgInterestRates."Interest Rate";
+                  UseInterestPeriod := FinChrgInterestRates."Interest Period (Days)";
+                  IF FinChrgInterestRates.NEXT <> 0 THEN BEGIN
+                    IF FinChrgInterestRates."Start Date" <= FinChrgMemoHeader."Document Date" THEN
+                      UseCalcDate := CALCDATE('<-1D>',FinChrgInterestRates."Start Date")
+                    ELSE
+                      UseCalcDate := FinChrgMemoHeader."Document Date";
+                  END ELSE
+                    UseCalcDate := FinChrgMemoHeader."Document Date";
+
+                  IF (CustLedgEntry."Closed at Date" <> 0D) AND
+                     (UseCalcDate > CustLedgEntry."Closed at Date")
+                  THEN
+                    UseCalcDate := CustLedgEntry."Closed at Date";
+
+                  ExtraFinChrgMemoLine := Rec;
+                  ExtraFinChrgMemoLine."Line No." := NextLineNo;
+                  ExtraFinChrgMemoLine."Due Date" := CALCDATE('<+1D>',InterestCalcDate);
+                  IF CurrInterestRateStartDate > ExtraFinChrgMemoLine."Due Date" THEN
+                    ExtraFinChrgMemoLine."Due Date" := CurrInterestRateStartDate;
+                  ExtraFinChrgMemoLine."Interest Rate" := UseInterestRate;
+                  IF InterestCalcDate < UseCalcDate THEN BEGIN
+                    CumulateDetailedEntries(ExtraFinChrgMemoLine.Amount,UseDueDate,UseCalcDate,
+                      UseInterestRate,UseInterestPeriod,BaseAmount);
+                    IF ExtraFinChrgMemoLine.Amount <> 0 THEN BEGIN
+                      NrOfDays := NrOfDays + (UseCalcDate - UseDueDate);
+                      BuildDescription(ExtraFinChrgMemoLine.Description,UseInterestRate,UseDueDate,UseCalcDate - UseDueDate,
+                        BaseAmount);
+                      CumAmount := CumAmount + ExtraFinChrgMemoLine.Amount;
+                      ExtraFinChrgMemoLine."Multiple Interest Rates Entry" := TRUE;
+                      IF NOT Checking THEN
+                        ExtraFinChrgMemoLine.INSERT;
+                      InsertedLines := TRUE;
+                      NextLineNo := ExtraFinChrgMemoLine."Line No." + LineSpacing;
+                    END;
+                  END;
+                  NrOfLinesToInsert := NrOfLinesToInsert - 1;
+                UNTIL NrOfLinesToInsert = 0;
+                VALIDATE(Amount,CumAmount);
               IF (NOT FinChrgTerms."Add. Line Fee in Interest") AND
                  (CustLedgEntry."Document Type" = CustLedgEntry."Document Type"::Reminder) AND
                  IssuedReminderHeader.GET(CustLedgEntry."Document No.")
@@ -417,11 +563,7 @@ OBJECT Table 303 Finance Charge Memo Line
                   Amount := 0;
               END;
             END;
-            BaseAmount := Amount / FinChrgTerms."Interest Period (Days)";
-            IF CalcInterest THEN
-              Amount := Amount / FinChrgTerms."Interest Period (Days)" * "Interest Rate" / 100
-            ELSE
-              Amount := 0;
+           END;
           END;
         FinChrgTerms."Interest Calculation Method"::"Balance Due":
           IF CALCDATE(FinChrgTerms."Grace Period","Due Date") < FinChrgMemoHeader."Document Date" THEN BEGIN
@@ -430,25 +572,10 @@ OBJECT Table 303 Finance Charge Memo Line
           END;
       END;
 
-      IF FinChrgTerms."Line Description" <> '' THEN BEGIN
-        DocTypeText := DELCHR(FORMAT("Document Type"),'<');
-        IF DocTypeText = '' THEN
-          DocTypeText := Text002;
-        Description :=
-          COPYSTR(
-            STRSUBSTNO(
-              FinChrgTerms."Line Description",
-              CustLedgEntry.Description,
-              DocTypeText,
-              "Document No.",
-              "Interest Rate",
-              FORMAT("Original Amount",0,ApplicationManagement.AutoFormatTranslate(1,FinChrgMemoHeader."Currency Code")),
-              FORMAT(BaseAmount,0,ApplicationManagement.AutoFormatTranslate(1,FinChrgMemoHeader."Currency Code")),
-              "Due Date",
-              FinChrgMemoHeader."Currency Code"),
-            1,
-            MAXSTRLEN(Description));
-      END;
+      IF InsertedLines THEN
+        BuildMultiDescription(FinChrgTerms."Line Description", UseDueDate, NrOfDays,BaseAmount);
+      BuildDescription(Description, UseInterestRate, UseDueDate, NrOfDays,BaseAmount);
+
 
       IF Amount <> 0 THEN BEGIN
         CustPostingGr.GET(FinChrgMemoHeader."Customer Posting Group");
@@ -613,6 +740,130 @@ OBJECT Table 303 Finance Charge Memo Line
           ELSE
             ClosedatDate := CustLedgEntry."Closed at Date";
         UNTIL CustLedgEntry2.NEXT = 0;
+    END;
+
+    PROCEDURE SetCheckingMode@1080000(DoChecking@1080000 : Boolean);
+    BEGIN
+      Checking := DoChecking;
+    END;
+
+    LOCAL PROCEDURE BuildDescription@1080001(VAR Descr@1080000 : Text[50];InterestRate@1080001 : Decimal;DueDate@1080002 : Date;NrOfDays@1080003 : Integer;BaseAmount@1040000 : Decimal);
+    BEGIN
+      DocTypeText := DELCHR(FORMAT("Document Type"),'<');
+      IF DocTypeText = '' THEN
+        DocTypeText := Text002;
+      IF FinChrgTerms.Description = '' THEN
+        Descr := COPYSTR(CustLedgEntry.Description,1,MAXSTRLEN(Description))
+      ELSE
+        Descr :=
+          COPYSTR(
+            STRSUBSTNO(
+              FinChrgTerms."Line Description",
+              CustLedgEntry.Description,
+              DocTypeText,
+              "Document No.",
+              InterestRate,
+              FORMAT("Original Amount",0,ApplicationManagement.AutoFormatTranslate(1,FinChrgMemoHeader."Currency Code")),
+              FORMAT("Remaining Amount",0,ApplicationManagement.AutoFormatTranslate(1,FinChrgMemoHeader."Currency Code")),
+              DueDate,
+              FinChrgMemoHeader."Currency Code",
+              NrOfDays),
+            1,
+            MAXSTRLEN(Description));
+      IF Descr <> '' THEN;
+    END;
+
+    LOCAL PROCEDURE BuildMultiDescription@1090000(VAR Descr@1080000 : Text[50];DueDate@1080002 : Date;NrOfDays@1080003 : Integer;BaseAmount@1040000 : Decimal);
+    BEGIN
+      DocTypeText := DELCHR(FORMAT("Document Type"),'<');
+      IF DocTypeText = '' THEN
+        DocTypeText := Text002;
+      IF FinChrgTerms.Description = '' THEN
+        Descr := COPYSTR(CustLedgEntry.Description,1,MAXSTRLEN(Description))
+      ELSE
+        Descr :=
+          COPYSTR(
+            STRSUBSTNO(
+              FinChrgTerms."Multiple Lines Description",
+              CustLedgEntry.Description,
+              DocTypeText,
+              "Document No.",
+              FORMAT("Original Amount",0,ApplicationManagement.AutoFormatTranslate(1,FinChrgMemoHeader."Currency Code")),
+              FORMAT("Remaining Amount",0,ApplicationManagement.AutoFormatTranslate(1,FinChrgMemoHeader."Currency Code")),
+              DueDate,
+              FinChrgMemoHeader."Currency Code",
+              NrOfDays),
+            1,
+            MAXSTRLEN(Description));
+    END;
+
+    LOCAL PROCEDURE CumulateDetailedEntries@1080002(VAR CumAmount@1080000 : Decimal;UseDueDate@1080003 : Date;UseCalcDate@1080004 : Date;UseInterestRate@1080005 : Decimal;UseInterestPeriod@1080006 : Integer;VAR BaseAmount@1040000 : Decimal);
+    VAR
+      DtldCLE@1080001 : Record 379;
+      IssuedReminderHeader@1000 : Record 297;
+      InterestStartDate@1080002 : Date;
+      LineFee@1001 : Decimal;
+    BEGIN
+      CalcInterest := TRUE;
+      IF CustLedgEntry."Calculate Interest" THEN BEGIN
+        ClosedatDate := CalcClosedatDate;
+        IF ClosedatDate <= CALCDATE(FinChrgTerms."Grace Period","Due Date") THEN
+          CalcInterest := FALSE;
+      END;
+      DtldCLE.SETCURRENTKEY("Cust. Ledger Entry No.","Entry Type","Posting Date");
+      DtldCLE.SETRANGE("Cust. Ledger Entry No.",CustLedgEntry."Entry No.");
+      DtldCLE.SETFILTER("Entry Type",'%1|%2|%3|%4|%5',
+        DtldCLE."Entry Type"::"Initial Entry",
+        DtldCLE."Entry Type"::Application,
+        DtldCLE."Entry Type"::"Payment Tolerance",
+        DtldCLE."Entry Type"::"Payment Discount Tolerance (VAT Excl.)",
+        DtldCLE."Entry Type"::"Payment Discount Tolerance (VAT Adjustment)");
+      DtldCLE.SETRANGE("Posting Date",0D,FinChrgMemoHeader."Document Date");
+      CumAmount := 0;
+      IF DtldCLE.FIND('-') THEN
+        REPEAT
+          IF DtldCLE."Entry Type" = DtldCLE."Entry Type"::"Initial Entry" THEN
+            InterestStartDate := UseDueDate
+          ELSE
+            IF UseDueDate < DtldCLE."Posting Date" THEN
+              InterestStartDate := DtldCLE."Posting Date";
+          IF InterestCalcDate > InterestStartDate THEN
+            InterestStartDate := InterestCalcDate;
+          IF InterestStartDate < UseCalcDate THEN
+            CumAmount := CumAmount + (DtldCLE.Amount * (UseCalcDate - InterestStartDate));
+        UNTIL DtldCLE.NEXT = 0;
+
+      IF NOT FinChrgTerms."Add. Line Fee in Interest" THEN
+        IF CustLedgEntry."Document Type" = CustLedgEntry."Document Type"::Reminder THEN
+          IF IssuedReminderHeader.GET(CustLedgEntry."Document No.") THEN BEGIN
+            IssuedReminderHeader.CALCFIELDS("Add. Fee per Line");
+            LineFee := IssuedReminderHeader."Add. Fee per Line" + IssuedReminderHeader.CalculateLineFeeVATAmount;
+            CumAmount := CumAmount - LineFee * (FinChrgMemoHeader."Document Date" - InterestStartDate);
+            IF CumAmount < 0 THEN
+              CumAmount := 0;
+          END;
+
+      BaseAmount := CumAmount / UseInterestPeriod;
+      IF CalcInterest THEN
+        CumAmount := ROUND(CumAmount / UseInterestPeriod * UseInterestRate / 100,
+            Currency."Amount Rounding Precision")
+      ELSE
+        CumAmount := 0;
+    END;
+
+    PROCEDURE LookupDocNo@1080003();
+    BEGIN
+      IF Type <> Type::"Customer Ledger Entry" THEN
+        EXIT;
+      SetCustLedgEntryView;
+      IF "Document Type" <> 0 THEN
+        CustLedgEntry.SETRANGE("Document Type","Document Type");
+      IF "Document No." <> '' THEN
+        CustLedgEntry.SETRANGE("Document No.","Document No.");
+      IF CustLedgEntry.FINDFIRST THEN;
+      CustLedgEntry.SETRANGE("Document Type");
+      CustLedgEntry.SETRANGE("Document No.");
+      LookupCustLedgEntry;
     END;
 
     BEGIN

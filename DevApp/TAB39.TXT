@@ -4,7 +4,7 @@ OBJECT Table 39 Purchase Line
   {
     Date=;
     Time=;
-    Version List=NAVW19.00.00.45480,DCNL9.00.00.43897.4.04,4PS9.00;
+    Version List=NAVW19.00.00.45480,NAVSE9.FI9.NO9,DCNL9.00.00.43897.4.04,4PS9.00,4PSSE;
   }
   PROPERTIES
   {
@@ -58,6 +58,17 @@ OBJECT Table 39 Purchase Line
                "Input by" := USERID; //DP00469
                "Input Date" := TODAY; //DP00469
                //**4PS.en
+
+               "Date/Time Last Modified" := CURRENTDATETIME; // 4PSHM 140131
+
+               // ExFlow ->
+               IF ExFlowSetup.GET(COMPANYNAME,0) THEN BEGIN
+                 IF Approve OR xRec.Approve THEN
+                   ExFlow.CreateDocumentLine(Rec,TRUE,TRUE);
+
+                 ExFlow.AmountToDocHead(Rec,FALSE);
+               END;
+               // <- ExFlow
              END;
 
     OnModify=VAR
@@ -122,6 +133,22 @@ OBJECT Table 39 Purchase Line
                "Modified by" := USERID; //DP00469
                "Last Date Modified" := TODAY;//DP00469
                //**4PS.en
+               "Date/Time Last Modified" := CURRENTDATETIME; // 4PSHM 140131
+
+               //>>IME171
+               DimMgt.SetDimensionValueChainsBool(TRUE);
+               IF "Shortcut Dimension 1 Code" <> '' THEN ValidateShortcutDimCode(1,"Shortcut Dimension 1 Code");
+               IF "Shortcut Dimension 2 Code" <> '' THEN ValidateShortcutDimCode(2,"Shortcut Dimension 2 Code");
+               DimMgt.SetDimensionValueChainsBool(FALSE);
+               //<<IME171
+               // ExFlow ->
+               IF ExFlowSetup.GET(COMPANYNAME,0) THEN BEGIN
+                 IF Approve OR xRec.Approve THEN
+                   ExFlow.UpdateLine(Rec,xRec,FALSE);
+
+                 ExFlow.AmountToDocHead(Rec,FALSE);
+               END;
+               // <- ExFlow
              END;
 
     OnDelete=VAR
@@ -237,6 +264,11 @@ OBJECT Table 39 Purchase Line
                    PurchLine2.MODIFY;
                  END;
                END;
+
+               // ExFlow ->
+               IF ExFlowSetup.GET(COMPANYNAME,0) THEN
+                 ExFlow.DeletePurchaseLine(Rec,StatusCheckSuspended);
+               // <- ExFlow
 
                IF "Deferral Code" <> '' THEN
                  DeferralUtilities.DeferralCodeOnDelete(
@@ -391,6 +423,10 @@ OBJECT Table 39 Purchase Line
                                                                   "Allow Item Charge Assignment" := TRUE
                                                                 ELSE
                                                                   "Allow Item Charge Assignment" := FALSE;
+
+                                                                // ExFlow ->
+                                                                CopyExFlowFields(TempPurchLine);
+                                                                // <- ExFlow
                                                               END;
 
                                                    CaptionML=ENU=Type;
@@ -411,6 +447,7 @@ OBJECT Table 39 Purchase Line
                                                    OnValidate=VAR
                                                                 PrepmtMgt@1002 : Codeunit 441;
                                                                 lvPlantCreateFAOnReceipt@1100485000 : Boolean;
+                                                                l_Vendor@1100285000 : Record 23;
                                                               BEGIN
                                                                 TestStatusOpen;
                                                                 TESTFIELD("Qty. Rcd. Not Invoiced",0);
@@ -528,6 +565,17 @@ OBJECT Table 39 Purchase Line
                                                                 UpdateLeadTimeFields;
                                                                 UpdateDates;
 
+                                                                // ExFlow ->
+                                                                CopyExFlowFields(TempPurchLine);
+
+                                                                IF ExFlowSetup.GET(COMPANYNAME,0) THEN
+                                                                  ExFlow.SetApproveForPurchLine(PurchHeader,Rec);
+
+                                                                IF Approve AND ("First Approver" = '') THEN
+                                                                  IF "Document Type" IN ["Document Type"::Order,"Document Type"::Quote,"Document Type"::"Blanket Order"] THEN
+                                                                    "First Approver" := ExFlow.FindUserGroup(USERID,TempApproverName,TRUE);
+                                                                // <- ExFlow
+
                                                                 CASE Type OF
                                                                   Type::" ":
                                                                     BEGIN
@@ -565,6 +613,9 @@ OBJECT Table 39 Purchase Line
                                                                       IF NOT PurchSetup."Calc. Inv. Discount" THEN //**4PS.n
                                                                         "Allow Invoice Disc." := FALSE;
                                                                       "Allow Item Charge Assignment" := FALSE;
+
+                                                                      "Auto. Acc. Group" := GLAcc."Auto. Acc. Group";  //NAVSE,NAVFI
+
                                                                       InitDeferralCode;
                                                                     END;
                                                                   Type::Item:
@@ -668,8 +719,44 @@ OBJECT Table 39 Purchase Line
 
                                                                 VALIDATE("Prepayment %");
 
+                                                                // ExFlow
+                                                                IF PurchHeader.Approve THEN BEGIN
+                                                                  IF (xRec."No." <> "No.") AND (Type IN [Type::"G/L Account",Type::"Fixed Asset"]) THEN BEGIN
+                                                                    VALIDATE("Direct Unit Cost", xRec."Direct Unit Cost");
+                                                                    VALIDATE("Line Discount %", xRec."Line Discount %");
+                                                                    IF xRec.Description <> '' THEN BEGIN
+                                                                      DocLine."Line Type" := xRec.Type;
+                                                                      DocLine."No." := xRec."No.";
+                                                                      IF xRec.Description <> DocLine.GetName THEN
+                                                                        Description := xRec.Description;
+                                                                    END;
+                                                                  END;
+
+                                                                  IF ("Document Type" IN ["Document Type"::Invoice,"Document Type"::"Credit Memo"]) THEN BEGIN
+                                                                    IF Type > 0 THEN BEGIN
+                                                                      IF ExFlowSetup.GET(COMPANYNAME,0) THEN BEGIN
+                                                                        IF "Gen. Prod. Posting Group" = '' THEN
+                                                                          "Gen. Prod. Posting Group" := ExFlowSetup."Std. Prod. Posting Group";
+
+                                                                        IF "VAT Prod. Posting Group" = '' THEN
+                                                                          "VAT Prod. Posting Group" := ExFlowSetup."Std. VAT Prod. Posting Group";
+
+                                                                        IF PurchHeader."Propose VAT Line" THEN
+                                                                          IF Type = Type::"Fixed Asset" THEN
+                                                                            VALIDATE("VAT Prod. Posting Group", ExFlowSetup."VAT Prod. Posting Group 0%")
+                                                                          ELSE
+                                                                            "VAT Prod. Posting Group" := ExFlowSetup."VAT Prod. Posting Group 0%";
+                                                                      END;
+                                                                    END;
+                                                                  END;
+                                                                END;
+                                                                // ExFlow
+
                                                                 IF Type <> Type::" " THEN BEGIN
                                                                   IF Type <> Type::"Fixed Asset" THEN
+                                                                    // ExFlow
+                                                                    IF NOT ChangeJournalLine.GET(COMPANYNAME,"Document Type","Document No.","Line No.","Line No.") THEN
+                                                                    // ExFlow
                                                                     VALIDATE("VAT Prod. Posting Group");
                                                                   IF "Line No." = xRec."Line No." THEN //**4PS.n
                                                                     Quantity := xRec.Quantity;
@@ -693,6 +780,25 @@ OBJECT Table 39 Purchase Line
                                                                   END;
                                                                 END;
 
+                                                                // ExFlow ->
+                                                                DoNotUpdateDim := FALSE;
+                                                                IF PurchHeader.Approve THEN
+                                                                  IF ((xRec."No." <> '') OR (xRec."Line Amount" <> 0)) AND (Type > 0) THEN
+                                                                    IF ("Document Type" IN ["Document Type"::Invoice,
+                                                                                            "Document Type"::"Credit Memo",
+                                                                                            "Document Type"::Order,
+                                                                                            "Document Type"::Quote]) THEN BEGIN
+                                                                      ExFlowSetup.GET(COMPANYNAME,0);
+                                                                      IF ExFlowSetup."Do Not Upd Dim Purchase Line" OR
+                                                                         ("ExFlow Order No." <> '')
+                                                                      THEN BEGIN
+                                                                        DoNotUpdateDim := TRUE;
+                                                                        "Shortcut Dimension 1 Code" := xRec."Shortcut Dimension 1 Code";
+                                                                        "Shortcut Dimension 2 Code" := xRec."Shortcut Dimension 2 Code";
+                                                                      END;
+                                                                    END;
+                                                                IF NOT DoNotUpdateDim THEN
+                                                                // <- ExFlow
                                                                 IF NOT ISTEMPORARY THEN
                                                                   CreateDim(
                                                                     DimMgt.TypeToTableID3(Type),"No.",
@@ -717,6 +823,12 @@ OBJECT Table 39 Purchase Line
                                                                 IF NOT CreateFromReqLine THEN
                                                                   StrategicPurchMgt.FindContractForPurchaseLine(Rec);
                                                                 //**4PS.en
+
+                                                                //PSSE, construction tax (Byggmoms)
+                                                                IF PurchHeader.GET("Document Type","Document No.") THEN
+                                                                  IF l_Vendor.GET(PurchHeader."Buy-from Vendor No.") THEN
+                                                                    IF l_Vendor."VAT Prod. Posting Grp to lines" THEN
+                                                                      VALIDATE("VAT Prod. Posting Group",l_Vendor."VAT Prod. Posting Group");
                                                               END;
 
                                                    CaptionML=ENU=No. }
@@ -1044,7 +1156,8 @@ OBJECT Table 39 Purchase Line
                                                                   "VAT Base Amount" := 0;
                                                                 END;
 
-                                                                UpdatePrePaymentAmounts;
+                                                                IF ("Document Type" = "Document Type"::Invoice) AND ("Prepayment %" <> 0) THEN
+                                                                  UpdatePrePaymentAmounts;
 
                                                                 IF "Job Planning Line No." <> 0 THEN
                                                                   VALIDATE("Job Planning Line No.");
@@ -1054,6 +1167,15 @@ OBJECT Table 39 Purchase Line
                                                                   UpdateJobPrices;
                                                                 END;
                                                                 CheckWMS;
+
+                                                                // ExFlow ->
+                                                                IF (Type <> Type::" ") AND (Quantity <> 0)
+                                                                  AND ExFlowSetup.GET(COMPANYNAME,0) THEN BEGIN
+                                                                  ExFlow.SetReceiptNoMand(PurchHeader,Rec);
+
+                                                                  ExFlow.SetApproveForPurchLine(PurchHeader,Rec);
+                                                                END;
+                                                                // <- ExFlow
 
                                                                 //**4PS.sn
                                                                 IF Quantity <> 0 THEN BEGIN
@@ -1511,6 +1633,7 @@ OBJECT Table 39 Purchase Line
                                                               END;
 
                                                    CaptionML=ENU=Amount Including VAT;
+                                                   Editable=No;
                                                    AutoFormatType=1;
                                                    AutoFormatExpr="Currency Code" }
     { 31  ;   ;Unit Price (LCY)    ;Decimal       ;OnValidate=BEGIN
@@ -2084,7 +2207,7 @@ OBJECT Table 39 Purchase Line
                                                    OnValidate=VAR
                                                                 GLSetup@1100485000 : Record 98;
                                                               BEGIN
-                                                                GLSetup.GET; //**4PS.n
+                                                                GetGLSetup; //**4PS.n
                                                                 IF xRec."Gen. Bus. Posting Group" <> "Gen. Bus. Posting Group" THEN
                                                                   IF NOT GLSetup."Extended Purch. VAT Determ." THEN //**4PS.n
                                                                     IF GenBusPostingGrp.ValidateVatBusPostingGroup(GenBusPostingGrp,"Gen. Bus. Posting Group") THEN
@@ -2145,6 +2268,10 @@ OBJECT Table 39 Purchase Line
     { 89  ;   ;VAT Bus. Posting Group;Code10      ;TableRelation="VAT Business Posting Group";
                                                    OnValidate=BEGIN
                                                                 VALIDATE("VAT Prod. Posting Group");
+
+                                                                GetGLSetup;
+                                                                IF GLSetup."Norwegian Localization Active" THEN
+                                                                  NorwegianVATTools.InitVATCode_PurchaseLine(Rec);  //NAVNO
                                                               END;
 
                                                    CaptionML=ENU=VAT Bus. Posting Group }
@@ -2178,6 +2305,10 @@ OBJECT Table 39 Purchase Line
                                                                       "Direct Unit Cost" * (100 + "VAT %") / (100 + xRec."VAT %"),
                                                                       Currency."Unit-Amount Rounding Precision");
                                                                 UpdateAmounts;
+
+                                                                GetGLSetup;
+                                                                IF GLSetup."Norwegian Localization Active" THEN
+                                                                  NorwegianVATTools.InitVATCode_PurchaseLine(Rec);  //NAVNO
                                                               END;
 
                                                    CaptionML=ENU=VAT Prod. Posting Group }
@@ -2313,6 +2444,7 @@ OBJECT Table 39 Purchase Line
                                                                     FIELDERROR("Line Amount", Text11012015);
                                                                 END;
                                                                 //**4PS.en
+                                                                GetPurchHeader;
                                                                 "Line Amount" := ROUND("Line Amount",Currency."Amount Rounding Precision");
 
                                                                 //**4PS.sn
@@ -5023,6 +5155,157 @@ OBJECT Table 39 Purchase Line
     { 11020315;;Marked for Receipt Run;Boolean    ;CaptionML=ENU=Marked for Receipt Run }
     { 11020320;;Reason Code        ;Code10        ;TableRelation="Reason Code";
                                                    CaptionML=ENU=Reason Code }
+    { 11128010;;Auto. Acc. Group   ;Code10        ;TableRelation="Automatic Acc. Header";
+                                                   CaptionML=ENU=Auto. Acc. Group;
+                                                   Description=NAVSE,NAVFI }
+    { 11128011;;Periodic Template Code;Code10     ;TableRelation="Periodic Template".Code;
+                                                   CaptionML=ENU=Periodic Template Code }
+    { 11128012;;Periodic Starting Date;Date       ;CaptionML=ENU=Periodic Starting Date }
+    { 11128013;;Date/Time Last Modified;DateTime  ;CaptionML=ENU=Date/Time Last Modified }
+    { 11128504;;VAT Code           ;Code10        ;TableRelation="VAT Code".Code;
+                                                   OnValidate=BEGIN
+                                                                NorwegianVATTools.InitPostingGrps_PurchaseLine(Rec);
+                                                              END;
+
+                                                   CaptionML=ENU=VAT Code;
+                                                   Description=NAVNO }
+    { 12013600;;Receipt No. Mandatory;Boolean     ;CaptionML=ENU=Receipt No. Mandatory;
+                                                   Description=ExFlow }
+    { 12013601;;Approve            ;Boolean       ;OnValidate=BEGIN
+                                                                // ExFlow
+                                                                ExFlow.ValidateApprovalPurchLine(xRec,Rec);
+                                                              END;
+
+                                                   CaptionML=ENU=Approval;
+                                                   Description=ExFlow;
+                                                   Editable=Yes }
+    { 12013602;;Difference         ;Option        ;CaptionML=ENU=Difference;
+                                                   OptionCaptionML=ENU=,VAT,Amount,Net,Remove;
+                                                   OptionString=,Moms,Belopp,Netto,TaBort;
+                                                   Description=ExFlow }
+    { 12013603;;First Approver     ;Code50        ;OnValidate=BEGIN
+                                                                // ExFlow
+                                                                "First Approver" := ExFlow.FindUserGroup("First Approver",TempApproverName,FALSE);
+                                                              END;
+
+                                                   OnLookup=BEGIN
+                                                              // ExFlow
+                                                              TempApprover := ExFlow.LookUpUserGroup("First Approver",TempApproverName);
+                                                              IF TempApprover <> "First Approver" THEN
+                                                                VALIDATE("First Approver", TempApprover);
+                                                            END;
+
+                                                   CaptionML=ENU=First Approver;
+                                                   Description=ExFlow }
+    { 12013606;;ExFlow Order No.   ;Code20        ;OnValidate=BEGIN
+                                                                IF CurrFieldNo = FIELDNO("ExFlow Order No.") THEN
+                                                                  ExFlow.OrderNoValidate(Rec,xRec);
+                                                              END;
+
+                                                   OnLookup=BEGIN
+                                                              ExFlow.OrderNoLookup(Rec);
+                                                            END;
+
+                                                   CaptionML=ENU=Order No.;
+                                                   Description=ExFlow }
+    { 12013610;;History            ;Boolean       ;CaptionML=ENU=History;
+                                                   Description=ExFlow }
+    { 12013611;;Invoice to Customer;Boolean       ;CaptionML=ENU=Invoice to Customer;
+                                                   Description=ExFlow }
+    { 12013612;;Invoicing Amount   ;Decimal       ;CaptionML=ENU=Invoicing Amount;
+                                                   Description=ExFlow }
+    { 12013613;;Start Date for Invoicing;Date     ;CaptionML=ENU=Start Date for Invoicing;
+                                                   Description=ExFlow }
+    { 12013614;;Invoicing Code     ;Code10        ;OnValidate=VAR
+                                                                ExInvoicingCode@1100285000 : Record 12013597;
+                                                              BEGIN
+                                                                ExInvoicingCode.SETRANGE("Company Name", COMPANYNAME);
+                                                                ExInvoicingCode.SETRANGE("Invoicing Code", "Invoicing Code");
+                                                                ExInvoicingCode.FINDFIRST;
+                                                              END;
+
+                                                   OnLookup=VAR
+                                                              ExInvoicingCode@1100285000 : Record 12013597;
+                                                              ExInvoicingCodeForm@1100285001 : Page 12057095;
+                                                            BEGIN
+                                                              ExInvoicingCode.SETRANGE("Company Name", COMPANYNAME);
+                                                              ExInvoicingCodeForm.LOOKUPMODE := TRUE;
+                                                              ExInvoicingCodeForm.SETTABLEVIEW(ExInvoicingCode);
+                                                              IF ExInvoicingCodeForm.RUNMODAL = ACTION::LookupOK THEN BEGIN
+                                                                ExInvoicingCodeForm.GETRECORD(ExInvoicingCode);
+                                                                VALIDATE("Invoicing Code", ExInvoicingCode."Invoicing Code");
+                                                              END;
+                                                            END;
+
+                                                   CaptionML=ENU=Invoicing Code;
+                                                   Description=ExFlow }
+    { 12013645;;PO Matched Document;Boolean       ;CaptionML=ENU=Matched against Purchase Order;
+                                                   Description=ExFlow }
+    { 12013650;;Web Receipt        ;Boolean       ;CaptionML=ENU=Web Receipt;
+                                                   Description=ExFlow }
+    { 12013651;;ExFlow Add         ;Boolean       ;CaptionML=ENU=ExFlow Add;
+                                                   Description=ExFlow }
+    { 12013652;;Fully Matched      ;Boolean       ;CaptionML=ENU=Fully Matched;
+                                                   Description=ExFlow }
+    { 12013655;;PO Approved Amount ;Decimal       ;CaptionML=ENU=Approved Amount;
+                                                   Description=ExFlow;
+                                                   Editable=No }
+    { 12013659;;Applied Template Rule;Code20      ;OnLookup=BEGIN
+                                                              CLEAR(TemplateRuleForm);
+
+                                                              TemplateRuleForm.EDITABLE(FALSE);
+                                                              TemplateRule.RESET;
+                                                              TemplateRule.SETRANGE("Company Name",COMPANYNAME);
+                                                              IF "Applied Template Rule" <> '' THEN
+                                                                TemplateRule.SETRANGE(Code, "Applied Template Rule");
+                                                              TemplateRuleForm.SETTABLEVIEW(TemplateRule);
+                                                              TemplateRuleForm.RUN;
+                                                            END;
+
+                                                   CaptionML=ENU=Applied Template Rule;
+                                                   Description=ExFlow;
+                                                   Editable=No }
+    { 12013660;;Template Rule      ;Code20        ;OnValidate=BEGIN
+                                                                // ExFlow
+                                                                IF "Template Rule" <> '' THEN
+                                                                  IF NOT TemplateRule.GET(COMPANYNAME,"Template Rule") THEN
+                                                                    ERROR(EXF101,"Template Rule");
+                                                              END;
+
+                                                   OnLookup=BEGIN
+                                                              // ExFlow
+                                                              CLEAR(TemplateRuleForm);
+
+                                                              TemplateRuleForm.EDITABLE(FALSE);
+                                                              TemplateRuleForm.LOOKUPMODE(TRUE);
+                                                              TemplateRule.RESET;
+                                                              TemplateRule.SETRANGE("Company Name",COMPANYNAME);
+                                                              TemplateRuleForm.SETTABLEVIEW(TemplateRule);
+                                                              IF TemplateRuleForm.RUNMODAL = ACTION::LookupOK THEN
+                                                                BEGIN
+                                                                  TemplateRuleForm.GETRECORD(TemplateRule);
+                                                                  VALIDATE("Template Rule",TemplateRule.Code);
+                                                                END;
+                                                            END;
+
+                                                   CaptionML=ENU=Template Rule;
+                                                   Description=ExFlow }
+    { 12013666;;Approval Flow Modified;Boolean    ;CaptionML=ENU=Approval Flow Modified;
+                                                   Description=ExFlow;
+                                                   Editable=No }
+    { 12013667;;ExFlow Order Line No.;Integer     ;OnValidate=BEGIN
+                                                                ExFlow.OrderLineNoValidate(Rec,xRec);
+                                                              END;
+
+                                                   OnLookup=BEGIN
+                                                              ExFlow.OrderLineNoLookup(Rec);
+                                                            END;
+
+                                                   CaptionML=ENU=Order Line No.;
+                                                   Description=ExFlow }
+    { 12013668;;Contract No.       ;Integer       ;TableRelation="ExFlow Contract";
+                                                   CaptionML=ENU=Contract No.;
+                                                   Description=ExFlow }
     { 99000750;;Routing No.        ;Code20        ;TableRelation="Routing Header";
                                                    CaptionML=ENU=Routing No. }
     { 99000751;;Operation No.      ;Code10        ;TableRelation="Prod. Order Routing Line"."Operation No." WHERE (Status=CONST(Released),
@@ -5312,6 +5595,7 @@ OBJECT Table 39 Purchase Line
       PurchPriceCalcMgt@1030 : Codeunit 7010;
       CalendarMgmt@1032 : Codeunit 7600;
       CheckDateConflict@1013 : Codeunit 99000815;
+      NorwegianVATTools@1080002 : Codeunit 11128500;
       DeferralUtilities@1081 : Codeunit 1720;
       TrackingBlocked@1070 : Boolean;
       StatusCheckSuspended@1073 : Boolean;
@@ -5395,6 +5679,20 @@ OBJECT Table 39 Purchase Line
       Text11012036@1100525012 : TextConst 'ENU=may not be negative for purchase or rent of Plant';
       DCSetupRead@1100409002 : Boolean;
       DocumentCaptureSetup@1100409003 : Record 6085573;
+      "*** ExFlow ***"@12013587 : Integer;
+      ExFlow@12013588 : Codeunit 12013601;
+      DocLine@12013589 : Record 12013609;
+      ExFlowSetup@12013591 : Record 12013601;
+      EXF101@12013599 : TextConst 'ENU=Template %1 missing.';
+      ChangeJournalLine@12013593 : Record 12013618;
+      TemplateRule@12013603 : Record 12013645;
+      DocLineApp@12013606 : Record 12013610;
+      TemplateRuleForm@12013604 : Page 12013648;
+      DoNotUpdateDim@12013596 : Boolean;
+      TempApprover@12013601 : Code[100];
+      TempApproverName@12013602 : Text[100];
+      DontUseSingleGTIN@11128200 : Boolean;
+      DontCheckItemPurchBlocked@1100285100 : Boolean;
       SaveJobNo@1100525015 : Code[20];
       SaveDocNo@1100525014 : Code[20];
       SaveLineNo@1100525013 : Integer;
@@ -6427,12 +6725,21 @@ OBJECT Table 39 Purchase Line
 
     PROCEDURE ValidateShortcutDimCode@29(FieldNumber@1000 : Integer;VAR ShortcutDimCode@1001 : Code[20]);
     BEGIN
+      // ExFlow ->
+      IF Approve AND NOT StatusCheckSuspended THEN
+        ExFlow.TestifApprovedPurchLineDim(Rec);
+      // <- ExFlow
       //**4PS.sn
       IF FieldNumber = 1 THEN
         DimMgt.CheckDepartmentAuthorization(DATABASE::"Purchase Line", ShortcutDimCode);
       DimMgt.SetCompany("Receiving Company");
       //**4PS.en
       DimMgt.ValidateShortcutDimValues(FieldNumber,ShortcutDimCode,"Dimension Set ID");
+
+      // ExFlow ->
+      IF (FieldNumber > 2) AND Approve THEN
+        ExFlow.ShortCutDim(FieldNumber,ShortcutDimCode,Rec);
+      // <- ExFlow
     END;
 
     PROCEDURE LookupShortcutDimCode@30(FieldNumber@1000 : Integer;VAR ShortcutDimCode@1001 : Code[20]);
@@ -6659,6 +6966,8 @@ OBJECT Table 39 Purchase Line
     END;
 
     LOCAL PROCEDURE TestStatusOpen@37();
+    VAR
+      WorkFlowSetup4PSConstruct@1100528200 : Record 11229316;
     BEGIN
       IF StatusCheckSuspended THEN
         EXIT;
@@ -6681,10 +6990,9 @@ OBJECT Table 39 Purchase Line
       IF IsDocumentCaptureActive AND
         (PurchHeader.Status = PurchHeader.Status::"Pending Approval")
       THEN BEGIN
-      //FIXME
-      //   ApprovalSetup.GET;
-      //   IF ApprovalSetup."Purch. Invoice Modify Allowed" THEN
-      //     EXIT;
+         WorkFlowSetup4PSConstruct.GET;
+         IF WorkFlowSetup4PSConstruct."Purch. Invoice Modify Allowed" THEN
+           EXIT;
       END;
 
       PurchHeader.TESTFIELD(Status,PurchHeader.Status::Open);
@@ -7999,17 +8307,40 @@ OBJECT Table 39 Purchase Line
         END;
       END;
 
-      IF (Quantity < MinQuanToInvoice) OR (Quantity > MaxQuanToInvoice) THEN
-        IF NOT CONFIRM(STRSUBSTNO(
-          Text11012002,
-          "Receipt No.",
-          "Receipt Line No.",
-          MinQuanToInvoice,MaxQuanToInvoice),FALSE)
-        THEN BEGIN
-          Quantity := xRec.Quantity;
-          EXIT;
-        END ELSE
+      //>>140203 SYM988
+
+      //First block disabled due to lack of NAS compability
+      //IF (Quantity < MinQuanToInvoice) OR (Quantity > MaxQuanToInvoice) THEN
+      //  IF NOT CONFIRM(STRSUBSTNO(
+      //    Text11012002,
+      //    "Receipt No.",
+      //    "Receipt Line No.",
+      //    MinQuanToInvoice,MaxQuanToInvoice),FALSE)
+      //  THEN BEGIN
+      //    Quantity := xRec.Quantity;
+      //    EXIT;
+      //  END ELSE
+      //    CheckReceipt(FIELDNO(Quantity));
+
+      //Correction to handle Job Cue
+      IF (Quantity < MinQuanToInvoice) OR (Quantity > MaxQuanToInvoice) THEN BEGIN
+        IF GUIALLOWED THEN BEGIN
+          IF NOT CONFIRM(STRSUBSTNO(
+            Text11012002,
+            "Receipt No.",
+            "Receipt Line No.",
+            MinQuanToInvoice,MaxQuanToInvoice),FALSE)
+          THEN BEGIN
+            Quantity := xRec.Quantity;
+            EXIT;
+          END ELSE
           CheckReceiptRelationAmount(FIELDNO(Quantity));
+
+        END ELSE BEGIN //This confirms dialog when run on NAS
+          CheckReceiptRelationAmount(FIELDNO(Quantity));
+        END;
+      END;
+      //<<140203 SYM988
       //**4PS.en
     END;
 
@@ -8689,7 +9020,10 @@ OBJECT Table 39 Purchase Line
 
       GetReferenceData(lvRefDate, lvDiscRef1, lvDiscRef2);
       ValidateCu.SetLanguageCode(PurchHeader."Language Code");  //db, 20-12-11: M29573
-
+      //>>150608, SYM086
+        IF DontUseSingleGTIN THEN
+        ValidateCu.SetDontUseSingleGTIN(DontUseSingleGTIN);
+      //<<150608
       ValidateCu.ValidateItem(LTypeArtOpt,"Trade Item","Item No.",Manufacturer,"Vendor (Trade Item)",
         "Basic Item","Shortcut Dimension 2 Code",Description,"Unit of Measure Code","Direct Unit Cost",
         "Discount % (Item)",DummyDat,"Unit Price (LCY)","Description 2","Cost Component",
@@ -11719,6 +12053,10 @@ OBJECT Table 39 Purchase Line
     LOCAL PROCEDURE CheckIfItemIsBlocked@1100528303(Item@1100528300 : Record 27);
     BEGIN
       //**4PS.n
+      //>>SYM107
+      IF DontCheckItemPurchBlocked THEN
+        EXIT;
+      //<<SYM107
       IF "Document Type" IN ["Document Type"::Quote, "Document Type"::Order, "Document Type"::"Blanket Order"] THEN
         Item.TESTFIELD("Purchase Blocked",FALSE);
 
@@ -12134,6 +12472,78 @@ OBJECT Table 39 Purchase Line
       EXIT(PlantNumber."Inspection No.");
     END;
 
+    PROCEDURE "**** ExFlow ****"@12013607();
+    BEGIN
+    END;
+
+    PROCEDURE CopyExFlowFields@12013600(VAR _TempPurchLine@1100285000 : TEMPORARY Record 39);
+    BEGIN
+      // ExFlow
+      "First Approver" := _TempPurchLine."First Approver";
+      "ExFlow Order No." := _TempPurchLine."ExFlow Order No.";
+      "PO Matched Document" := _TempPurchLine."PO Matched Document";
+      "Web Receipt" := _TempPurchLine."Web Receipt";
+      "Fully Matched" := _TempPurchLine."Fully Matched";
+      "Applied Template Rule" := _TempPurchLine."Applied Template Rule";
+      "Template Rule" := _TempPurchLine."Template Rule";
+      "ExFlow Order Line No." := _TempPurchLine."ExFlow Order Line No.";
+      "Invoice to Customer" := _TempPurchLine."Invoice to Customer";
+      "Invoicing Amount" := _TempPurchLine."Invoicing Amount";
+      "Start Date for Invoicing" := _TempPurchLine."Start Date for Invoicing";
+      "Invoicing Code" := _TempPurchLine."Invoicing Code";
+    END;
+
+    PROCEDURE ExFlowFormat@12013608() : Integer;
+    BEGIN
+      // ExFlow
+      IF Approve THEN BEGIN
+        IF NOT DocLine.READPERMISSION THEN
+          EXIT(0);
+        IF NOT DocLineApp.READPERMISSION THEN
+          EXIT(0);
+
+        DocLine.RESET;
+        IF DocLine.SETCURRENTKEY("Document No.") THEN;
+        DocLine.SETRANGE("Company Name",COMPANYNAME);
+        DocLine.SETRANGE("Document Type","Document Type");
+        DocLine.SETRANGE("Document No.","Document No.");
+        DocLine.SETRANGE("Line No.","Line No.");
+        DocLine.SETRANGE(Flowstatus,DocLine.Flowstatus::Rejected);
+        IF DocLine.FINDFIRST THEN
+          EXIT(255)
+        ELSE BEGIN
+          DocLineApp.RESET;
+          IF DocLineApp.SETCURRENTKEY("Document No.") THEN;
+          DocLineApp.SETRANGE("Company Name",COMPANYNAME);
+          DocLineApp.SETRANGE("Document Type","Document Type");
+          DocLineApp.SETRANGE("Document No.","Document No.");
+          DocLineApp.SETRANGE("Line No.","Line No.");
+          IF NOT DocLineApp.FINDFIRST THEN
+            EXIT(16776960);
+        END;
+      END;
+
+      EXIT(0);
+    END;
+
+    LOCAL PROCEDURE "--ITERO---"@1100285000();
+    BEGIN
+    END;
+
+    PROCEDURE SetDontUseSingleGTIN@1100285001(setFlag@1100285000 : Boolean);
+    BEGIN
+      DontUseSingleGTIN := setFlag;
+    END;
+
+    PROCEDURE SetDontCheckItemPurchBlocked@1000000000(pDontCheckItemPurchBlocked@1000000000 : Boolean);
+    BEGIN
+      //SYM107
+      DontCheckItemPurchBlocked := pDontCheckItemPurchBlocked;
+
+      //SYM108
+      SkipExpired := pDontCheckItemPurchBlocked;
+    END;
+
     PROCEDURE EditConsentLines@1100528406();
     VAR
       PurchaseHeader@1100528401 : Record 38;
@@ -12223,6 +12633,52 @@ OBJECT Table 39 Purchase Line
       - MaintainSIFTIndex disabled for key Document Type,Buy-from Vendor No.,Job No.,Service Contract No.,Item No.,Trade Item
       - MaintainSQLIndex disabled for key Document Type,Buy-from Vendor No.,Job No.,Service Contract No.,Item No.,Trade Item
       4PS, 26-11-15, C027373, SiftIndex en SumindexFiels added on index Document Type,Pay-to Vendor No.,Currency Code
+
+      4PSSE, DL, 131211, 4PS-020, email from TomZ, Different invoice quantity from receipt.docx
+      4PSSE, DL, 131217, 4PS-020, Call C011651
+
+      ITERO.MH 4PSHM 140131 New field "Date/Time Last Modified" and with triggers on onInsert() and onModify()
+
+      ITERO.DJ SYM988 140203 edition to handle validation of quantity on purchase line when run by NAS
+      140905 ITERO.DL IME171 Dimensions are not extended due to lack of VALIDATEs
+
+      -- ExFlow --->
+      Field 12013600 : Receipt No. Mandatory
+      Field 12013601 : Approve (Code)
+      Field 12013602 : Difference
+      Field 12013603 : First Approver (Code)
+      Field 12103606 : Order No.
+      Field 12013610 : History
+      Field 12013611 : Invoice to Customer
+      Field 12013612 : Invoicing Amount
+      Field 12013613 : Start Date for Invoicing
+      Field 12013614 : Invoicing Code
+      Field 12013645 : PO Matched Document
+      Field 12013650 : Web Receipt
+      Field 12013651 : ExFlow Add
+      Field 12013652 : Fully Matched
+      Field 12013655 : PO Approved Amount
+      Field 12013659 : Applied Template Rule
+      Field 12013660 : Template Rule (Code)
+      Field 12013666 : Approval Flow Modified
+      Field 12013667 : Order Line No.
+      Field 12013668  : Contract No.
+      Code           : OnInsert, OnModify, OnDelete, No. - OnValidate(),ValidateShortcutDimCode(),LookupShortcutDimCode()
+      Text Const.    : EXF101
+      Globals
+      Function       : CopyExFlowFields,ExFlowFormat
+      Keygroup ExFlow1:
+      Keys           : Order No.,Order Line No.
+                     : Contract No.
+      <-- ExFlow ---
+
+      150303 ITERO.WG SC003188 Added code from 4PSNL, call C020690, for correct calculation of items from foreign vendors
+      150608 ITERO.DL SYM086, Error unit of measure NAV
+      160304 ITERO.DL SYM107 Order stuck in buffer because NAV article is blocked
+      160310 ITERO.DL SYM108 Order stuck in buffer because NAV article is expired (extension to SYM107)
+      Version List=NAVSE9.00.00.45834
+      Version List=NAVW19.00.00.45834,NAVFI9.00.00.45834;
+      Version List=NAVW19.00.00.45834,NAVNO9.00.00.45834;
     }
     END.
   }

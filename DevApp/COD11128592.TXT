@@ -1,0 +1,266 @@
+OBJECT Codeunit 11128592 Match FIK Gen. Journal Lines
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVDK8.00 (13652);
+  }
+  PROPERTIES
+  {
+    TableNo=81;
+    OnRun=VAR
+            GenJnlLine@1000 : Record 81;
+          BEGIN
+            GenJnlLine.COPY(Rec);
+            Code(GenJnlLine."Journal Template Name",GenJnlLine."Journal Batch Name");
+            Rec := GenJnlLine;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      MatchSummaryMsg@1060020 : TextConst 'ENU=%1 payment lines out of %2 have been applied.\\';
+      ProgressBarMsg@1060022 : TextConst 'ENU=Please wait while the operation is being completed.';
+      MatchGeneralJournalLines@1060009 : Codeunit 1250;
+      MatchLengthTreshold@1060023 : Integer;
+      NormalizingFactor@1060024 : Integer;
+      FIKDescriptionPartialTxt@1060003 : TextConst 'ENU=Partial Amount';
+      FIKDescriptionExtraTxt@1060004 : TextConst 'ENU=Excess Amount';
+      FIKDescriptionDuplicateTxt@1060006 : TextConst 'ENU=Duplicate FIK Number';
+      FIKDescriptionNoMatchTxt@1060001 : TextConst 'ENU=No Matching FIK Number';
+      FIKDescriptionFullMatchTxt@1060007 : TextConst 'ENU=Matching Amount';
+      FIKDescriptionIsPaidTxt@1060008 : TextConst 'ENU=Invoice Already Paid';
+      MatchPartialTxt@1060002 : TextConst 'ENU=%1 payment lines are partially paid.\';
+      MatchExtraTxt@1060005 : TextConst 'ENU=%1 payment lines have excess amounts.\';
+      MatchFullyTxt@1060011 : TextConst 'ENU=%1 payment lines are fully applied.\';
+      MatchDetailsTxt@1060010 : TextConst 'ENU=Details:\';
+      MatchStatus@1060000 : 'NoMatch,Duplicate,IsPaid,Partial,Extra,Fully';
+
+    PROCEDURE Code@1060068(TemplateName@1060002 : Code[10];BatchName@1060003 : Code[10]);
+    VAR
+      TempBankStatementMatchingBuffer@1060001 : TEMPORARY Record 1250;
+      GenJournalBatch@1060004 : Record 232;
+      TempGenJournalLine@1060005 : TEMPORARY Record 81;
+      Window@1060000 : Dialog;
+    BEGIN
+      GenJournalBatch.GET(TemplateName,BatchName);
+      Window.OPEN(ProgressBarMsg);
+      SetMatchLengthThreshold(4);
+      SetNormalizingFactor(10);
+      MatchGeneralJournalLines.FillTempGenJournalLine(GenJournalBatch,TempGenJournalLine);
+      FindMatchingCustEntries(TempBankStatementMatchingBuffer,TempGenJournalLine);
+      SaveOneToOneMatching(TempBankStatementMatchingBuffer,GenJournalBatch);
+
+      Window.CLOSE;
+      ShowMatchSummary(TempBankStatementMatchingBuffer,GenJournalBatch);
+    END;
+
+    LOCAL PROCEDURE FindMatchingCustEntries@1060000(VAR TempBankStatementMatchingBuffer@1060003 : TEMPORARY Record 1250;VAR TempGenJournalLine@1060005 : TEMPORARY Record 81);
+    VAR
+      CustLedgerEntry@1060006 : Record 21;
+    BEGIN
+      TempGenJournalLine.SETFILTER("Payment Reference",'<>%1','');
+      TempGenJournalLine.SETRANGE("Applied Automatically",FALSE);
+
+      IF TempGenJournalLine.FINDSET THEN
+        REPEAT
+          CustLedgerEntry.RESET;
+          CustLedgerEntry.SETRANGE("Applies-to ID",'');
+          CustLedgerEntry.SETRANGE("Document No.",TempGenJournalLine."Payment Reference");
+          CustLedgerEntry.SETAUTOCALCFIELDS("Remaining Amt. (LCY)");
+          IF CustLedgerEntry.FINDFIRST AND
+             (CustLedgerEntry.COUNT = 1) AND (TempGenJournalLine."Posting Date" >= CustLedgerEntry."Posting Date")
+          THEN
+            CASE TRUE OF
+              CustLedgerEntry."Remaining Amt. (LCY)" = 0:
+                AddMatchCandidate(TempBankStatementMatchingBuffer,TempGenJournalLine,CustLedgerEntry,MatchStatus::IsPaid);
+              -TempGenJournalLine."Amount (LCY)" > CustLedgerEntry."Remaining Amt. (LCY)":
+                AddMatchCandidate(TempBankStatementMatchingBuffer,TempGenJournalLine,CustLedgerEntry,MatchStatus::Extra);
+              -TempGenJournalLine."Amount (LCY)" < CustLedgerEntry."Remaining Amt. (LCY)":
+                AddMatchCandidate(TempBankStatementMatchingBuffer,TempGenJournalLine,CustLedgerEntry,MatchStatus::Partial);
+              -TempGenJournalLine."Amount (LCY)" = CustLedgerEntry."Remaining Amt. (LCY)":
+                AddMatchCandidate(TempBankStatementMatchingBuffer,TempGenJournalLine,CustLedgerEntry,MatchStatus::Fully);
+            END
+          ELSE
+            AddMatchCandidate(TempBankStatementMatchingBuffer,TempGenJournalLine,CustLedgerEntry,MatchStatus::NoMatch);
+        UNTIL TempGenJournalLine.NEXT = 0;
+
+      TempGenJournalLine.RESET;
+    END;
+
+    LOCAL PROCEDURE SaveOneToOneMatching@1060028(VAR TempBankStatementMatchingBuffer@1060000 : TEMPORARY Record 1250;VAR GenJournalBatch@1060001 : Record 232);
+    VAR
+      GenJournalLine@1060002 : Record 81;
+    BEGIN
+      TempBankStatementMatchingBuffer.RESET;
+      TempBankStatementMatchingBuffer.SETCURRENTKEY(Quality);
+      TempBankStatementMatchingBuffer.ASCENDING(FALSE);
+
+      IF TempBankStatementMatchingBuffer.FINDSET THEN
+        REPEAT
+          GenJournalLine.GET(GenJournalBatch."Journal Template Name",
+            GenJournalBatch.Name,TempBankStatementMatchingBuffer."Line No.");
+          ApplyRecords(GenJournalLine,TempBankStatementMatchingBuffer);
+          GenJournalLine.Description := GetUpdatedFIKDescription(TempBankStatementMatchingBuffer);
+          GenJournalLine."Payment Reference" := '';
+          GenJournalLine.MODIFY;
+        UNTIL TempBankStatementMatchingBuffer.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE ApplyRecords@1060030(VAR GenJournalLine@1060000 : Record 81;VAR TempBankStatementMatchingBuffer@1060001 : TEMPORARY Record 1250);
+    VAR
+      CustLedgerEntry@1060002 : Record 21;
+      OrigCurrencyCode@1060004 : Code[10];
+    BEGIN
+      IF TempBankStatementMatchingBuffer."Account Type" = TempBankStatementMatchingBuffer."Account Type"::Customer THEN
+        IF CustLedgerEntry.GET(TempBankStatementMatchingBuffer."Entry No.") THEN
+          IF NOT GenJournalLine.IsApplied THEN BEGIN
+            OrigCurrencyCode := GenJournalLine."Currency Code";
+            GenJournalLine.VALIDATE("Document Type",GenJournalLine."Document Type"::Payment);
+            GenJournalLine.VALIDATE("Account Type",GenJournalLine."Account Type"::Customer);
+            GenJournalLine.VALIDATE("Account No.",CustLedgerEntry."Customer No.");
+            IF TempBankStatementMatchingBuffer.Quality > MatchStatus::IsPaid THEN
+              GenJournalLine.VALIDATE("Applies-to ID",GenJournalLine."Document No.");
+            IF OrigCurrencyCode <> GenJournalLine."Currency Code" THEN
+              GenJournalLine.VALIDATE("Currency Code",OrigCurrencyCode);
+            GenJournalLine.VALIDATE("Applied Automatically",TempBankStatementMatchingBuffer.Quality > MatchStatus::IsPaid);
+            GenJournalLine.MODIFY(TRUE);
+
+            IF TempBankStatementMatchingBuffer.Quality > MatchStatus::IsPaid THEN
+              MatchGeneralJournalLines.PrepareCustLedgerEntryForApplication(CustLedgerEntry,GenJournalLine);
+          END;
+    END;
+
+    LOCAL PROCEDURE AddMatchCandidate@1060008(VAR TempBankStatementMatchingBuffer@1060006 : TEMPORARY Record 1250;VAR TempGenJournalLine@1060008 : TEMPORARY Record 81;CustLedgerEntry@1060009 : Record 21;MatchOption@1060000 : Option);
+    BEGIN
+      CASE TRUE OF
+        IsDublicate(TempBankStatementMatchingBuffer,TempGenJournalLine):
+          TempBankStatementMatchingBuffer.AddMatchCandidateWithDescription(
+            TempGenJournalLine."Line No.",CustLedgerEntry."Entry No.",MatchStatus::Duplicate,
+            TempBankStatementMatchingBuffer."Account Type"::Customer,CustLedgerEntry."Customer No.",TempGenJournalLine.Description,
+            MatchOption);
+        MatchOption = MatchStatus::NoMatch:
+          TempBankStatementMatchingBuffer.AddMatchCandidateWithDescription(
+            TempGenJournalLine."Line No.",CustLedgerEntry."Entry No.",MatchOption,
+            TempBankStatementMatchingBuffer."Account Type"::"G/L Account",'',TempGenJournalLine.Description,MatchOption);
+        MatchOption = MatchStatus::IsPaid:
+          TempBankStatementMatchingBuffer.AddMatchCandidateWithDescription(
+            TempGenJournalLine."Line No.",CustLedgerEntry."Entry No.",MatchOption,
+            TempBankStatementMatchingBuffer."Account Type"::Customer,CustLedgerEntry."Customer No.",TempGenJournalLine.Description,
+            MatchOption)
+        ELSE
+          TempBankStatementMatchingBuffer.AddMatchCandidateWithDescription(
+            TempGenJournalLine."Line No.",CustLedgerEntry."Entry No.",MatchOption,
+            TempBankStatementMatchingBuffer."Account Type"::Customer,CustLedgerEntry."Customer No.",TempGenJournalLine.Description,
+            MatchOption);
+      END;
+    END;
+
+    LOCAL PROCEDURE IsDublicate@1060014(VAR TempBankStatementMatchingBuffer@1060002 : TEMPORARY Record 1250;VAR TempGenJournalLine@1060001 : TEMPORARY Record 81) : Boolean;
+    BEGIN
+      TempBankStatementMatchingBuffer.RESET;
+      TempBankStatementMatchingBuffer.SETFILTER(Description,TempGenJournalLine.Description);
+      IF TempBankStatementMatchingBuffer.FINDSET THEN BEGIN
+        REPEAT
+          TempBankStatementMatchingBuffer.Quality := MatchStatus::Duplicate;
+          TempBankStatementMatchingBuffer.MODIFY;
+        UNTIL TempBankStatementMatchingBuffer.NEXT = 0;
+
+        EXIT(TRUE);
+      END;
+
+      EXIT(FALSE);
+    END;
+
+    LOCAL PROCEDURE ShowMatchSummary@1060009(VAR TempBankStatementMatchingBuffer@1060000 : TEMPORARY Record 1250;GenJournalBatch@1060010 : Record 232);
+    VAR
+      GenJournalLine@1060001 : Record 81;
+      FinalText@1060002 : Text;
+      MatchStatisticText@1060004 : Text;
+      TotalCount@1060005 : Integer;
+      MatchedCount@1060006 : Integer;
+      MatchStatistic@1060007 : ARRAY [6] OF Integer;
+    BEGIN
+      GenJournalLine.SETRANGE("Journal Template Name",GenJournalBatch."Journal Template Name");
+      GenJournalLine.SETRANGE("Journal Batch Name",GenJournalBatch.Name);
+      GenJournalLine.SETFILTER("Document Type",'%1',GenJournalLine."Document Type"::Payment);
+      TotalCount := GenJournalLine.COUNT;
+
+      GenJournalLine.SETRANGE("Applied Automatically",TRUE);
+      MatchedCount := GenJournalLine.COUNT;
+      GetMatchDetails(TempBankStatementMatchingBuffer,MatchStatistic);
+
+      IF MatchStatistic[MatchStatus::Fully] > 0 THEN
+        MatchStatisticText := MatchStatisticText +
+          STRSUBSTNO(MatchFullyTxt,MatchStatistic[MatchStatus::Fully]);
+      IF MatchStatistic[MatchStatus::Partial] > 0 THEN
+        MatchStatisticText := MatchStatisticText +
+          STRSUBSTNO(MatchPartialTxt,MatchStatistic[MatchStatus::Partial]);
+      IF MatchStatistic[MatchStatus::Extra] > 0 THEN
+        MatchStatisticText := MatchStatisticText +
+          STRSUBSTNO(MatchExtraTxt,MatchStatistic[MatchStatus::Extra]);
+
+      IF MatchStatisticText <> '' THEN
+        MatchStatisticText := MatchDetailsTxt + MatchStatisticText;
+
+      FinalText := STRSUBSTNO(MatchSummaryMsg,MatchedCount,TotalCount) + MatchStatisticText;
+      MESSAGE(FinalText);
+    END;
+
+    PROCEDURE SetMatchLengthThreshold@1060060(NewMatchLengthThreshold@1060000 : Integer);
+    BEGIN
+      MatchLengthTreshold := NewMatchLengthThreshold;
+    END;
+
+    PROCEDURE SetNormalizingFactor@1060015(NewNormalizingFactor@1060000 : Integer);
+    BEGIN
+      NormalizingFactor := NewNormalizingFactor;
+    END;
+
+    PROCEDURE GetMatchLengthTreshold@1060062() : Integer;
+    BEGIN
+      EXIT(MatchLengthTreshold);
+    END;
+
+    PROCEDURE GetNormalizingFactor@1060063() : Integer;
+    BEGIN
+      EXIT(NormalizingFactor);
+    END;
+
+    LOCAL PROCEDURE GetUpdatedFIKDescription@1060064(TempBankStatementMatchingBuffer@1060001 : TEMPORARY Record 1250) : Text[50];
+    BEGIN
+      CASE TempBankStatementMatchingBuffer.Quality OF
+        MatchStatus::Fully:
+          EXIT(STRSUBSTNO('%1 - %2',FIKDescriptionFullMatchTxt,TempBankStatementMatchingBuffer.Description));
+        MatchStatus::Partial:
+          EXIT(STRSUBSTNO('%1 - %2',FIKDescriptionPartialTxt,TempBankStatementMatchingBuffer.Description));
+        MatchStatus::Extra:
+          EXIT(STRSUBSTNO('%1 - %2',FIKDescriptionExtraTxt,TempBankStatementMatchingBuffer.Description));
+        MatchStatus::NoMatch:
+          EXIT(STRSUBSTNO('%1 - %2',FIKDescriptionNoMatchTxt,TempBankStatementMatchingBuffer.Description));
+        MatchStatus::IsPaid:
+          EXIT(STRSUBSTNO('%1 - %2',FIKDescriptionIsPaidTxt,TempBankStatementMatchingBuffer.Description));
+        MatchStatus::Duplicate:
+          EXIT(STRSUBSTNO('%1 - %2',FIKDescriptionDuplicateTxt,TempBankStatementMatchingBuffer.Description));
+      END;
+
+      EXIT(TempBankStatementMatchingBuffer.Description);
+    END;
+
+    LOCAL PROCEDURE GetMatchDetails@1060065(VAR TempBankStatementMatchingBuffer@1060000 : TEMPORARY Record 1250;VAR MatchStatistic@1060001 : ARRAY [6] OF Integer);
+    BEGIN
+      TempBankStatementMatchingBuffer.RESET;
+      IF TempBankStatementMatchingBuffer.FINDSET(TRUE) THEN
+        REPEAT
+          IF TempBankStatementMatchingBuffer.Quality > MatchStatus::IsPaid THEN
+            MatchStatistic[TempBankStatementMatchingBuffer.Quality] += 1;
+        UNTIL TempBankStatementMatchingBuffer.NEXT = 0;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

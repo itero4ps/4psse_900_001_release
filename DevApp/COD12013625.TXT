@@ -1,0 +1,240 @@
+OBJECT Codeunit 12013625 ExFlow Escalation Management
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=EXF350000;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+            IF CONFIRM(cTExt004,FALSE) THEN
+              Escalate;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      cText001@1100285001 : TextConst 'ENU=Escalating @1@@@@@@@@@@@@@@@@@@';
+      cTExt004@1100285000 : TextConst 'ENU=Perform escalation ?';
+      cText005@1100285002 : TextConst 'ENU=Escalated from %1';
+      cText006@1100285003 : TextConst 'ENU=Document has been escalated.';
+
+    PROCEDURE Escalate@1100285001();
+    VAR
+      lAppSetup@1100285013 : Record 12013601;
+      lEXUserGroup@1100285012 : Record 12013606;
+      lEXDocument@1100285011 : Record 12013608;
+      lEXDocumentLine@1100285010 : Record 12013609;
+      lEXDocumentLineApprover@1100285009 : Record 12013610;
+      lTempEXDocumentLineApprover@1100285008 : TEMPORARY Record 12013610;
+      ExFlowToInvoice@1100285014 : Codeunit 12013592;
+      lCount@1100285007 : Integer;
+      lTotalCount@1100285006 : Integer;
+      lWindow@1100285005 : Dialog;
+      lDaysBeforeEscalation@1100285004 : Integer;
+      lManager@1100285003 : Code[50];
+      lDays@1100285002 : Integer;
+      lDoEscalate@1100285001 : Boolean;
+      lDocEscalated@1100285015 : Boolean;
+      lTempApproverOrder@1100285000 : Integer;
+    BEGIN
+      lAppSetup.GET(COMPANYNAME,0);
+
+      lAppSetup.TESTFIELD("Escalation Text");
+      lAppSetup.TESTFIELD("Days before escalation");
+      lAppSetup.TESTFIELD("Senior Manager");
+      lAppSetup.TESTFIELD("System Approver");
+
+      lEXDocument.RESET;
+      lEXDocument.SETCURRENTKEY("Company Name");
+      lEXDocument.SETRANGE("Company Name",COMPANYNAME);
+      IF lEXDocument.FINDSET THEN BEGIN
+        IF GUIALLOWED THEN
+          lWindow.OPEN(cText001);
+        lTotalCount := lEXDocument.COUNT;
+
+        REPEAT
+          lDocEscalated := FALSE;
+
+          lEXDocument.CALCFIELDS(Rejected);
+          IF NOT lEXDocument.Rejected THEN BEGIN
+            lCount += 1;
+            IF GUIALLOWED THEN
+              lWindow.UPDATE(1,ROUND(lCount / lTotalCount * 10000,1));
+
+            lEXDocumentLine.RESET;
+            lEXDocumentLine.SETCURRENTKEY("Document ID");
+            lEXDocumentLine.SETRANGE("Document ID", lEXDocument.ID);
+            lEXDocumentLine.SETRANGE(Flowstatus,lEXDocumentLine.Flowstatus::Active);
+            IF lEXDocumentLine.FINDSET THEN BEGIN
+              REPEAT
+                lEXDocumentLineApprover.RESET;
+                lEXDocumentLineApprover.SETCURRENTKEY("Document Line ID");
+                lEXDocumentLineApprover.SETRANGE("Document Line ID", lEXDocumentLine.ID);
+                lEXDocumentLineApprover.SETRANGE(Flowstatus,lEXDocumentLineApprover.Flowstatus::Current);
+                IF lEXDocumentLineApprover.FIND('-') THEN
+                  IF (DT2DATE(lEXDocumentLineApprover."Flowstatus Change Date") <> 0D) AND
+                     (lEXDocumentLineApprover.Approver <> lAppSetup."Senior Manager") THEN BEGIN
+
+                    lEXUserGroup.GET(lEXDocumentLineApprover."Company Name",lEXDocumentLineApprover.Approver);
+
+                    IF lEXUserGroup."Days before escalation" > 0 THEN
+                      lDaysBeforeEscalation := lEXUserGroup."Days before escalation"
+                    ELSE
+                      lDaysBeforeEscalation := lAppSetup."Days before escalation";
+                    IF lEXUserGroup.Manager <> '' THEN
+                      lManager := lEXUserGroup.Manager
+                    ELSE
+                      lManager := lAppSetup."Senior Manager";
+                    lDays := CalcNoOfWorkdays(
+                              lAppSetup."Base Calendar Code",
+                              DT2DATE(lEXDocumentLineApprover."Flowstatus Change Date"),
+                              TODAY);
+                    lDoEscalate := (lDays > lDaysBeforeEscalation);
+                    IF lDoEscalate THEN BEGIN
+                      lDocEscalated := TRUE;
+
+                      //
+                      // Ok, let's escalate this line.
+                      //
+                      // Mark current row as Approved
+                      //
+                      lEXDocumentLineApprover.VALIDATE(Flowstatus,lEXDocumentLineApprover.Flowstatus::Approved);
+                      lEXDocumentLineApprover."Approval Date" := CREATEDATETIME(WORKDATE,TIME);
+                      lEXDocumentLineApprover."Approved By" := lAppSetup."System Approver";
+                      lEXDocumentLineApprover."Auto Approved" := TRUE;
+                      IF lEXDocumentLineApprover.Comment = '' THEN
+                        lEXDocumentLineApprover.Comment := lAppSetup."Escalation Text"
+                      ELSE
+                        lEXDocumentLineApprover.Comment :=
+                          COPYSTR(
+                            lAppSetup."Escalation Text" + ', ' + lEXDocumentLineApprover.Comment,
+                            1,
+                            MAXSTRLEN(lEXDocumentLineApprover.Comment)
+                          );
+                      lEXDocumentLineApprover.MODIFY(FALSE);
+                      //
+                      // Check if there is any more approvers in the current flow
+                      //
+
+                      lTempEXDocumentLineApprover.COPY(lEXDocumentLineApprover);
+
+                      lEXDocumentLineApprover.RESET;
+                      lEXDocumentLineApprover.SETCURRENTKEY("Company Name","Document Type","Document No.","Line No.","Approver Order");
+                      lEXDocumentLineApprover.SETRANGE("Company Name",lEXDocumentLine."Company Name");
+                      lEXDocumentLineApprover.SETRANGE("Document Type",lEXDocumentLine."Document Type");
+                      lEXDocumentLineApprover.SETRANGE("Document No.",lEXDocumentLine."Document No.");
+                      lEXDocumentLineApprover.SETRANGE("Line No.",lEXDocumentLine."Line No.");
+                      lEXDocumentLineApprover.SETFILTER("Approver Order",'>%1',lTempEXDocumentLineApprover."Approver Order");
+                      IF lEXDocumentLineApprover.FIND('-') THEN BEGIN
+                        //
+                        // Yes, there are at least one additional approver.
+                        //
+                        // Check to see if it's the manager who is the next approver.
+                        //
+                        IF lEXDocumentLineApprover.Approver = lManager THEN BEGIN
+                          lEXDocumentLineApprover.VALIDATE(Flowstatus,lEXDocumentLineApprover.Flowstatus::Current);
+                          lEXDocumentLineApprover.Comment := STRSUBSTNO(cText005,lTempEXDocumentLineApprover.Approver);
+                          lEXDocumentLineApprover.MODIFY(FALSE);
+                        END
+                        ELSE BEGIN
+                          //
+                          // No, it was not the manager. Insert a new approver line in the current flow.
+                          //
+                          lTempApproverOrder := lEXDocumentLineApprover."Approver Order";
+                          lEXDocumentLineApprover.COPY(lTempEXDocumentLineApprover);
+                          lEXDocumentLineApprover."Approver Order" :=
+                            ROUND(lEXDocumentLineApprover."Approver Order" +
+                                  ((lTempApproverOrder - lEXDocumentLineApprover."Approver Order") / 2),1);
+                          lEXDocumentLineApprover.Approver := lManager;
+                          CLEAR(lEXDocumentLineApprover."Approval Date");
+                          CLEAR(lEXDocumentLineApprover."Approved By");
+                          CLEAR(lEXDocumentLineApprover.Comment);
+                          CLEAR(lEXDocumentLineApprover."Reminder Sent Date");
+                          CLEAR(lEXDocumentLineApprover."Reminder Status");
+                          CLEAR(lEXDocumentLineApprover."No. of Reminders");
+                          CLEAR(lEXDocumentLineApprover."Auto Approved");
+                          CLEAR(lEXDocumentLineApprover.ID);
+                          lEXDocumentLineApprover.VALIDATE(Flowstatus,lEXDocumentLineApprover.Flowstatus::Current);
+                          lEXDocumentLineApprover.Comment := STRSUBSTNO(cText005,lTempEXDocumentLineApprover.Approver);
+                          lEXDocumentLineApprover.INSERT(FALSE);
+                        END;
+                      END
+                      ELSE BEGIN
+                        //
+                        // No, this is the last approver. Add a new approver line at the end of the flow.
+                        //
+                        lEXDocumentLineApprover.COPY(lTempEXDocumentLineApprover);
+                        IF lEXDocumentLineApprover.Approver <> lManager THEN BEGIN
+                          lEXDocumentLineApprover."Approver Order" += 10000;
+                          lEXDocumentLineApprover.Approver := lManager;
+                          CLEAR(lEXDocumentLineApprover."Approval Date");
+                          CLEAR(lEXDocumentLineApprover."Approved By");
+                          CLEAR(lEXDocumentLineApprover.Comment);
+                          CLEAR(lEXDocumentLineApprover."Reminder Sent Date");
+                          CLEAR(lEXDocumentLineApprover."Reminder Status");
+                          CLEAR(lEXDocumentLineApprover."No. of Reminders");
+                          CLEAR(lEXDocumentLineApprover."Auto Approved");
+                          CLEAR(lEXDocumentLineApprover.ID);
+                          lEXDocumentLineApprover.VALIDATE(Flowstatus,lEXDocumentLineApprover.Flowstatus::Current);
+                          lEXDocumentLineApprover.Comment := STRSUBSTNO(cText005,lTempEXDocumentLineApprover.Approver);
+                          lEXDocumentLineApprover.INSERT(FALSE);
+                        END;
+                      END;
+                    END;
+                  END;
+              UNTIL lEXDocumentLine.NEXT = 0;
+
+              IF lDocEscalated THEN BEGIN
+                ExFlowToInvoice.InsertApproverComment(lEXDocument,cText006);
+                lEXDocument.MODIFY;
+              END;
+            END;
+          END;
+        UNTIL lEXDocument.NEXT = 0;
+
+        IF GUIALLOWED THEN
+          lWindow.CLOSE;
+      END;
+
+      COMMIT;
+    END;
+
+    PROCEDURE CalcNoOfWorkdays@1100285000(pBaseCalCode@1100285000 : Code[10];pStartDate@1100285001 : Date;pEndDate@1100285002 : Date) : Integer;
+    VAR
+      lCalManagement@1100285006 : Codeunit 7600;
+      lDateRec@1100285007 : Record 2000000007;
+      lDays@1100285005 : Integer;
+      lTempDate@1100285004 : Date;
+      lTempStr@1100285003 : Text[50];
+    BEGIN
+      //
+      // Calculate number of workdays between two dates. If a Base Calendar Code
+      // is specified then use the specified Base Calendar, otherwise calculate
+      // based on normal week where we allways exclude Saturdays and Sundays.
+      //
+      IF pBaseCalCode <> '' THEN BEGIN
+        lTempDate := pStartDate;
+        WHILE lTempDate <= pEndDate DO BEGIN
+          IF lCalManagement.CheckDateStatus(pBaseCalCode,lTempDate,lTempStr) = FALSE THEN lDays += 1;
+          lTempDate := CALCDATE('+1D',lTempDate);
+        END;
+      END
+      ELSE BEGIN
+        lDateRec.RESET;
+        lDateRec.SETRANGE("Period Type", 0);  // lDateRec."Period Type"::Date
+        lDateRec.SETRANGE("Period Start",pStartDate,pEndDate);
+        lDateRec.SETRANGE("Period No.",1,5);
+        lDays := lDateRec.COUNT;
+      END;
+      EXIT(lDays);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

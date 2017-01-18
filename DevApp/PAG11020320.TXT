@@ -21,8 +21,17 @@ OBJECT Page 11020320 Hour Accounting on Time SF
                        OnAfterGetCurrRecord;
                      END;
 
-    OnNewRecord=BEGIN
-                  Type := xRec.Type;
+    OnNewRecord=VAR
+                  EmplRec@1100294002 : Record 5200;
+                  HourAccLine@1100294001 : Record 11012039;
+                BEGIN
+                  // SESB.I029 ASH 03.07.2013 >>
+                  IF NOT HourAccLine.GET(xRec.Year,xRec.Week,xRec."Employee No.",xRec."Line No.") THEN BEGIN
+                    IF ("Employee No." <> '') AND EmplRec.GET("Employee No.") THEN
+                      Type := EmplRec."Default Line Type";
+                  END ELSE
+                  // SESB.I029 ASH 03.07.2013 <<
+                    Type := xRec.Type;
                   "Connection No." := 0;
                   OnAfterGetCurrRecord;
                 END;
@@ -72,7 +81,15 @@ OBJECT Page 11020320 Hour Accounting on Time SF
                              CostCodeOnAfterValidate;
                              OnAfterGetCurrRecord;
                            END;
-                            }
+
+                OnLookup=BEGIN
+                           // SESB.I028 VKO 03.07.2013 >>
+                           LookupCostCode;
+                           CostCodeOnAfterValidate;
+                           OnAfterGetCurrRecord;
+                           // SESB.I028 VKO 03.07.2013 <<
+                         END;
+                          }
 
     { 1100485060;2;Field  ;
                 SourceExpr="Cost Code Description";
@@ -163,11 +180,20 @@ OBJECT Page 11020320 Hour Accounting on Time SF
 
     { 1100485058;2;Field  ;
                 SourceExpr="Wage Component";
+                Editable=WageComponentEditable;
                 OnValidate=BEGIN
                              WageComponentOnAfterValidate;
                              CostCodeOnAfterValidate;
                            END;
-                            }
+
+                OnLookup=BEGIN
+                           // SESB.I028 VKO 03.07.2013 >>
+                           LookupWageComponent;
+                           WageComponentOnAfterValidate;
+                           CostCodeOnAfterValidate;
+                           // SESB.I028 VKO 03.07.2013 <<
+                         END;
+                          }
 
     { 1100485086;2;Field  ;
                 SourceExpr=Description;
@@ -253,6 +279,15 @@ OBJECT Page 11020320 Hour Accounting on Time SF
                 SourceExpr="Cost Price Found at";
                 Visible=FALSE }
 
+    { 1100294000;2;Field  ;
+                SourceExpr=Denied }
+
+    { 1100294001;2;Field  ;
+                SourceExpr="Denied By" }
+
+    { 1100294002;2;Field  ;
+                SourceExpr="Deny Comment" }
+
   }
   CODE
   {
@@ -267,10 +302,13 @@ OBJECT Page 11020320 Hour Accounting on Time SF
       ProjectNoEditable@1210190002 : Boolean INDATASET;
       ProjectRelatedEditable@1210190003 : Boolean INDATASET;
       CostComponentEditable@1210190004 : Boolean INDATASET;
+      WageComponentEditable@1100285500 : Boolean INDATASET;
       QuantityEditable@1210190006 : Boolean INDATASET;
       AmountEditable@1210190007 : Boolean INDATASET;
       PostingDateEditable@1210190008 : Boolean INDATASET;
       TimeRelatedEditable@1210190009 : Boolean INDATASET;
+      LabourRuleCostCode@1100294001 : Record 11128231;
+      LabourRuleWageComponent@1100294000 : Record 11128232;
 
     PROCEDURE GetHoursFromPostedHours@1100485001(iHourAccountingRec@1100485000 : Record 11012038);
     BEGIN
@@ -336,28 +374,85 @@ OBJECT Page 11020320 Hour Accounting on Time SF
         (("Service Order No." <> '') AND ServiceSetup."Cost Component Editable") OR
         (("Project No." = '') AND ("Service Order No." = ''));
 
+      WageComponentEditable := ("Cost Type" <> "Cost Type"::Plant);
 
-      QuantityEditable := ("Component Type" = "Component Type"::Expenses);
-      TimeRelatedEditable := ("Component Type" = "Component Type"::Hours );
+      // SESB.I038 ASH 10.07.2013 >>
+      // QuantityEditable := ("Component Type" = "Component Type"::Expenses );
+      QuantityEditable := "Component Type" IN ["Component Type"::Expenses,"Component Type"::"Expense hours"];
+      // TimeRelatedEditable := ("Component Type" = "Component Type"::Hours );
+      TimeRelatedEditable := "Component Type" IN ["Component Type"::Hours,"Component Type"::"Expense hours"];
+      // SESB.I038 ASH 10.07.2013 <<
 
       IF "Cost Object" = '' THEN BEGIN
-        AmountEditable := ("Component Type" = "Component Type"::Expenses);
+        // SESB.I038 ASH 10.07.2013 >>
+        // AmountEditable := ("Component Type" = "Component Type"::Expenses);
+        AmountEditable := "Component Type" IN ["Component Type"::Expenses,"Component Type"::"Expense hours"];
+        // SESB.I038 ASH 10.07.2013 <<
       END ELSE BEGIN
         DimValRec.CHANGECOMPANY("Receiving Company");
         DimMgt.GetDimValueRec(2, "Cost Object", DimValRec, FALSE, '');
-        AmountEditable :=
-          (("Component Type" = "Component Type"::Expenses) AND
-           (DimValRec.Code <> '') AND
-           NOT (DimValRec."Fixed at Hours Accounting"));
+        AmountEditable := (
+          ("Component Type" IN ["Component Type"::Expenses,"Component Type"::"Expense hours"]) AND // SESB.I038 ASH 10.07.2013
+          (DimValRec.Code <> '') AND
+          NOT (DimValRec."Fixed at Hours Accounting"));
       END;
 
-      IF "Component Type" <> "Component Type"::Expenses THEN
-        AmountHideValue := TRUE; //to prevent showing people's salary
+      // SESB.I038 ASH 10.07.2013 >>
+      //IF "Component Type" <> "Component Type"::Expenses THEN
+      //  AmountHideValue := TRUE; //to prevent showing people's salary
+      AmountHideValue := NOT ("Component Type" IN ["Component Type"::Expenses,"Component Type"::"Expense hours"]);
+      // SESB.I038 ASH 10.07.2013 <<
 
       PostingDateEditable := CompTypeEditable;
     END;
 
+    PROCEDURE LookupCostCode@1100294001();
+    VAR
+      NewCostCode@1100294000 : Code[10];
     BEGIN
+      // SESB.I028 VKO 03.07.2013 >>
+      IF CostCodeEditable THEN BEGIN
+        NewCostCode := LabourRuleCostCode.LookupCostCodeWithFilter("Employee No.");
+        IF NewCostCode <> '' THEN
+          VALIDATE("Cost Code",NewCostCode);
+      END ELSE
+        LabourRuleCostCode.LookupCostCodeWithFilter("Employee No.");
+      // SESB.I028 VKO 03.07.2013 <<
+    END;
+
+    PROCEDURE LookupWageComponent@1100294004();
+    VAR
+      NewWageComponentCode@1100294000 : Code[10];
+    BEGIN
+      // SESB.I028 VKO 03.07.2013 >>
+      IF WageComponentEditable THEN BEGIN
+        NewWageComponentCode := LabourRuleWageComponent.LookupWageComponentWithFilter("Employee No.");
+        IF NewWageComponentCode <> '' THEN
+          VALIDATE("Wage Component",NewWageComponentCode);
+      END ELSE
+        LabourRuleWageComponent.LookupWageComponentWithFilter("Employee No.");
+      // SESB.I028 VKO 03.07.2013 <<
+    END;
+
+    BEGIN
+    {
+      SESB.I028 Cost Codes and Wage Component filter
+         VKO 03.07.2013 Trigger "Cost Code - OnLookup" changed
+         VKO 03.07.2013 Trigger "Wage Component - OnLookup" changed
+         VKO 03.07.2013 Trigger LookupCostCode added
+         VKO 03.07.2013 Trigger LookupWageComponent added
+
+      SESB.I029 Default value type of time
+         ASH 03.07.2013 Trigger "Form - OnNewRecord" changed
+
+      SESB.I038 New Wage Component type
+         ASH 10.07.2013 Trigger "OnAfterGetCurrRecord" changed
+
+      SESB.I035.I036 FD Message when dissaproving-correcting hours
+         VKO 29.07.2013 Control "Denied" added
+         VKO 29.07.2013 Control "Denied By" added
+         VKO 29.07.2013 Control "Deny Comment" added
+    }
     END.
   }
 }

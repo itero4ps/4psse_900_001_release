@@ -4,7 +4,7 @@ OBJECT Table 37 Sales Line
   {
     Date=;
     Time=;
-    Version List=NAVW19.00.00.45480,4PS9.00;
+    Version List=NAVW19.00.00.45480,NAVSE9.FI9.DK9.NO9,4PS9.00,4PSSE.NO;
   }
   PROPERTIES
   {
@@ -77,6 +77,13 @@ OBJECT Table 37 Sales Line
                IF ((Quantity <> 0) OR (xRec.Quantity <> 0)) AND (ItemExists(xRec."No.") OR NSItemExists(xRec."Item No.")) AND //**4PS.n DP00121
                   NOT FullReservedQtyIsForAsmToOrder THEN //**4PS.n DP00121
                  ReserveSalesLine.VerifyChange(Rec,xRec);
+
+               //>>IME171
+               DimMgt.SetDimensionValueChainsBool(TRUE);
+               IF "Shortcut Dimension 1 Code" <> '' THEN ValidateShortcutDimCode(1,"Shortcut Dimension 1 Code");
+               IF "Shortcut Dimension 2 Code" <> '' THEN ValidateShortcutDimCode(2,"Shortcut Dimension 2 Code");
+               DimMgt.SetDimensionValueChainsBool(FALSE);
+               //<<IME171
              END;
 
     OnDelete=VAR
@@ -93,6 +100,7 @@ OBJECT Table 37 Sales Line
                CollectiveListSCInvLine@1100528602 : Record 11071931;
                ProjectCollectiveList@1100528200 : Record 11071875;
                SalesRecipe@1100525002 : Record 11229788;
+               AmountToInvoice@1100285000 : Decimal;
              BEGIN
                TestStatusOpen;
 
@@ -225,20 +233,24 @@ OBJECT Table 37 Sales Line
                      //  ProjInstalmRec."Installment Amount" - ProjInstalmRec."Invoiced Price" -
                      //  ProjInstalmRec."Invoice in Process" - ProjInstalmRec."Credit Memo in Process";
                      //*C-027814.eo
+
+                     //>> ITERO.LP NAVSE
                      IF "Document Type" = "Document Type"::"Credit Memo" THEN
-                       ProjInstalmRec."Invoice Price" := ProjInstalmRec."Invoice Price" - Amount
+                       AmountToInvoice := ProjInstalmRec."Amount to Invoice" - (Amount + "Withheld Amount")
                      ELSE
-                       ProjInstalmRec."Invoice Price" := ProjInstalmRec."Invoice Price" + Amount;
-                     IF (ProjInstalmRec."Invoice Price" <> 0) AND
-                        (((ProjInstalmRec."Installment Amount" >= 0) AND (ProjInstalmRec."Invoice Price" < 0)) OR
-                         ((ProjInstalmRec."Installment Amount" <  0) AND (ProjInstalmRec."Invoice Price" > 0)))
-                     THEN
-                       ProjInstalmRec."Invoice Price" := 0;
+                       AmountToInvoice := ProjInstalmRec."Amount to Invoice" + (Amount + "Withheld Amount");
+                     ProjInstalmRec.VALIDATE("Amount to Invoice", AmountToInvoice);
+                     ProjInstalmRec.VALIDATE(Chargeable, TRUE);
+
                      IF (ProjInstalmRec.Points > 0) AND (ProjInstalmRec."Installment Amount" <> 0) THEN
                        ProjInstalmRec."Points to be invoiced" :=
                          ROUND(ProjInstalmRec."Invoice Price" / ProjInstalmRec."Installment Amount" * ProjInstalmRec.Points , 1);
-                     ProjInstalmRec.VALIDATE("Invoice Price");
-                     ProjInstalmRec.Chargeable := TRUE;  //db, 05-09-13: C009275
+
+                     //>> ITERO.LP NAVSE: Disabled code below
+                     //ProjInstalmRec.VALIDATE("Invoice Price");
+                     //ProjInstalmRec.Chargeable := TRUE;  //db, 05-09-13: C009275
+                     //<< ITERO.LP NAVSE
+
                      ProjInstalmRec.MODIFY;
                    END;
                  END ELSE BEGIN
@@ -480,6 +492,7 @@ OBJECT Table 37 Sales Line
                                                                                                                                         ELSE IF (Type=CONST("Charge (Item)")) "Item Charge";
                                                    OnValidate=VAR
                                                                 PrepaymentMgt@1002 : Codeunit 441;
+                                                                l_Customer@1100285000 : Record 18;
                                                               BEGIN
                                                                 TestJobPlanningLine;
                                                                 TestStatusOpen;
@@ -526,6 +539,10 @@ OBJECT Table 37 Sales Line
                                                                   GetTemporarySalesLine;  //**4PS.n
                                                                 GetSalesHeader;
                                                                 InitHeaderDefaults(SalesHeader);
+
+                                                                "Account Code DK" := SalesHeader."Account Code DK";  //NAVDK
+                                                                "Account Code NO" := SalesHeader."Account Code NO";  //NAVNO
+
                                                                 CALCFIELDS("Substitution Available");
 
                                                                 "Promised Delivery Date" := SalesHeader."Promised Delivery Date";
@@ -583,6 +600,7 @@ OBJECT Table 37 Sales Line
                                                                         "Allow Invoice Disc." := FALSE;
                                                                       //**4PS.en
                                                                       "Allow Item Charge Assignment" := FALSE;
+                                                                      "Auto. Acc. Group" := GLAcc."Auto. Acc. Group";
                                                                       InitDeferralCode;
                                                                     END;
                                                                   Type::Item:
@@ -710,6 +728,11 @@ OBJECT Table 37 Sales Line
                                                                 END;
 
                                                                 UpdateItemCrossRef;
+                                                                //PSSE, construction tax (Byggmoms), corrected 02-01-2013
+                                                                IF SalesHeader.GET("Document Type","Document No.") THEN
+                                                                  IF l_Customer.GET(SalesHeader."Bill-to Customer No.") THEN
+                                                                    IF l_Customer."VAT Prod. Posting Grp to lines" THEN
+                                                                      VALIDATE("VAT Prod. Posting Group",l_Customer."VAT Prod. Posting Group");
                                                               END;
 
                                                    CaptionML=ENU=No. }
@@ -1710,18 +1733,26 @@ OBJECT Table 37 Sales Line
     { 88  ;   ;VAT Clause Code     ;Code10        ;TableRelation="VAT Clause";
                                                    CaptionML=ENU=VAT Clause Code }
     { 89  ;   ;VAT Bus. Posting Group;Code10      ;TableRelation="VAT Business Posting Group";
-                                                   OnValidate=BEGIN
+                                                   OnValidate=VAR
+                                                                lGLSetup@1100285400 : Record 98;
+                                                              BEGIN
                                                                 //**4PS.sn
                                                                 GetSalesHeader;
                                                                 IF SalesHeader."Extended VAT Determination" THEN
                                                                   "VAT Bus. Posting Group" := SalesHeader."VAT Bus. Posting Group";
                                                                 VALIDATE("VAT Prod. Posting Group");
                                                                 //**4PS.en
+
+                                                                lGLSetup.GET;
+                                                                IF lGLSetup."Norwegian Localization Active" THEN
+                                                                  NorwegianVATTools.InitVATCode_SalesLine(Rec);  //NAVNO
                                                               END;
 
                                                    CaptionML=ENU=VAT Bus. Posting Group }
     { 90  ;   ;VAT Prod. Posting Group;Code10     ;TableRelation="VAT Product Posting Group";
-                                                   OnValidate=BEGIN
+                                                   OnValidate=VAR
+                                                                lGLSetup@1100285400 : Record 98;
+                                                              BEGIN
                                                                 TestStatusOpen;
                                                                 //**4PS.sn
                                                                 //VATPostingSetup.GET("VAT Bus. Posting Group","VAT Prod. Posting Group");
@@ -1752,6 +1783,10 @@ OBJECT Table 37 Sales Line
                                                                       "Unit Price" * (100 + "VAT %") / (100 + xRec."VAT %"),
                                                                       Currency."Unit-Amount Rounding Precision");
                                                                 UpdateAmounts;
+
+                                                                lGLSetup.GET;
+                                                                IF lGLSetup."Norwegian Localization Active" THEN
+                                                                  NorwegianVATTools.InitVATCode_SalesLine(Rec);  //NAVNO
                                                               END;
 
                                                    CaptionML=ENU=VAT Prod. Posting Group }
@@ -2580,7 +2615,7 @@ OBJECT Table 37 Sales Line
                                                                     VALIDATE(Quantity,Quantity);
                                                                     IF "Drop Shipment" THEN BEGIN
                                                                       EVALUATE("Outbound Whse. Handling Time",'<0D>');
-                                                                      EVALUATE("Shipping Time",'0D');
+                                                                      EVALUATE("Shipping Time",'<0D>');
                                                                       UpdateDates;
                                                                       "Bin Code" := '';
                                                                     END;
@@ -4024,6 +4059,37 @@ OBJECT Table 37 Sales Line
     { 11012999;;Collective List No.;Code20        ;TableRelation="Service Collective-List";
                                                    CaptionML=ENU=Collective List No.;
                                                    Editable=No }
+    { 11128010;;Auto. Acc. Group   ;Code10        ;TableRelation="Automatic Acc. Header";
+                                                   CaptionML=ENU=Auto. Acc. Group;
+                                                   Description=NAVSE,NAVFI }
+    { 11128011;;Periodic Template Code;Code10     ;TableRelation="Periodic Template".Code;
+                                                   CaptionML=ENU=Periodic Template Code }
+    { 11128012;;Periodic Starting Date;Date       ;CaptionML=ENU=Periodic Starting Date }
+    { 11128020;;Withheld Amount    ;Decimal       ;CaptionML=ENU=Withheld Amount;
+                                                   Description=NAVSE }
+    { 11128504;;VAT Code           ;Code10        ;TableRelation="VAT Code".Code;
+                                                   OnValidate=BEGIN
+                                                                NorwegianVATTools.InitPostingGrps_SalesLine(Rec);
+                                                              END;
+
+                                                   CaptionML=ENU=VAT Code;
+                                                   Description=NAVNO }
+    { 11128505;;Account Code NO    ;Text30        ;OnValidate=VAR
+                                                                Text11128570@1100285000 : TextConst 'ENU=You cannot enter %1 if %2 is "%3".';
+                                                              BEGIN
+                                                                IF (Type = Type::" ") AND ("Account Code NO" <> '') THEN
+                                                                  ERROR(Text11128570, FIELDCAPTION("Account Code NO"), FIELDCAPTION(Type), Type);
+                                                              END;
+
+                                                   CaptionML=ENU=Account Code NO;
+                                                   Description=NAVNO }
+    { 11128570;;Account Code DK    ;Text30        ;OnValidate=BEGIN
+                                                                IF (Type = Type::" ") AND ("Account Code DK" <> '') THEN
+                                                                  ERROR(Text13600, FIELDCAPTION("Account Code DK"), FIELDCAPTION(Type), Type);
+                                                              END;
+
+                                                   CaptionML=ENU=Account Code DK;
+                                                   Description=NAVDK }
   }
   KEYS
   {
@@ -4140,6 +4206,7 @@ OBJECT Table 37 Sales Line
       NonstockItemMgt@1087 : Codeunit 5703;
       WhseValidateSourceLine@1088 : Codeunit 5777;
       TransferExtendedText@1100 : Codeunit 378;
+      NorwegianVATTools@1080000 : Codeunit 11128500;
       DeferralUtilities@1026 : Codeunit 1720;
       JobPostLine@1097 : Codeunit 11072006;
       FullAutoReservation@1092 : Boolean;
@@ -4182,6 +4249,7 @@ OBJECT Table 37 Sales Line
       Text058@1028 : TextConst 'ENU=The quantity that you are trying to invoice is greater than the quantity in shipment %1.';
       Text059@1029 : TextConst 'ENU=must have the same sign as the return receipt';
       Text060@1041 : TextConst 'ENU=The quantity that you are trying to invoice is greater than the quantity in return receipt %1.';
+      Text13600@1101100000 : TextConst 'ENU=You cannot enter %1 if %2 is "%3".';
       SalesLineCompletelyShippedErr@1053 : TextConst 'ENU=You cannot change the purchasing code for a sales line that has been completely shipped.';
       SalesSetupRead@1067 : Boolean;
       DeferralPostDate@1069 : Date;
@@ -6956,6 +7024,7 @@ OBJECT Table 37 Sales Line
       "Prepayment Tax Liable" := SalesHeader."Tax Liable";
       "Responsibility Center" := SalesHeader."Responsibility Center";
 
+      "Account Code NO" := SalesHeader."Account Code NO";  //NAVNO
       "Shipping Agent Code" := SalesHeader."Shipping Agent Code";
       "Shipping Agent Service Code" := SalesHeader."Shipping Agent Service Code";
       "Outbound Whse. Handling Time" := SalesHeader."Outbound Whse. Handling Time";
@@ -8924,6 +8993,15 @@ OBJECT Table 37 Sales Line
       4PS03 JD 14-02-08 Fill Cost component from SOType or Cost object
       4PS04 JD 29-06-2008, Improvements for intrastat
       4PS05 JD 3-11-2008, Call 12697 add Line Price to some forms
+
+      140905 ITERO.DL IME171 Dimensions are not extended due to lack of VALIDATEs
+
+      Version List=NAVW19.00.00.45834,NAVSE9.00.00.45834
+      Version List=NAVW19.00.00.45834,NAVFI9.00.00.45834;
+      Version List=NAVW19.00.00.45834,NAVDK9.00.00.45834;
+      Version List=NAVW19.00.00.45834,NAVNO9.00.00.45834;
+      151207 ITERO.WG IME339 Added code from 4PS call C023319
+      160312 ITERO.LP NAVSE New field 11128020 "Withheld Amount". Handling of restored Installment values.
     }
     END.
   }

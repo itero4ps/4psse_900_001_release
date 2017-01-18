@@ -1,0 +1,191 @@
+OBJECT Codeunit 12013669 Ex WS Queue Dispacher
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=EXF350000;
+  }
+  PROPERTIES
+  {
+    SingleInstance=No;
+    OnRun=BEGIN
+            ExecuteJob;
+          END;
+
+  }
+  CODE
+  {
+
+    PROCEDURE ExecuteJob@1100285000();
+    BEGIN
+      ResetDueSessions;
+      HandleRequest;
+    END;
+
+    LOCAL PROCEDURE HandleRequest@6();
+    VAR
+      JobQueueEntry@1000 : Record 12057111;
+      JobLogEntryNo@1002 : Integer;
+      WasSuccess@1003 : Boolean;
+      MoreRequests@1006 : Boolean;
+      NAVJobQueueEntry@1100285000 : Record 472;
+    BEGIN
+      MoreRequests := GetNextRequest(JobQueueEntry);  // locks table
+
+      WHILE MoreRequests DO BEGIN
+        JobLogEntryNo := InsertLogEntry(JobQueueEntry);
+        COMMIT;
+        NAVJobQueueEntry.INIT;
+        NAVJobQueueEntry.TRANSFERFIELDS(JobQueueEntry);
+        WasSuccess := CODEUNIT.RUN(CODEUNIT::"Job Queue Start Codeunit",NAVJobQueueEntry);
+        IF WasSuccess THEN BEGIN
+          IF JobQueueEntry."Recurring Job" THEN BEGIN
+            JobQueueEntry."No. of Attempts to Run" := 0;
+            JobQueueEntry.Status := JobQueueEntry.Status::Ready;
+          END ELSE
+            JobQueueEntry.Status := JobQueueEntry.Status::"On Hold";
+          JobQueueEntry."Session Due" := CREATEDATETIME(0D,0T);
+          JobQueueEntry.MODIFY;
+        END ELSE BEGIN
+          IF JobQueueEntry."Maximum No. of Attempts to Run" > JobQueueEntry."No. of Attempts to Run" THEN BEGIN
+            JobQueueEntry."No. of Attempts to Run" := JobQueueEntry."No. of Attempts to Run" + 1;
+            JobQueueEntry.Status := JobQueueEntry.Status::Ready;
+          END ELSE
+            JobQueueEntry.Status := JobQueueEntry.Status::Error;
+          JobQueueEntry."Session Due" := CREATEDATETIME(0D,0T);
+          JobQueueEntry.MODIFY;
+        END;
+        UpdateLogEntry(JobLogEntryNo,WasSuccess);
+        CLEARLASTERROR;
+        COMMIT;
+        MoreRequests := GetNextRequest(JobQueueEntry);  // locks table
+      END;
+      COMMIT;
+    END;
+
+    LOCAL PROCEDURE GetNextRequest@5(VAR JobQueueEntry@1000 : Record 12057111) : Boolean;
+    VAR
+      Found@1001 : Boolean;
+    BEGIN
+      JobQueueEntry.LOCKTABLE;
+      JobQueueEntry.SETFILTER("Expiration Date/Time",'>%1|%2',CURRENTDATETIME,CREATEDATETIME(0D,0T));
+      JobQueueEntry.SETFILTER("Earliest Start Date/Time",'<=%1',CURRENTDATETIME);
+      JobQueueEntry.SETRANGE(Status,JobQueueEntry.Status::Ready);
+      JobQueueEntry.SETCURRENTKEY(Priority);
+      Found := JobQueueEntry.FINDFIRST;
+      IF Found THEN BEGIN
+        IF JobQueueEntry."Recurring Job" THEN
+          JobQueueEntry."Earliest Start Date/Time" := CalcNextRunTime(JobQueueEntry);
+        JobQueueEntry.Status := JobQueueEntry.Status::"In Process";
+        JobQueueEntry."Session Due" := CURRENTDATETIME + (JobQueueEntry."Time Out (mins)" * 60000);
+        JobQueueEntry.MODIFY;
+      END;
+
+      EXIT(Found);
+    END;
+
+    LOCAL PROCEDURE InsertLogEntry@7(VAR JobQueueEntry@1000 : Record 12057111) : Integer;
+    VAR
+      JobQueueLogEntry@1001 : Record 12057113;
+    BEGIN
+      JobQueueLogEntry.INIT;
+      JobQueueLogEntry.ID := JobQueueEntry.ID;
+      JobQueueLogEntry."User ID" := JobQueueEntry."User ID";
+      JobQueueLogEntry."Start Date/Time" := CURRENTDATETIME;
+      JobQueueLogEntry."Object Type to Run" := JobQueueEntry."Object Type to Run";
+      JobQueueLogEntry."Object ID to Run" :=  JobQueueEntry."Object ID to Run";
+      JobQueueLogEntry.Status := JobQueueLogEntry.Status::"In Process";
+      JobQueueLogEntry.INSERT(TRUE);
+      EXIT(JobQueueLogEntry."Entry No.");
+    END;
+
+    LOCAL PROCEDURE UpdateLogEntry@8(LogEntryNo@1000 : Integer;WasSuccess@1002 : Boolean);
+    VAR
+      JobQueueLogEntry@1003 : Record 12057113;
+    BEGIN
+      JobQueueLogEntry.GET(LogEntryNo);
+      JobQueueLogEntry."End Date/Time" := CURRENTDATETIME;
+      IF WasSuccess THEN
+        JobQueueLogEntry.Status := JobQueueLogEntry.Status::Success
+      ELSE BEGIN
+        JobQueueLogEntry.Status := JobQueueLogEntry.Status::Error;
+        JobQueueLogEntry.SetErrorMessage(COPYSTR(GETLASTERRORTEXT,1,1000));
+      END;
+      JobQueueLogEntry.MODIFY;
+    END;
+
+    LOCAL PROCEDURE CalcNextRunTime@1(VAR JobQueueEntry@1000 : Record 12057111) : DateTime;
+    VAR
+      NewRunTime@1001 : Time;
+      NewRunDateTime@1002 : DateTime;
+      RunOnDate@1003 : ARRAY [7] OF Boolean;
+      CurrWeekDay@1005 : Integer;
+      NoOfDays@1007 : Integer;
+      Found@1006 : Boolean;
+    BEGIN
+      RunOnDate[7] := JobQueueEntry."Run on Sundays";
+      RunOnDate[1] := JobQueueEntry."Run on Mondays";
+      RunOnDate[2] := JobQueueEntry."Run on Tuesdays";
+      RunOnDate[3] := JobQueueEntry."Run on Wednesdays";
+      RunOnDate[4] := JobQueueEntry."Run on Thursdays";
+      RunOnDate[5] := JobQueueEntry."Run on Fridays";
+      RunOnDate[6] := JobQueueEntry."Run on Saturdays";
+
+      IF JobQueueEntry."No. of Minutes between Runs" > 0 THEN BEGIN
+        NewRunTime := TIME + 60000 * JobQueueEntry."No. of Minutes between Runs";
+        IF (JobQueueEntry."Ending Time" = 0T) AND (JobQueueEntry."No. of Minutes between Runs" * 60000 > 235900T - TIME) OR
+          (JobQueueEntry."Ending Time" <> 0T) AND
+            (JobQueueEntry."No. of Minutes between Runs" * 60000 > JobQueueEntry."Ending Time" - TIME)
+        THEN BEGIN
+          NewRunTime := JobQueueEntry."Starting Time";
+          NoOfDays := 1;
+        END;
+      END ELSE BEGIN
+        NewRunTime := DT2TIME(JobQueueEntry."Earliest Start Date/Time");
+        NoOfDays := 1;
+      END;                                                   ;
+
+      CurrWeekDay := DATE2DWY(TODAY,1);
+      Found := RunOnDate[(CurrWeekDay - 1 + NoOfDays) MOD 7 + 1];
+      WHILE NOT Found AND (NoOfDays < 7) DO BEGIN
+        NoOfDays := NoOfDays + 1;
+        Found := RunOnDate[(CurrWeekDay - 1 + NoOfDays) MOD 7 + 1];
+      END;
+      IF NOT Found THEN
+        NoOfDays := 10000;
+
+      NewRunDateTime := CREATEDATETIME(TODAY + NoOfDays,NewRunTime);
+      EXIT(NewRunDateTime);
+    END;
+
+    LOCAL PROCEDURE ResetDueSessions@3();
+    VAR
+      JobQueueEntry@1100285000 : Record 12057111;
+    BEGIN
+      JobQueueEntry.LOCKTABLE;
+      JobQueueEntry.SETFILTER("Session Due",'<=%1&<>%2',CURRENTDATETIME,CREATEDATETIME(0D,0T));
+      JobQueueEntry.SETRANGE(Status,JobQueueEntry.Status::"In Process");
+      IF JobQueueEntry.FINDFIRST THEN
+        REPEAT
+          IF JobQueueEntry."Maximum No. of Attempts to Run" > JobQueueEntry."No. of Attempts to Run" THEN BEGIN
+            JobQueueEntry."No. of Attempts to Run" := JobQueueEntry."No. of Attempts to Run" + 1;
+            JobQueueEntry.Status := JobQueueEntry.Status::Ready;
+          END ELSE
+            JobQueueEntry.Status := JobQueueEntry.Status::Error;
+          JobQueueEntry."Session Due" := CREATEDATETIME(0D,0T);
+          JobQueueEntry.MODIFY;
+          COMMIT;
+        UNTIL JobQueueEntry.NEXT =0;
+    END;
+
+    PROCEDURE StartJob@1100285001();
+    BEGIN
+      ExecuteJob;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

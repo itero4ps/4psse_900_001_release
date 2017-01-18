@@ -84,6 +84,7 @@ OBJECT Codeunit 6085722 DC Approval Management
       PurchHeader@1006 : Record 38;
       ApprovalEntryArgument@1002 : Record 454;
       DCApprovalsBridge@1001 : Codeunit 6085790;
+      ApprovalManagement4PSConstr@1100528202 : Codeunit 11125349;
     BEGIN
       IF RecRef.NUMBER = DATABASE::"Purchase Header" THEN BEGIN
         RecRef.SETTABLE(PurchHeader);
@@ -91,10 +92,16 @@ OBJECT Codeunit 6085722 DC Approval Management
 
         DCApprovalsBridge.InitializeApprovalEntry(RecRef,ApprovalEntryArgument);
 
+        //**4PS.sn
+        IF DCApprovalsBridge.GetApprovalType = ApprovalEntryArgument."Approval Type"::"Consent Rules" THEN BEGIN
+          Handled  := ApprovalManagement4PSConstr.FindPurchaseConsenters(RecRef,ApprovalEntryArgument);
+        END ELSE BEGIN
+        //**4Ps.en
         IF PurchHeaderDCInfo.GetApprovalFlowCode(PurchHeader) <> '' THEN BEGIN
           FindPurchaseApprovers(PurchHeader,ApprovalEntryArgument);
           Handled := TRUE;
         END;
+        END; //**4PS.n
 
         IF DCApprovalsBridge.GetApprovalType = ApprovalEntryArgument."Approval Type"::"Advanced Approver" THEN BEGIN
           AdvAppvlMgt.SubmitForApproval(PurchHeader);
@@ -105,7 +112,8 @@ OBJECT Codeunit 6085722 DC Approval Management
           DCApprovalsBridge.InformUserOnStatusChange(RecRef);
       END;
 
-      IF NOT Handled THEN
+      //IF NOT Handled THEN //**4Ps.old
+      IF (NOT Handled) AND (RecRef.NUMBER = DATABASE::"Purchase Header")  THEN  //**4Ps.new
         Handled := DCApprovalsBridge.CreateApprovalRequestsStandard(RecRef);
 
       IF (RecRef.NUMBER = DATABASE::"Purchase Header") AND DCApprovalsBridge.IsWorkflowSupported THEN BEGIN
@@ -125,36 +133,12 @@ OBJECT Codeunit 6085722 DC Approval Management
       PurchCrMemoHdr@1100528200 : Record 124;
     BEGIN
       OnBeforeApproveApprovalRequest(ApprovalEntry);
-      //IF ApprovalEntry."Table ID" <> DATABASE::"Purchase Header" THEN //**4PS.o
-      //**4PS.sn
-      IF NOT (ApprovalEntry."Table ID" IN [DATABASE::"Purchase Header",
-        DATABASE::"Purch. Inv. Header", DATABASE::"Purch. Cr. Memo Hdr."]) THEN
-      //**4PS.en
+      IF ApprovalEntry."Table ID" <> DATABASE::"Purchase Header" THEN
         EXIT;
 
-      //**4PS.sn
-      CASE ApprovalEntry."Table ID" OF
-      DATABASE::"Purchase Header":
-        BEGIN
-      //**4PS.en
-          IF NOT PurchHeader.GET(ApprovalEntry."Document Type",ApprovalEntry."Document No.") THEN
-            EXIT;
-      //**4PS.sn
-        END;
-      DATABASE::"Purch. Inv. Header":
-        BEGIN
-          IF NOT PurchInvHeader.GET(ApprovalEntry."Document No.") THEN
-            EXIT;
-          PurchHeader."Document Type" := PurchHeader."Document Type"::Invoice;
-        END;
-       DATABASE::"Purch. Cr. Memo Hdr.":
-        BEGIN
-          IF NOT PurchCrMemoHdr.GET(ApprovalEntry."Document No.") THEN
-            EXIT;
-          PurchHeader."Document Type" := PurchHeader."Document Type"::"Credit Memo";
-        END;
-      END;
-      //**4PS.en
+      IF NOT PurchHeader.GET(ApprovalEntry."Document Type",ApprovalEntry."Document No.") THEN
+        EXIT;
+
       IF NOT (PurchHeader."Document Type" IN [PurchHeader."Document Type"::Invoice,PurchHeader."Document Type"::"Credit Memo"]) THEN
         EXIT;
 
@@ -538,6 +522,9 @@ OBJECT Codeunit 6085722 DC Approval Management
       DCApprovalsBridge@1003 : Codeunit 6085790;
       ApprovalComment@1000000004 : Page 660;
       Answer@161024012 : 'Dialog Cancelled,Send Back,Reject';
+      WorkFlowSetup4PSConstruct@1100528200 : Record 11229316;
+      UserSetup@1100528201 : Record 91;
+      SelectionforDelegate@1100528202 : 'ApproveAndDelegate,DelegateWithoutApproval,DelegateAndSendBack';
     BEGIN
       DCApprovalsBridge.FindApprovalRequestForCurrUser(ApprovalEntry,PurchHeader);
 
@@ -546,10 +533,27 @@ OBJECT Codeunit 6085722 DC Approval Management
       IF Answer = Answer::"Dialog Cancelled" THEN
         ERROR('');
 
+      //**4PS.sn
+      WorkFlowSetup4PSConstruct.GET;
+      IF (Answer = Answer::Reject) AND (WorkFlowSetup4PSConstruct."Reject and Delegate") THEN BEGIN
+        UserSetup.GET(USERID);
+        IF UserSetup.GET(UserSetup.Substitute) THEN;
+        IF PAGE.RUNMODAL(PAGE::"Purch. Delegate to User",UserSetup) <> ACTION::LookupOK THEN
+          ERROR('');
+      END;
+      //4PS.en
+
       IF Answer = Answer::"Send Back" THEN
         DCApprovalsBridge.SendBackApprovalRequest(ApprovalEntry)
       ELSE
-        DCApprovalsBridge.RejectApprovalRequest(ApprovalEntry);
+        //**4PS sn
+      BEGIN
+        IF WorkFlowSetup4PSConstruct."Reject and Delegate" THEN BEGIN
+          DelegateApprovalRequest2(ApprovalEntry,SelectionforDelegate::DelegateWithoutApproval, UserSetup."User ID");
+        END ELSE
+      //**4PS en
+          DCApprovalsBridge.RejectApprovalRequest(ApprovalEntry);
+      END;//**4PS n
 
       WebSearchMgt.UpdateWebSearchFromAppvlEntry(ApprovalEntry,ApprovalEntry."Approver ID");
       WebSearchMgt.UpdateWebSearchFromAppvlEntry(ApprovalEntry,GetCurrUserID);
@@ -681,7 +685,12 @@ OBJECT Codeunit 6085722 DC Approval Management
 
       ApprovalEntry.SETCURRENTKEY("Approver ID");
       ApprovalEntry.SETRANGE("Approver ID",GetCurrUserID);
-      ApprovalEntry.SETRANGE("Table ID",TableID);
+      //ApprovalEntry.SETRANGE("Table ID",TableID); //4PS.o
+      //4PS.sn
+      IF TableID IN [38,122,124] THEN
+        ApprovalEntry.SETFILTER("Table ID", '%1|%2|%3',
+          DATABASE::"Purchase Header",DATABASE::"Purch. Inv. Header", DATABASE::"Purch. Cr. Memo Hdr.");
+      //4Ps.en
 
       IF ApprovalEntry.FINDSET THEN
         REPEAT
@@ -715,7 +724,8 @@ OBJECT Codeunit 6085722 DC Approval Management
               TempApprovalEntry."Temp. Entry Type" := TempApprovalEntry."Temp. Entry Type"::"Out of Office Sharing";
             TempApprovalEntry."Temp. Display Sorting" := i;
             TempApprovalEntry.Status := TempApprovalEntry.Status::Open;
-            TempApprovalEntry.INSERT(TRUE);
+            //TempApprovalEntry.INSERT(TRUE);        //**4PS.en
+            IF TempApprovalEntry.INSERT(TRUE) THEN;  //**4PS.en
 
             REPEAT
               i := i + 1;
@@ -953,9 +963,15 @@ OBJECT Codeunit 6085722 DC Approval Management
 
         "Original Approver ID" := "Approver ID";
 
-        IF "Table ID" <> DATABASE::"Purchase Header" THEN
-          EXIT;
-
+      //**4PA.so   maybe try to insert a function in 4PS construct to eliminate changes in DC Continia, later phase
+      //  IF "Table ID" <> DATABASE::"Purchase Header" THEN
+      //    EXIT;
+      //**4PS.eo
+      //**4PS.sn
+      IF NOT (ApprovalEntry."Table ID" IN [DATABASE::"Purchase Header",
+        DATABASE::"Purch. Inv. Header", DATABASE::"Purch. Cr. Memo Hdr."]) THEN
+        EXIT;
+      //**4PS.en
         DCApprovalsBridge.FinishApprovalEntry(ApprovalEntry,ApprovalEntryArgument);
         UpdateApprovalEntry(ApprovalEntry);
         DCApprovalsBridge.InsertApprovalEntry(ApprovalEntry);
@@ -1239,7 +1255,8 @@ OBJECT Codeunit 6085722 DC Approval Management
             END;
           END; //**4PS.n
         END; //**4PS.n
-        IF GET(ApprovalEntry2."Table ID",ApprovalEntry2."Document Type",ApprovalEntry2."Document No.",ApprovalEntry2."Sequence No.") THEN;
+        //IF GET(ApprovalEntry2."Table ID",ApprovalEntry2."Document Type",ApprovalEntry2."Document No.",ApprovalEntry2."Sequence No.") THEN;
+        IF GET(ApprovalEntry2."Entry No.") THEN;
       END;
     END;
 
@@ -1386,6 +1403,7 @@ OBJECT Codeunit 6085722 DC Approval Management
       Template@1001 : Record 6085579;
       Document@161024017 : Record 6085590;
       PurchHeaderDCInfo@1160040000 : Record 6085767;
+      WorkFlowSetup4PSConstruct@1100528200 : Record 11229316;
       SkipAmtExclVATTest@1002 : Boolean;
       SkipAmtInclVATTest@1003 : Boolean;
       AmountExclVAT@161024012 : Decimal;
@@ -1430,11 +1448,10 @@ OBJECT Codeunit 6085722 DC Approval Management
       GLSetup.GET;
       //**4PS.sn
       //**4PS Call C020358 sn
-      //FIXME
-      //ApprovalSetup.GET;
-      //IF (ApprovalSetup."Appr. P. Hdr. And P. I. Hdr.") AND (PurchHeaderDCInfo.GetApprovalFlowCode(PurchHeader) <> '') THEN BEGIN
-      //  EXIT;  //Purchase Order Send for Advice to another Approver. Thus the amounts may be incorrect.
-      //END;
+      WorkFlowSetup4PSConstruct.GET;
+      IF (WorkFlowSetup4PSConstruct."Appr. P. Hdr. And P. I. Hdr.") AND (PurchHeaderDCInfo.GetApprovalFlowCode(PurchHeader) <> '') THEN BEGIN
+        EXIT;  //Purchase Order Send for Advice to another Approver. Thus the amounts may be incorrect.
+      END;
       //**4PS Call C020358 en
       IF PurchHeader."Ext. Document ID" <> '' THEN
         IF NOT PurchHeader."Manually VAT Posting" THEN BEGIN
@@ -1861,6 +1878,7 @@ OBJECT Codeunit 6085722 DC Approval Management
 
     PROCEDURE ApprovePurchHeader4PS@1000000011(VAR PurchHeader@1000000000 : Record 38) : Boolean;
     VAR
+      WorkFlowSetup4PSConstruct@1100528201 : Record 11229316;
       DCSetup@1000000006 : Record 6085573;
       SalesHeader@1000000008 : Record 36;
       PurchDocMgnt@1000000001 : Codeunit 6085709;
@@ -1870,22 +1888,21 @@ OBJECT Codeunit 6085722 DC Approval Management
       LineAmountInclVAT@1000000002 : Decimal;
       AutomaticApprovalstartUp@1100409000 : Boolean;
       PurchHeaderDCInfo@1100528200 : Record 6085767;
+      ApprovalManagement4PSConstr@1100528203 : Codeunit 11125349;
     BEGIN
       //**4PS
       PurchHeader.FIND('=');
 
-      //FIXME
-      //ApprovalSetup.GET;//CALL C020358
+      WorkFlowSetup4PSConstruct.GET;
 
       IF PurchHeader."Ext. Document ID" <> '' THEN BEGIN
         IF PurchDocMgnt.DocumentExists(PurchHeader) THEN BEGIN
           AutomaticApprovalstartUp := PurchDocMgnt.TemplateStep2Approve(PurchHeader); //CALL C020358
           //**4PS Call C020358 sn
-          //FIXME
-          //IF NOT (
-          //     (ApprovalSetup."Appr. P. Hdr. And P. I. Hdr.") AND (PurchHeaderDCInfo.GetApprovalFlowCode(PurchHeader) <> '')
-          //       )
-          //THEN BEGIN
+          IF NOT (
+               (WorkFlowSetup4PSConstruct."Appr. P. Hdr. And P. I. Hdr.") AND (PurchHeaderDCInfo.GetApprovalFlowCode(PurchHeader) <> '')
+                 )
+          THEN BEGIN
           // NOT Purchase Order Send for Advice to another Approver. Thus the amounts may be incorrect.
           //**4PS Call C020358 en
             PurchDocMgnt.GetPurchStatusAmounts(PurchHeader, AmountExclVAT, AmountInclVAT, LineAmountExclVAT, LineAmountInclVAT);
@@ -1895,20 +1912,18 @@ OBJECT Codeunit 6085722 DC Approval Management
             END ELSE
               IF (AmountInclVAT <> LineAmountInclVAT) THEN // Toegestaan om bedrag excl. BTW af te laten wijken.
                 ERROR(Text11012002);
-          //FIXME END;//**4PS Call C020358
+          END;//**4PS Call C020358
         END;
       END;
 
       IF AutomaticApprovalstartUp THEN BEGIN//CALL C020358
-      //FIXME
-      //  IF NOT ApprovalSetup."Purch. Hdr. Inv. Keep On Hold" THEN //CALL C020358
-      //    PurchHeader.VALIDATE("On Hold", '');
+        IF NOT WorkFlowSetup4PSConstruct."Purch. Hdr. Inv. Keep On Hold" THEN //CALL C020358
+          PurchHeader.VALIDATE("On Hold", '');
         PurchHeader.MODIFY(TRUE);
       //CALL C020358 n
       END ELSE BEGIN
-      //FIXME
-      //  IF NOT ApprovalSetup."Purch. Hdr. Inv. Keep On Hold" THEN
-      //    PurchHeader.VALIDATE("On Hold", '');
+        IF NOT WorkFlowSetup4PSConstruct."Purch. Hdr. Inv. Keep On Hold" THEN
+          PurchHeader.VALIDATE("On Hold", '');
         PurchHeaderDCInfo.UpdateApprovalFlowCode(PurchHeader,'');
         PurchHeader.MODIFY(TRUE);
       END;
@@ -1916,12 +1931,9 @@ OBJECT Codeunit 6085722 DC Approval Management
 
       DCSetup.GET;
       IF DCSetup."Purch: Automatic Post" THEN BEGIN
-      //  IF ApprovalMgt.PrePostApprovalCheck(SalesHeader, PurchHeader) THEN  //**4PS Call C022022 old
-      //    CODEUNIT.RUN(CODEUNIT::"Purch.-Post", PurchHeader);                //**4PS Call C022022 old
       //**4PS Call C022022 sn
-      //FIXME
-      //  IF NOT ApprovalMgt.PrePostApprovalCheck(SalesHeader, PurchHeader) THEN
-      //    EXIT(FALSE);
+        IF NOT ApprovalManagement4PSConstr.PrePostApprovalCheckPurch(PurchHeader) THEN
+          EXIT(FALSE);
         COMMIT;
         IF NOT CODEUNIT.RUN(CODEUNIT::"Purch.-Post", PurchHeader) THEN BEGIN
           MESSAGE('%1', GETLASTERRORTEXT);
@@ -1938,6 +1950,7 @@ OBJECT Codeunit 6085722 DC Approval Management
       PostInvoiceApproval@1100409000 : Codeunit 11012027;
       ApprovalEntry@1100528203 : Record 454;
       InvoiceApprovalLine@1100409001 : Record 11012032;
+      ApprovalManagement4PSConstr@1100528202 : Codeunit 11125349;
     BEGIN
       //**4PS
       VendLedgEntry.SETCURRENTKEY("Document No.");
@@ -1955,9 +1968,9 @@ OBJECT Codeunit 6085722 DC Approval Management
       ApprovalEntry.SETRANGE("Table ID",DATABASE::"Purch. Inv. Header");
       ApprovalEntry.SETRANGE("Document Type",ApprovalEntry."Document Type"::Invoice);
       ApprovalEntry.SETRANGE("Document No.",PurchInvHeader."No.");
-      //FIXME
-      //ApprovalMgt.MoveApprvalEntryToPosted(ApprovalEntry,DATABASE::"Purch. Inv. Header",PurchInvHeader."No.");
-      //ApprovalMgt.DeleteApprovalEntry(DATABASE::"Purch. Inv. Header",ApprovalEntry."Document Type"::Invoice,PurchInvHeader."No.");
+
+      ApprovalManagement4PSConstr.MoveApprvalEntryToPosted(ApprovalEntry,DATABASE::"Purch. Inv. Header",PurchInvHeader."No.");
+      ApprovalManagement4PSConstr.DeleteApprovalEntry(DATABASE::"Purch. Inv. Header",ApprovalEntry."Document Type"::Invoice,PurchInvHeader."No.");
 
       IF NOT PurchInvHeader."Invoice Approved" THEN BEGIN
         PurchInvHeader.AddToDMSWorkFlow();
@@ -1990,6 +2003,7 @@ OBJECT Codeunit 6085722 DC Approval Management
       PostInvoiceApproval@1100409001 : Codeunit 11012027;
       ApprovalEntry@1100528203 : Record 454;
       InvoiceApprovalLine@1100409000 : Record 11012032;
+      ApprovalManagement4PSConstr@1100528202 : Codeunit 11125349;
     BEGIN
       //**4PS
       PurchCrMemoHdr.FIND('=');
@@ -2009,9 +2023,9 @@ OBJECT Codeunit 6085722 DC Approval Management
       ApprovalEntry.SETRANGE("Table ID",DATABASE::"Purch. Cr. Memo Hdr.");
       ApprovalEntry.SETRANGE("Document Type",ApprovalEntry."Document Type"::"Credit Memo");
       ApprovalEntry.SETRANGE("Document No.",PurchCrMemoHdr."No.");
-      //FIXME
-      //ApprovalMgt.MoveApprvalEntryToPosted(ApprovalEntry,DATABASE::"Purch. Cr. Memo Hdr.",PurchCrMemoHdr."No.");
-      //ApprovalMgt.DeleteApprovalEntry(DATABASE::"Purch. Cr. Memo Hdr.",ApprovalEntry."Document Type"::"Credit Memo",PurchCrMemoHdr."No.");
+
+      ApprovalManagement4PSConstr.MoveApprvalEntryToPosted(ApprovalEntry,DATABASE::"Purch. Cr. Memo Hdr.",PurchCrMemoHdr."No.");
+      ApprovalManagement4PSConstr.DeleteApprovalEntry(DATABASE::"Purch. Cr. Memo Hdr.",ApprovalEntry."Document Type"::"Credit Memo",PurchCrMemoHdr."No.");
 
       IF NOT PurchCrMemoHdr."Credit Memo Approved" THEN BEGIN
         PurchCrMemoHdr.AddToDMSWorkFlow();
@@ -2038,514 +2052,44 @@ OBJECT Codeunit 6085722 DC Approval Management
       //**4PS CALL C018916 en
     END;
 
-    PROCEDURE RejectPurchInvHeader4PS@1100528200(VAR PurchInvHeader@1100528201 : Record 122);
-    VAR
-      ApprovalEntry@1000000002 : Record 454;
-      ApprovalCmtMgnt@161024016 : Codeunit 6085600;
-      ApprovalComment@1000000004 : Page 660;
-      Answer@161024012 : 'Dialog Cancelled,Send Back,Reject';
-      DummyApprovalEntry@1100528200 : Record 454;
-      UserSetup@1100525000 : Record 91;
-    BEGIN
-      //**4PS
-      //FIXME
-      {
-      FilterApprovalEntry4PS(2,PurchInvHeader."No.",ApprovalEntry,TRUE);
-
-      Answer := SendBackOrRejectApprovalReq(ApprovalEntry);
-      IF Answer = Answer::"Dialog Cancelled" THEN
-        ERROR('');
-
-
-      ApprovalSetup.GET;
-
-      //CALL C020011 sn
-      IF (Answer = Answer::Reject) AND (ApprovalSetup."Reject and Delegate") THEN BEGIN
-        UserSetup.GET(USERID);
-        IF UserSetup.GET(UserSetup.Substitute) THEN;
-
-        IF PAGE.RUNMODAL(PAGE::"Purch. Delegate to User",UserSetup) <> ACTION::LookupOK THEN
-          ERROR('');
-      END;
-      //CALL C020011 en
-
-      IF ApprovalSetup."Request Rejection Comment" THEN
-        ApprovalCmtMgnt.RequestComment4PS(ApprovalEntry."Document Type"::Invoice,PurchInvHeader."No.");
-
-      IF Answer = Answer::"Send Back" THEN
-        SendBackApprovalRequest(ApprovalEntry)
-      ELSE
-        IF NOT ApprovalSetup."Reject and Delegate" THEN                          //CALL C020011 n
-          ApprovalMgt.RejectApprovalRequest(ApprovalEntry)
-        ELSE                                                                     //CALL C020011 n
-          RejectAndDelegateApprReq4PS(ApprovalEntry,UserSetup."User ID",USERID); //CALL C020011 n
-
-      WebSearchMgt.UpdateWebSearchFromAppvlEntry(ApprovalEntry,ApprovalEntry."Approver ID");
-      WebSearchMgt.UpdateWebSearchFromAppvlEntry(ApprovalEntry,USERID);
-
-      DummyApprovalEntry."Document Type" := DummyApprovalEntry."Document Type"::Invoice;
-      IF ApprovalEntry.ISEMPTY THEN BEGIN
-        IF Answer = Answer::"Send Back" THEN
-          MESSAGE(Text008, DummyApprovalEntry."Document Type",PurchInvHeader."No.")
-        ELSE
-          MESSAGE(Text007, DummyApprovalEntry."Document Type",PurchInvHeader."No.");
-      END;
-      }
-    END;
-
-    PROCEDURE RejectPurchCrMemoHdr4PS@1100528201(VAR PurchCrMemoHdr@1100528200 : Record 124);
-    VAR
-      ApprovalEntry@1000000002 : Record 454;
-      ApprovalCmtMgnt@161024016 : Codeunit 6085600;
-      ApprovalComment@1000000004 : Page 660;
-      Answer@161024012 : 'Dialog Cancelled,Send Back,Reject';
-      DummyApprovalEntry@1100528201 : Record 454;
-      UserSetup@1100525000 : Record 91;
-    BEGIN
-      //**4PS
-      //FIXME
-      {
-      FilterApprovalEntry4PS(3, PurchCrMemoHdr."No.",ApprovalEntry,TRUE);
-
-      Answer := SendBackOrRejectApprovalReq(ApprovalEntry);
-
-      IF Answer = Answer::"Dialog Cancelled" THEN
-        ERROR('');
-
-      ApprovalSetup.GET;
-
-      //CALL C020011 sn
-      IF (Answer = Answer::Reject) AND (ApprovalSetup."Reject and Delegate") THEN BEGIN
-
-        UserSetup.GET(USERID);
-        IF UserSetup.GET(UserSetup.Substitute) THEN;
-
-        IF PAGE.RUNMODAL(PAGE::"Purch. Delegate to User",UserSetup) <> ACTION::LookupOK THEN
-          ERROR('');
-
-      END;
-      //CALL C020011 en
-
-
-      IF ApprovalSetup."Request Rejection Comment" THEN
-        ApprovalCmtMgnt.RequestComment4PS(ApprovalEntry."Document Type"::"Credit Memo",PurchCrMemoHdr."No.");
-
-      IF Answer = Answer::"Send Back" THEN
-        SendBackApprovalRequest(ApprovalEntry)
-      ELSE
-        IF NOT ApprovalSetup."Reject and Delegate" THEN                          //CALL C020011 n
-          ApprovalMgt.RejectApprovalRequest(ApprovalEntry)
-        ELSE                                                                     //CALL C020011 n
-          RejectAndDelegateApprReq4PS(ApprovalEntry,UserSetup."User ID",USERID); //CALL C020011 n
-
-      WebSearchMgt.UpdateWebSearchFromAppvlEntry(ApprovalEntry,ApprovalEntry."Approver ID");
-      WebSearchMgt.UpdateWebSearchFromAppvlEntry(ApprovalEntry,USERID);
-
-      DummyApprovalEntry."Document Type" := DummyApprovalEntry."Document Type"::"Credit Memo";
-      IF ApprovalEntry.ISEMPTY THEN BEGIN
-        IF Answer = Answer::"Send Back" THEN
-          MESSAGE(Text008,DummyApprovalEntry."Document Type",PurchCrMemoHdr."No.")
-        ELSE
-          MESSAGE(Text007,DummyApprovalEntry."Document Type",PurchCrMemoHdr."No.");
-      END;
-      }
-    END;
-
     PROCEDURE RejectAndDelegateApprReq4PS@1100525000(VAR ApprovalEntry@161024015 : Record 454;NewUserId@161024018 : Code[50];CurrUserId@161024026 : Code[50]);
     VAR
-      PurchHeader@161024012 : Record 38;
-      DCSetup@161024017 : Record 6085573;
-      ApprovalEntry2@161024024 : Record 454;
-      ApprovalEntry3@161024025 : Record 454;
-      AdvAppvlMgt@161024027 : Codeunit 6085746;
-      Comment@161024022 : Text[80];
-      PrevUserId@161024020 : Code[50];
-      NextSeqNo@161024029 : Integer;
-      RecreateHierarchy@161024030 : Boolean;
-      PurchInvHeader@1100528200 : Record 122;
-      PurchCrMemoHdr@1100528201 : Record 124;
-      ApprovalCmtMgnt@1100528202 : Codeunit 6085600;
-      ApprovalCmtLine@1100525000 : Record 455;
-      PurchHeaderDCInfo@1100525001 : Record 6085767;
-      PurchInvHeaderDCInfo@1100525003 : Record 6085769;
-      PurchCrMemoHdrDCInfo@1100525002 : Record 6085770;
+      ApprovalManagement4PSConstr@1100528200 : Codeunit 11125349;
     BEGIN
-      //**4PS CALL C020011
-      //FIXME
-      {
-      DCSetup.GET;
-      ApprovalSetup.GET;
-
-      CASE ApprovalEntry."Table ID" OF
-        DATABASE::"Purchase Header":
-        BEGIN
-          PurchHeader.GET(ApprovalEntry."Document Type",ApprovalEntry."Document No.");
-          IF ApprovalSetup."Request Delegation Comment" THEN
-            ApprovalCmtMgnt.RequestComment(PurchHeader);
-        END;
-        DATABASE::"Purch. Inv. Header":
-        BEGIN
-          PurchInvHeader.GET(ApprovalEntry."Document No.");
-          IF ApprovalSetup."Request Delegation Comment" THEN
-            ApprovalCmtMgnt.RequestComment4PS(2, PurchInvHeader."No.");
-        END;
-        DATABASE::"Purch. Cr. Memo Hdr.":
-        BEGIN
-          PurchCrMemoHdr.GET(ApprovalEntry."Document No.");
-          IF ApprovalSetup."Request Delegation Comment" THEN
-            ApprovalCmtMgnt.RequestComment4PS(3,PurchCrMemoHdr."No.");
-        END;
-      END;
-
-      PrevUserId := ApprovalEntry."Approver ID";
-
-      IF NewUserId = PrevUserId THEN
-        ERROR('');
-
-      UserSetup.GET(NewUserId);
-
-      ApprovalTempl.SETCURRENTKEY("Table ID","Document Type",Enabled);
-      ApprovalTempl.SETRANGE("Table ID",ApprovalEntry."Table ID");
-      ApprovalTempl.SETRANGE("Document Type",ApprovalEntry."Document Type");
-      ApprovalTempl.SETRANGE(Enabled,TRUE);
-      ApprovalTempl.FINDFIRST;
-
-      ApprovalEntry2 := ApprovalEntry;
-      ApprovalEntry2.SETRANGE("Table ID",ApprovalEntry2."Table ID");
-      ApprovalEntry2.SETRANGE("Document Type",ApprovalEntry2."Document Type");
-      ApprovalEntry2.SETRANGE("Document No.",ApprovalEntry2."Document No.");
-
-      CASE ApprovalEntry."Table ID" OF
-        DATABASE::"Purchase Header":
-        BEGIN
-          RecreateHierarchy := (DCSetup."Purch.: Recreate Appvl. Hiera.") AND  (PurchHeaderDCInfo.GetApprovalFlowCode(PurchHeader) = '');
-        END;
-        DATABASE::"Purch. Inv. Header":
-        BEGIN
-          RecreateHierarchy := (DCSetup."Purch.: Recreate Appvl. Hiera.") AND (PurchInvHeaderDCInfo.GetApprovalFlowCode(PurchInvHeader) = '');
-        END;
-        DATABASE::"Purch. Cr. Memo Hdr.":
-        BEGIN
-          RecreateHierarchy := (DCSetup."Purch.: Recreate Appvl. Hiera.") AND (PurchCrMemoHdrDCInfo.GetApprovalFlowCode(PurchCrMemoHdr) = '');
-        END;
-      END;
-
-
-      // Move pending approval entries forward (2 steps)
-      ApprovalEntry2.SETFILTER("Sequence No.",'>%1',ApprovalEntry2."Sequence No.");
-      ApprovalEntry2.ASCENDING(FALSE);
-      IF ApprovalEntry2.FINDFIRST THEN
-        REPEAT
-          ApprovalEntry3 := ApprovalEntry2;
-          ApprovalEntry3."Sequence No." := ApprovalEntry3."Sequence No." + 20000;
-          ApprovalEntry3."Last Modified By ID" := CurrUserId;
-          ApprovalEntry3."Last Date-Time Modified" := CURRENTDATETIME;
-          ApprovalEntry3.INSERT;
-          ApprovalEntry2.DELETE;
-        UNTIL ApprovalEntry2.NEXT = 0;
-
-      IF RecreateHierarchy THEN BEGIN
-        ApprovalEntry2.SETRANGE("Sequence No.");
-        ApprovalEntry2.SETRANGE(Status,ApprovalEntry2.Status::Created);
-        ApprovalEntry2.DELETEALL(TRUE);
-      END;
-
-      // Insert the new entry currentuserid
-      ApprovalEntry2 := ApprovalEntry;
-      ApprovalEntry2.Status := ApprovalEntry2.Status::Created;
-      ApprovalEntry2."Sequence No." := ApprovalEntry2."Sequence No." + 20000;
-      ApprovalEntry2."Last Modified By ID" := USERID;
-      ApprovalEntry2."Last Date-Time Modified" := CURRENTDATETIME;
-      ApprovalEntry2."Approver ID" := CurrUserId;
-      ApprovalEntry2."Original Approver ID" := CurrUserId;
-      ApprovalEntry2.INSERT;
-
-      // Insert the next entry newuserid
-      ApprovalEntry2 := ApprovalEntry;
-      ApprovalEntry2.Status := ApprovalEntry.Status;
-      ApprovalEntry2."Sequence No." := ApprovalEntry2."Sequence No." + 10000;
-      ApprovalEntry2."Last Modified By ID" := USERID;
-      ApprovalEntry2."Last Date-Time Modified" := CURRENTDATETIME;
-      ApprovalEntry2."Approver ID" := NewUserId;
-      ApprovalEntry2."Original Approver ID" := NewUserId;
-      ApprovalEntry2.INSERT;
-
-      //Reject the existing entry currentuserid
-      ApprovalEntry.Status := ApprovalEntry.Status::Rejected;
-      ApprovalEntry."Last Date-Time Modified" := CREATEDATETIME(TODAY,TIME);
-      ApprovalEntry."Last Modified By ID" := USERID;
-      ApprovalEntry.MODIFY;
-
-
-      IF (ApprovalTempl."Approval Type" <> ApprovalTempl."Approval Type"::"Advanced Approver") AND (RecreateHierarchy) THEN BEGIN
-        CASE ApprovalEntry."Table ID" OF
-          DATABASE::"Purchase Header":
-          BEGIN
-            // Call the standard function to find approvers
-            PurchHeader."Purchaser Code" := UserSetup."Salespers./Purch. Code";
-            ApprovalMgt.FindApproverPurchase(PurchHeader,ApprovalSetup,ApprovalTempl);
-          END;
-          DATABASE::"Purch. Inv. Header":
-          BEGIN
-            // Call the standard function to find approvers
-            PurchInvHeader."Purchaser Code" := UserSetup."Salespers./Purch. Code";
-            ApprovalMgt.FindApproverPurchInvHeaderIDYN(PurchInvHeader,ApprovalSetup,ApprovalTempl);
-          END;
-          DATABASE::"Purch. Cr. Memo Hdr.":
-          BEGIN
-            // Call the standard function to find approvers
-            PurchCrMemoHdr."Purchaser Code" := UserSetup."Salespers./Purch. Code";
-            ApprovalMgt.FindApproverPurchInvCrMemoIDYN(PurchCrMemoHdr,ApprovalSetup,ApprovalTempl);
-          END;
-        END;
-        //
-
-      END;
-
-      ApprovalMgt.SetCurrUserId(CurrUserId);
-      Comment := STRSUBSTNO(Text11012006,PrevUserId,NewUserId);
-
-      CASE ApprovalEntry."Table ID" OF
-        DATABASE::"Purchase Header":
-        BEGIN
-          ApprovalCmtLine."Table ID" := ApprovalEntry."Table ID";
-          ApprovalCmtLine."Document Type" := PurchHeader."Document Type";
-          ApprovalCmtLine."Document No." := PurchHeader."No.";
-          ApprovalCmtLine."User ID" := CurrUserId;
-          ApprovalCmtLine."Date and Time" := CURRENTDATETIME;
-          ApprovalCmtLine.Comment := Comment;
-          ApprovalCmtLine.INSERT(TRUE);
-        END;
-        DATABASE::"Purch. Inv. Header":
-        BEGIN
-          ApprovalCmtLine."Table ID" := ApprovalEntry."Table ID";
-          ApprovalCmtLine."Document Type" := ApprovalCmtLine."Document Type"::Invoice;
-          ApprovalCmtLine."Document No." := PurchInvHeader."No.";
-          ApprovalCmtLine."User ID" := CurrUserId;
-          ApprovalCmtLine."Date and Time" := CURRENTDATETIME;
-          ApprovalCmtLine.Comment := Comment;
-          ApprovalCmtLine.INSERT(TRUE);
-        END;
-        DATABASE::"Purch. Cr. Memo Hdr.":
-        BEGIN
-          ApprovalCmtLine."Table ID" := ApprovalEntry."Table ID";
-          ApprovalCmtLine."Document Type" := ApprovalCmtLine."Document Type"::"Credit Memo";
-          ApprovalCmtLine."Document No." := PurchCrMemoHdr."No.";
-          ApprovalCmtLine."User ID" := CurrUserId;
-          ApprovalCmtLine."Date and Time" := CURRENTDATETIME;
-          ApprovalCmtLine.Comment := Comment;
-          ApprovalCmtLine.INSERT(TRUE);
-        END;
-      END;
-      //
-
-      WebSearchMgt.UpdateWebSearchFromAppvlEntry(ApprovalEntry,ApprovalEntry."Approver ID");
-      WebSearchMgt.UpdateWebSearchFromAppvlEntry(ApprovalEntry,CurrUserId);
-
-      CASE ApprovalEntry."Table ID" OF
-      DATABASE::"Purchase Header":
-        BEGIN
-          IF ApprovalSetup.Delegations THEN
-            AppMgntNotifi.SendPurchaseDelegationsMail(PurchHeader,ApprovalEntry2);
-        END;
-      DATABASE::"Purch. Inv. Header":
-        BEGIN
-          IF ApprovalSetup.Delegations THEN
-            AppMgntNotifi.SendPurchaseDelegationsMail4PS(2,ApprovalEntry."Document No.",ApprovalEntry2);
-        END;
-       DATABASE::"Purch. Cr. Memo Hdr.":
-        BEGIN
-          IF ApprovalSetup.Delegations THEN
-          AppMgntNotifi.SendPurchaseDelegationsMail4PS(3,ApprovalEntry."Document No.",ApprovalEntry2);
-        END;
-      END;
-      //
-      }
+      //**4PS
+      //ApprovalManagement4PSConstr.RejectAndDelegateApprReq(ApprovalEntry,NewUserId,CurrUserId)
     END;
 
     PROCEDURE FilterApprovalEntry4PS@1100528203(lDocType@1100528200 : Integer;lDocNo@1100528201 : Code[20];VAR ApprovalEntry@1000000001 : Record 454;OnlyCurrUser@161024012 : Boolean);
     VAR
-      UserFilter@161024013 : Text[1024];
+      ApprovalManagement4PSConstr@1100528202 : Codeunit 11125349;
     BEGIN
       //**4PS
-      ApprovalEntry.SETCURRENTKEY("Table ID","Document Type","Document No.");
-      IF lDocType = 2 THEN BEGIN
-        ApprovalEntry.SETRANGE("Table ID",DATABASE::"Purch. Inv. Header");
-        ApprovalEntry.SETRANGE("Document Type", 2);
-      END;
-      IF lDocType = 3 THEN BEGIN
-        ApprovalEntry.SETRANGE("Table ID",DATABASE::"Purch. Cr. Memo Hdr.");
-        ApprovalEntry.SETRANGE("Document Type", 3);
-      END;
-
-      ApprovalEntry.SETRANGE("Document No.",lDocNo);
-
-      IF OnlyCurrUser THEN BEGIN
-        UserFilter := GetApprovalSharingToUserFilter(USERID);
-        IF UserFilter = '' THEN
-          ApprovalEntry.SETRANGE("Approver ID",USERID)
-        ELSE
-          ApprovalEntry.SETFILTER("Approver ID",USERID + '|' + UserFilter);
-      END;
-
-      ApprovalEntry.SETRANGE(Status,ApprovalEntry.Status::Open);
-      IF NOT ApprovalEntry.FINDFIRST THEN
-        ERROR(Text001);
+      ApprovalManagement4PSConstr.FilterApprovalEntryOpen(lDocType,lDocNo,ApprovalEntry,OnlyCurrUser);
     END;
 
     PROCEDURE SwitchOnHold4PS@1100528205(lDocType@1100528201 : Integer;lDocNo@1100528200 : Code[20];AskComment@1100528205 : Boolean;GiveMessage@1100528204 : Boolean);
     VAR
-      ApprovalEntry@161024017 : Record 454;
-      ApprovalCmtMgnt@161024013 : Codeunit 6085600;
-      PurchInvHeader@1100528202 : Record 122;
-      PurchCrMemoHdr@1100528203 : Record 124;
+      ApprovalManagement4PSConstr@1100528202 : Codeunit 11125349;
     BEGIN
       //**4PS
-      //FIXME
-      {
-      ApprovalSetup.GET;
-      IF ApprovalSetup."Specific On Hold Code" = '' THEN
-        ERROR(Text11012003);
-
-      IF lDocType = 2 THEN BEGIN
-        PurchInvHeader.GET(lDocNo);
-        IF (PurchInvHeader."On Hold" = '') OR (PurchInvHeader."On Hold" = ApprovalSetup."Specific On Hold Code") THEN
-          PutOnHold4PS(lDocType, lDocNo,FALSE,FALSE,TRUE)
-        ELSE
-          PutOnSpecificHold4PS(lDocType, lDocNo,ApprovalSetup."Specific On Hold Code",TRUE,TRUE);
-      END;
-      IF lDocType = 3 THEN BEGIN
-        PurchCrMemoHdr.GET(lDocNo);
-        IF (PurchCrMemoHdr."On Hold" = '') OR (PurchCrMemoHdr."On Hold" = ApprovalSetup."Specific On Hold Code") THEN
-          PutOnHold4PS(lDocType, lDocNo,TRUE,TRUE,TRUE)
-        ELSE
-          PutOnSpecificHold4PS(lDocType, lDocNo,ApprovalSetup."Specific On Hold Code",TRUE,TRUE);
-      END;
-      }
+      ApprovalManagement4PSConstr.SwitchOnHold(lDocType,lDocNo,AskComment,GiveMessage);
     END;
 
     PROCEDURE PutOnHold4PS@1100528204(lDocType@1100528201 : Integer;lDocNo@1100528200 : Code[20];AskComment@1100528205 : Boolean;GiveMessage@1100528206 : Boolean;OnlyCurrUser@1100528207 : Boolean);
     VAR
-      ApprovalEntry@161024017 : Record 454;
-      ApprovalCmtMgnt@161024013 : Codeunit 6085600;
-      PurchInvHeader@1100528202 : Record 122;
-      PurchCrMemoHdr@1100528203 : Record 124;
-      OnHoldCodeRec@1100528204 : Record 11012031;
+      ApprovalManagement4PSConstr@1100528202 : Codeunit 11125349;
     BEGIN
       //**4PS
-      FilterApprovalEntry4PS(lDocType, lDocNo,ApprovalEntry,OnlyCurrUser);
-      IF AskComment THEN
-        ApprovalCmtMgnt.RequestComment4PS(lDocType, lDocNo);
-
-      IF lDocType = 2 THEN
-        OnHoldCodeRec.SETRANGE("Default Value Purchase Invoice", TRUE)
-      ELSE
-        OnHoldCodeRec.SETRANGE("Default Value Credit Memo", TRUE);
-
-      IF NOT OnHoldCodeRec.FIND('-') THEN BEGIN
-        OnHoldCodeRec.Code := COPYSTR(USERID,1,MAXSTRLEN(OnHoldCodeRec.Code));
-      END;
-
-      IF lDocType = 2 THEN BEGIN
-        PurchInvHeader.GET(lDocNo);
-        PurchInvHeader."On Hold" := OnHoldCodeRec.Code;
-        PurchInvHeader.MODIFY(TRUE);
-        PurchInvHeader.UpdateOnHoldOfPurchaseInvoice(lDocNo,OnHoldCodeRec.Code,FALSE);
-        IF GiveMessage THEN
-          MESSAGE(Text024,ApprovalEntry."Document Type",PurchInvHeader."No.");
-      END;
-      IF lDocType = 3 THEN BEGIN
-        PurchCrMemoHdr.GET(lDocNo);
-        PurchCrMemoHdr."On Hold" := OnHoldCodeRec.Code;
-        PurchCrMemoHdr.MODIFY(TRUE);
-        PurchCrMemoHdr.UpdateOnHoldOfPurchCreditMemo(lDocNo,OnHoldCodeRec.Code,FALSE);
-        IF GiveMessage THEN
-          MESSAGE(Text024,ApprovalEntry."Document Type",PurchCrMemoHdr."No.");
-      END;
+      ApprovalManagement4PSConstr.PutOnHold(lDocType,lDocNo,AskComment,GiveMessage,OnlyCurrUser);
     END;
 
     PROCEDURE PutOnSpecificHold4PS@1100528223(lDocType@1100528201 : Integer;lDocNo@1100528200 : Code[20];lOnHoldCode@1100528207 : Code[3];AskComment@1100528205 : Boolean;GiveMessage@1100528206 : Boolean);
     VAR
-      ApprovalEntry@161024017 : Record 454;
-      ApprovalCmtMgnt@161024013 : Codeunit 6085600;
-      PurchInvHeader@1100528202 : Record 122;
-      PurchCrMemoHdr@1100528203 : Record 124;
-      OnHoldCodeRec@1100528204 : Record 11012031;
+      ApprovalManagement4PSConstr@1100528202 : Codeunit 11125349;
     BEGIN
       //**4PS
-      IF lOnHoldCode = '' THEN
-        EXIT;
-
-      FilterApprovalEntry4PS(lDocType, lDocNo,ApprovalEntry,TRUE);
-      IF AskComment THEN
-        ApprovalCmtMgnt.RequestComment4PS(lDocType, lDocNo);
-
-      OnHoldCodeRec.GET(lOnHoldCode);
-
-      IF lDocType = 2 THEN BEGIN
-        PurchInvHeader.GET(lDocNo);
-        PurchInvHeader."On Hold" := OnHoldCodeRec.Code;
-        PurchInvHeader.MODIFY(TRUE);
-        PurchInvHeader.UpdateOnHoldOfPurchaseInvoice(lDocNo,OnHoldCodeRec.Code,FALSE);
-        IF GiveMessage THEN
-          MESSAGE(Text11012004,ApprovalEntry."Document Type",PurchInvHeader."No.", lOnHoldCode);
-      END;
-      IF lDocType = 3 THEN BEGIN
-        PurchCrMemoHdr.GET(lDocNo);
-        PurchCrMemoHdr."On Hold" := OnHoldCodeRec.Code;
-        PurchCrMemoHdr.MODIFY(TRUE);
-        PurchCrMemoHdr.UpdateOnHoldOfPurchCreditMemo(lDocNo,OnHoldCodeRec.Code,FALSE);
-        IF GiveMessage THEN
-          MESSAGE(Text11012004,ApprovalEntry."Document Type",PurchCrMemoHdr."No.", lOnHoldCode);
-      END;
-    END;
-
-    PROCEDURE ApprovePI4PS@1100528207(VAR PurchInvHeader@1000000000 : Record 122);
-    VAR
-      ApprovalEntry@1000000001 : Record 454;
-    BEGIN
-      //**4PS
-      //FIXME
-      {
-      FilterApprovalEntry4PS(2,PurchInvHeader."No.",ApprovalEntry,TRUE);
-      ApprovalMgt.ApproveApprovalRequest(ApprovalEntry);
-      }
-    END;
-
-    PROCEDURE ApproveCM4PS@1100528208(VAR PurchCrMemoHdr@1000000000 : Record 124);
-    VAR
-      ApprovalEntry@1000000001 : Record 454;
-    BEGIN
-      //**4PS
-      //FIXME
-      {
-      FilterApprovalEntry4PS(3,PurchCrMemoHdr."No.",ApprovalEntry,TRUE);
-      ApprovalMgt.ApproveApprovalRequest(ApprovalEntry);
-      }
-    END;
-
-    PROCEDURE DelegatePI4PS@1100528206(VAR PurchInvHeader@1100528201 : Record 122);
-    VAR
-      ApprovalEntry@1000000002 : Record 454;
-      ApprovalCmtMgnt@1100528200 : Codeunit 6085600;
-    BEGIN
-      //**4PS
-      FilterApprovalEntry4PS(2,PurchInvHeader."No.",ApprovalEntry,NOT IsApprovalAdminUser(FALSE));
-
-      DelegateApprovalRequest(ApprovalEntry);
-      MESSAGE(Text11012007);
-    END;
-
-    PROCEDURE DelegateCM4PS@1100528211(VAR PurchCrMemoHdr@1100528201 : Record 124);
-    VAR
-      ApprovalEntry@1000000002 : Record 454;
-      ApprovalCmtMgnt@1100528200 : Codeunit 6085600;
-    BEGIN
-      //**4PS
-      FilterApprovalEntry4PS(3,PurchCrMemoHdr."No.",ApprovalEntry,NOT IsApprovalAdminUser(FALSE));
-
-      DelegateApprovalRequest(ApprovalEntry);
-      MESSAGE(Text11012007);
+      ApprovalManagement4PSConstr.PutOnSpecificHold(lDocType,lDocNo,lOnHoldCode,AskComment,GiveMessage);
     END;
 
     PROCEDURE DrillDownApprovalComments4PS@1100528212(lDocType@1100528201 : Integer;lDocNo@1100528200 : Code[20]) : Integer;
@@ -2675,187 +2219,6 @@ OBJECT Codeunit 6085722 DC Approval Management
       EXIT(ApprovalCmt.COUNT);
     END;
 
-    PROCEDURE ForceApprovalPI4PS@1100528217(VAR PurchInvHeader@161024012 : Record 122);
-    VAR
-      UserSetup@161024016 : Record 91;
-      ApprovalCmtLine@161024013 : Record 455;
-      ApprovalEntry@161024021 : Record 454;
-      ApprovalAmount@161024018 : Decimal;
-      ApprovalAmountLCY@161024019 : Decimal;
-      ApprovalCmtMgnt@1100528200 : Codeunit 6085600;
-    BEGIN
-      //**4PS
-      //FIXME
-      {
-      IsApprovalAdminUser(TRUE);
-
-      ApprovalEntry."Document Type" := ApprovalEntry."Document Type"::Invoice;
-      IF NOT CONFIRM(Text012,TRUE,ApprovalEntry."Document Type",PurchInvHeader."No.") THEN
-       ERROR('');
-
-      ApprovalCmtMgnt.RequestComment4PS(2, PurchInvHeader."No.");
-
-      ApprovalSetup.GET;
-
-      AppvlTemplate.SETCURRENTKEY("Table ID","Document Type",Enabled);
-      AppvlTemplate.SETRANGE("Table ID",DATABASE::"Purch. Inv. Header");
-      AppvlTemplate.SETRANGE("Document Type",2);
-      AppvlTemplate.SETRANGE(Enabled,TRUE);
-      AppvlTemplate.FINDFIRST;
-
-      UserSetup.GET(USERID);
-
-      PurchInvHeader.CALCFIELDS(Amount);
-      ApprovalAmount  :=  PurchInvHeader.Amount;
-      ApprovalAmountLCY :=PurchInvHeader.Amount;
-
-      AppMgnt.MakeApprovalEntry(
-        DATABASE::"Purch. Inv. Header",2,PurchInvHeader."No.",PurchInvHeader."Purchaser Code",
-        ApprovalSetup,USERID,UserSetup,ApprovalAmount,ApprovalAmountLCY,
-        PurchInvHeader."Currency Code",AppTemplate,0);
-
-      ApprovalEntry.SETRANGE("Table ID",DATABASE::"Purch. Inv. Header");
-      ApprovalEntry.SETRANGE("Document Type",2);
-      ApprovalEntry.SETRANGE("Document No.",PurchInvHeader."No.");
-      ApprovalEntry.FINDLAST;
-      ApprovalEntry.Status := ApprovalEntry.Status::Approved;
-      ApprovalEntry.MODIFY;
-
-      ApprovalCmtLine."Table ID" := DATABASE::"Purch. Inv. Header";
-      ApprovalCmtLine."Document Type" := 2;
-      ApprovalCmtLine."Document No." := PurchInvHeader."No.";
-      ApprovalCmtLine."User ID" := USERID;
-      ApprovalCmtLine."Date and Time" := CURRENTDATETIME;
-      ApprovalCmtLine.Comment := STRSUBSTNO(Text011,USERID);
-      ApprovalCmtLine.SETRANGE("Table ID", ApprovalCmtLine."Table ID");
-      ApprovalCmtLine.SETRANGE("Document Type", ApprovalCmtLine."Document Type");
-      ApprovalCmtLine.SETRANGE("Document No.", ApprovalCmtLine."Document No.");
-
-      ApprovalCmtLine.INSERT(TRUE);
-
-      ApprovePurchInvHeader4PS(PurchInvHeader); //**4PS
-      }
-    END;
-
-    PROCEDURE ForceApprovalCM4PS@1100528218(VAR PurchCrMemoHdr@161024012 : Record 124);
-    VAR
-      UserSetup@161024016 : Record 91;
-      ApprovalCmtLine@161024013 : Record 455;
-      ApprovalEntry@161024021 : Record 454;
-      ApprovalAmount@161024018 : Decimal;
-      ApprovalAmountLCY@161024019 : Decimal;
-      ApprovalCmtMgnt@1100528200 : Codeunit 6085600;
-    BEGIN
-      //**4PS
-      //FIXME
-      {
-      IsApprovalAdminUser(TRUE);
-
-      ApprovalEntry."Document Type" := ApprovalEntry."Document Type"::"Credit Memo";
-      IF NOT CONFIRM(Text012,TRUE,ApprovalEntry."Document Type",PurchCrMemoHdr."No.") THEN
-       ERROR('');
-
-      ApprovalCmtMgnt.RequestComment4PS(3, PurchCrMemoHdr."No.");
-
-      ApprovalSetup.GET;
-
-      AppvlTemplate.SETCURRENTKEY("Table ID","Document Type",Enabled);
-      AppvlTemplate.SETRANGE("Table ID",DATABASE::"Purch. Cr. Memo Hdr.");
-      AppvlTemplate.SETRANGE("Document Type",3);
-      AppvlTemplate.SETRANGE(Enabled,TRUE);
-      AppvlTemplate.FINDFIRST;
-
-      UserSetup.GET(USERID);
-
-      PurchCrMemoHdr.CALCFIELDS(Amount);
-      ApprovalAmount := PurchCrMemoHdr.Amount;
-      ApprovalAmountLCY := PurchCrMemoHdr.Amount;
-
-      AppMgnt.MakeApprovalEntry(
-        DATABASE::"Purch. Cr. Memo Hdr.",3,PurchCrMemoHdr."No.",PurchCrMemoHdr."Purchaser Code",
-        ApprovalSetup,USERID,UserSetup,ApprovalAmount,ApprovalAmountLCY,
-        PurchCrMemoHdr."Currency Code",AppTemplate,0);
-
-      ApprovalEntry.SETRANGE("Table ID",DATABASE::"Purch. Cr. Memo Hdr.");
-      ApprovalEntry.SETRANGE("Document Type",3);
-      ApprovalEntry.SETRANGE("Document No.",PurchCrMemoHdr."No.");
-      ApprovalEntry.FINDLAST;
-      ApprovalEntry.Status := ApprovalEntry.Status::Approved;
-      ApprovalEntry.MODIFY;
-
-      ApprovalCmtLine."Table ID" := DATABASE::"Purch. Cr. Memo Hdr.";
-      ApprovalCmtLine."Document Type" := 3;
-      ApprovalCmtLine."Document No." := PurchCrMemoHdr."No.";
-      ApprovalCmtLine."User ID" := USERID;
-      ApprovalCmtLine."Date and Time" := CURRENTDATETIME;
-      ApprovalCmtLine.Comment := STRSUBSTNO(Text011,USERID);
-      ApprovalCmtLine.SETRANGE("Table ID", ApprovalCmtLine."Table ID");
-      ApprovalCmtLine.SETRANGE("Document Type", ApprovalCmtLine."Document Type");
-      ApprovalCmtLine.SETRANGE("Document No.", ApprovalCmtLine."Document No.");
-
-      ApprovalCmtLine.INSERT(TRUE);
-
-      ApprovePurchCrMemo4PS(PurchCrMemoHdr);
-      }
-    END;
-
-    PROCEDURE FindPurchaseApprovers4PS@1100528219(lDocType@1100528201 : Integer;lDocNo@1100528200 : Code[20];ApprovalAmount@161024017 : Decimal;ApprovalAmountLCY@161024018 : Decimal);
-    VAR
-      AppvlFlowLine@161024014 : Record 6085726;
-      UserSetup@161024019 : Record 91;
-      PurchInvHeader@1100528203 : Record 122;
-      PurchCrMemoHdr@1100528202 : Record 124;
-      PurchaseHeader@1100528204 : Record 38;
-      PurchInvHeaderDCInfo@1100528206 : Record 6085769;
-      PurchCrMemoHdrDCInfo@1100528205 : Record 6085770;
-    BEGIN
-      //**4PS
-      //FIXME
-      {
-      parameters RemoveDomainName:
-      VarNameDataTypeSubtypeLength
-      NoApprovalSetupRecordTable452
-      NoAppTemplateRecordTable464
-
-      IF lDocType = 2 THEN BEGIN
-        PurchInvHeader.GET(lDocNo);
-        IF PurchInvHeaderDCInfo.GetApprovalFlowCode(PurchInvHeader) = '' THEN EXIT;
-        AppvlFlowLine.SETRANGE("Approval Flow Code",PurchInvHeaderDCInfo.GetApprovalFlowCode(PurchInvHeader));
-        AppvlFlowLine.FINDFIRST;
-        REPEAT
-          UserSetup.GET(AppvlFlowLine."Approver ID");
-          AppvlMgnt.SetNoOpenEntry(SetOpenApprovalEntry); //CALL C023060
-          AppvlMgnt.MakeApprovalEntry(
-            DATABASE::"Purch. Inv. Header",
-            PurchaseHeader."Document Type"::Invoice,
-            PurchInvHeader."No.",
-            PurchInvHeader."Purchaser Code",
-            ApprovalSetup,AppvlFlowLine."Approver ID",
-            UserSetup,ApprovalAmount,ApprovalAmountLCY,
-            PurchInvHeader."Currency Code",AppTemplate,0);
-        UNTIL AppvlFlowLine.NEXT = 0;
-      END;
-      IF lDocType = 3 THEN BEGIN
-        PurchCrMemoHdr.GET(lDocNo);
-        IF PurchCrMemoHdrDCInfo.GetApprovalFlowCode(PurchCrMemoHdr)  = '' THEN EXIT;
-        AppvlFlowLine.SETRANGE("Approval Flow Code",PurchCrMemoHdrDCInfo.GetApprovalFlowCode(PurchCrMemoHdr));
-        AppvlFlowLine.FINDFIRST;
-        REPEAT
-          UserSetup.GET(AppvlFlowLine."Approver ID");
-          AppvlMgnt.SetNoOpenEntry(SetOpenApprovalEntry); //CALL C023060
-          AppvlMgnt.MakeApprovalEntry(
-            DATABASE::"Purch. Cr. Memo Hdr.",
-            PurchaseHeader."Document Type"::"Credit Memo",
-            PurchCrMemoHdr."No.",
-            PurchCrMemoHdr."Purchaser Code",
-            ApprovalSetup,AppvlFlowLine."Approver ID",
-            UserSetup,ApprovalAmount,ApprovalAmountLCY,
-            PurchCrMemoHdr."Currency Code",AppTemplate,0);
-        UNTIL AppvlFlowLine.NEXT = 0;
-      END;
-      }
-    END;
-
     PROCEDURE ManuallyInsertAppvlEntry4PS@1100528222(VAR ApprovalEntry@161024012 : Record 454);
     VAR
       PurchHeader@161024019 : Record 38;
@@ -2869,12 +2232,11 @@ OBJECT Codeunit 6085722 DC Approval Management
       NoOpenEntry@1100528200 : Boolean;
       PurchInvHeader@1100528201 : Record 122;
       PurchCrMemoHdr@1100528202 : Record 124;
+      ApprovalsBridge4PSConstruct@1100528203 : Codeunit 11125348;
+      Variant@1100528204 : Variant;
     BEGIN
       //**4PS
-      //FIXME
-      {
       IsApprovalAdminUser(TRUE);
-
       CASE ApprovalEntry."Table ID" OF
         DATABASE::"Purch. Inv. Header":
           BEGIN
@@ -2889,27 +2251,13 @@ OBJECT Codeunit 6085722 DC Approval Management
               EXIT;
             END;
 
-            ApprovalSetup.GET;
-
-            AppvlTemplate.SETCURRENTKEY("Table ID","Document Type",Enabled);
-            AppvlTemplate.SETRANGE("Table ID",DATABASE::"Purch. Inv. Header");
-            AppvlTemplate.SETRANGE("Document Type",PurchHeader."Document Type"::Invoice);
-            AppvlTemplate.SETRANGE(Enabled,TRUE);
-            AppvlTemplate.FINDFIRST;
+            Variant := PurchInvHeader;
+            ApprovalsBridge4PSConstruct.IsPostedPurchaseApprovalsWorkflowEnabled(Variant);
 
             UserSetup.GET(ApprovalEntry."Approver ID");
-            PurchInvHeader.CALCFIELDS(Amount);
-            ApprovalAmount := PurchInvHeader.Amount;
-            ApprovalAmountLCY := PurchInvHeader.Amount;
-            ApprovalMgnt.SetNoOpenEntry(NoOpenEntry);
-            ApprovalMgnt.MakeApprovalEntry(
-               DATABASE::"Purch. Inv. Header",
-                 PurchHeader."Document Type"::Invoice,
-                 PurchInvHeader."No.",
-                 PurchInvHeader."Purchaser Code",
-                 ApprovalSetup,ApprovalEntry."Approver ID",
-                 UserSetup,ApprovalAmount,ApprovalAmountLCY,
-                 PurchInvHeader."Currency Code",AppvlTemplate,0);
+
+            SetNoOpenEntry(NoOpenEntry);
+            MakeApprovalEntry(ApprovalEntry, 0, ApprovalEntry."Approver ID");
 
             ApprovalEntry2.SETRANGE(Status);
             ApprovalEntry2.SETRANGE("Sequence No.");
@@ -2924,15 +2272,10 @@ OBJECT Codeunit 6085722 DC Approval Management
 
             ApprovalEntry := ApprovalEntry2;
 
-            ApprovalCmtLine."Table ID" := DATABASE::"Purch. Inv. Header";
-            ApprovalCmtLine."Document Type" := ApprovalEntry."Document Type";
-            ApprovalCmtLine."Document No." := ApprovalEntry."Document No.";
-            ApprovalCmtLine.Comment := COPYSTR(STRSUBSTNO(Text034,ApprovalEntry."Approver ID"),1,MAXSTRLEN(ApprovalCmtLine.Comment));
-            ApprovalCmtLine.SETRANGE("Table ID", ApprovalCmtLine."Table ID");
-            ApprovalCmtLine.SETRANGE("Document Type", ApprovalCmtLine."Document Type");
-            ApprovalCmtLine.SETRANGE("Document No.", ApprovalCmtLine."Document No.");
+            CreateAppvlCmtLine(
+              DATABASE::"Purch. Inv. Header",ApprovalEntry."Document Type",ApprovalEntry."Document No.",
+              COPYSTR(STRSUBSTNO(Text034,ApprovalEntry."Approver ID"),1,MAXSTRLEN(ApprovalCmtLine.Comment)));
 
-            ApprovalCmtLine.INSERT(TRUE);
           END;
         DATABASE::"Purch. Cr. Memo Hdr.":
           BEGIN
@@ -2947,28 +2290,13 @@ OBJECT Codeunit 6085722 DC Approval Management
               EXIT;
             END;
 
-            ApprovalSetup.GET;
-
-            AppvlTemplate.SETCURRENTKEY("Table ID","Document Type",Enabled);
-            AppvlTemplate.SETRANGE("Table ID",DATABASE::"Purch. Cr. Memo Hdr.");
-            AppvlTemplate.SETRANGE("Document Type",PurchHeader."Document Type"::"Credit Memo");
-            AppvlTemplate.SETRANGE(Enabled,TRUE);
-            AppvlTemplate.FINDFIRST;
+            Variant := PurchCrMemoHdr;
+            ApprovalsBridge4PSConstruct.IsPostedPurchaseApprovalsWorkflowEnabled(Variant);
 
             UserSetup.GET(ApprovalEntry."Approver ID");
-            PurchCrMemoHdr.CALCFIELDS(Amount);
-            ApprovalAmount := PurchCrMemoHdr.Amount;
-            ApprovalAmountLCY := PurchCrMemoHdr.Amount;
 
-            ApprovalMgnt.SetNoOpenEntry(NoOpenEntry);
-            ApprovalMgnt.MakeApprovalEntry(
-               DATABASE::"Purch. Cr. Memo Hdr.",
-                 PurchHeader."Document Type"::"Credit Memo",
-                 PurchCrMemoHdr."No.",
-                 PurchCrMemoHdr."Purchaser Code",
-                 ApprovalSetup,ApprovalEntry."Approver ID",
-                 UserSetup,ApprovalAmount,ApprovalAmountLCY,
-                 PurchCrMemoHdr."Currency Code",AppvlTemplate,0);
+            SetNoOpenEntry(NoOpenEntry);
+            MakeApprovalEntry(ApprovalEntry, 0, ApprovalEntry."Approver ID");
 
             ApprovalEntry2.SETRANGE(Status);
             ApprovalEntry2.SETRANGE("Sequence No.");
@@ -2983,18 +2311,13 @@ OBJECT Codeunit 6085722 DC Approval Management
 
             ApprovalEntry := ApprovalEntry2;
 
-            ApprovalCmtLine."Table ID" := DATABASE::"Purch. Cr. Memo Hdr.";
-            ApprovalCmtLine."Document Type" := ApprovalEntry."Document Type";
-            ApprovalCmtLine."Document No." := ApprovalEntry."Document No.";
-            ApprovalCmtLine.Comment := COPYSTR(STRSUBSTNO(Text034,ApprovalEntry."Approver ID"),1,MAXSTRLEN(ApprovalCmtLine.Comment));
-            ApprovalCmtLine.SETRANGE("Table ID", ApprovalCmtLine."Table ID");
-            ApprovalCmtLine.SETRANGE("Document Type", ApprovalCmtLine."Document Type");
-            ApprovalCmtLine.SETRANGE("Document No.", ApprovalCmtLine."Document No.");
+            CreateAppvlCmtLine(
+              DATABASE::"Purch. Cr. Memo Hdr.",ApprovalEntry."Document Type",ApprovalEntry."Document No.",
+              COPYSTR(STRSUBSTNO(Text034,ApprovalEntry."Approver ID"),1,MAXSTRLEN(ApprovalCmtLine.Comment)));
 
             ApprovalCmtLine.INSERT(TRUE);
           END;
       END;
-      }
     END;
 
     PROCEDURE ManuallyEditAppvlEntry4PS@1100528221(VAR ApprovalEntry@161024012 : Record 454);

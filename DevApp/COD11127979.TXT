@@ -1,0 +1,764 @@
+OBJECT Codeunit 11127979 Export To Symbrio
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PSSE;
+  }
+  PROPERTIES
+  {
+    TableNo=11127988;
+    Permissions=TableData 349=rm,
+                TableData 11012004=rm,
+                TableData 11072003=rm;
+    OnRun=VAR
+            _status@1100285000 : Code[1];
+          BEGIN
+            IF NOT SymbrioSetup.GET THEN
+              EXIT;
+            GLSetup.GET;
+
+            CASE "Table No." OF
+               DATABASE::Job: HandleJobEntry(Rec);
+               DATABASE::"Extension Contract": HandleExtensionContractEntry(Rec);
+               DATABASE::"Dimension Value": HandleDimValueEntry(Rec);
+               DATABASE::"Project Element": HandleElementEntry(Rec);
+            //>>150305 ITERO.SB
+               DATABASE::"Service Order": HandleServiceOrderEntry(Rec);
+            //<<
+            END;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      SymbrioSetup@1100285005 : Record 11127975;
+      GLSetup@1100285000 : Record 98;
+
+    PROCEDURE HandleJobEntry@1100285506(VAR SymbrioExportQueue@1100285500 : Record 11127988);
+    VAR
+      Job@1100285000 : Record 11072003;
+      JobTEMP@1100285501 : TEMPORARY Record 11072003;
+      ProjectElement@1100285502 : Record 11012010;
+      ProjectElementTEMP@1100285503 : TEMPORARY Record 11012010;
+      ExtensionContract@1100285504 : Record 11012004;
+      ExtensionContractTEMP@1100285505 : TEMPORARY Record 11012004;
+      SymbrioExportQueue2@1100285506 : Record 11127988;
+    BEGIN
+
+      JobTEMP.DELETEALL;
+      ExtensionContractTEMP.DELETEALL;
+      ProjectElementTEMP.DELETEALL;
+
+      IF (Job.GET(SymbrioExportQueue."Record ID")) THEN BEGIN
+         JobTEMP.COPY(Job);
+         JobTEMP."Project Status" := SymbrioExportQueue."Project Status";
+         JobTEMP.INSERT();
+      END ELSE BEGIN
+         JobTEMP.INIT;
+         JobTEMP."No." := SymbrioExportQueue."Job No.";
+         JobTEMP."Project Status" := Job."Project Status"::Archived;
+         IF (SymbrioExportQueue."Special Export" = SymbrioExportQueue."Special Export"::"Delete Main") THEN
+            JobTEMP."Single/Main/Sub Project" := JobTEMP."Single/Main/Sub Project"::"Main Project";
+         JobTEMP.INSERT();
+      END;
+
+      IF (SymbrioExportQueue."Special Export" = SymbrioExportQueue."Special Export"::Normal) THEN BEGIN
+         IF (JobIsReadyForExport(JobTEMP)) THEN BEGIN
+            ExportJob(JobTEMP);
+
+            // Export Extension Contracts as well when a non-main project is changed.
+            IF (JobTEMP."Single/Main/Sub Project" <> JobTEMP."Single/Main/Sub Project"::"Main Project") THEN BEGIN
+               // It is a single/sub-project - export all extensions!
+
+               ExtensionContract.SETRANGE("Project No.", JobTEMP."No.");
+               IF (ExtensionContract.FINDSET(FALSE)) THEN REPEAT
+                  //IF (ExtensionIsReadyForExport(ExtensionContract)) THEN BEGIN
+                  IF (ExtensionIsReadyForExport(ExtensionContract)) OR (ExtensionHasTransactions(ExtensionContract."Project No.",ExtensionContract."Contract No.")) THEN BEGIN     //or has transactions
+                     // Only add to Extensio Export if it does not already appear in the queue.
+                     SymbrioExportQueue2.SETRANGE("Table No.", DATABASE::"Extension Contract");
+                     SymbrioExportQueue2.SETRANGE("Extension/Element No.", ExtensionContract."Contract No.");
+                     SymbrioExportQueue2.SETRANGE("Error Occured", FALSE);
+                     IF (SymbrioExportQueue2.ISEMPTY) THEN BEGIN
+                        ExtensionContractTEMP.COPY(ExtensionContract);
+                        ExtensionContractTEMP.INSERT();
+                     END;
+                  END;
+               UNTIL ExtensionContract.NEXT = 0;
+            END;
+
+            IF NOT (ExtensionContractTEMP.ISEMPTY()) THEN
+               ExportExtensionContract(ExtensionContractTEMP, JobTEMP); // Exports Extension Contract
+
+         END;
+      END ELSE BEGIN
+         CASE SymbrioExportQueue."Special Export" OF
+            SymbrioExportQueue."Special Export"::"Inactivate Single": BEGIN
+               /// **************** INACTIVATION OF SINLGE PROJECT AND EXPORT OF MAIN PROJECT ****************************************'
+               //150713 JobTEMP."Single/Main/Sub Project" := JobTEMP."Single/Main/Sub Project"::Single;
+               //150918 JobTEMP."Project Status" := JobTEMP."Project Status"::Archived;
+               JobTEMP.MODIFY();
+
+               ExportJob(JobTEMP); // Exports inactivation of Single project
+
+               ProjectElement.SETRANGE("Project No.", JobTEMP."No.");
+               IF (ProjectElement.FINDSET(FALSE)) THEN REPEAT
+                  ProjectElementTEMP.COPY(ProjectElement);
+                  ProjectElementTEMP.Blocked := TRUE;
+                  ProjectElementTEMP.INSERT();
+               UNTIL ProjectElement.NEXT = 0;
+
+               IF NOT ProjectElementTEMP.ISEMPTY THEN
+                  ExportElements(ProjectElementTEMP); // Exports inactivation of all elements
+
+               ExtensionContract.SETRANGE("Project No.", JobTEMP."No.");
+               IF (ExtensionContract.FINDSET(FALSE)) THEN REPEAT
+      //>>RFC014
+                  //IF (ExtensionIsReadyForExport(ExtensionContract)) THEN BEGIN
+                  IF (ExtensionIsReadyForExport(ExtensionContract)) OR (ExtensionHasTransactions(ExtensionContract."Project No.",ExtensionContract."Contract No.")) THEN BEGIN     //or has transactions
+      //<<RFC014
+                     ExtensionContractTEMP.COPY(ExtensionContract);
+                     ExtensionContractTEMP.Status := ExtensionContractTEMP.Status::Expired; // Inactive = 0;
+                     ExtensionContractTEMP.INSERT();
+                  END;
+               UNTIL ExtensionContract.NEXT = 0;
+
+               IF NOT (ExtensionContractTEMP.ISEMPTY()) THEN BEGIN
+                  ExportExtensionContract(ExtensionContractTEMP, JobTEMP); // Exports Extension Contracts with inactive status
+                  IF NOT ProjectElementTEMP.ISEMPTY THEN
+                     ExportExtensionContractElements(ExtensionContractTEMP, ProjectElementTEMP); // Exports extension contract elements with inactive status
+               END;
+
+
+               SLEEP(300);
+               // ****************** POSSIBLE ACTIVATION OF MAIN PROJECT **********************
+               JobTEMP."Single/Main/Sub Project" := Job."Single/Main/Sub Project";
+               //150910 JobTEMP."Project Status" := Job."Project Status";
+               JobTEMP.MODIFY();
+
+               IF (JobIsReadyForExport(JobTEMP)) THEN
+                  ExportJob(JobTEMP); // Exports new project
+            END;
+            SymbrioExportQueue."Special Export"::"Inactivate Main": BEGIN
+               JobTEMP."Single/Main/Sub Project" := JobTEMP."Single/Main/Sub Project"::"Main Project";
+      //RFC014        JobTEMP."Project Status" := JobTEMP."Project Status"::Archived;
+               JobTEMP.MODIFY();
+
+               ExportJob(JobTEMP); // Exports inactivation of MAIN project
+
+               SLEEP(300);
+               JobTEMP."Single/Main/Sub Project" := Job."Single/Main/Sub Project";
+               JobTEMP."Project Status" := Job."Project Status";
+               JobTEMP.MODIFY();
+
+               //************************************************* ACTIVATION OF SINGLE PROJECT **********************************
+      //>>RFC014
+               //IF (JobIsReadyForExport(JobTEMP)) THEN BEGIN
+               IF (JobIsReadyForExport(JobTEMP)) OR (JobIsReadyForExportAndClosing(JobTEMP)) THEN BEGIN
+      //<<RFC014
+                  ExportJob(JobTEMP); // Exports new project
+
+                  SymbrioExportQueue2.SETRANGE("Table No.", DATABASE::"Project Element");
+                  SymbrioExportQueue2.SETRANGE("Job No.", JobTEMP."No.");
+                  SymbrioExportQueue2.SETRANGE("Error Occured", FALSE);
+                  // Only add to Element Export if it does not already appear in the queue.
+                  IF (SymbrioExportQueue2.ISEMPTY) THEN BEGIN
+
+                     ProjectElement.SETRANGE("Project No.", JobTEMP."No.");
+
+                     IF (ProjectElement.FINDSET(FALSE)) THEN REPEAT
+                        ProjectElementTEMP.COPY(ProjectElement);
+                        ProjectElementTEMP.INSERT();
+                     UNTIL ProjectElement.NEXT = 0;
+                  END;
+
+                  IF NOT ProjectElementTEMP.ISEMPTY THEN
+                     ExportElements(ProjectElementTEMP); // Exports inactivation of all elements
+
+                  ExtensionContract.SETRANGE("Project No.", JobTEMP."No.");
+                  IF (ExtensionContract.FINDSET(FALSE)) THEN REPEAT
+                     // Only add to Extensio Export if it does not already appear in the queue.
+                     SymbrioExportQueue2.SETRANGE("Table No.", DATABASE::"Extension Contract");
+                     SymbrioExportQueue2.SETRANGE("Extension/Element No.", ExtensionContract."Contract No.");
+                     SymbrioExportQueue2.SETRANGE("Error Occured", FALSE);
+                     IF (SymbrioExportQueue2.ISEMPTY) THEN BEGIN
+
+                        IF (ExtensionIsReadyForExport(ExtensionContract)) THEN BEGIN
+                           ExtensionContractTEMP.COPY(ExtensionContract);
+                           ExtensionContractTEMP.INSERT();
+                        END;
+                     END;
+                  UNTIL ExtensionContract.NEXT = 0;
+
+                  IF NOT (ExtensionContractTEMP.ISEMPTY()) THEN BEGIN
+                     ExportExtensionContract(ExtensionContractTEMP, JobTEMP); // Exports Extension Contracts
+                     IF NOT ProjectElementTEMP.ISEMPTY THEN
+                        ExportExtensionContractElements(ExtensionContractTEMP, ProjectElementTEMP); // Exports extension contract elements
+                  END;
+               END;
+
+            END;
+            SymbrioExportQueue."Special Export"::"Delete Main": BEGIN
+               JobTEMP."Single/Main/Sub Project" := JobTEMP."Single/Main/Sub Project"::"Main Project";
+               JobTEMP."Project Status" := JobTEMP."Project Status"::Archived;
+               JobTEMP.MODIFY();
+               ExportJob(JobTEMP); // Exports Inactivation
+            END;
+            SymbrioExportQueue."Special Export"::"Delete Single": BEGIN
+               JobTEMP."Single/Main/Sub Project" := JobTEMP."Single/Main/Sub Project"::Single;
+               JobTEMP."Project Status" := JobTEMP."Project Status"::Archived;
+               JobTEMP.MODIFY();
+               ExportJob(JobTEMP); // Exports Inactivation
+            END;
+         END;
+      END;
+    END;
+
+    PROCEDURE HandleServiceOrderEntry@3(VAR SymbrioExportQueue@1000 : Record 11127988);
+    VAR
+      ServiceOrder@1001 : Record 11012823;
+      ServiceOrderTEMP@1002 : TEMPORARY Record 11012823;
+    BEGIN
+      // ITERO.MH 150505 Exports service orders from Symbrio
+
+      ServiceOrderTEMP.DELETEALL;
+
+      IF (ServiceOrder.GET(SymbrioExportQueue."Record ID")) THEN BEGIN
+         IF (SOIsReadyForExport(ServiceOrder)) THEN BEGIN
+            ServiceOrderTEMP.COPY(ServiceOrder);
+
+            IF (SymbrioExportQueue."Special Export" = SymbrioExportQueue."Special Export"::"Delete Single") THEN
+               ServiceOrderTEMP.Status := ServiceOrder.Status::Finished;
+         END;
+         ServiceOrderTEMP.INSERT();
+      END ELSE BEGIN
+         ServiceOrderTEMP.INIT;
+         ServiceOrderTEMP."No." := SymbrioExportQueue."Job No.";
+         ServiceOrderTEMP.Status := ServiceOrder.Status::Finished;
+         ServiceOrderTEMP.INSERT();
+      END;
+
+
+      IF NOT ServiceOrderTEMP.ISEMPTY THEN
+         ExportServiceOrder(ServiceOrderTEMP);
+    END;
+
+    PROCEDURE HandleExtensionContractEntry@1100285502(VAR SymbrioExportQueue@1100285501 : Record 11127988);
+    VAR
+      ElementTEMP@1100285503 : TEMPORARY Record 11012010;
+      ExtensionContract@1100285509 : Record 11012004;
+      ExtensionContractTEMP@1100285504 : TEMPORARY Record 11012004;
+      Element@1100409001 : Record 11012010;
+      "Extension Contract"@1100285505 : Record 11012004;
+      Export@1100285500 : Boolean;
+      Job@1100285502 : Record 11072003;
+      JobTEMP@1100285508 : TEMPORARY Record 11072003;
+      ExportedElementFound@1100285506 : Boolean;
+      SymbrioExportQueue2@1100285507 : Record 11127988;
+    BEGIN
+      // Handle an Extension Contract Entry in the Symbrio Job Queue. ************************************
+      // *************************************************************************************************
+      // Saves in TEMP-files all that should be exported.
+      JobTEMP.DELETEALL;
+      ExtensionContractTEMP.DELETEALL;
+      ElementTEMP.DELETEALL;
+
+      IF ExtensionContract.GET(SymbrioExportQueue."Record ID") THEN BEGIN
+         ExtensionContractTEMP.COPY(ExtensionContract);
+         ExtensionContractTEMP.INSERT();
+      END ELSE BEGIN
+         // Cannnot find Ext. Cont. Possibly deleted.
+         ExtensionContractTEMP.INIT;
+         ExtensionContractTEMP."Project No." := SymbrioExportQueue."Job No.";
+         ExtensionContractTEMP."Contract No." := SymbrioExportQueue."Extension/Element No.";
+         ExtensionContractTEMP.Status := ExtensionContractTEMP.Status::Expired;
+         ExtensionContractTEMP.INSERT();
+      END;
+
+      IF (Job.GET(ExtensionContractTEMP."Project No.")) THEN BEGIN
+         JobTEMP.COPY(Job);
+         JobTEMP."Project Status" := SymbrioExportQueue."Project Status";
+         JobTEMP.INSERT();
+      END ELSE BEGIN
+         JobTEMP.INIT;
+         JobTEMP."No." := ExtensionContractTEMP."Project No.";
+         JobTEMP."Project Status" := SymbrioExportQueue."Project Status";
+         JobTEMP.INSERT();
+      END;
+
+      Export := TRUE;
+
+      Element.SETRANGE("Project No.", JobTEMP."No.");
+      IF (Element.FINDSET(FALSE)) THEN REPEAT
+         ElementTEMP.COPY(Element);
+         ElementTEMP.INSERT();
+      UNTIL Element.NEXT = 0;
+
+
+      IF (SymbrioExportQueue."Special Export" = SymbrioExportQueue."Special Export"::Normal) THEN BEGIN
+         Export := FALSE;
+         IF Job.GET(ExtensionContractTEMP."Project No.") AND JobIsReadyForExport(Job) AND (ExtensionIsReadyForExport(ExtensionContractTEMP)) THEN BEGIN
+            Export := TRUE;
+         END;
+
+         // Check through all elements connected to the same project
+         ExportedElementFound := FALSE;
+         IF NOT (ElementTEMP.ISEMPTY) THEN BEGIN
+            // If any element has ever been exported than ELEMATA file shall be created. Otherwise skipped.
+            // The trick here is that if the element is NOT in the Symbrio Export Queue it means
+            // that the element once has been exported.
+            SymbrioExportQueue2.SETRANGE("Table No.", DATABASE::"Project Element");
+            SymbrioExportQueue2.SETRANGE("Job No.", ElementTEMP."Project No.");
+            SymbrioExportQueue2.SETRANGE("Error Occured", FALSE);
+
+            IF SymbrioExportQueue2.ISEMPTY THEN BEGIN
+              // Exported Element found
+              ExportedElementFound := TRUE;
+            END;
+         END;
+
+      END ELSE BEGIN
+         // Special export: Inactivate all elements
+         IF NOT (ElementTEMP.ISEMPTY) THEN BEGIN
+            ExportedElementFound := TRUE;
+            ElementTEMP.MODIFYALL(Blocked, TRUE);
+         END;
+      END;
+
+      IF (Export) THEN BEGIN
+
+         ExportExtensionContract(ExtensionContractTEMP, JobTEMP);
+
+         IF (ExportedElementFound) AND NOT (ExtensionContractTEMP.ISEMPTY) THEN BEGIN
+            ExportExtensionContractElements(ExtensionContractTEMP, ElementTEMP);
+         END;
+      END;
+    END;
+
+    PROCEDURE HandleElementEntry@1100285510(VAR SymbrioExportQueue@1100285501 : Record 11127988);
+    VAR
+      ElementTEMP@1100285503 : TEMPORARY Record 11012010;
+      ExtensionContractTEMP@1100285504 : TEMPORARY Record 11012004;
+      Element@1100409001 : Record 11012010;
+      ExtensionContract@1100285505 : Record 11012004;
+      Export@1100285500 : Boolean;
+      Job@1100285502 : Record 11072003;
+      SymbrioExportQueue2@1100285506 : Record 11127988;
+    BEGIN
+      // Handle an Element Entry in the Symbrio Job Queue. ***********************************************
+      // *************************************************************************************************
+      // Saves in TEMP-files all that should be exported.
+      ExtensionContractTEMP.DELETEALL;
+      ElementTEMP.DELETEALL;
+      IF (SymbrioExportQueue."Error Occured") THEN EXIT;
+
+      Element.SETRANGE("Project No.", SymbrioExportQueue."Job No.");
+      IF (Element.FINDSET(FALSE)) THEN REPEAT
+         ElementTEMP.COPY(Element);
+         ElementTEMP.INSERT();
+      UNTIL  Element.NEXT = 0;
+
+      IF NOT (ElementTEMP.GET(SymbrioExportQueue."Job No.", SymbrioExportQueue."Extension/Element No.")) THEN BEGIN
+         ElementTEMP."Project No." := SymbrioExportQueue."Job No.";
+         ElementTEMP.Element := SymbrioExportQueue."Extension/Element No.";
+         ElementTEMP.Blocked := TRUE;
+         ElementTEMP.INSERT();
+      END;
+
+      SymbrioExportQueue2.SETRANGE("Error Occured", FALSE);
+      SymbrioExportQueue2.SETRANGE("Table No.", DATABASE::"Project Element");
+      SymbrioExportQueue2.SETRANGE("Job No.", SymbrioExportQueue."Job No.");
+      SymbrioExportQueue2.SETFILTER("Entry No.", '<>%1', SymbrioExportQueue."Entry No.");
+      SymbrioExportQueue2.SETRANGE("Special Export", SymbrioExportQueue."Special Export"::"Delete Single");
+      IF (SymbrioExportQueue2.FINDSET(TRUE)) THEN REPEAT
+         ElementTEMP."Project No." := SymbrioExportQueue2."Job No.";
+         ElementTEMP.Element := SymbrioExportQueue2."Extension/Element No.";
+         ElementTEMP.Blocked := TRUE;
+         ElementTEMP.INSERT();
+         SymbrioExportQueue2.DELETE(FALSE);// := TRUE;
+         //SymbrioExportQueue2.MODIFY();
+      UNTIL SymbrioExportQueue2.NEXT = 0;
+      SymbrioExportQueue2.RESET();
+
+
+      Export := FALSE;
+      IF Job.GET(ElementTEMP."Project No.") AND JobIsReadyForExport(Job) THEN
+         Export := TRUE;
+
+      ExtensionContract.SETRANGE("Project No.", ElementTEMP."Project No.");
+      IF (ExtensionContract.FINDSET(FALSE)) THEN REPEAT
+         IF (ExtensionIsReadyForExport(ExtensionContract)) THEN BEGIN
+            SymbrioExportQueue2.SETRANGE("Table No.", DATABASE::"Extension Contract");
+            SymbrioExportQueue2.SETRANGE("Extension/Element No.", ExtensionContract."Contract No.");
+            SymbrioExportQueue2.SETRANGE("Error Occured", FALSE);
+            IF (SymbrioExportQueue2.ISEMPTY) THEN BEGIN
+               ExtensionContractTEMP.COPY(ExtensionContract);
+               ExtensionContractTEMP.INSERT();
+            END;
+         END;
+      UNTIL ExtensionContract.NEXT = 0;
+
+      IF (Export) THEN BEGIN
+         // EXPORT ELEMENTS*****************************************
+         IF NOT ElementTEMP.ISEMPTY THEN
+            ExportElements(ElementTEMP);
+
+         IF NOT (ExtensionContract.ISEMPTY) THEN
+            // EXPORT EXTENSION CONTRACT ELEMENTS ******************
+            ExportExtensionContractElements(ExtensionContractTEMP, ElementTEMP);
+      END;
+    END;
+
+    PROCEDURE HandleDimValueEntry@1100285507(VAR SymbrioExportQueue@1100285500 : Record 11127988);
+    VAR
+      SymbrioExportQueue2@1100285502 : Record 11127988;
+      DimValue@1100285501 : Record 349;
+      DimValue1Temp@1100285000 : TEMPORARY Record 349;
+      DimValue2Temp@1100285001 : TEMPORARY Record 349;
+    BEGIN
+      /////////////////////////Export ValueDimensionFiles to Symbrio///////////////////////
+      //>>IME104
+      IF NOT SymbrioSetup.GET() THEN EXIT;
+
+      // Load temporary variables with data for Dim1 and Dim2.
+      SymbrioExportQueue2.SETRANGE("Table No.",DATABASE::"Dimension Value");
+      SymbrioExportQueue2.SETRANGE("Error Occured",FALSE);
+      IF SymbrioExportQueue2.FINDSET THEN REPEAT
+
+        IF DimValue.GET(SymbrioExportQueue2."Record ID") THEN BEGIN
+          IF (DimValue."Dimension Code" = SymbrioSetup."Indirect Export Dim1") AND
+             (DimValue.CostCenterResponsible <> '') THEN BEGIN
+            DimValue1Temp.TRANSFERFIELDS(DimValue);
+            DimValue1Temp.INSERT;
+          END ELSE
+          IF DimValue."Dimension Code" = SymbrioSetup."Indirect Export Dim2" THEN BEGIN
+            DimValue2Temp.TRANSFERFIELDS(DimValue);
+            DimValue2Temp.INSERT;
+          END;
+        END;
+        //SymbrioExportQueue.DELETE;
+      UNTIL SymbrioExportQueue2.NEXT = 0;
+
+      // Handle the export from the dimension variables.
+      ExportDimValues(DimValue1Temp, DimValue2Temp);
+      //<<
+    END;
+
+    PROCEDURE ExportDimValues@1100285004(VAR DimValue1Rec@1100285503 : Record 349;VAR DimValue2Rec@1100285502 : Record 349);
+    VAR
+      ExportIndirect@1100285002 : XMLport 11127979;
+      TempBLOB@1100285500 : Record 99008535;
+      OutstrBlob@1100285501 : OutStream;
+    BEGIN
+      /////////////////////////Export ValueDimensionFiles to Symbrio///////////////////////
+      // Exports Dimvalues fr†n DimValue1Rec and DimValue2Rec
+      IF NOT SymbrioSetup.GET() THEN EXIT;
+
+
+      // Handle the export from the dimension variables.
+      IF DimValue1Rec.FINDSET THEN REPEAT
+        IF DimValue2Rec.FINDSET THEN REPEAT
+
+         CLEAR(TempBLOB);
+         TempBLOB.Blob.CREATEOUTSTREAM(OutstrBlob);
+         ExportIndirect.fnSetDim(DimValue2Rec."Dimension Code",DimValue2Rec.Code,DimValue1Rec."Dimension Code",DimValue1Rec.Code);
+         ExportIndirect.SETDESTINATION(OutstrBlob);
+         ExportIndirect.EXPORT;
+         TempBLOB.Blob.EXPORT(
+
+         SymbrioSetup."Path Project Indirect" + 'PROJ' +
+                       DimValue2Rec."Dimension Code" +
+                       DimValue2Rec.Code +
+                       DimValue1Rec."Dimension Code" +
+                       DimValue1Rec.Code +
+                       FORMAT(WORKDATE,0,'<year4><month,2><day,2>') +
+                       FORMAT(TIME,0,'<Standard format,2>') + '.xml');
+
+          //oFile.CREATEOUTSTREAM(oStream);
+
+          //oStream.WRITE(TempBLOB.Blob);
+          //oFile.CLOSE;
+        UNTIL DimValue2Rec.NEXT = 0;
+      UNTIL DimValue1Rec.NEXT = 0;
+      //<<
+    END;
+
+    PROCEDURE ExportJob@1100285001(VAR Job@1100285500 : Record 11072003);
+    VAR
+      TempBLOB@1100285502 : Record 99008535;
+      OutstrBlob@1100285501 : OutStream;
+      xmlExportMainP@1100285503 : XMLport 11127983;
+      xmlExport@1100285504 : XMLport 11127975;
+    BEGIN
+      /////////////////////Export ProjectFiles to Symbrio////////////////////////////////////
+      //>> IME104
+
+      //SymbrioExportQueue.SETRANGE("Entry No.",DATABASE::Job);
+      //IF SymbrioExportQueue.FINDSET THEN REPEAT
+
+      IF Job."Single/Main/Sub Project" = Job."Single/Main/Sub Project"::"Main Project" THEN BEGIN
+         CLEAR(TempBLOB);
+         TempBLOB.Blob.CREATEOUTSTREAM(OutstrBlob);
+         CLEAR(xmlExportMainP);
+         xmlExportMainP.setJobNo(Job,Job."Project Status");
+         xmlExportMainP.SETDESTINATION(OutstrBlob);
+         xmlExportMainP.EXPORT;
+         TempBLOB.Blob.EXPORT(
+         SymbrioSetup."Path Project" + 'PROJM' + Job."No." + '_' + FORMAT(WORKDATE,0,'<year4><month,2><day,2>') +
+                        FORMAT(TIME,0,'<Standard format,2>') + '.xml');
+         //oFile.CREATEOUTSTREAM(oStream);
+         //oStream.WRITE(TempBLOB.Blob);
+         //oFile.CLOSE;
+      END ELSE BEGIN
+         CLEAR(TempBLOB);
+         TempBLOB.Blob.CREATEOUTSTREAM(OutstrBlob);
+         CLEAR(xmlExport);
+         xmlExport.setJobNo(Job,Job."Project Status");
+         xmlExport.SETDESTINATION(OutstrBlob);
+         xmlExport.EXPORT;
+
+         TempBLOB.Blob.EXPORT(
+         SymbrioSetup."Path Project" + 'PROJ' + Job."No." + '_' + FORMAT(WORKDATE,0,'<year4><month,2><day,2>') +
+                          FORMAT(TIME,0,'<Standard format,2>') + '.xml');
+
+      END;
+    END;
+
+    PROCEDURE ExportExtensionContract@1100285000(VAR ExtensionContract@1100285506 : Record 11012004;VAR Job@1100285500 : Record 11072003);
+    VAR
+      "xmlŽTA"@1100285000 : XMLport 11127976;
+      TempBLOB@1100285502 : Record 99008535;
+      OutstrBlob@1100285501 : OutStream;
+    BEGIN
+      /////////////////////Export ŽTAFiles to Symbrio////////////////////////////////////
+      IF NOT (SymbrioSetup.GET()) THEN EXIT;
+
+
+      IF ExtensionContract.FINDSET(FALSE) THEN REPEAT
+         CLEAR(TempBLOB);
+         TempBLOB.Blob.CREATEOUTSTREAM(OutstrBlob);
+         CLEAR(xmlŽTA);
+         //xmlŽTA.fnSetJobNo(ExtensionContract, Job);
+         xmlŽTA.setExtensioncContract(ExtensionContract,Job,Job."Project Status");
+         xmlŽTA.SETDESTINATION(OutstrBlob);
+         xmlŽTA.EXPORT;
+         TempBLOB.Blob.EXPORT(
+         SymbrioSetup."Path Project ŽTA" + 'PROJ' + ExtensionContract."Project No." + '_' + FormatContractNo(ExtensionContract."Contract No.") + '_' +
+                        FORMAT(WORKDATE,0,'<year4><month,2><day,2>') +
+                        FORMAT(TIME,0,'<Standard format,2>') + '.xml');
+
+      UNTIL ExtensionContract.NEXT = 0;
+    END;
+
+    PROCEDURE ExportElements@1100409002(VAR ProjectElement@1100285501 : Record 11012010);
+    VAR
+      FileName@1100285502 : Text;
+      xmlElement@1100285503 : XMLport 11127980;
+      TempBLOB@1100285504 : Record 99008535;
+      OutstrBlob@1100285500 : OutStream;
+    BEGIN
+
+
+      IF NOT SymbrioSetup.GET() THEN EXIT;
+
+      CLEAR(TempBLOB);
+      TempBLOB.Blob.CREATEOUTSTREAM(OutstrBlob);
+
+      FileName := SymbrioSetup."Path Elements" + 'ELEM' + FORMAT(WORKDATE,0,'<year4><month,2><day,2>') +
+                          FORMAT(TIME,0,'<Standard format,2>') + '.xml';
+
+      xmlElement.fnSetElement(ProjectElement);
+      xmlElement.SETDESTINATION(OutstrBlob);
+      xmlElement.EXPORT;
+
+      TempBLOB.Blob.EXPORT(FileName);
+    END;
+
+    PROCEDURE ExportExtensionContractElements@1100285516(VAR ExtensionContract@1100285503 : Record 11012004;VAR ProjectElement@1100285501 : Record 11012010);
+    VAR
+      Filename@1100285500 : Text;
+      xmlElementExt@1100285004 : XMLport 11127988;
+      TempBLOB@1100285504 : Record 99008535;
+      OutstrBlob@1100285502 : OutStream;
+    BEGIN
+      IF NOT (SymbrioSetup.GET()) THEN EXIT;
+
+      IF (ExtensionContract.FINDSET(FALSE)) THEN REPEAT
+         CLEAR(TempBLOB);
+         TempBLOB.Blob.CREATEOUTSTREAM(OutstrBlob);
+
+         Filename := SymbrioSetup."Path Elements" + 'ELEMATA' + ExtensionContract."Contract No." + FORMAT(WORKDATE,0,'<year4><month,2><day,2>') +
+                                FORMAT(TIME,0,'<Standard format,2>') + '.xml';
+
+         CLEAR(xmlElementExt);
+         xmlElementExt.fnSetElement(ProjectElement);
+         xmlElementExt.SetContractCode(FormatContractNo(ExtensionContract."Contract No."));
+         xmlElementExt.SETDESTINATION(OutstrBlob);
+         xmlElementExt.EXPORT;
+
+         TempBLOB.Blob.EXPORT(Filename);
+
+      UNTIL ExtensionContract.NEXT = 0;
+    END;
+
+    PROCEDURE FormatContractNo@1100285005(ContractNoIn@1100285000 : Code[10]) FormContractNo : Code[10];
+    VAR
+      Text001@1100285001 : TextConst 'ENU=Extension Contract number can only contain 4 characters for export';
+    BEGIN
+
+      IF STRLEN(ContractNoIn) > 4 THEN
+        ERROR(Text001);
+
+      FormContractNo := ContractNoIn;
+
+      WHILE STRLEN (FormContractNo) < 4 DO BEGIN
+
+        FormContractNo := '0' + FormContractNo;
+
+        END;
+
+      EXIT(FormContractNo);
+    END;
+
+    PROCEDURE JobIsReadyForExport@1100285503(VAR Job@1100285500 : Record 11072003) : Boolean;
+    BEGIN
+      IF (Job.Description <> '') AND
+         (Job."Global Dimension 1 Code" <> '') AND
+         (Job."Project Type" <> '') AND
+         ((Job."Project Status" IN [Job."Project Status"::Preparation, Job."Project Status"::Production])) AND
+         (Job."Project Manager" <> '') THEN
+        EXIT(TRUE)
+      ELSE
+        EXIT(FALSE);
+    END;
+
+    PROCEDURE JobIsReadyForExportAndClosing@1100285002(VAR Job@1100285500 : Record 11072003) : Boolean;
+    BEGIN
+      //RFC014
+      IF (Job.Description <> '') AND
+         (Job."Global Dimension 1 Code" <> '') AND
+         (Job."Project Type" <> '') AND
+         ((Job."Project Status" IN [Job."Project Status"::"Technical Finished", Job."Project Status"::"Administrative Finished"])) AND
+         (Job."Project Manager" <> '') THEN
+        EXIT(TRUE)
+      ELSE
+        EXIT(FALSE);
+    END;
+
+    PROCEDURE ExtensionIsReadyForExport@1100285500(ExtensionContract@1100285500 : Record 11012004) : Boolean;
+    VAR
+      Job@1100285501 : Record 11072003;
+    BEGIN
+      //IME156
+      IF (ExtensionContract.Description = '') THEN
+        EXIT(FALSE);
+
+      IF (ExtensionContract.Status<>ExtensionContract.Status::Order) AND
+         (ExtensionContract.Status<>ExtensionContract.Status::"Invoicing Allowed") THEN
+        EXIT(FALSE);
+
+      IF NOT Job.GET(ExtensionContract."Project No.") THEN
+        EXIT(FALSE);
+
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE DeleteJobFromQueue@1100285501(Job@1100285500 : Record 11072003);
+    VAR
+      SymbrioExportQueue@1100285501 : Record 11127988;
+    BEGIN
+      //IME156
+      IF Job."No." = '' THEN
+        EXIT;
+
+      SymbrioExportQueue.SETRANGE("Job No.",Job."No.");
+      IF NOT SymbrioExportQueue.ISEMPTY THEN
+        SymbrioExportQueue.DELETEALL(FALSE);
+    END;
+
+    PROCEDURE ExportServiceOrder@1(VAR ServiceOrder@1000 : Record 11012823);
+    VAR
+      TempBLOB@1100285500 : Record 99008535;
+      OutstrBlob@1100285501 : OutStream;
+      xmlExport@1001 : XMLport 11127995;
+    BEGIN
+      // 150818 ITERO.MH Export Service Order
+
+      CLEAR(TempBLOB);
+      TempBLOB.Blob.CREATEOUTSTREAM(OutstrBlob);
+      CLEAR(xmlExport);
+      xmlExport.setJobNo(ServiceOrder);
+      xmlExport.SETDESTINATION(OutstrBlob);
+      xmlExport.EXPORT;
+
+      TempBLOB.Blob.EXPORT(
+      SymbrioSetup."Path Project" + 'PROJ' + ServiceOrder."No." + '_' + FORMAT(WORKDATE,0,'<year4><month,2><day,2>') +
+                          FORMAT(TIME,0,'<Standard format,2>') + '.xml');
+    END;
+
+    PROCEDURE SOIsReadyForExport@4(VAR ServiceOrder@1100285500 : Record 11012823) : Boolean;
+    BEGIN
+      //>>150305 ITERO.SB
+
+      IF (ServiceOrder.Description <> '') AND
+         (ServiceOrder."Global Dimension 1 Code" <> '') AND
+         (ServiceOrder."Service Type" <> '') AND
+         //>> 150925 ITERO.SB
+         (ServiceOrder.Name <> '') AND
+         //>> 160122 ITERO.SB Added Status control in function SOIsReadyForExport
+         ((ServiceOrder.Status IN [ServiceOrder.Status::Open, ServiceOrder.Status::"In Process"])) AND
+         //<<
+         (ServiceOrder."Order Manager" <> '') THEN
+         //<<
+        EXIT(TRUE)
+      ELSE
+        EXIT(FALSE);
+    END;
+
+    PROCEDURE ExtensionHasTransactions@1100285006(projno@1100285000 : Code[20];extno@1100285001 : Code[10]) : Boolean;
+    VAR
+      ExtensionContract@1100285002 : Record 11012004;
+      JobLedgerEntry@1100285003 : Record 11072005;
+    BEGIN
+      //RFC014
+      JobLedgerEntry.SETRANGE("Job No.",projno);
+      JobLedgerEntry.SETRANGE("Extension Contract",extno);
+      EXIT(NOT JobLedgerEntry.ISEMPTY);
+    END;
+
+    BEGIN
+    {
+
+      131009 SYM935 Added fnExportElements func.
+      131015 ITERO.SB SYM918 export of elements of ŽTAs.
+      131021 SYM920 Changed format for Contract No. (function format contract no)
+      131022 SYM918
+      131203 SYM961 Added permisisons
+      131210 SYM971 Changed filename
+      140121 SYM009 Changed filename
+      140121 SYM010 Added filter for Costcenter Responsible on export of dimensions
+      140121 SYM008 Added filters for export of Projects
+      140204 ITERO.DJ IME104 change to function "ExportJob". Part 1.
+      140206 ITERO.LP SYM989 New function JobIsReadyForExport to check Projects when running functions ExportŽTA and ExportElements.
+      140213 ITERO.LP IME104 Part 2: ExportŽTA, ExportDimValues, ExportElements
+      140625 ITERO.DJ SYM020 PROJ exports not sending Active0
+      140630 ITERO.DL IME156 Symbrio NAS taking 5 minutes to process
+      150203 ITERO.MH SYM048 Added Inactivate of Main/Single projects handeling
+
+      150217 ITERO.MH SYM048/040/036 ***************** MAJOR REWRITE *****************
+               * Added seperate function to handle specific Entry Posts. Each Table-type has its Handle-function. That function can also trigger export
+               * Changed Export-functions to have no control at all and instead use TEMP-tables to be exported. TEMP-tables are added from Handle-functions
+               * Made the whole codeunit be called from other codeunit by adding Symbrio Export Queue as a Codeunit-Record
+      150305 ITERO.SB Handle export of Service orders
+      150713 SYM096
+      150818 ITERO.MH Adjusted export of Service Orders
+      150918 ITERO.DL RFC014 new value in tag <Active>
+      151112 ITERO.DL RFC014-2 timingerrors, use JobStatus at modified-time instead of current
+      160122 ITERO.SB Added Status control in function SOIsReadyForExport
+    }
+    END.
+  }
+}
+

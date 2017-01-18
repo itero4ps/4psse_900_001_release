@@ -56,6 +56,8 @@ OBJECT Table 11012019 Project Cost Plus Entry
                  CheckRemovalContribution;
                END;
                DeleteCommentLines();
+
+               DeleteHourAccCommentLines; // SESB.I039 VKO 30.07.2013
              END;
 
     OnRename=BEGIN
@@ -157,7 +159,7 @@ OBJECT Table 11012019 Project Cost Plus Entry
                                                    Editable=No }
     { 60  ;   ;Description         ;Text50        ;CaptionML=ENU=Description }
     { 65  ;   ;Description 2       ;Text50        ;CaptionML=ENU=Description 2 }
-    { 70  ;   ;Wage Component      ;Code10        ;TableRelation="Wage Component".Code WHERE (Component Type=FILTER(Hours|Expenses));
+    { 70  ;   ;Wage Component      ;Code10        ;TableRelation="Wage Component".Code WHERE (Component Type=FILTER(Hours|Expenses|Expense hours));
                                                    OnValidate=BEGIN
                                                                 GetBasicPrice;
 
@@ -526,7 +528,8 @@ OBJECT Table 11012019 Project Cost Plus Entry
     { 314 ;   ;Purchase Discount % (Item);Decimal ;OnValidate=BEGIN
                                                                 IF CheckItemLine OR
                                                                   (("Entry No. Project Ledger" = 0) AND ("Posted Hour Line No." = 0)) THEN
-                                                                  VALIDATE("Cost Price", "Gross Price" * (100 - "Purchase Discount % (Item)")/100);
+                                                                  IF "Cost Type" <> "Cost Type"::Labor THEN   // 150919 ITERO.AC IME374
+                                                                    VALIDATE("Cost Price", "Gross Price" * (100 - "Purchase Discount % (Item)")/100);
                                                               END;
 
                                                    CaptionML=ENU=Purchase Discount % (Item);
@@ -537,8 +540,12 @@ OBJECT Table 11012019 Project Cost Plus Entry
                                                                   VALIDATE("Surcharge %", GetSurcharge);
 
                                                                 VALIDATE("Basic Price", "Gross Price" * (100 - "Sales Discount % (Item)")/100);
-                                                                IF CheckItemLine THEN
-                                                                  "Basic Price Found at" := Text010;
+                                                                //>> 160311 ITERO.AC RFC082 Added Check for Sales discount Or Existing text = ''
+                                                                IF CheckItemLine THEN BEGIN
+                                                                  IF ("Sales Discount % (Item)" <> 0) OR ("Basic Price Found at" = '') THEN
+                                                                    "Basic Price Found at" := Text010;
+                                                                END;
+                                                                //<< 160311 ITERO.AC RFC082
                                                               END;
 
                                                    CaptionML=ENU=Sales Discount % (Item);
@@ -572,11 +579,11 @@ OBJECT Table 11012019 Project Cost Plus Entry
                                                                   SaveUnit := "Unit of Measure";
                                                                   SaveQuan := Quantity;
                                                                   GetBasicPrice;
-                                                                  IF (SaveUnit <> '') AND (SaveUnit <> "Unit of Measure") THEN BEGIN
+                                                                //  IF (SaveUnit <> '') AND (SaveUnit <> "Unit of Measure") THEN BEGIN  // Removed ANCA 150609 IME-299 IME-355
                                                                     VALIDATE("Unit of Measure", SaveUnit);
                                                                     CheckItemUnitConversion(Rec, xRec);
                                                                     VALIDATE(Quantity, SaveQuan);
-                                                                  END;
+                                                                //  END;
                                                                 END;
                                                               END;
 
@@ -696,6 +703,22 @@ OBJECT Table 11012019 Project Cost Plus Entry
 
                                                    CaptionML=ENU=Currency Code;
                                                    Description=DP00887: range 800-900 RESERVED (diekus) }
+    { 11128000;;Periodic Template Code;Code10     ;TableRelation="Periodic Template".Code;
+                                                   CaptionML=ENU=Periodic Template Code;
+                                                   Description=SE }
+    { 11128001;;Periodic Starting Date;Date       ;CaptionML=ENU=Periodic Starting Date;
+                                                   Description=SE }
+    { 11128270;;Price History Found;Boolean       ;CaptionML=ENU=Price History Found;
+                                                   Description=EVRY }
+    { 11128271;;Price History Vendor No.;Code20   ;CaptionML=ENU=Price History Vendor no.;
+                                                   Description=EVRY }
+    { 11128272;;Price History PriceList;Code20    ;TableRelation="Customer Price List" WHERE (Display Price List=CONST(Yes));
+                                                   CaptionML=ENU=Customer price list;
+                                                   Description=ITERO }
+    { 11128273;;Price History DiscountRef1;Code20 ;CaptionML=ENU=Sales Discount Term Group (Customer);
+                                                   Description=ITERO }
+    { 11128274;;Cost Price Adjustment;Decimal     ;CaptionML=ENU=Adjustment % (Cost Price);
+                                                   Description=ITERO }
   }
   KEYS
   {
@@ -749,13 +772,46 @@ OBJECT Table 11012019 Project Cost Plus Entry
       SaveQuan@1100525004 : Decimal;
       SkipGetCostObjectDesc@1210190001 : Boolean;
       SkipDetermineChargeable@1100525002 : Boolean;
+      "-EVRY-"@1100285001 : Integer;
+      Job4PS@1100285000 : Record 11072003;
+      TradeItem@1100285002 : Record 11012317;
+      "--ITERO--"@1100285003 : Integer;
+      gvUseManualPriceList@1100285004 : Code[20];
+      Text11128001@11128001 : TextConst 'ENU=Cost Price + Surcharge Customer Price List';
+      Text11128002@1100409001 : TextConst 'ENU=Cost Price + Cost Price adjustment';
+      Text11128003@1100409002 : TextConst 'ENU=Vendor Gross Price';
 
     PROCEDURE GetSurcharge@1100485012() lvPerc : Decimal;
     VAR
       CustSurchRec@1100485003 : Record 11020367;
       ProjSetup@1100525001 : Record 315;
       PriceHistRec@1100525000 : Record 11012315;
+      CustPriceList@1100285500 : Record 11128273;
     BEGIN
+      //>>ENH-007, 4PSSE, DL/DJ
+      CALCFIELDS("Cost Type");
+      IF ("Cost Type" = "Cost Type"::Material) THEN BEGIN
+        ProjRec.GET("Project No.");
+        IF CustPriceList.GET(ProjRec."Price List Code") THEN
+          IF CustPriceList."Apply Material Surcharge" THEN BEGIN
+            IF NOT ProjPrincipalRec.GET("Project No.",Principal) THEN
+              CLEAR(ProjPrincipalRec);
+            EXIT(ProjPrincipalRec."Surcharge % Material");
+          END;
+      END;
+      //<<ENH-007
+
+      //>> LAHE 130117
+      IF NOT ProjPrincipalRec.GET("Project No.",Principal) THEN
+        CLEAR(ProjPrincipalRec);
+      IF "Price History Found" THEN     //almost always true if price list exists
+        EXIT(0)
+      ELSE
+        IF "Trade Item" <> '' THEN  //4PSSE 131001
+          IF NOT ProjPrincipalRec."Cost Price Behaviour" THEN
+            EXIT(0);
+      //<< LAHE 130117
+
       lvPerc := 0;
 
       CALCFIELDS("Cost Type");
@@ -850,8 +906,9 @@ OBJECT Table 11012019 Project Cost Plus Entry
       IF ("Cost Object" <> xRec."Cost Object") THEN BEGIN
         DimMgt.GetDimValueRec(2, "Cost Object", DimValRec, TRUE, "Project No.");
         IF xRec."Cost Object" <> '' THEN
-          IF NOT CONFIRM(Text001,FALSE) THEN
-            EXIT(FALSE);
+          IF (GUIALLOWED) THEN //140703 ITERO.MH
+            IF NOT CONFIRM(Text001,FALSE) THEN
+              EXIT(FALSE);
         EXIT(TRUE);
       END;
       EXIT(FALSE);
@@ -1028,6 +1085,8 @@ OBJECT Table 11012019 Project Cost Plus Entry
     END;
 
     PROCEDURE DetermineVATProdPostingGroup@4();
+    VAR
+      ProjPrincipalRec@11012000 : Record 11012005;
     BEGIN
       "VAT Prod. Posting Group" := UpdateVatProdPostingGrp;  //RFC 547
       //IF ProjPrincipalRec.GET("Project No.",Principal) THEN //RFC 547 old
@@ -1040,6 +1099,12 @@ OBJECT Table 11012019 Project Cost Plus Entry
     END;
 
     PROCEDURE ValidateItem@31(LTypeArtOpt@11012000 : 'Item,Basic Item,Trade Item');
+    VAR
+      lvPriceHistoryFound@1100409001 : Boolean;
+      lvDoSalesPriceCalulation@1100409002 : Boolean;
+      lvSurchargeIfMissingArticles@1100409003 : Decimal;
+      lvPriceFactor@1100409000 : Decimal;
+      lvGrossPrice@1100409004 : Decimal;
     BEGIN
       IF NOT CheckItemLine() THEN
         EXIT;
@@ -1049,8 +1114,66 @@ OBJECT Table 11012019 Project Cost Plus Entry
         "Reference Date" := FillReferenceDate;
 
       FindCostPrice(LTypeArtOpt);
+      //>> 160317 ITERO.AC RFC082 Add CostSurcharge % from Project Principal
+      CALCFIELDS("Cost Type");
+      lvPriceFactor := GetPrincipalCostPriceFactor("Project No.", Principal, "Cost Type");
+      //<< 160317 ITERO.AC RFC082
       "Basic Price" := "Cost Price";
-      "Basic Price Found at" := FIELDCAPTION("Cost Price");
+      //>> 160317 ITERO.AC RFC082 Adjust text describing how Basic Price was calculated
+      IF lvPriceFactor <> 1 THEN
+        "Basic Price Found at" := Text11128002
+      ELSE
+      //<< 160317 ITERO.AC RFC082
+        "Basic Price Found at" := FIELDCAPTION("Cost Price");
+
+
+      //>> 160311 ITERO.AC RFC082 Check for Cost Price Behaviour
+      lvDoSalesPriceCalulation := TRUE;
+      lvPriceHistoryFound := FALSE;
+      lvGrossPrice := 0;
+
+      IF LTypeArtOpt = LTypeArtOpt::"Trade Item" THEN BEGIN
+        lvPriceHistoryFound := CheckIfPriceHistoryExists("Project No.", "Reference Date", "Trade Item", lvGrossPrice);
+
+        IF CheckCostPriceBehaviour("Project No.", Principal ) THEN BEGIN
+          IF lvPriceHistoryFound THEN BEGIN
+            "Gross Price" := lvGrossPrice;
+            "Basic Price Found at" := Text010;
+          END
+          ELSE BEGIN
+            //>> 160401 ITERO.AC RFC082 Keep original Cost Price and adjust Gross Price and Basic price with price factor
+            "Cost Price Adjustment" := (lvPriceFactor - 1) * 100;
+            "Gross Price" := "Cost Price" * lvPriceFactor;
+            "Basic Price" := "Gross Price";
+            //>> 160401 ITERO.AC RFC082
+          END;
+        END
+        ELSE BEGIN
+          IF lvPriceHistoryFound THEN BEGIN
+            "Basic Price Found at" := Text010;
+          END
+          ELSE BEGIN
+            lvSurchargeIfMissingArticles := GetSurchargeIfMissingArticles("Project No.");
+            IF lvSurchargeIfMissingArticles <> 1 THEN BEGIN
+              "Cost Price Adjustment" := (lvSurchargeIfMissingArticles - 1) * 100;      // 160401 ITERO.AC RFC082
+              //VALIDATE("Gross Price", "Cost Price" * lvSurchargeIfMissingArticles);   // 160324 ITERO.AC RFC083 Do not use Validate (will lead to wrong Cost Price)
+              "Gross Price" := "Cost Price" * lvSurchargeIfMissingArticles;
+              VALIDATE("Sales Discount % (Item)", 0);
+              "Basic Price Found at" := Text11128001;
+              lvDoSalesPriceCalulation := FALSE;
+            END
+            ELSE BEGIN
+              "Basic Price Found at" := Text11128003;
+            END;
+          END;
+        END;
+      END;
+
+      IF lvDoSalesPriceCalulation THEN BEGIN
+        "Price History Found" := lvPriceHistoryFound;
+      //<< 160311 ITERO.AC RFC082
+        FindSalesPrice;  //db, 28-12-09: M16871
+      END;
 
       FindSalesPrice;
       VALIDATE("Surcharge %", GetSurcharge);
@@ -1076,10 +1199,24 @@ OBJECT Table 11012019 Project Cost Plus Entry
       lvRefDate := "Reference Date";
       ValidateCu.GetRefDiscProject(ProjRec, lvDiscRef1, lvDiscRef2, lvDiscType::Purchase);
       lvRefPrio := ValidateCu.GetRefPrioProject(ProjRec, lvDiscType::Purchase);
+      //>> Removed by ANCA 150608 IME-299 IME-355
+      //>> LAHE 130117
+      //IF NOT Job4PS.GET("Project No.") THEN
+      //  CLEAR(Job4PS);
+      //ValidateCu.SetPriceListCode(Job4PS."Price List Code");
+      ValidateCu.SetPriceListCode('');
+      //<< LAHE 130117
+      //<< ANCA 150608
+      ValidateCu.SetDontUseSingleGTIN(TRUE); // 151102 ITERO.AC IME420
       ValidateCu.ValidateItem(LTypeArtOpt, "Trade Item", "Item No.", Manufacturer, "Vendor (Trade Item)",
         "Basic Item", "Cost Object", Description, "Unit of Measure", "Cost Price", "Purchase Discount % (Item)",
         DummyDat, "Gross Price", "Description 2", "Cost Component",
         lvDiscRef1, lvDiscRef2, lvRefDate, lvRefPrio);
+      // "Price History Found" := ValidateCu.GetPriceHistFound(); // LAHE 130117 - Removed by ANCA 150608  IME-299 IME-355
+      // "Price History Vendor No." := ValidateCu.GetPriceHistVendorNo(); // LAHE 130425 - Removed by ANCA 150608  IME-299 IME-355
+      //>> 160317 ITERO.AC RFC082 If not FindSalesPrice calculation is executed or article not found in customer price list, this value will remain as an information
+      "Price History Vendor No." := ValidateCu.GetPriceHistVendorNo();
+      //<< 160317 ITERO.AC RFC082
     END;
 
     PROCEDURE FindSalesPrice@1100525006();
@@ -1089,18 +1226,56 @@ OBJECT Table 11012019 Project Cost Plus Entry
       lvDiscRef2@1100525002 : Code[20];
       lvRefPrio@1100525001 : Code[10];
       lvDiscType@1100525000 : 'Purchase,Sales';
+      lvTempPriceHistVendor@1100409000 : Code[20];
     BEGIN
       IF NOT CustRec.GET(Principal) THEN CustRec.INIT;
-      IF CustRec."Item Price Cost Plus Project" = CustRec."Item Price Cost Plus Project"::GrossMin THEN BEGIN
+      //IF CustRec."Item Price Cost Plus Entry" = CustRec."Item Price Cost Plus Entry"::GrossMin THEN BEGIN
+      IF NOT UseCostPrice(CustRec) THEN BEGIN // LAHE 130117
         ValidateCu.SetQuantity(Quantity);
         lvRefDate := "Reference Date";
         ValidateCu.GetRefDiscProject(ProjRec, lvDiscRef1, lvDiscRef2, lvDiscType::Sales);
         lvRefPrio := ValidateCu.GetRefPrioProject(ProjRec, lvDiscType::Sales);
-        "Sales Condition Present" := ValidateCu.GetSalesDiscount(  //db, 26-01-16: C015604
+        //>> ANCA 150608 IME-299 IME-355
+        IF NOT Job4PS.GET("Project No.") THEN
+          CLEAR(Job4PS);
+        //>> 150914 ITERO.AC RFC001-2 New editable column "Price History PriceList"
+        IF gvUseManualPriceList = '' THEN BEGIN
+          ValidateCu.SetPriceListCode(Job4PS."Price List Code");
+        END ELSE BEGIN
+          ValidateCu.SetPriceListCode(gvUseManualPriceList);
+        END;
+        //<< 150914 ITERO.AC RFC001-2
+        "Sales Condition Present" := ValidateCu.GetSalesDiscount(
           CustRec."No.", "Item No.", "Basic Item", "Trade Item",
           Manufacturer, "Vendor (Trade Item)", "Basic Price", "Sales Discount % (Item)", "Gross Price", "Reference Date", '',
           lvDiscRef1, lvDiscRef2, lvRefPrio);
+        "Price History Found" := ValidateCu.GetPriceHistFound();
+        //>> 160317 ITERO.AC RFC082 Do not replace "Price History Vendor No." with blank
+        lvTempPriceHistVendor := ValidateCu.GetPriceHistVendorNo();
+        IF lvTempPriceHistVendor <> '' THEN
+          "Price History Vendor No." := lvTempPriceHistVendor;
+        //>> 160317 ITERO.AC RFC082
+        "Gross Price" :=  ValidateCu.GetLatestCustGrossPrice();
+        //<< ANCA 150608
+        //>> 150914 ITERO.AC RFC001-2 Save price list code found in "Price History Trade Item" if user has not selected a price list manually, also save Discount Reference1 to new Column
+        IF gvUseManualPriceList = '' THEN BEGIN
+          IF ("Price History Found") THEN
+            "Price History PriceList" := Job4PS."Price List Code"
+          ELSE
+            "Price History PriceList" := '';
+        END;
+        "Price History DiscountRef1" := ValidateCu.GetFoundSalesDiscRef;
+        //<< 150914 ITERO.AC
         VALIDATE("Sales Discount % (Item)");
+      //>> LAHE 130425 (same call but with PriceHistVendorNo)
+      IF ("Sales Discount % (Item)" = 0) AND ("Price History Vendor No." <> '') THEN BEGIN
+        "Sales Condition Present" := ValidateCu.GetSalesDiscount(
+          CustRec."No.", "Item No.", "Basic Item", "Trade Item",
+          Manufacturer, "Price History Vendor No.", "Basic Price", "Sales Discount % (Item)", "Gross Price", "Reference Date", '',
+          lvDiscRef1, lvDiscRef2, lvRefPrio);
+        VALIDATE("Sales Discount % (Item)");
+      END;
+      //<< LAHE 130425
       END ELSE BEGIN
         GetSalesDiscount;
       END;
@@ -1246,6 +1421,10 @@ OBJECT Table 11012019 Project Cost Plus Entry
         VALIDATE("Gross Price",
           MeansPriceCalcMgtcu.FindSalesPrice2(
             Principal,'',"Means No.",Quantity,"Unit of Measure",'',"Reference Date",FALSE));
+        //>> 150918 ITERO.AC IME374 Calculate Cost price for means
+        IF MeansRec.Costprice <> 0 THEN
+          VALIDATE("Cost Price", MeansRec.Costprice);
+        //<< 150918 ITERO.AC
       END;
     END;
 
@@ -1402,9 +1581,12 @@ OBJECT Table 11012019 Project Cost Plus Entry
     PROCEDURE GetCostPrice@1100485010();
     VAR
       lvHourLineRec@1100485000 : Record 11012039;
+      lvPriceFactor@1100409000 : Decimal;
     BEGIN
-      IF "Entry No. Project Ledger" = 0 THEN
-        EXIT;
+      //>> 150918 ITERO.AC IME374 Allow calculation of Cost price for manual rows, Override call 18326
+      // IF "Entry No. Project Ledger" = 0 THEN //Call 18326
+      //  EXIT;
+      //<< 150918 ITERO.AC
 
       IF ("Employee No." <> xRec."Employee No.") OR
          ("Project No." <> xRec."Project No.") OR
@@ -1430,7 +1612,11 @@ OBJECT Table 11012019 Project Cost Plus Entry
         IF EmplRec.GET("Employee No.") THEN
           lvHourLineRec.External := EmplRec.External;
         lvHourLineRec.CalcRateAndAmount;
-        "Cost Price" := lvHourLineRec."Unit Cost (LCY)";
+        //>> 160317 ITERO.AC RFC082 Get Price Factor for current Cost Type
+        lvPriceFactor := GetPrincipalCostPriceFactor( "Project No.", Principal, "Cost Type") ;
+        "Cost Price Adjustment" := (lvPriceFactor - 1) * 100; // 160401 ITERO.AC RFC082
+        //<< 160317 ITERO.AC RFC082
+        "Cost Price" := lvHourLineRec."Unit Cost (LCY)" * lvPriceFactor;  // 160317 ITERO.AC RFC082 Added lvPriceFactor
       END;
     END;
 
@@ -1708,7 +1894,8 @@ OBJECT Table 11012019 Project Cost Plus Entry
 
       CostPlusPrice := "Sales Price";
       CostPlusDisc := 0;
-      IF CustRec."Item Price Cost Plus Project" = CustRec."Item Price Cost Plus Project"::GrossMin THEN
+      //IF CustRec."Item Price Cost Plus Entry" = CustRec."Item Price Cost Plus Entry"::GrossMin THEN
+      IF NOT UseCostPrice(CustRec) THEN // LAHE 130117
       BEGIN
         IF ("Gross Price" > "Sales Price") AND ("Gross Price" <> 0) THEN BEGIN
           CostPlusPrice := "Gross Price";
@@ -1720,6 +1907,8 @@ OBJECT Table 11012019 Project Cost Plus Entry
           END;
         END;
       END;
+
+      Currency.InitRoundingPrecision;  // 160317 ITERO.AC RFC082
 
       IF ProjPrincipalRec.GET("Project No.", Principal) THEN
         IF ProjPrincipalRec."Currency Code" <> '' THEN
@@ -1749,7 +1938,8 @@ OBJECT Table 11012019 Project Cost Plus Entry
 
       CostPlusPrice := "Basic Price";
       CostPlusDisc := 0;
-      IF Customer."Item Price Cost Plus Project" = Customer."Item Price Cost Plus Project"::GrossMin THEN
+      //IF Customer."Item Price Cost Plus Entry" = Customer."Item Price Cost Plus Entry"::GrossMin THEN
+      IF NOT UseCostPrice(CustRec) THEN // LAHE 130117
       BEGIN
         IF ("Gross Price" > CostPlusPrice) AND ("Gross Price" <> 0) THEN BEGIN
           CostPlusPrice := "Gross Price";
@@ -1785,6 +1975,14 @@ OBJECT Table 11012019 Project Cost Plus Entry
       HistCostPriceItem@1210190001 : Boolean;
       HistCostPriceCostObject@1210190000 : Boolean;
       UOMMgt@1210190002 : Codeunit 5402;
+      HourCommentLine@1100285001 : Record 11128234;
+      RecRef@1100285000 : RecordRef;
+      DimValue@1100285100 : Record 349;
+      lvSurchargeIfMissingArticles@1100409000 : Decimal;
+      lvPriceHistoryFound@1100409001 : Boolean;
+      lvPriceFactor@1100409002 : Decimal;
+      lvGrossPrice@1100409003 : Decimal;
+      lvTempText@1100409004 : Text[1000];
     BEGIN
       //db, 10-01-11: M22696 (removed from report 11012013)
 
@@ -1861,6 +2059,12 @@ OBJECT Table 11012019 Project Cost Plus Entry
           CostPlusRec."Employee No." := "Employee No."; //call 27723/28625
 
           CostPlusRec.CALCFIELDS("Cost Type"); //call C008533 sn
+          //>> 160317 ITERO.AC RFC082 Price Factor for current Cost Type. lvPriceFactor will only be <> 1 if Cost Price Behaviour is TRUE
+          CostPlusRec.CALCFIELDS("Cost Type");
+          lvPriceFactor := GetPrincipalCostPriceFactor( ProjCde, CustCde, CostPlusRec."Cost Type") ;
+          // lvCostPrice := lvCostPrice * lvPriceFactor;                    // 160401 ITERO.AC RFC082 Do not recalculate cost price
+          CostPlusRec."Cost Price Adjustment" := (lvPriceFactor - 1) * 100; // 160401 ITERO.AC RFC082 New field
+          //<< 160317 ITERO.AC RFC082
           IF CostPlusRec."Cost Type" = CostPlusRec."Cost Type"::Labor THEN BEGIN
             SettlementSheet.INIT;
             IF SettlementSheet.GET(
@@ -1885,7 +2089,8 @@ OBJECT Table 11012019 Project Cost Plus Entry
           END;
           CustRec.GET(CostPlusRec.Principal);  //db, 18-07-06: check option GrossMin by customer instead common setup
           IF CostPlusRec.CheckItemLine THEN
-            IF (CostPlusRec."Basic Price" = 0) OR (HistCostPriceItem = TRUE) THEN BEGIN  //db, 17-09-09: M14148+16524
+            //IF (CostPlusRec."Basic Price" = 0) OR (HistCostPriceItem = TRUE) THEN BEGIN  //db, 17-09-09: M14148+16524
+            IF NOT UseCostPrice(CustRec) THEN BEGIN // LAHE 130117
               CostPlusRec."Cost Price" := lvCostPrice;  //db, 08-08-11
               //db.sn, 24-03-15: C021579
               //CostPlusRec."Unit of Measure" := "Unit of Measure Code"; //C009984
@@ -1893,7 +2098,43 @@ OBJECT Table 11012019 Project Cost Plus Entry
               IF CustRec."Item Price Cost Plus Project" = CustRec."Item Price Cost Plus Project"::CostPrice THEN BEGIN
                 CostPlusRec."Basic Price" := lvCostPrice;
                 CostPlusRec."Basic Price Found at" := TABLECAPTION;
+              END //;
+      //>>131112 ITERO.DJ IME053
+              ELSE BEGIN
+                IF ProjPrincipalRec.GET(JobRec."No.",JobRec."Bill-to Customer No.") THEN
+                  IF ProjPrincipalRec."Cost Price Behaviour" THEN BEGIN
+                    //>> 160401 ITERO.AC RFC082 Clear new field "Cost Price Adjustment" if price found in customer price list
+                    IF CostPlusRec."Price History Found" THEN BEGIN
+                      CostPlusRec."Cost Price Adjustment" := 0;
+                    END ELSE BEGIN
+                      CostPlusRec."Basic Price" := lvCostPrice * lvPriceFactor;
+                      CostPlusRec."Gross Price" := lvCostPrice * lvPriceFactor;
+                    //<< 160401 ITERO.AC RFC082
+                      //>> 160317 ITERO.AC RFC082 Check if Price Factor has been added to Cost Price in order to set relevant text
+                      IF lvPriceFactor <> 1 THEN
+                        CostPlusRec."Basic Price Found at" := Text11128002
+                      ELSE
+                        CostPlusRec."Basic Price Found at" := TABLECAPTION;
+                      //>> 160317 ITERO.AC RFC082
+                    END;                                                  // 160317 ITERO.AC RFC082
+                  END ELSE BEGIN
+                  //>> 160311 ITERO.AC RFC082 Check If Current trade item is missing in Customer Pricelist and the pricelist has SurchargeIfMissingArticles <> 0
+                    lvGrossPrice := 0;
+                    lvPriceHistoryFound := CheckIfPriceHistoryExists(CostPlusRec."Project No.", CostPlusRec."Reference Date", CostPlusRec."Trade Item", lvGrossPrice);
+                    IF NOT lvPriceHistoryFound THEN BEGIN
+                      lvSurchargeIfMissingArticles := GetSurchargeIfMissingArticles(CostPlusRec."Project No.");
+                      IF lvSurchargeIfMissingArticles <> 1 THEN BEGIN
+                        CostPlusRec."Cost Price Adjustment" := (lvSurchargeIfMissingArticles - 1) * 100;   // 160401 ITERO.AC RFC082
+                        CostPlusRec."Basic Price" := lvCostPrice * lvSurchargeIfMissingArticles;
+                        CostPlusRec."Gross Price" := lvCostPrice * lvSurchargeIfMissingArticles;
+                        CostPlusRec."Sales Discount % (Item)" :=0;
+                        CostPlusRec."Basic Price Found at" := Text11128001;
+                      END
+                    END;
+                  //<< 160311 ITERO.AC RFC082
+                  END;
               END;
+      //<<IME053
             END;
 
           lvSavedQuantity := CostPlusRec.Quantity;  //validate item-data disturbes quantity/unit
@@ -1909,7 +2150,8 @@ OBJECT Table 11012019 Project Cost Plus Entry
                            (UPPERCASE(TradeItemRec."Packaging Unit") <> "Unit of Measure Code"));  //db,13-06-08: M10310
             IF (lvMissUnit = FALSE) AND
                ((TradeItemRec."Removal Contribution" <> 0) OR
-                (CustRec."Item Price Cost Plus Project" = CustRec."Item Price Cost Plus Project"::GrossMin)) THEN BEGIN
+                //(CustRec."Item Price Cost Plus Entry" = CustRec."Item Price Cost Plus Entry"::GrossMin)) THEN BEGIN
+                (NOT UseCostPrice(CustRec))) THEN BEGIN  // LAHE 130117
               CostPlusRec.VALIDATE("Trade Item", "Trade Item");
               lvCostPrice := CostPlusRec."Cost Price";  //db, 20-08-07
               //db, 20-05-15: C021579 (disable 32761)
@@ -1941,7 +2183,8 @@ OBJECT Table 11012019 Project Cost Plus Entry
                              (UPPERCASE(BasicItemRec."Packaging Unit") <> "Unit of Measure Code"));  //db,13-06-08: M10310
               IF (lvMissUnit = FALSE) AND
                  ((BasicItemRec."Removal Contribution" <> 0) OR
-                  (CustRec."Item Price Cost Plus Project" = CustRec."Item Price Cost Plus Project"::GrossMin)) THEN BEGIN
+                  //(CustRec."Item Price Cost Plus Entry" = CustRec."Item Price Cost Plus Entry"::GrossMin)) THEN BEGIN
+                  (NOT UseCostPrice(CustRec))) THEN BEGIN  // LAHE 130117
                 CostPlusRec.VALIDATE("Basic Item", "Basic Item");
                 lvCostPrice := CostPlusRec."Cost Price";  //db, 20-08-07
                 //db, 20-05-15: C021579 (disable 32761)
@@ -1972,7 +2215,8 @@ OBJECT Table 11012019 Project Cost Plus Entry
                   END;
                   //db.en, 06-09-11: M22696
                   IF (ItemRec."Removal Contribution" <> 0) OR
-                     (CustRec."Item Price Cost Plus Project" = CustRec."Item Price Cost Plus Project"::GrossMin) THEN BEGIN
+                     //(CustRec."Item Price Cost Plus Entry" = CustRec."Item Price Cost Plus Entry"::GrossMin) THEN BEGIN
+                     (NOT UseCostPrice(CustRec)) THEN BEGIN // LAHE 130117
                     CostPlusRec.VALIDATE("Item No.", "Item No.");
                     lvCostPrice := CostPlusRec."Cost Price";
                     //32761.sn
@@ -2007,6 +2251,33 @@ OBJECT Table 11012019 Project Cost Plus Entry
           CostPlusRec."Entry No. Project Ledger" := "Entry No."; //Call C006617 n
           IF NOT CostPlusRec.CheckItemLine AND (CostPlusRec."Basic Price" = 0) THEN
             CostPlusRec.GetBasicPrice;
+
+          //>> 160317 ITERO.AC RFC082, Add Customer Price List Surcharge if no "Trade Item" or "Item No."
+          IF NOT (CostPlusRec.CheckItemLine) THEN BEGIN
+            //>> 160401 ITERO.AC RFC082, Do not recalculate Cost price but use price factor in Gross Price / Basic Price
+            IF CheckCostPriceBehaviour(ProjCde, CustCde ) THEN BEGIN
+              CostPlusRec."Gross Price" := lvCostPrice * lvPriceFactor;
+              CostPlusRec."Basic Price" := lvCostPrice * lvPriceFactor;
+            END
+            ELSE BEGIN
+            //<< 160401 ITERO.AC RFC082
+              lvSurchargeIfMissingArticles := GetSurchargeIfMissingArticles(ProjCde);
+              IF lvSurchargeIfMissingArticles <> 1 THEN BEGIN
+                IF lvCostPrice <> 0 THEN BEGIN
+                  CostPlusRec."Cost Price Adjustment" := (lvSurchargeIfMissingArticles - 1) * 100;   // 160401 ITERO.AC RFC082
+                  CostPlusRec.VALIDATE("Basic Price", lvCostPrice * lvSurchargeIfMissingArticles);
+                  CostPlusRec."Cost Price" := lvCostPrice;
+                  CostPlusRec."Basic Price Found at" := Text11128001;
+                END;
+              END;
+            END;
+          END;
+
+          // Alter text if Cost Price and we have got a CostPriceSurcharge from current Projcet Principal
+          IF (CostPlusRec."Basic Price Found at" = CostPlusRec.FIELDCAPTION("Cost Price")) AND (lvPriceFactor <> 1) THEN
+            CostPlusRec."Basic Price Found at" := Text11128002;
+          //<< 160317 ITERO.AC RFC082
+
 
           IF (CostPlusRec."Basic Price" = 0) AND (JobRec."Internal Project") THEN
           BEGIN
@@ -2097,7 +2368,16 @@ OBJECT Table 11012019 Project Cost Plus Entry
           CostPlusRec.VALIDATE(Text, Text);
 
           CostPlusRec.MODIFY(TRUE);
-          CostPlusRec.InsertCustPlusCommentLine(Comment);  //*31668.n
+          // SESB.I039 ASH 05.07.2013 >>
+          // CostPlusRec.InsertCustPlusCommentLine(Comment);  //*31668.n
+          RecRef.GETTABLE(ProjEntryRec);
+          HourCommentLine.SETRANGE("Table Name",HourCommentLine."Table Name"::"Job Ledger Entry");
+          HourCommentLine.SETRANGE("Record ID",RecRef.RECORDID);
+          IF HourCommentLine.FINDSET THEN
+            REPEAT
+              CostPlusRec.InsertHourAccCommentLine(HourCommentLine.Comment); // SESB.I039 VKO 30.07.2013
+            UNTIL HourCommentLine.NEXT = 0;
+          // SESB.I039 ASH 05.07.2013 <<
 
           CostPlusRec.DetermineRemovalContribution;
         END;
@@ -2398,6 +2678,199 @@ OBJECT Table 11012019 Project Cost Plus Entry
       END;
     END;
 
+    LOCAL PROCEDURE "---EVRY---"@1100290000();
+    BEGIN
+    END;
+
+    PROCEDURE UseCostPrice@1100290002(_customer@1100290000 : Record 18) : Boolean;
+    VAR
+      _projPrincipal@1100290001 : Record 11012005;
+    BEGIN
+          //new        IF CustRec."Item Price Cost Plus Project" = CustRec."Item Price Cost Plus Project"::GrossMin THEN BEGIN
+          //old replaced (CustRec."Item Price Cost Plus Entry" = CustRec."Item Price Cost Plus Entry"::GrossMin)) THEN BEGIN
+
+      IF NOT _projPrincipal.GET("Project No.",Principal) THEN
+        CLEAR(_projPrincipal);
+      EXIT((_customer."Item Price Cost Plus Project" = _customer."Item Price Cost Plus Project"::CostPrice)
+        OR (_projPrincipal."Cost Price Behaviour" AND NOT "Price History Found"));
+    END;
+
+    PROCEDURE ShowLineComments@61(CommentsEditable@1100294002 : Boolean);
+    VAR
+      HourAccountingCommentLine@1100294001 : Record 11128234;
+      HourAccountingCommentListForm@1001 : Page 11128235;
+      HourAccountingCommentSheetForm@1100294003 : Page 11128234;
+      RecRef@1100294000 : RecordRef;
+    BEGIN
+      // SESB.I039 ASH 05.07.2013 >>
+      RecRef.GETTABLE(Rec);
+      HourAccountingCommentLine.SETRANGE("Table Name",HourAccountingCommentLine."Table Name"::"Project Cost Plus Entry");
+      HourAccountingCommentLine.SETRANGE("Record ID",RecRef.RECORDID);
+      IF CommentsEditable THEN BEGIN
+        HourAccountingCommentSheetForm.SETTABLEVIEW(HourAccountingCommentLine);
+        HourAccountingCommentSheetForm.RUNMODAL;
+      END ELSE BEGIN
+        HourAccountingCommentListForm.SETTABLEVIEW(HourAccountingCommentLine);
+        HourAccountingCommentListForm.RUNMODAL;
+      END;
+      // SESB.I039 ASH 05.07.2013 <<
+    END;
+
+    PROCEDURE InsertHourAccCommentLine@1100294000(CommentLineText@1210190002 : Text[80]);
+    VAR
+      RecRef@1210190000 : RecordRef;
+      HourAccountingCommentLine@1210190001 : Record 11128234;
+      NextLineNo@1210190003 : Integer;
+    BEGIN
+      // SESB.I039 VKO 30.07.2013 >>
+      RecRef.GETTABLE(Rec);
+      HourAccountingCommentLine.SETRANGE("Table Name",HourAccountingCommentLine."Table Name"::"Project Cost Plus Entry");
+      HourAccountingCommentLine.SETFILTER("Record ID",FORMAT(RecRef.RECORDID));
+      NextLineNo := 10000;
+      IF HourAccountingCommentLine.FINDLAST THEN
+        NextLineNo := NextLineNo + HourAccountingCommentLine."Line No.";
+
+      HourAccountingCommentLine.INIT;
+      HourAccountingCommentLine."Table Name" := HourAccountingCommentLine."Table Name"::"Project Cost Plus Entry";
+      HourAccountingCommentLine."Record ID" :=  RecRef.RECORDID;
+      HourAccountingCommentLine."Line No." := NextLineNo;
+      HourAccountingCommentLine.Date := WORKDATE;
+      HourAccountingCommentLine.Comment := CommentLineText;
+      HourAccountingCommentLine.INSERT(TRUE);
+      // SESB.I039 VKO 30.07.2013 <<
+    END;
+
+    PROCEDURE HourAccCommentLineExists@1100294001() : Boolean;
+    VAR
+      RecRef@1210190000 : RecordRef;
+      HourAccountingCommentLine@1100294000 : Record 11128234;
+    BEGIN
+      // SESB.I039 VKO 30.07.2013 >>
+      RecRef.GETTABLE(Rec);
+      HourAccountingCommentLine.SETRANGE("Table Name",HourAccountingCommentLine."Table Name"::"Project Cost Plus Entry");
+      HourAccountingCommentLine.SETFILTER("Record ID",FORMAT(RecRef.RECORDID));
+      EXIT(NOT HourAccountingCommentLine.ISEMPTY);
+      // SESB.I039 VKO 30.07.2013 <<
+    END;
+
+    PROCEDURE DeleteHourAccCommentLines@1100294002() : Boolean;
+    VAR
+      RecRef@1210190000 : RecordRef;
+      HourAccountingCommentLine@1100294000 : Record 11128234;
+    BEGIN
+      // SESB.I039 VKO 30.07.2013 >>
+      RecRef.GETTABLE(Rec);
+      HourAccountingCommentLine.SETRANGE("Table Name",HourAccountingCommentLine."Table Name"::"Project Cost Plus Entry");
+      HourAccountingCommentLine.SETFILTER("Record ID",FORMAT(RecRef.RECORDID));
+      IF NOT HourAccountingCommentLine.ISEMPTY THEN
+        HourAccountingCommentLine.DELETEALL;
+      // SESB.I039 VKO 30.07.2013 <<
+    END;
+
+    LOCAL PROCEDURE "---ITERO---"@1100285000();
+    BEGIN
+    END;
+
+    PROCEDURE SetManualPriceList@1100285001(pUseManualPl@1100285000 : Code[10]);
+    BEGIN
+      BEGIN
+        // ITERO.AC 150914 This flag is used to handle process flow in FindSalesPrice
+        gvUseManualPriceList := pUseManualPl;
+      END;
+    END;
+
+    PROCEDURE CheckCostPriceBehaviour@1100409005(pProjectNo@1100409001 : Code[20];pPrincipalNo@1100409002 : Code[20]) : Boolean;
+    VAR
+      lvProjPrincipal@1100290001 : Record 11012005;
+      lvCustomer@1100409000 : Record 18;
+    BEGIN
+      // 160310 ITERO.AC RFC082 New function used to determine if Cost Price Behaviour should be used
+      IF NOT lvCustomer.GET(pPrincipalNo) THEN
+        CLEAR(lvCustomer);
+      IF NOT lvProjPrincipal.GET(pProjectNo, pPrincipalNo) THEN
+        CLEAR(lvProjPrincipal);
+      EXIT((lvCustomer."Item Price Cost Plus Project" = lvCustomer."Item Price Cost Plus Project"::CostPrice)
+        OR (lvProjPrincipal."Cost Price Behaviour"));
+    END;
+
+    PROCEDURE CheckIfPriceHistoryExists@1100409011(pProjectNo@1100409003 : Code[20];pReferenceDate@1100409004 : Date;pItemCode@1100409001 : Code[20];VAR pGrossPrice@1100409002 : Decimal) : Boolean;
+    VAR
+      lvPriceHistRec@1100409000 : Record 11012315;
+    BEGIN
+      // 160310 ITERO.AC RFC082 New function used to Determine if "Price History Trade Item" exists for Current Customer PriceList And Current Trade Item Code
+
+      IF NOT ProjRec.GET(pProjectNo) THEN CLEAR(ProjRec);
+      pGrossPrice := 0;
+
+      IF ProjRec."Price List Code" <> '' THEN BEGIN
+        lvPriceHistRec.SETCURRENTKEY("Item Code", "Starting Date", "Price List Code");
+        lvPriceHistRec.SETRANGE("Item Code", pItemCode);
+        lvPriceHistRec.SETRANGE("Starting Date", 0D, pReferenceDate);
+        lvPriceHistRec.SETRANGE("Price List Code",ProjRec."Price List Code");
+
+        IF lvPriceHistRec.FINDLAST THEN BEGIN
+          pGrossPrice := lvPriceHistRec."Gross Price";
+          EXIT(TRUE);
+        END;
+      END;
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE GetSurchargeIfMissingArticles@1100409001(pProjNo@1100409000 : Code[20]) : Decimal;
+    VAR
+      lvCustPriceList@1100409001 : Record 11128273;
+    BEGIN
+      // 160311 ITERO.AC RFC082 Get new Surcharge value from current Customer Price List as a factor
+      // Return 1 if ther is no customer price list is selected or it doesnt exist
+
+      IF NOT ProjRec.GET(pProjNo) THEN CLEAR(ProjRec);
+      IF ProjRec."Price List Code" <> '' THEN BEGIN
+        IF lvCustPriceList.GET(ProjRec."Price List Code") THEN
+          EXIT( 1 + (lvCustPriceList.SurchargeIfMissingArticles / 100))
+        ELSE
+          EXIT(1);
+      END;
+      EXIT(1);
+    END;
+
+    PROCEDURE GetPrincipalCostPriceFactor@1100409002(pProjectNo@1100409000 : Code[20];pPrincipalNo@1100409001 : Code[20];pCostType@1100409002 : 'Labor,Material,Subcontracting,Plant,Sundry,Revenue') : Decimal;
+    VAR
+      lvProjPrincipal@1100409004 : Record 11012005;
+      lvCustomer@1100409003 : Record 18;
+      lvPerc@1100409005 : Decimal;
+    BEGIN
+      // 160317 ITERO.AC RFC082 Calculate Cost Price Factor if not Cost Price Behaviour is True
+      IF NOT CheckCostPriceBehaviour( pProjectNo, pPrincipalNo ) THEN BEGIN
+        EXIT(1);
+      END
+      ELSE BEGIN
+
+        lvPerc := 0;
+
+        IF NOT lvCustomer.GET(pPrincipalNo) THEN
+          CLEAR(lvCustomer);
+        IF NOT lvProjPrincipal.GET(pProjectNo, pPrincipalNo) THEN
+          EXIT(1);
+
+          CASE pCostType OF
+            pCostType::Labor:
+              lvPerc := lvProjPrincipal."CostSurcharge % Labor";
+            pCostType::Material:
+              lvPerc := lvProjPrincipal."CostSurcharge % Material";
+            pCostType::Subcontracting:
+              lvPerc := lvProjPrincipal."CostSurcharge % Subcontr.";
+            pCostType::Plant:
+              lvPerc := lvProjPrincipal."CostSurcharge % Plant";
+            pCostType::Sundry:
+              lvPerc := lvProjPrincipal."CostSurcharge % Sundry";
+          END;
+
+          EXIT( 1 + (lvPerc / 100))
+
+      END;
+    END;
+
     PROCEDURE AssistEditSalesCondition@1100525027();
     VAR
       ProjRec@1100525000 : Record 11072003;
@@ -2420,6 +2893,34 @@ OBJECT Table 11012019 Project Cost Plus Entry
     END;
 
     BEGIN
+    {
+      -SE EVRY-
+      LAHE 130117 "Price List Code", "Price History Found"
+      LAHE 130507 "Price History Vendor No."
+
+      SESB.I039 Extend no of characters in hour line
+         ASH 05.07.2013 Trigger GenerateCostPlusFromProjEntry changed
+         ASH 05.07.2013 Trigger ShowLineComments added
+         VKO 30.07.2013 Trigger InsertHourAccCommentLine added
+         VKO 30.07.2013 Trigger HourAccCommentLineExists added
+         VKO 30.07.2013 Trigger DeleteHourAccCommentLines added
+         VKO 30.07.2013 Trigger OnDelete changed
+
+      131112 ITERO.DJ IME053 Added check for cost price behavior in project principal
+      140122 ITERO.DJ/DL ENH007 modified GetSurcharge function, apply for material surcharge
+      140326 4PSSE ITERO.SB Added fields: Periodic Template Code, Periodic Starting Date
+      140610 ITERO.WvG/GH 4PS041 Added |Expense hours to TableRelation on field 70 Wage Component
+      140703 ITERO.MH Added GUIALLOWED
+      150914 ITERO.AC RFC001-2 Added field "Price History PriceList" and "Price History DiscountRef1", added Function SetManualPriceList and modified function FindSalesPrice
+      150918 ITERO.AC IME374 Adjustments in functions GetCostPrice() and UpdateMeansPrice()
+      150919 ITERO.AC IME374 Avoid Cost price calculation in Purchase Discount % (Item) - OnValidate for Cost Type Labour
+      151102 ITERO.AC IME420 Set variable DontUseSingleGTIN in CodeUnit ValidateItems to avoid mixup of GTIN Code in Item Relation
+      160310 ITERO.AC RFC082 Handle calculation for Cost Price Behaviour / Apply Material Surcharge (Bug Fixes)
+      160311 ITERO.AC RFC082 Handle calculation of SurchargeIfMissingArticles in Customer price lists (RFC082 addition 1)
+      160317 ITERO.AC RFC082 Handle calculation of CostSurcharge in project principal. Added price factor for Cost Prices (RFC082 addition 2)
+      160324 ITERO.AC RFC082 Bug fix in ValidateItem
+      160401 ITERO.AC RFC082 Added new field "Cost Price Adjustment" and removed recalculation of Cost Price
+    }
     END.
   }
 }

@@ -34,6 +34,8 @@ OBJECT Report 11012014 Create Project Invoices
     OnPostReport=VAR
                    SaveProjNo@1100525000 : Code[20];
                    InternalCounter@1210190000 : Integer;
+                   lvRotInformation@1100285500 : Record 11128101;
+                   lvRotInformation2@1100285501 : Record 11128101;
                  BEGIN
                    Window.CLOSE;
                    Window.OPEN(
@@ -54,6 +56,7 @@ OBJECT Report 11012014 Create Project Invoices
                          MultipleOrderNos := FALSE;
                          MultipleOrderDates := FALSE;
                          MultipleDim1 := FALSE;
+                         AmountLaborForROT := 0; // 140410 ROT
                          Window.UPDATE(1,Principal);
                          CASE "Collect Invoices By" OF
                            "Collect Invoices By"::InstalmPos,
@@ -158,6 +161,30 @@ OBJECT Report 11012014 Create Project Invoices
                            SalesHeaderRec."Commision Date Customer" := 0D;
                            SalesHeaderRec.MODIFY;
                          END;
+                         // ITERO.MH I012 ROT Amount calculation 140410 <<<
+                         IF (SalesHeaderRec."Job No." <> '') AND (SalesHeaderRec."Document Type" = SalesHeaderRec."Document Type"::Invoice) THEN BEGIN
+                            lvRotInformation.RESET();
+                            lvRotInformation.SETRANGE(Type, lvRotInformation.Type::Project);
+                            lvRotInformation.SETRANGE("Document No.", SalesHeaderRec."Job No.");
+                            lvRotInformation.SETRANGE("Project Principle", Principal);
+                            IF (lvRotInformation.FINDSET(FALSE)) THEN BEGIN
+                               SalesHeaderRec.ROT := TRUE;
+                               SalesHeaderRec.MODIFY(FALSE);
+                               REPEAT
+                                  lvRotInformation2 := lvRotInformation;
+                                  lvRotInformation2.Type := lvRotInformation2.Type::Invoice;
+                                  lvRotInformation2."Invoice No." := SalesHeaderRec."No.";
+                                  lvRotInformation2.INSERT();
+                                  lvRotInformation2.CopyExtendedROTInformation(lvRotInformation); // 150320
+                               UNTIL lvRotInformation.NEXT = 0;
+                               IF (AmountLaborForROT > 0) THEN BEGIN
+                                  lvRotInformation2.ValidateLaborCost; // 141124
+                                  lvRotInformation2.VALIDATE("Labour Cost", AmountLaborForROT);
+                                  lvRotInformation2.MODIFY();
+                               END;
+                            END;
+                         END;
+                         // ITERO.MH I012 ROT AMount calculation 140410 >>>
                        UNTIL NEXT = 0;
 
                      IF InternalChargeMgt.GetNumInternalCharges > 0 THEN
@@ -188,7 +215,12 @@ OBJECT Report 11012014 Create Project Invoices
                    Window.CLOSE;
                    InternalCounter := InternalChargeMgt.GetNumInternalCharges;  //db, 15-04-11
                    IF (InvCounter = 0) AND (CreditMemoCounter = 0) AND (InternalCounter = 0) THEN
-                     MESSAGE(Text005)
+                     // SESB.I022 KD 09.08.2013 >>
+                     IF FinalInstNotCreated THEN
+                       MESSAGE(Text005 + Text11128230)
+                     ELSE
+                     // SESB.I022 KD 09.08.2013 <<
+                       MESSAGE(Text005)
                    ELSE
                      MESSAGE(
                        Text006,
@@ -242,6 +274,13 @@ OBJECT Report 11012014 Create Project Invoices
 
                                   IF ProjRec.Blocked <> ProjRec.Blocked::" " THEN
                                     CurrReport.SKIP;
+
+                                   // SESB.I022 KD 09.08.2013 >>
+                                   IF NOT GenerateInst.CheckFinalInstCreated("Project Principal") THEN BEGIN
+                                     FinalInstNotCreated := TRUE;
+                                     CurrReport.SKIP;
+                                   END;
+                                   // SESB.I022 KD 09.08.2013 <<
 
                                   TmpProjPrincipalRec := "Project Principal";
                                   TmpProjPrincipalRec.INSERT;
@@ -614,6 +653,7 @@ OBJECT Report 11012014 Create Project Invoices
       OnOpenPage=BEGIN
                    TransferCommentLines := TRUE; // **4PS MVOS M28906
                    ExtensionTextHeader := TRUE;  // C000321.n
+                   CheckForInternalProject();  // 160307 ITERO.AC IME443
                  END;
 
     }
@@ -636,6 +676,11 @@ OBJECT Report 11012014 Create Project Invoices
       { 1210190001;2;Field  ;
                   CaptionML=ENU="Extension Text in Invoice Header ";
                   SourceExpr=ExtensionTextHeader }
+
+      { 1100409000;2;Field  ;
+                  CaptionML=ENU=Use Sales Price in Internal Invoice;
+                  SourceExpr=gvUseSalesPriceInInternalInvoice;
+                  Enabled=gvUseSalesPriceInInternalInvoiceEnabled }
 
     }
   }
@@ -725,6 +770,13 @@ OBJECT Report 11012014 Create Project Invoices
       SortingOrder@1210190010 : Integer;
       TransferCommentLines@1100529800 : Boolean;
       ExtensionTextHeader@1210190011 : Boolean;
+      GenerateInst@1100294000 : Codeunit 11012007;
+      FinalInstNotCreated@1100294001 : Boolean;
+      Text11128230@1100294002 : TextConst 'ENU=\Final Installment is not Calculated.';
+      AmountLaborForROT@1100285500 : Decimal;
+      gWithheldAmount@1100285000 : Decimal;
+      gvUseSalesPriceInInternalInvoice@1100285300 : Boolean;
+      gvUseSalesPriceInInternalInvoiceEnabled@1100285301 : Boolean INDATASET;
 
     PROCEDURE TestProject@2();
     BEGIN
@@ -751,6 +803,9 @@ OBJECT Report 11012014 Create Project Invoices
       SkipRecord@1100485000 : Boolean;
       Qty@1100485001 : Decimal;
       InvPrice@1100485002 : Decimal;
+      Job@1100285500 : Record 11072003;
+      ROTInformation@1100285501 : Record 11128101;
+      ROTInformation2@1100285502 : Record 11128101;
     BEGIN
       //reduce parameters for writing saleslines.
       CostPlusEntryRec.INIT;
@@ -900,6 +955,10 @@ OBJECT Report 11012014 Create Project Invoices
                   gDescr2 := '';
                   gUPCode := '';
 
+                  //>> ITERO.LP NAVSE
+                  gWithheldAmount := InstalmRec."Withheld Amount";
+                  //<< ITERO.LP NAVSE
+
                   IF ProjRec."Internal Project" THEN BEGIN
                     //db.sn, 15-04-11
                     InternalChargeMgt.InsertTempGLEntry(0, InstalmRec."Project No.",
@@ -933,6 +992,10 @@ OBJECT Report 11012014 Create Project Invoices
                   InstalmRec."Invoice Price (LCY)" := 0;
                   InstalmRec."Points to be invoiced" := 0;
                   InstalmRec.Chargeable := FALSE;  //db, 10-09-13: C009275
+                  //>> ITERO.LP NAVSE
+                  InstalmRec."Withheld Amount" := 0;
+                  InstalmRec."Amount to Invoice" := 0;
+                  //<< ITERO.LP NAVSE
                   InstalmRec.MODIFY;
                 END;
               UNTIL InstalmRec.NEXT = 0;
@@ -946,6 +1009,8 @@ OBJECT Report 11012014 Create Project Invoices
     VAR
       CostPlusDisc@1210190001 : Decimal;
       CostPlusAmnt@1210190000 : Decimal;
+      lvDimensionValue@1100285500 : Record 349;
+      lvGeneralLedgerSetup@1100285501 : Record 98;
     BEGIN
       //reduce parameters for writing saleslines.
       InstalmRec.INIT;
@@ -985,7 +1050,7 @@ OBJECT Report 11012014 Create Project Invoices
               CostPlusEntryRec.CALCFIELDS("Cost Type");
               CostPlusDisc := 0;
               CostPlusAmnt := CostPlusEntryRec."Sales Price";
-              IF CustRec."Item Price Cost Plus Project" = CustRec."Item Price Cost Plus Project"::GrossMin THEN
+              IF (CustRec."Item Price Cost Plus Project" = CustRec."Item Price Cost Plus Project"::GrossMin) AND (gvUseSalesPriceInInternalInvoice = FALSE) THEN  // 160307 ITERO.AC IME443 Added UseSalesPriceInInternalInvoice
               BEGIN
                 IF (CostPlusEntryRec."Gross Price" > CostPlusEntryRec."Sales Price") AND
                    (CostPlusEntryRec."Gross Price" <> 0) THEN BEGIN
@@ -1063,6 +1128,18 @@ OBJECT Report 11012014 Create Project Invoices
                                 CostPlusDisc,
                                 CostPlusEntryRec."Execution Date");
                 UpdateSalesHeaderInvText(CostPlusEntryRec."Project No.", Principal); //mg, 02-08-11: M24517
+
+                // 140410 New Calculation of ROT Amount <<<
+                // *********************************************************************************************************************
+                // 1. ROT CALCULATON FROM CostPlus
+                // Cost Plus entry is added to a Sales Line. Now check if the entry is ROT-based.
+                lvGeneralLedgerSetup.GET();
+                IF (lvDimensionValue.GET(lvGeneralLedgerSetup."Global Dimension 2 Code", CostPlusEntryRec."Cost Object")) THEN BEGIN
+                   IF (lvDimensionValue."ROT-reduction") THEN AmountLaborForROT += SalesLineRec."Amount Including VAT";
+                END;
+                // *********************************************************************************************************************
+                // 140410 New Calculation of ROT Amount >>>
+
               END;
               CostPlusEntryRec.Invoiced := TRUE;
               CostPlusEntryRec.Chargeable := FALSE;
@@ -1361,6 +1438,8 @@ OBJECT Report 11012014 Create Project Invoices
       SalesHeader2@1100528400 : Record 36;
       DimMgt@1100485000 : Codeunit 408;
       UnitPrice@1210190002 : Decimal;
+      DimValRec2@1000 : Record 349;
+      DimSetID@1100285000 : Integer;
     BEGIN
       //when tablefields used (either for costplus or installment), take care of init values.
 
@@ -1382,8 +1461,13 @@ OBJECT Report 11012014 Create Project Invoices
       SalesLineRec."Wage Component Cost Plus Line" := CostPlusEntryRec."Wage Component";
       SalesLineRec."Hour Rate Cost Plus Line" := CostPlusEntryRec."Hour Rate Code";
       //kzwerver, 110615, en, #RfC Electr. Purchase Order
+      //>> 140326 4PSSE ITERO.SB
+      SalesLineRec."Periodic Template Code":= CostPlusEntryRec."Periodic Template Code";
+      SalesLineRec."Periodic Starting Date":= CostPlusEntryRec."Periodic Starting Date";
+      //<<
+
       IF ((InvoiceType = InvoiceType::CostPlus) AND
-         ((CostPlusEntryRec."Attached to Line No." <> 0) OR (CostPlusEntryRec."Standard Text Code" <> '')))
+         ((CostPlusEntryRec."Attached to Line No." <> 0))) //OR (CostPlusEntryRec."Standard Text Code" <> '')))  //<<
          OR
          ((TmpProjInvBuffer."Collect Invoices By" >= TmpProjInvBuffer."Collect Invoices By"::ProductionMot) AND (Qty = 0))
       THEN BEGIN
@@ -1513,6 +1597,21 @@ OBJECT Report 11012014 Create Project Invoices
         SalesLineRec."Trade Item" := CostPlusEntryRec."Trade Item";
         SalesLineRec.Manufacturer := CostPlusEntryRec.Manufacturer;
         SalesLineRec."Vendor (Trade Item)" := CostPlusEntryRec."Vendor (Trade Item)";
+
+        //>>4PSSE 150116 SS002067
+        IF SalesLineRec."Installment Invoice" THEN BEGIN
+          UnitOfMeasure := '';
+          GenLedgerSetup.GET;
+          IF GenLedgerSetup."Danish localization active" THEN BEGIN
+            DimValRec2.RESET;
+            DimValRec2.SETRANGE("Dimension Code",GenLedgerSetup."Global Dimension 2 Code");   // Filter on Global Dimension 2 Code = Cost Object
+            DimValRec2.SETFILTER(Code,SalesLineRec."Shortcut Dimension 2 Code");              // Filter on the Shortcut Dimension 2 Code from the line
+            IF DimValRec2.FINDFIRST THEN
+              UnitOfMeasure := DimValRec2."Unit of Measure";                                // Fill the Unit of Measure with Unit of Measure of the Cost Object
+          END;
+        END;
+        //<<SS002067
+
         SalesLineRec.VALIDATE("Unit of Measure Code", UnitOfMeasure);
         SalesLineRec.VALIDATE("Line Discount %", DiscPerc);
         SalesLineRec."Sales Surcharge Overtime %" := CostPlusEntryRec."Sales Surcharge Overtime %";
@@ -1580,6 +1679,12 @@ OBJECT Report 11012014 Create Project Invoices
             SalesLineRec."Sub Group" := InstalmRec."Sub Group";
             SalesLineRec.Option := InstalmRec.Option;
           END;
+
+          //>> ITERO.LP NAVSE
+          SalesLineRec."Withheld Amount" := gWithheldAmount;
+          gWithheldAmount := 0;
+          //<< ITERO.LP NAVSE
+
         END ELSE BEGIN
           SalesLineRec."Cost Entry No. Project Ledger" := CostPlusEntryRec."Entry No. Project Ledger";
           IF SalesLineRec."Shortcut Dimension 2 Code" <> '' THEN BEGIN
@@ -1598,11 +1703,27 @@ OBJECT Report 11012014 Create Project Invoices
               VATPostingSetup.FIELDERROR("VAT %", Text011);
           END;
         END;
+        //>> ITERO.LP NAVSE
+
+        //<< ITERO.LP NAVSE
       END;
       SalesLineRec.SuspendUpdateVATAmounts(FALSE);
       IF SalesLineRec.Type <> SalesLineRec.Type::" " THEN
         SalesLineRec.UpdateAmounts;  //* this will also execute 'UpdateVATAmounts'
       SalesLineRec.INSERT;
+
+      //>>IME171
+      DimSetID := SalesLineRec."Dimension Set ID";
+      DimMgt.SetDimensionValueChainsBool(TRUE);
+      IF (NOT SalesLineRec."Plant Invoice") THEN
+        DimMgt.CheckDepartmentAuthorization(DATABASE::"Sales Line", SalesLineRec."Shortcut Dimension 1 Code");
+      DimMgt.ValidateShortcutDimValues(1,SalesLineRec."Shortcut Dimension 1 Code",SalesLineRec."Dimension Set ID");
+      DimMgt.ValidateShortcutDimValues(2,SalesLineRec."Shortcut Dimension 2 Code",SalesLineRec."Dimension Set ID");
+      DimMgt.SetDimensionValueChainsBool(FALSE);
+      IF DimSetID <> SalesLineRec."Dimension Set ID" THEN
+        SalesLineRec.MODIFY;
+      //<<IME171
+
 
       CopyCommentLines(); // **4PS MVOS
 
@@ -1895,6 +2016,31 @@ OBJECT Report 11012014 Create Project Invoices
         EXIT(SalesLine."Line No.");
     END;
 
+    PROCEDURE CheckForInternalProject@1100409000();
+    VAR
+      lvJobsSetupRec@1100409000 : Record 315;
+      lvJobRec@1100409002 : Record 11072003;
+      lvPrincipalInternalProj@1100409001 : Code[20];
+    BEGIN
+      //>> 160307 ITERO.AC IME443, New function used to set Check Box gvUseSalesPriceInInternalInvoice enabled True/False
+
+      // Determine if current project is an Internal Project
+      lvJobsSetupRec.GET;
+      lvPrincipalInternalProj := lvJobsSetupRec."Principal Internal Project";
+
+      lvJobRec.SETFILTER("No.",Job.GETFILTER("No."));
+        IF lvJobRec.FINDFIRST THEN BEGIN
+          IF lvJobRec."Bill-to Customer No." = lvPrincipalInternalProj THEN BEGIN
+            gvUseSalesPriceInInternalInvoiceEnabled := TRUE;
+            gvUseSalesPriceInInternalInvoice := TRUE;
+          END ELSE BEGIN
+            gvUseSalesPriceInInternalInvoiceEnabled := FALSE;
+            gvUseSalesPriceInInternalInvoice := FALSE;
+          END;
+        END;
+      //<< 160307 ITERO.AC IME443
+    END;
+
     BEGIN
     {
       4PS01 07-11-2006 JD: The field Principal Reference (from table Project Principal) or Your Reference (from table Extension Contract)
@@ -1909,6 +2055,23 @@ OBJECT Report 11012014 Create Project Invoices
       4PS08 PS 11-03-08 Call 11005, Quantity in Credit Memo is filled Correctly now
       4PS09 JD 14-08-08 Invoice can be created from Unit Price Production Motivation
       4PS10 JD 11-03-08 Call 14344 Unit Price Production Motivations can be collected by Project or Principal
+      140326 4PSSE ITERO.SB Changed function InsertSalesLine (handle periodic template)
+      SESB.I022 Final Instalment
+         KD 09.08.2013 Trigger "Project Principal - OnAfterGetRecord" changed
+         KD 09.08.2013 Trigger "Report - OnPostReport" changed
+
+      *** 4PSSE.I022 130923
+                    Added code to handle ROT information.
+      140227 ENH020 ROT from fixed price projects
+      140324 ENH020 change to ENH020, project -> principal
+      140410 ITERO.MH I012 Major Change of ROT calculation
+      140905 ITERO.DL IME171 Dimensions are not extended due to lack of VALIDATEs
+      141124 ITERO.MH Fixed validation of labor cost for ROT
+      150116 ITERO.DL SS002067 Installment Unit of Measurement on invoice
+      150320 ITERO.MH Added ROT Extended ROT Information
+      150902 ITERO.SB RFC-001 Handle standard text code lines
+      160315 ITERO.LP Handling of "Withheld Amount".
+      160307 ITERO.AC IME443 New check box "Use Sales Price in Internal Invoice" in request page and changed IF clause in InvoiceCostPlus()
     }
     END.
   }

@@ -1,0 +1,1367 @@
+OBJECT Codeunit 12013604 ExFlow Import Manager
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=EXF350003,NAV2013;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      ExFlowSetup@1100285000 : Record 12013601;
+      EXF001@1100285007 : TextConst 'ENU=Check action messages and reverify';
+      EXF002@1100285019 : TextConst 'ENU=ExFlow Import Type can not be empty!';
+      EXF003@1100285018 : TextConst 'ENU=File Name missing.';
+      EXF004@1100285017 : TextConst 'ENU=File is corrupt';
+      EXF005@1100285016 : TextConst 'ENU=File can not be found in database.';
+      EXF006@1100285015 : TextConst 'ENU=Transferred Inovice';
+      EXF007@1100285012 : TextConst 'ENU=The Invoice is being transferred, including unmodified import data. Continue?';
+      EXF008@1100285013 : TextConst 'ENU=The Invoice (only image) is being transferred. Continue?';
+      EXF009@1100285014 : TextConst 'ENU=No Companies to move to. Assign Company ID:s i ExFlow Setup.';
+      EXF010@1100285011 : TextConst 'ENU=Invoice transfered.';
+      EXF051@1100285001 : TextConst 'ENU=Please select a valid OCR Import path. (Batch/Approval setup)';
+      EXF056@1100285003 : TextConst 'ENU=Imported in Company: %1, Waiting in other companies: %2.';
+      EXF057@1100285002 : TextConst 'ENU=Select a valid batch before importing OCR';
+      EXF115@1100285009 : TextConst 'ENU=Imported in Batch: %1, Waiting in other batches/companies: %2.';
+      EXF116@1100285010 : TextConst 'ENU=%1 Invoices Imported from other companies.';
+      EXF117@1100285005 : TextConst 'ENU=Imported in Company: %1.';
+      EXF150@1100285020 : TextConst 'ENU=Journal Batch %1 is not setup for importing image files.';
+      EXF151@1100285021 : TextConst 'ENU=Do you want to import documents for all batches?';
+      EXF152@1100285022 : TextConst 'ENU=%1 invoices out of a total of %2 have now been created.';
+      EXF153@1100285024 : TextConst 'ENU=Select a valid import path for OCR files.';
+      EXF154@1100285023 : TextConst 'ENU=Importing Documents    @1@@@@@@@@@@@@@@@@@@@';
+      NoOfCompImport@1100285004 : Integer;
+      EXF155@1100285025 : TextConst 'ENU=Dataports cannot be run under the Servicetier!';
+      OStream@1100285008 : OutStream;
+      IStream@1100285006 : InStream;
+
+    PROCEDURE ImportXML@1100285007(pcurrTemplate@1100285013 : Code[10];pcurrBatch@1100285014 : Code[10];HideValidationDialog@1100285005 : Boolean);
+    VAR
+      lrecExfJnlBatch@1100285003 : Record 12013590;
+      ltxtImportPath@1100285002 : Text[250];
+      XMLPortNo@1100285000 : Integer;
+      DataPortImport@1100285001 : Boolean;
+    BEGIN
+      GetDefaultImpDir(pcurrTemplate,pcurrBatch,ltxtImportPath);
+
+      ExFlowSetup.GET(COMPANYNAME, 0);
+      IF ltxtImportPath = '' THEN
+        ERROR(EXF153);
+
+      IF ExFlowSetup."OCR XML Port No." <> 0 THEN
+        XMLPortNo := ExFlowSetup."OCR XML Port No."
+      ELSE
+        XMLPortNo := 12013605;
+
+      //344701
+      lrecExfJnlBatch.GET(pcurrTemplate,pcurrBatch);
+      DataPortImport := FALSE;
+      IF lrecExfJnlBatch."OCR Import Port No." <> 0 THEN BEGIN
+        XMLPortNo := lrecExfJnlBatch."OCR Import Port No.";
+        DataPortImport := lrecExfJnlBatch."OCR Import Type" = lrecExfJnlBatch."OCR Import Type"::Dataport;
+      END;
+      //344701
+
+      RunXMLPort(ltxtImportPath,XMLPortNo,lrecExfJnlBatch."OCR Import File Suffix",DataPortImport);
+
+      ProcessImportHeader(ltxtImportPath);
+      COMMIT;
+
+      ImportExFlowData(pcurrTemplate,pcurrBatch,FALSE,HideValidationDialog); // 350003
+    END;
+
+    PROCEDURE SetupNewImportHeader@1100285022(VAR pvarrecExfDocHead@1100285002 : Record 12013587;precExfImpHeader@1100285005 : Record 12013648;pcurrTemplate@1100285000 : Code[20];pcurrBatch@1100285001 : Code[20]);
+    VAR
+      lrecExfJnlBatch@1100285004 : Record 12013590;
+      ExfValidatePurchDoc@1100285007 : Codeunit 12013594;
+    BEGIN
+      lrecExfJnlBatch.GET(pcurrTemplate,pcurrBatch);
+
+      pvarrecExfDocHead."Bal. Account No." := lrecExfJnlBatch."Predefined Account";
+
+      pvarrecExfDocHead."Vendor ID" := precExfImpHeader."Vendor ID";
+      pvarrecExfDocHead."Currency Code (Import)" := precExfImpHeader."Currency Code";
+
+      //344762
+      IF STRLEN(precExfImpHeader."Import VendorNo") <= MAXSTRLEN(pvarrecExfDocHead."Vendor No. (Import)") THEN
+        pvarrecExfDocHead."Vendor No. (Import)" := precExfImpHeader."Import VendorNo";
+      //344762
+
+      // Amounts
+      pvarrecExfDocHead."Document Amount Including VAT" := ABS(precExfImpHeader."Document Amount Including VAT");
+      pvarrecExfDocHead."Document Amount VAT" := ABS(precExfImpHeader."Document Amount VAT");
+      pvarrecExfDocHead."Document Amount" := pvarrecExfDocHead."Document Amount Including VAT" -
+                                             pvarrecExfDocHead."Document Amount VAT";
+
+      // Dates
+      pvarrecExfDocHead."Posting Date" := precExfImpHeader."Posting Date";
+      pvarrecExfDocHead."Document Date" := precExfImpHeader."Posting Date";
+      pvarrecExfDocHead."Due Date" := precExfImpHeader."Due Date";
+
+      IF (pvarrecExfDocHead."Due Date" = 0D) AND (precExfImpHeader.DueDays <> 0) THEN
+        pvarrecExfDocHead."Due Date" := ExfValidatePurchDoc.CalcIntDate(pvarrecExfDocHead."Document Date",precExfImpHeader.DueDays);
+      pvarrecExfDocHead."Admin Comment" := precExfImpHeader.Message;
+      pvarrecExfDocHead."Due Days (Import)" := precExfImpHeader.DueDays;
+      pvarrecExfDocHead."Posting Date (Import)" := precExfImpHeader."Posting Date";
+      pvarrecExfDocHead."Due Date (Import)" := precExfImpHeader."Due Date";
+
+      ExFlowSetup.GET(COMPANYNAME, 0);
+      IF ExFlowSetup."Set Posting Date To (OCR)" = ExFlowSetup."Set Posting Date To (OCR)"::"Work Date" THEN
+        pvarrecExfDocHead."Posting Date" := WORKDATE;
+
+      IF ExFlowSetup."Set Document Date To" = ExFlowSetup."Set Document Date To"::"Posting Date" THEN
+        pvarrecExfDocHead."Document Date" := pvarrecExfDocHead."Posting Date";
+
+      pvarrecExfDocHead."Order No. (Import)" := precExfImpHeader."Order No.";
+      pvarrecExfDocHead.Reference := precExfImpHeader.Reference;
+      pvarrecExfDocHead."Image File Name" := precExfImpHeader."Image File Name";
+      pvarrecExfDocHead."Image Buffer ID" := precExfImpHeader."Image Buffer ID";
+      pvarrecExfDocHead."Buy-from Vendor Name" := EXF001;
+      pvarrecExfDocHead."VAT calculated from" := pvarrecExfDocHead."VAT calculated from"::"Gross Amount";
+      pvarrecExfDocHead."PO Matched Document" := precExfImpHeader."PO Matched Document";
+      //348824
+      pvarrecExfDocHead."Job No. (Import)" := precExfImpHeader."Job No.";
+      //348824
+    END;
+
+    PROCEDURE SetupNewImportLine@1100285004(precExfDocHead@1100285002 : Record 12013587;VAR pvarrecExfDocLine@1100285005 : Record 12013588;VAR TempLineNo@1100285000 : Integer);
+    BEGIN
+      pvarrecExfDocLine."Inbound Document No." := precExfDocHead."Inbound Document No.";
+      pvarrecExfDocLine."Line No." := TempLineNo;
+      TempLineNo := TempLineNo + 10000;
+
+      pvarrecExfDocLine."Document Type" := precExfDocHead."Document Type";
+      pvarrecExfDocLine."OCR Imported Line" := TRUE;
+    END;
+
+    PROCEDURE CopyImportLine@1100285020(VAR pvarrecExfDocLine@1100285000 : Record 12013588;precExfImpLine@1100285001 : Record 12013649);
+    BEGIN
+      pvarrecExfDocLine."Original No. (Matching)" := GetNo(precExfImpLine);
+      pvarrecExfDocLine."Original No. (Import)" := COPYSTR(pvarrecExfDocLine."Original No. (Matching)",1
+                                                          ,MAXSTRLEN(pvarrecExfDocLine."Original No. (Import)"));
+      pvarrecExfDocLine."Order No. (Import)" := COPYSTR(precExfImpLine."Order No.",1,MAXSTRLEN(pvarrecExfDocLine."Order No. (Import)"));
+      pvarrecExfDocLine."Check Order Line (OCR)" := pvarrecExfDocLine."Order No. (Import)" <> '';
+      pvarrecExfDocLine."Line Amount (Import)" := ConvertLineAmount(pvarrecExfDocLine, precExfImpLine."Line Amount");
+      //348843
+      pvarrecExfDocLine."Direct Unit Cost (Import)" := ConvertLineAmount(pvarrecExfDocLine, CalcDirectUnitCost(precExfImpLine));
+      //348843
+      pvarrecExfDocLine."Description (Import)" := COPYSTR(precExfImpLine.Description,1
+                                                         ,MAXSTRLEN(pvarrecExfDocLine."Description (Import)"));
+      pvarrecExfDocLine."Quantity (Import)" := ConvertLineAmount(pvarrecExfDocLine, precExfImpLine.Quantity);
+      pvarrecExfDocLine."Line Discount % (Import)" := CalcLineDisc(precExfImpLine);
+      pvarrecExfDocLine."Unit of Measure (Import)" := COPYSTR(precExfImpLine."Unit of Measure",1,
+                                                              MAXSTRLEN(pvarrecExfDocLine."Unit of Measure (Import)"));
+      //348824
+      pvarrecExfDocLine."Job No. (Import)" := COPYSTR(precExfImpLine."Job No.",1,MAXSTRLEN(pvarrecExfDocLine."Job No. (Import)"));
+      //348824
+      pvarrecExfDocLine.Description := EXF001;
+
+      // Outstanding Quantity (Order) represents the imported quantity which can not be assigned to a ReciptLine.
+      ExFlowSetup.GET(COMPANYNAME, 0);
+      IF (ExFlowSetup."Order Applies-to" <> ExFlowSetup."Order Applies-to"::"Order not used") AND
+         (pvarrecExfDocLine."Order No. (Import)" <> '')THEN
+        pvarrecExfDocLine."Outstanding Quantity (Order)" := pvarrecExfDocLine."Quantity (Import)";
+    END;
+
+    PROCEDURE Verify@1100285021(pcurrTemplate@1100285004 : Code[10];pcurrBatch@1100285005 : Code[10]);
+    VAR
+      lrecExvPurchHead@1100285003 : Record 12013587;
+      VerifyImportJournal@1100285000 : Report 12013589;
+    BEGIN
+      lrecExvPurchHead.RESET;
+      lrecExvPurchHead.SETRANGE("Journal Template Name",pcurrTemplate);
+      lrecExvPurchHead.SETRANGE("Journal Batch Name",pcurrBatch);
+      CLEAR(VerifyImportJournal);
+      VerifyImportJournal.SETTABLEVIEW(lrecExvPurchHead);
+      VerifyImportJournal.RUNMODAL();
+    END;
+
+    PROCEDURE GetDefaultImpDir@1100285003(pcurrTemplate@1100285000 : Code[10];pcurrBatch@1100285001 : Code[10];VAR pvarTxtPath@1100285002 : Text[250]);
+    VAR
+      lrecExfJnlBatch@1100285003 : Record 12013590;
+    BEGIN
+      ExFlowSetup.GET(COMPANYNAME, 0);
+
+      IF NOT lrecExfJnlBatch.GET(pcurrTemplate,pcurrBatch) THEN
+        ERROR(EXF057);
+
+      IF lrecExfJnlBatch."OCR Import Folder" <> '' THEN
+        pvarTxtPath := lrecExfJnlBatch."OCR Import Folder"
+      ELSE IF ExFlowSetup."Path to New OCR-files" <> '' THEN
+        pvarTxtPath := ExFlowSetup."Path to New OCR-files"
+      ELSE
+        ERROR(EXF051);
+    END;
+
+    PROCEDURE GetNo@1100285002(precExfImpLine@1100285000 : Record 12013649) : Code[20];
+    BEGIN
+      IF precExfImpLine."Vendor Item No." <> '' THEN
+        EXIT(COPYSTR(precExfImpLine."Vendor Item No.",1,20))
+      ELSE
+        EXIT(COPYSTR(precExfImpLine."Original No.",1,20));
+    END;
+
+    PROCEDURE LineIsBlank@1100285000(lrecExfImpLine@1100285000 : Record 12013649) : Boolean;
+    BEGIN
+      WITH lrecExfImpLine DO BEGIN
+        IF lrecExfImpLine."Vendor Item No." <> '' THEN
+          EXIT(FALSE);
+
+        IF lrecExfImpLine."Original No." <> '' THEN
+          EXIT(FALSE);
+
+        IF lrecExfImpLine."Order No." <> '' THEN
+          EXIT(FALSE);
+
+        IF Quantity <> 0 THEN
+          EXIT(FALSE);
+
+        IF "Direct Unit Cost" <> 0 THEN
+          EXIT(FALSE);
+
+        IF Description <> '' THEN
+          EXIT(FALSE);
+
+        IF "Line Amount" <> 0 THEN
+          EXIT(FALSE);
+        //348824
+        IF lrecExfImpLine."Job No." <> '' THEN
+          EXIT(FALSE);
+        //348824
+      END;
+
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE LineIsText@1100285001(lrecExfImpLine@1100285000 : Record 12013649) : Boolean;
+    BEGIN
+      WITH lrecExfImpLine DO BEGIN
+        IF Quantity <> 0 THEN
+          EXIT(FALSE);
+
+        IF "Direct Unit Cost" <> 0 THEN
+          EXIT(FALSE);
+
+        IF "Line Amount" <> 0 THEN
+          EXIT(FALSE);
+      END;
+
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE ImportExFlowData@1100285005(pcurrTemplate@1100285013 : Code[10];pcurrBatch@1100285014 : Code[10];TransferOnly@1100285010 : Boolean;HideValidationDialog@1100285016 : Boolean);
+    VAR
+      lrecExfImpHeader@1100285000 : Record 12013648;
+      lrecExfImpLine@1100285001 : Record 12013649;
+      lrecExfImpHeader2@1100285002 : Record 12013648;
+      lrecExfDocLine@1100285003 : Record 12013588;
+      lrecExFImpAtt@1100285017 : Record 12013652;
+      lrecExFImportAttachment@1100285004 : Record 12013592;
+      lrecExfPurchDocHead@1100285006 : Record 12013587;
+      lrecExfJnlBatch@1100285011 : Record 12013590;
+      NoSeriesMgt@1100285007 : Codeunit 396;
+      SeriesBatchNo@1100285012 : Code[20];
+      TempLineNo@1100285015 : Integer;
+    BEGIN
+      IF NOT GUIALLOWED THEN
+        HideValidationDialog := TRUE;
+
+      NoOfCompImport := 0;
+      ExFlowSetup.GET(COMPANYNAME,0);
+      lrecExfImpHeader.RESET;
+      lrecExfImpHeader.LOCKTABLE;
+
+      IF TransferOnly THEN BEGIN
+        IF ExFlowSetup."Company-ID" = '' THEN
+          EXIT;
+
+         lrecExfImpHeader.SETFILTER("Transfer ExFlow Entry Type",'<>%1',0);
+      END;
+
+      IF ExFlowSetup."Company-ID" <> '' THEN
+        lrecExfImpHeader.SETRANGE("Company-ID",ExFlowSetup."Company-ID");
+
+      lrecExfJnlBatch.GET(pcurrTemplate,pcurrBatch);
+      IF (lrecExfJnlBatch."User ID" <> '') AND (NOT TransferOnly) THEN
+        lrecExfImpHeader.SETRANGE("Scan User ID",lrecExfJnlBatch."User ID");
+      IF lrecExfJnlBatch."Only PO Matched Documents" THEN
+        lrecExfImpHeader.SETRANGE("PO Matched Document", TRUE);
+
+      IF lrecExfImpHeader.FINDSET(TRUE) THEN BEGIN
+        IF NOT TransferOnly THEN BEGIN
+          IF ExFlowSetup."Batch No. is Import Date" THEN
+            SeriesBatchNo := FORMAT(TODAY)
+          ELSE IF (ExFlowSetup."Batch Import Nos." <> '') THEN
+            SeriesBatchNo := NoSeriesMgt.GetNextNo(ExFlowSetup."Batch Import Nos.",TODAY,TRUE);
+        END;
+
+        REPEAT
+          lrecExfPurchDocHead.INIT;
+          //344709
+          lrecExfPurchDocHead.TRANSFERFIELDS(lrecExfImpHeader);
+          lrecExfPurchDocHead."Currency Code" := '';
+          lrecExfPurchDocHead."Inbound Document No." := 0;
+          //344709
+
+          lrecExfPurchDocHead."Journal Template Name" := pcurrTemplate;
+          lrecExfPurchDocHead."Journal Batch Name" := pcurrBatch;
+
+          //344786
+          CASE lrecExfPurchDocHead."ExFlow Document Type" OF
+            lrecExfPurchDocHead."ExFlow Document Type"::Invoice:
+              lrecExfPurchDocHead."Document Type" := lrecExfPurchDocHead."Document Type"::Invoice;
+            lrecExfPurchDocHead."ExFlow Document Type"::"Credit Memo":
+              lrecExfPurchDocHead."Document Type" := lrecExfPurchDocHead."Document Type"::"Credit Memo"
+            ELSE
+              lrecExfPurchDocHead."Document Type" := lrecExfPurchDocHead."Document Type"::Invoice;
+          END;
+          //344786
+
+          lrecExfPurchDocHead."Vendor Document No." := lrecExfImpHeader."Vendor Invoice No.";
+
+          lrecExfPurchDocHead."ExFlow Entry Type" := lrecExfPurchDocHead."ExFlow Entry Type"::"OCR Import";
+          IF lrecExfImpHeader."Transfer ExFlow Entry Type" <> 0 THEN BEGIN
+            lrecExfPurchDocHead."ExFlow Entry Type" := lrecExfImpHeader."Transfer ExFlow Entry Type";
+            lrecExfPurchDocHead."Image Buffer ID" := lrecExfImpHeader."Image Buffer ID";
+            lrecExfPurchDocHead."Buy-from Vendor Name" := lrecExfImpHeader."Transfer Message";
+          END;
+
+          lrecExfPurchDocHead.INSERT(TRUE);
+
+          SetupNewImportHeader(lrecExfPurchDocHead,lrecExfImpHeader,pcurrTemplate,pcurrBatch);
+          lrecExfPurchDocHead.MODIFY(TRUE);
+
+          //344787
+          IF ExFlowSetup."Ignore OCR Lines" <> ExFlowSetup."Ignore OCR Lines"::Always THEN BEGIN
+          //344787
+            TempLineNo := 10000;
+            lrecExfImpLine.RESET;
+            lrecExfImpLine.SETRANGE("Import Document No.", lrecExfImpHeader."Import Document No.");
+            IF lrecExfImpLine.FINDSET THEN BEGIN
+              REPEAT
+                IF NOT LineIsBlank(lrecExfImpLine) THEN BEGIN
+                  lrecExfDocLine.INIT;
+                  //344709
+                  lrecExfDocLine.TRANSFERFIELDS(lrecExfImpLine);
+                  //344709
+                  SetupNewImportLine(lrecExfPurchDocHead,lrecExfDocLine,TempLineNo);
+                  CopyImportLine(lrecExfDocLine,lrecExfImpLine);
+                  lrecExfDocLine."OCR Line is Text Only" := LineIsText(lrecExfImpLine);
+                  lrecExfDocLine.INSERT(TRUE);
+                END;
+              UNTIL lrecExfImpLine.NEXT = 0;
+            END;
+          END;
+
+          //344708
+          lrecExFImpAtt.RESET;
+          lrecExFImpAtt.SETRANGE("Import Document No.", lrecExfImpHeader."Import Document No.");
+          IF lrecExFImpAtt.FINDSET THEN BEGIN
+            lrecExFImportAttachment.RESET;
+            lrecExFImportAttachment.SETRANGE("Inbound Document No.", lrecExfPurchDocHead."Inbound Document No.");
+            IF lrecExFImportAttachment.FINDFIRST THEN
+              TempLineNo := lrecExFImportAttachment."Line No." + 10000
+            ELSE
+              TempLineNo := 10000;
+
+            REPEAT
+              IF lrecExFImpAtt."Attached File" <> '' THEN BEGIN
+                lrecExFImportAttachment.INIT;
+                lrecExFImportAttachment.TRANSFERFIELDS(lrecExFImpAtt);
+                lrecExFImportAttachment."Inbound Document No." := lrecExfPurchDocHead."Inbound Document No.";
+                lrecExFImportAttachment."Line No." := TempLineNo;
+                lrecExFImportAttachment.INSERT;
+                TempLineNo := TempLineNo + 10000;
+              END;
+            UNTIL lrecExFImpAtt.NEXT = 0;
+          END;
+          //344708
+
+          NoOfCompImport := NoOfCompImport + 1;
+          lrecExfImpHeader2 := lrecExfImpHeader;
+          lrecExfPurchDocHead."Import Document No." := CopyImportedHeader(lrecExfImpHeader2,SeriesBatchNo);
+          lrecExfPurchDocHead.MODIFY;
+          lrecExfImpHeader2.DELETE(TRUE);
+
+          COMMIT;
+          lrecExfImpHeader.LOCKTABLE;
+        UNTIL lrecExfImpHeader.NEXT = 0;
+      END;
+
+      COMMIT;
+
+      IF TransferOnly THEN BEGIN
+        IF NoOfCompImport <> 0 THEN BEGIN
+          Verify(pcurrTemplate,pcurrBatch);
+          IF NOT HideValidationDialog THEN
+            MESSAGE(EXF116, NoOfCompImport);
+        END;
+      END
+      ELSE BEGIN
+        Verify(pcurrTemplate,pcurrBatch);
+
+        lrecExfImpHeader.RESET;
+        IF NOT HideValidationDialog THEN BEGIN
+          IF lrecExfJnlBatch."User ID" <> '' THEN
+            MESSAGE(EXF115, NoOfCompImport, lrecExfImpHeader.COUNT)
+          ELSE
+            MESSAGE(EXF056, NoOfCompImport, lrecExfImpHeader.COUNT);
+        END;
+      END;
+    END;
+
+    PROCEDURE TransferInvoice@1100285006(VAR pvarrecExfDocHead@1100285002 : Record 12013587);
+    VAR
+      lrecExfPurchImpHeader@1100285007 : Record 12013648;
+      FromExBlob@1100285000 : Record 12013591;
+      OcrNumber@1100285001 : Integer;
+      ToExBlob@1100285003 : Record 12013591;
+      ExCompanyTransForm@1100285004 : Page 12013629;
+      ExfImpPurchImpHead@1100285008 : Record 12013650;
+    BEGIN
+      IF pvarrecExfDocHead."ExFlow Entry Type" = 0 THEN
+        ERROR(EXF002);
+
+      IF pvarrecExfDocHead."Image File Name" = '' THEN
+        ERROR(EXF003);
+
+      IF pvarrecExfDocHead."Image Buffer ID" = 0 THEN
+        ERROR(EXF004);
+
+      IF NOT FromExBlob.GET(pvarrecExfDocHead."Image Buffer ID") THEN
+        ERROR(EXF005);
+
+      ExFlowSetup.SETFILTER("Company-ID",'<>%1','');
+      IF ExFlowSetup.ISEMPTY THEN
+        ERROR(EXF009);
+
+      ExCompanyTransForm.SETTABLEVIEW(ExFlowSetup);
+      ExCompanyTransForm.LOOKUPMODE(TRUE);
+      IF ExCompanyTransForm.RUNMODAL = ACTION::LookupOK THEN
+        ExCompanyTransForm.GETRECORD(ExFlowSetup)
+      ELSE
+        EXIT;
+
+      IF pvarrecExfDocHead."ExFlow Entry Type" = pvarrecExfDocHead."ExFlow Entry Type"::"OCR Import" THEN BEGIN
+        IF NOT CONFIRM(EXF007) THEN
+          EXIT;
+      END ELSE
+        IF NOT CONFIRM(EXF008) THEN
+          EXIT;
+
+      lrecExfPurchImpHeader.RESET;
+      lrecExfPurchImpHeader.LOCKTABLE;
+      IF lrecExfPurchImpHeader.FINDLAST THEN
+        OcrNumber := lrecExfPurchImpHeader."Import Document No." + 1
+      ELSE
+        OcrNumber := 1;
+
+      lrecExfPurchImpHeader.INIT;
+      IF ExfImpPurchImpHead.GET(pvarrecExfDocHead."Import Document No.") THEN BEGIN
+        lrecExfPurchImpHeader.TRANSFERFIELDS(ExfImpPurchImpHead);
+        TransferImportLine(pvarrecExfDocHead, OcrNumber);
+      END;
+
+      lrecExfPurchImpHeader."Import Document No." := OcrNumber;
+      lrecExfPurchImpHeader."Transfer ExFlow Entry Type" := pvarrecExfDocHead."ExFlow Entry Type";
+      lrecExfPurchImpHeader."Transfer Message" := EXF006;
+      lrecExfPurchImpHeader."Company-ID" := ExFlowSetup."Company-ID";
+
+      // MoveBlob
+      FromExBlob.CALCFIELDS(BLOB);
+      ToExBlob.INIT;
+      ToExBlob.BLOB := FromExBlob.BLOB;
+      ToExBlob."File Extension" := FromExBlob."File Extension";
+      ToExBlob.INSERT(TRUE);
+      lrecExfPurchImpHeader."Image Buffer ID" := ToExBlob."No.";
+      lrecExfPurchImpHeader."Image File Name" := pvarrecExfDocHead."Image File Name";
+
+      lrecExfPurchImpHeader.INSERT;
+
+      pvarrecExfDocHead.DELETE(TRUE);
+      MESSAGE(EXF010);
+    END;
+
+    PROCEDURE TransferToOtherJnl@1100285025(VAR pvarrecExfDocHead@1100285000 : Record 12013587);
+    VAR
+      ExFlowJnlBatches@1100285001 : Page 12013596;
+      ExFlowJnlBatch@1100285002 : Record 12013590;
+      pvarrecExfDocHead2@1100285004 : Record 12013587;
+    BEGIN
+      CLEAR(ExFlowJnlBatches);
+      ExFlowJnlBatches.LOOKUPMODE := TRUE;
+      IF ACTION::LookupOK = ExFlowJnlBatches.RUNMODAL THEN BEGIN
+        ExFlowJnlBatches.GETRECORD(ExFlowJnlBatch);
+
+        IF pvarrecExfDocHead.FIND('-') THEN
+          REPEAT
+            pvarrecExfDocHead2 := pvarrecExfDocHead;
+            pvarrecExfDocHead2."Journal Batch Name" := ExFlowJnlBatch.Name;
+            pvarrecExfDocHead2.MODIFY;
+          UNTIL pvarrecExfDocHead.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE TransferImportLine@1100285008(precExfDocHead@1100285000 : Record 12013587;OcrNumber@1100285002 : Integer);
+    VAR
+      recExfImpLine@1100285001 : Record 12013649;
+      recExfImpPurchImpLine@1100285003 : Record 12013651;
+    BEGIN
+      recExfImpPurchImpLine.SETRANGE("Import Document No.", precExfDocHead."Import Document No.");
+      IF recExfImpPurchImpLine.FINDSET THEN
+        REPEAT
+          recExfImpLine.INIT;
+          recExfImpLine.TRANSFERFIELDS(recExfImpPurchImpLine);
+          recExfImpLine."Import Document No." := OcrNumber;
+          recExfImpLine.INSERT;
+        UNTIL recExfImpPurchImpLine.NEXT = 0;
+    END;
+
+    PROCEDURE CopyImportedHeader@1100285009(VAR precExfImpHeader@1100285000 : Record 12013648;SeriesBatchNo@1100285004 : Code[20]) : Integer;
+    VAR
+      ExfImpPurchImpArchivedHead@1100285001 : Record 12013650;
+      ExfImpPurchImpArchivedHead2@1100285002 : Record 12013650;
+      OcrNumber@1100285003 : Integer;
+    BEGIN
+      ExfImpPurchImpArchivedHead2.RESET;
+      ExfImpPurchImpArchivedHead2.LOCKTABLE;
+      IF ExfImpPurchImpArchivedHead2.FINDLAST THEN
+        OcrNumber := ExfImpPurchImpArchivedHead2."Import Document No." + 1
+      ELSE
+        OcrNumber := 1;
+
+      ExfImpPurchImpArchivedHead.INIT;
+      precExfImpHeader.CALCFIELDS("XML File");
+      ExfImpPurchImpArchivedHead.TRANSFERFIELDS(precExfImpHeader);
+      ExfImpPurchImpArchivedHead."Import Document No." := OcrNumber;
+      IF ExfImpPurchImpArchivedHead."Batch No." = '' THEN
+        ExfImpPurchImpArchivedHead."Batch No." := SeriesBatchNo;
+
+      ExfImpPurchImpArchivedHead.INSERT;
+      CopyImportedLine(precExfImpHeader,OcrNumber);
+      EXIT(OcrNumber);
+    END;
+
+    PROCEDURE CopyImportedLine@1100285011(precExfImpHeader@1100285000 : Record 12013648;OcrNumber@1100285002 : Integer);
+    VAR
+      recExfImpLine@1100285001 : Record 12013649;
+      recExfImpPurchImpArchivedLine@1100285003 : Record 12013651;
+    BEGIN
+      recExfImpLine.SETRANGE("Import Document No.", precExfImpHeader."Import Document No.");
+      IF recExfImpLine.FINDSET THEN
+        REPEAT
+          recExfImpPurchImpArchivedLine.INIT;
+          recExfImpPurchImpArchivedLine.TRANSFERFIELDS(recExfImpLine);
+          recExfImpPurchImpArchivedLine."Import Document No." := OcrNumber;
+          recExfImpPurchImpArchivedLine.INSERT;
+        UNTIL recExfImpLine.NEXT = 0;
+    END;
+
+    PROCEDURE CalcLineDisc@1100285010(precExfImpLine@1100285000 : Record 12013649) : Decimal;
+    BEGIN
+      IF precExfImpLine."Line Discount %" <> 0 THEN
+        EXIT(precExfImpLine."Line Discount %");
+
+      IF precExfImpLine.LineDiscountAmt = 0 THEN
+        EXIT(0);
+
+      // Line Disc% cannot be calculated
+      IF (precExfImpLine."Line Amount" = 0) AND (precExfImpLine."Direct Unit Cost" = 0) THEN
+        EXIT(0);
+
+      IF precExfImpLine."Line Amount" = 0 THEN
+        EXIT(100 * precExfImpLine.LineDiscountAmt / precExfImpLine."Direct Unit Cost");
+
+      IF precExfImpLine.Quantity = 0 THEN
+        precExfImpLine.Quantity := 1;
+
+      IF (precExfImpLine."Direct Unit Cost" = 0) THEN BEGIN
+        precExfImpLine."Direct Unit Cost" := (precExfImpLine."Line Amount"/precExfImpLine.Quantity) - precExfImpLine.LineDiscountAmt;
+        EXIT(100 * precExfImpLine.LineDiscountAmt / precExfImpLine."Direct Unit Cost");
+      END;
+
+      EXIT(100 * precExfImpLine.LineDiscountAmt / precExfImpLine."Direct Unit Cost");
+    END;
+
+    PROCEDURE ImportImage@1000000000(pcurrTemplate@1100285006 : Code[10];pcurrBatch@1100285005 : Code[10];HideValidationDialog@1100285002 : Boolean);
+    VAR
+      TempFileMgtBuffer@1100285008 : TEMPORARY Record 12013593;
+      ExFPurchDocHeader@1100285004 : Record 12013587;
+      lcduVerifyDoc@1100285000 : Codeunit 12013594;
+      ExflowFileMgt@1100285003 : Codeunit 12013602;
+      FilePath@1100285009 : Text[1024];
+      FileName@1100285010 : Text[1024];
+      TempImportNo@1100285001 : Integer;
+    BEGIN
+      ExflowFileMgt.CreateImportFileTable(ImageImportFolder(pcurrTemplate,pcurrBatch),TempFileMgtBuffer);
+
+      IF TempFileMgtBuffer.FINDSET THEN BEGIN
+        REPEAT
+          IF TempFileMgtBuffer."Is a File" AND (STRLEN(TempFileMgtBuffer.Path) > 3) AND (TempFileMgtBuffer."Size (Kb)" > 0) THEN
+            IF (COPYSTR(UPPERCASE(TempFileMgtBuffer.Path),STRLEN(TempFileMgtBuffer.Path)-2,3) = 'TIF') OR
+               (COPYSTR(UPPERCASE(TempFileMgtBuffer.Path),STRLEN(TempFileMgtBuffer.Path)-2,3) = 'HTM') OR
+               (COPYSTR(UPPERCASE(TempFileMgtBuffer.Path),STRLEN(TempFileMgtBuffer.Path)-2,3) = 'PDF') THEN
+              BEGIN
+                ExFPurchDocHeader.INIT;
+                ExFPurchDocHeader."Journal Template Name" := pcurrTemplate;
+                ExFPurchDocHeader."Journal Batch Name" := pcurrBatch;
+                ExFPurchDocHeader.SetupNewLine(ExFPurchDocHeader);
+                FilePath := ExflowFileMgt.Path(TempFileMgtBuffer.Path);
+                FileName := COPYSTR(TempFileMgtBuffer.Path,STRLEN(FilePath)+1);
+                lcduVerifyDoc.UploadImage(ExFPurchDocHeader,FilePath, FileName);
+
+                ExFPurchDocHeader.INSERT(TRUE);
+
+                TempImportNo += 1;
+              END;
+        UNTIL TempFileMgtBuffer.NEXT = 0;
+      END;
+
+      IF NOT HideValidationDialog THEN
+        MESSAGE(EXF117, TempImportNo)
+      ELSE
+        NoOfCompImport := TempImportNo;
+    END;
+
+    PROCEDURE ImageImportFolder@1100285013(pcurrTemplate@1100285002 : Code[10];pcurrBatch@1100285001 : Code[10]) : Text[250];
+    VAR
+      lrecExfJnlBatch@1100285000 : Record 12013590;
+    BEGIN
+      ExFlowSetup.GET(COMPANYNAME,0);
+      lrecExfJnlBatch.GET(pcurrTemplate,pcurrBatch);
+
+      IF lrecExfJnlBatch."Image Import Folder" <> '' THEN
+        EXIT(lrecExfJnlBatch."Image Import Folder")
+      ELSE
+        EXIT(ExFlowSetup."Path to New Invoices");
+    END;
+
+    PROCEDURE ImportDocuments@1100285012(pcurrTemplate@1100285002 : Code[10];pcurrBatch@1100285001 : Code[10];SilentMode@1100285012 : Boolean);
+    VAR
+      lrecExfJnlBatch@1100285000 : Record 12013590;
+      TempExfJnlBatch@1100285003 : TEMPORARY Record 12013590;
+      lrecExFPurchDocHeader@1100285005 : Record 12013587;
+      lrecExfImpHeader@1100285011 : Record 12013648;
+      repBatchCreateInv@1100285004 : Report 12013587;
+      CounterOK@1100285007 : Integer;
+      CounterTotal@1100285006 : Integer;
+      TempCounterOK@1100285009 : Integer;
+      TempCounterTotal@1100285008 : Integer;
+      TotNoOfCompImport@1100285010 : Integer;
+    BEGIN
+      PreImportFunctions; // contains commit
+
+      IF (pcurrTemplate <> '') AND (pcurrBatch <> '') THEN BEGIN
+        lrecExfJnlBatch.GET(pcurrTemplate,pcurrBatch);
+
+        IF lrecExfJnlBatch."Import Type" = lrecExfJnlBatch."Import Type"::None THEN
+          ERROR(EXF150,pcurrBatch)
+        ELSE
+          ImportforBatch(lrecExfJnlBatch,TempExfJnlBatch,FALSE);
+
+        lrecExfJnlBatch.GET(lrecExfJnlBatch."Journal Template Name",lrecExfJnlBatch.Name);
+        IF lrecExfJnlBatch."Automatically Create Documents" THEN BEGIN
+          COMMIT;
+          lrecExFPurchDocHeader.RESET;
+          lrecExFPurchDocHeader.SETRANGE("Journal Template Name", lrecExfJnlBatch."Journal Template Name");
+          lrecExFPurchDocHeader.SETRANGE("Journal Batch Name", lrecExfJnlBatch.Name);
+
+          CLEAR(repBatchCreateInv);
+          repBatchCreateInv.USEREQUESTPAGE := FALSE;
+          repBatchCreateInv.SETTABLEVIEW(lrecExFPurchDocHeader);
+          repBatchCreateInv.SetAutomaticMode(TRUE);
+          repBatchCreateInv.RUNMODAL;
+
+          repBatchCreateInv.GetCounters(CounterTotal,CounterOK);
+          IF GUIALLOWED THEN
+            MESSAGE(EXF152,CounterOK,CounterTotal);
+        END;
+      END
+      ELSE BEGIN // Batch Import
+        IF NOT SilentMode AND GUIALLOWED THEN
+          IF NOT CONFIRM(EXF151,FALSE) THEN
+            EXIT;
+
+        TempExfJnlBatch.RESET;
+        TempExfJnlBatch.DELETEALL;
+
+        TotNoOfCompImport := 0;
+
+        // Journals with USER ID filter and PO Matched docs only
+        NoOfCompImport := 0;
+        lrecExfJnlBatch.RESET;
+        lrecExfJnlBatch.SETRANGE("Only PO Matched Documents", TRUE);
+        lrecExfJnlBatch.SETFILTER("User ID", '<>%1', '');
+        IF lrecExfJnlBatch.FINDSET THEN BEGIN
+          REPEAT
+            ImportforBatch(lrecExfJnlBatch,TempExfJnlBatch,TRUE);
+            TotNoOfCompImport += NoOfCompImport;
+          UNTIL lrecExfJnlBatch.NEXT = 0;
+        END;
+
+        // Journals with no USER ID filter and PO Matched docs only
+        NoOfCompImport := 0;
+        lrecExfJnlBatch.RESET;
+        lrecExfJnlBatch.SETRANGE("Only PO Matched Documents", TRUE);
+        lrecExfJnlBatch.SETFILTER("User ID", '%1', '');
+        IF lrecExfJnlBatch.FINDSET THEN BEGIN
+          REPEAT
+            ImportforBatch(lrecExfJnlBatch,TempExfJnlBatch,TRUE);
+            TotNoOfCompImport += NoOfCompImport;
+          UNTIL lrecExfJnlBatch.NEXT = 0;
+        END;
+
+        // Journals with USER ID filter and no PO Matched docs only
+        NoOfCompImport := 0;
+        lrecExfJnlBatch.RESET;
+        lrecExfJnlBatch.SETRANGE("Only PO Matched Documents", FALSE);
+        lrecExfJnlBatch.SETFILTER("User ID", '<>%1', '');
+        IF lrecExfJnlBatch.FINDSET THEN BEGIN
+          REPEAT
+            ImportforBatch(lrecExfJnlBatch,TempExfJnlBatch,TRUE);
+            TotNoOfCompImport += NoOfCompImport;
+          UNTIL lrecExfJnlBatch.NEXT = 0;
+        END;
+
+        // Journals with no USER ID filter and no PO Matched docs only
+        NoOfCompImport := 0;
+        lrecExfJnlBatch.RESET;
+        lrecExfJnlBatch.SETRANGE("Only PO Matched Documents", FALSE);
+        lrecExfJnlBatch.SETFILTER("User ID", '%1', '');
+        IF lrecExfJnlBatch.FINDSET THEN BEGIN
+          REPEAT
+            ImportforBatch(lrecExfJnlBatch,TempExfJnlBatch,TRUE);
+            TotNoOfCompImport += NoOfCompImport;
+          UNTIL lrecExfJnlBatch.NEXT = 0;
+        END;
+
+        // Journals with no filters to make sure all batches are included
+        NoOfCompImport := 0;
+        CounterOK := 0;
+        lrecExfJnlBatch.RESET;
+        IF lrecExfJnlBatch.FINDSET THEN
+          REPEAT
+            ImportforBatch(lrecExfJnlBatch,TempExfJnlBatch,TRUE);
+            TotNoOfCompImport += NoOfCompImport;
+
+            IF lrecExfJnlBatch."Automatically Create Documents" THEN BEGIN
+              COMMIT;
+
+              lrecExFPurchDocHeader.RESET;
+              lrecExFPurchDocHeader.SETRANGE("Journal Template Name", lrecExfJnlBatch."Journal Template Name");
+              lrecExFPurchDocHeader.SETRANGE("Journal Batch Name", lrecExfJnlBatch.Name);
+
+              CLEAR(repBatchCreateInv);
+              repBatchCreateInv.USEREQUESTPAGE := FALSE;
+              repBatchCreateInv.SETTABLEVIEW(lrecExFPurchDocHeader);
+              repBatchCreateInv.SetAutomaticMode(TRUE);
+              repBatchCreateInv.RUNMODAL;
+
+              repBatchCreateInv.GetCounters(TempCounterTotal,TempCounterOK);
+
+              CounterOK := CounterOK + TempCounterOK;
+              CounterTotal := CounterTotal + TempCounterTotal;
+            END;
+          UNTIL lrecExfJnlBatch.NEXT = 0;
+
+        lrecExfImpHeader.RESET;
+        IF GUIALLOWED THEN
+          IF lrecExfJnlBatch."User ID" <> '' THEN
+            MESSAGE(EXF115,TotNoOfCompImport, lrecExfImpHeader.COUNT)
+          ELSE
+            MESSAGE(EXF056,TotNoOfCompImport, lrecExfImpHeader.COUNT);
+
+        IF (CounterOK <> 0) AND GUIALLOWED THEN
+          MESSAGE(EXF152,CounterOK,CounterTotal);
+      END;
+    END;
+
+    PROCEDURE ImportforBatch@1100285014(lrecExfJnlBatch@1100285000 : Record 12013590;VAR TempExfJnlBatch@1100285001 : TEMPORARY Record 12013590;HideValidationDialog@1100285002 : Boolean);
+    BEGIN
+      TempExfJnlBatch.RESET;
+      TempExfJnlBatch.SETRANGE("Journal Template Name", lrecExfJnlBatch."Journal Template Name");
+      TempExfJnlBatch.SETRANGE(Name, lrecExfJnlBatch.Name);
+      IF TempExfJnlBatch.FIND('-') THEN
+        EXIT;
+
+      CASE lrecExfJnlBatch."Import Type" OF
+        lrecExfJnlBatch."Import Type"::Image:
+          BEGIN
+            ImportImage(lrecExfJnlBatch."Journal Template Name",lrecExfJnlBatch.Name,HideValidationDialog);
+            // ImportImage inserts directly into purch doc header without going to import header first
+          END;
+        lrecExfJnlBatch."Import Type"::OCR:
+          ImportXML(lrecExfJnlBatch."Journal Template Name",lrecExfJnlBatch.Name,HideValidationDialog);
+      END;
+
+      TempExfJnlBatch."Journal Template Name" := lrecExfJnlBatch."Journal Template Name";
+      TempExfJnlBatch.Name := lrecExfJnlBatch.Name;
+      TempExfJnlBatch.INSERT;
+    END;
+
+    PROCEDURE GetExFlowDocType@1100285015(CredText@1100285000 : Text[30]) : Integer;
+    BEGIN
+      CredText := UPPERCASE(DELCHR(CredText));
+      IF CredText IN ['1','YES','TRUE'] THEN
+        EXIT(2);
+
+      EXIT(1); // Invoice is default option
+    END;
+
+    PROCEDURE ProcessImportHeader@1100285019(ImportPath@1100285002 : Text[250]) : Integer;
+    VAR
+      ExPurchImpHeader@1100285000 : Record 12013648;
+      ExPurchImpHeader2@1100285001 : Record 12013648;
+      VendorIDMgt@1100285005 : Codeunit 12013667;
+      ExPurchDocHead@1100285006 : Record 12013587;
+      lcduVerifyDoc@1100285007 : Codeunit 12013594;
+    BEGIN
+      ExFlowSetup.GET(COMPANYNAME,0);
+
+      ExPurchImpHeader2.RESET;
+      IF ExPurchImpHeader2.FINDSET THEN
+        REPEAT
+          IF ExPurchImpHeader2."XML File".HASVALUE() THEN
+            ExPurchImpHeader2.CALCFIELDS("XML File");
+
+          ExPurchImpHeader := ExPurchImpHeader2;
+
+          IF ExPurchImpHeader."Imported by User" = '' THEN BEGIN
+            ExPurchImpHeader."Imported by User" := USERID;
+            ExPurchImpHeader."Imported at DateTime" := CURRENTDATETIME;
+          END;
+
+          IF ExFlowSetup."Set Company ID on OCR Import" AND (ExPurchImpHeader."Company-ID" = '') THEN
+            ExPurchImpHeader."Company-ID" := ExFlowSetup."Company-ID";
+
+          ExPurchImpHeader."Posting Date" := TransformDate(ExPurchImpHeader."Posting Date (Text)");
+          ExPurchImpHeader."Due Date" := TransformDate(ExPurchImpHeader."Due Date (Text)");
+          ExPurchImpHeader."Exflow Document Type" := GetExFlowDocType(ExPurchImpHeader.Credit);
+          TransformInteger(ExPurchImpHeader."DueDays (Text)",ExPurchImpHeader.DueDays);
+
+          IF NOT ExFlowSetup."Set VAT to Zero at OCR Import" THEN
+            TransformNumber(ExPurchImpHeader."Document Amount VAT (Text)",ExPurchImpHeader."Document Amount VAT")
+          ELSE
+            ExPurchImpHeader."Document Amount VAT" := 0;
+
+          TransformNumber(ExPurchImpHeader."Amount Inc. VAT (Text)",ExPurchImpHeader."Document Amount Including VAT");
+
+          IF ExPurchImpHeader.Credit = '' THEN
+            IF ExPurchImpHeader."Document Amount Including VAT" < 0 THEN
+              ExPurchImpHeader."Exflow Document Type" := ExPurchImpHeader."Exflow Document Type"::"Credit Memo";
+
+          VendorIDMgt.RemoveSpecChars(ExPurchImpHeader."Vendor ID");
+          VendorIDMgt.RemoveSpecChars(ExPurchImpHeader."Vendor ID2");
+          VendorIDMgt.RemoveSpecChars(ExPurchImpHeader."Vendor ID3");
+          ExPurchImpHeader."PO Matched Document" := ExPurchImpHeader."Order No." <> '';
+
+          IF ExPurchImpHeader."Image Buffer ID" = 0 THEN BEGIN
+            ExPurchDocHead.INIT;
+            lcduVerifyDoc.UploadImage(ExPurchDocHead,ImportPath,ExPurchImpHeader."Image File Name");
+            IF ExPurchDocHead."Image Buffer ID" <> 0 THEN BEGIN
+              ExPurchImpHeader."Image File Name" := ExPurchDocHead."Image File Name";
+              ExPurchImpHeader."Image Buffer ID" := ExPurchDocHead."Image Buffer ID";
+            END;
+          END;
+
+          TransformNumber(ExPurchImpHeader."Misc Amount 1 (Text)",ExPurchImpHeader."Misc Amount 1");
+          TransformNumber(ExPurchImpHeader."Misc Amount 2 (Text)",ExPurchImpHeader."Misc Amount 2");
+
+          ExPurchImpHeader.MODIFY;
+          FormatConversionHeader(ExPurchImpHeader);
+          ExPurchImpHeader.MODIFY;
+
+          ProcessImportLines(ExPurchImpHeader);
+          ExPurchImpHeader.MODIFY;
+        UNTIL ExPurchImpHeader2.NEXT = 0;
+    END;
+
+    PROCEDURE ProcessImportLines@1100285023(VAR ExPurchImpHeader@1100285000 : Record 12013648);
+    VAR
+      ExPurchImpLine@1100285001 : Record 12013649;
+      ExPurchImpLine2@1100285002 : Record 12013649;
+    BEGIN
+      ExPurchImpLine2.RESET;
+      ExPurchImpLine2.SETRANGE("Import Document No.",ExPurchImpHeader."Import Document No.");
+      IF ExPurchImpLine2.FINDSET THEN
+        REPEAT
+          ExPurchImpLine := ExPurchImpLine2;
+
+          TransformNumber(ExPurchImpLine."Quantity (Text)",ExPurchImpLine.Quantity);
+          TransformNumber(ExPurchImpLine."Direct Unit Cost (Text)",ExPurchImpLine."Direct Unit Cost");
+          TransformNumber(ExPurchImpLine."Line Discount % (Text)",ExPurchImpLine."Line Discount %");
+          TransformNumber(ExPurchImpLine."LineDiscountAmt (Text)",ExPurchImpLine.LineDiscountAmt);
+          TransformNumber(ExPurchImpLine."Line Amount (Text)",ExPurchImpLine."Line Amount");
+
+          IF NOT ExPurchImpHeader."PO Matched Document" THEN
+            ExPurchImpHeader."PO Matched Document" := ExPurchImpLine."Order No." <> '';
+
+          ExPurchImpLine.MODIFY;
+          FormatConversionLine(ExPurchImpHeader,ExPurchImpLine);
+
+          IF ExPurchImpLine."Order No." = '' THEN
+            ExPurchImpLine."Order No." := ExPurchImpHeader."Order No.";
+
+          //348824
+          IF ExPurchImpLine."Job No." = '' THEN
+            ExPurchImpLine."Job No." := ExPurchImpHeader."Job No.";
+          //348824
+          ExPurchImpLine.MODIFY;
+        UNTIL ExPurchImpLine2.NEXT = 0;
+    END;
+
+    PROCEDURE RunXMLPort@1100285024(OCRpath@1100285000 : Text[250];XMLPortNo@1100285001 : Integer;ImportSuffix@1100285011 : Text[10];DataportImport@1100285008 : Boolean);
+    VAR
+      TempFileMgtBuffer@1100285012 : TEMPORARY Record 12013593;
+      ExfPurchImpHeader@1100285016 : Record 12013648;
+      ExflowFileMgt@1100285010 : Codeunit 12013602;
+      ExFlow@1100285009 : Codeunit 12013601;
+      ImportDataMgt@1100285013 : Codeunit 12013622;
+      ToFolder@1100285006 : Text[1024];
+      TempFileName@1100285005 : Text[1024];
+      TempFilePath@1100285004 : Text[1024];
+      UploadFolder@1100285014 : Text[1024];
+      UploadFileName@1100285015 : Text[1024];
+      Window@1100285003 : Dialog;
+      TotCount@1100285002 : Integer;
+      Number@1100285007 : Integer;
+      _tempExFlowBlob@1100285017 : TEMPORARY Record 12013591;
+    BEGIN
+      ToFolder := ExFlow.DayMap(WORKDATE);
+
+      ExflowFileMgt.CreateImportFileTable(OCRpath,TempFileMgtBuffer);
+
+      TempFileMgtBuffer.RESET;
+      TotCount := TempFileMgtBuffer.COUNT;
+      IF TotCount = 0 THEN
+        EXIT;
+
+      IF GUIALLOWED THEN
+        Window.OPEN(EXF154);
+
+      IF (ImportSuffix = '') AND NOT DataportImport THEN
+        ImportSuffix := 'XML';
+
+      ImportSuffix := DELCHR(ImportSuffix,'=','.');
+
+      // Lock import table since parallell imports are not possible
+      ExfPurchImpHeader.RESET;
+      ExfPurchImpHeader.LOCKTABLE;
+      IF ExfPurchImpHeader.FINDLAST THEN;
+
+      IF TempFileMgtBuffer.FINDSET THEN
+        REPEAT
+          Number := Number + 1;
+          IF GUIALLOWED THEN
+            Window.UPDATE(1, ROUND(Number / TotCount * 10000,1));
+
+          IF TempFileMgtBuffer."Is a File" AND (STRLEN(TempFileMgtBuffer.Path) > 3) AND (TempFileMgtBuffer."Size (Kb)" > 0) THEN
+            IF (ImportSuffix = '') OR
+               (UPPERCASE(COPYSTR(TempFileMgtBuffer.Path,STRLEN(TempFileMgtBuffer.Path)-2,3)) = UPPERCASE(ImportSuffix))
+            THEN BEGIN
+                // Copy to UPLOAD Folder
+                TempFilePath := ExflowFileMgt.Path(TempFileMgtBuffer.Path);
+                TempFileName := COPYSTR(TempFileMgtBuffer.Path,STRLEN(TempFilePath)+1);
+                UploadFolder := TempFilePath+'UPLOAD\';
+                UploadFileName := TempFileName+'UPLOAD';
+                ExflowFileMgt.Copy(TempFileName,UploadFileName,TempFilePath,UploadFolder,TempFilePath);
+
+                // Set file information
+                ImportDataMgt.SetImpFileName(TempFileName);
+                ImportDataMgt.SetImpFilePath(TempFilePath);
+                ImportDataMgt.SetUploadFilePathAndName(UploadFolder+UploadFileName);
+                ImportDataMgt.SetToFolder(ToFolder);
+
+                IF NOT DataportImport THEN
+                  ExflowFileMgt.ImportXML(XMLPortNo,TempFilePath,TempFileName,ToFolder)
+                ELSE BEGIN
+                  // Dataports can only be executed from classic client
+                  // IF NOT ISSERVICETIER THEN BEGIN
+                    // DATAPORT.RUNMODAL(XMLPortNo,FALSE);
+                    ERROR(EXF155);
+                  // END
+                END;
+
+                ImportDataMgt.SetImpFileName('');
+                ImportDataMgt.SetImpFilePath('');
+                ImportDataMgt.SetUploadFilePathAndName('');
+                ImportDataMgt.SetToFolder('');
+
+                COMMIT;
+
+              // if XML port missed due to new NAV2013R2 BLOB behaviour
+              ExfPurchImpHeader.FINDLAST();
+              IF NOT ExfPurchImpHeader."XML File".HASVALUE THEN BEGIN
+                ExflowFileMgt.ImportBLOB(_tempExFlowBlob,UploadFolder+UploadFileName);
+                _tempExFlowBlob.BLOB.CREATEINSTREAM(IStream);
+                ExfPurchImpHeader."XML File".CREATEOUTSTREAM(OStream);
+                COPYSTREAM(OStream,IStream);
+                ExfPurchImpHeader.MODIFY();
+                COMMIT();
+              END;
+
+                ExflowFileMgt.Delete(OCRpath,TempFileName);
+                ExflowFileMgt.Delete(UploadFolder,UploadFileName);
+                COMMIT;
+              END;
+        UNTIL TempFileMgtBuffer.NEXT = 0;
+
+      IF GUIALLOWED THEN
+        Window.CLOSE;
+    END;
+
+    PROCEDURE TransformDate@1100285018(InDate@1100285000 : Text[30]) OutDate : Date;
+    VAR
+      Year@1100285001 : Integer;
+      Month@1100285002 : Integer;
+      Day@1100285003 : Integer;
+      DateOK@1100285004 : Boolean;
+      LeapYear@1100285005 : Boolean;
+    BEGIN
+      ExFlowSetup.GET(COMPANYNAME,0);
+
+      OutDate := 0D;
+
+      InDate := DELCHR(InDate,'=',',.-\/');
+
+      CASE ExFlowSetup."Date Format (OCR Import)" OF
+        ExFlowSetup."Date Format (OCR Import)"::YYYYMMDD:
+          BEGIN
+            IF STRLEN(InDate) = 6 THEN BEGIN // YYMMDD
+              DateOK := TRUE;
+              IF NOT EVALUATE(Year, '20' + COPYSTR(InDate,1,2)) THEN
+                DateOK := FALSE;
+              IF NOT EVALUATE(Month, COPYSTR(InDate,3,2)) THEN
+                DateOK := FALSE;
+              IF NOT EVALUATE(Day, COPYSTR(InDate,5,2)) THEN
+                DateOK := FALSE;
+            END
+            ELSE
+              IF STRLEN(InDate) = 8 THEN BEGIN // YYYYMMDD
+                DateOK := TRUE;
+                IF NOT EVALUATE(Year, COPYSTR(InDate,1,4)) THEN
+                  DateOK := FALSE;
+                IF NOT EVALUATE(Month, COPYSTR(InDate,5,2)) THEN
+                  DateOK := FALSE;
+                IF NOT EVALUATE(Day, COPYSTR(InDate,7,2)) THEN
+                  DateOK := FALSE;
+              END;
+          END;
+        ExFlowSetup."Date Format (OCR Import)"::DDMMYYYY:
+          BEGIN
+            IF STRLEN(InDate) = 6 THEN BEGIN // DDMMYY
+              DateOK := TRUE;
+              IF NOT EVALUATE(Day, COPYSTR(InDate,1,2)) THEN
+                DateOK := FALSE;
+              IF NOT EVALUATE(Month, COPYSTR(InDate,3,2)) THEN
+                DateOK := FALSE;
+              IF NOT EVALUATE(Year, '20' + COPYSTR(InDate,5,2)) THEN
+                DateOK := FALSE;
+            END
+            ELSE
+              IF STRLEN(InDate) = 8 THEN BEGIN // DDMMYYYY
+                DateOK := TRUE;
+                IF NOT EVALUATE(Day, COPYSTR(InDate,1,2)) THEN
+                  DateOK := FALSE;
+                IF NOT EVALUATE(Month, COPYSTR(InDate,3,2)) THEN
+                  DateOK := FALSE;
+                IF NOT EVALUATE(Year, COPYSTR(InDate,5,4)) THEN
+                  DateOK := FALSE;
+              END;
+          END;
+        ExFlowSetup."Date Format (OCR Import)"::MMDDYYYY:
+          BEGIN
+            IF STRLEN(InDate) = 6 THEN BEGIN // MMDDYY
+              DateOK := TRUE;
+              IF NOT EVALUATE(Month, COPYSTR(InDate,1,2)) THEN
+                DateOK := FALSE;
+              IF NOT EVALUATE(Day, COPYSTR(InDate,3,2)) THEN
+                DateOK := FALSE;
+              IF NOT EVALUATE(Year, '20' + COPYSTR(InDate,5,2)) THEN
+                DateOK := FALSE;
+            END ELSE
+              IF STRLEN(InDate) = 8 THEN BEGIN // MMDDYYYY
+                DateOK := TRUE;
+                IF NOT EVALUATE(Month, COPYSTR(InDate,1,2)) THEN
+                  DateOK := FALSE;
+                IF NOT EVALUATE(Day, COPYSTR(InDate,3,2)) THEN
+                  DateOK := FALSE;
+                IF NOT EVALUATE(Year, COPYSTR(InDate,5,4)) THEN
+                  DateOK := FALSE;
+              END;
+          END;
+      END;
+
+      IF DateOK THEN
+        IF NOT (Year IN [1950..9999]) THEN
+          DateOK := FALSE;
+      IF DateOK THEN
+        IF NOT (Month IN [1..12]) THEN
+          DateOK := FALSE;
+      IF DateOK THEN
+        CASE Month OF
+          1,3,5,7,8,10,12: DateOK := Day IN [1..31];
+          4,6,9,11: DateOK := Day IN [1..30];
+          2:
+            BEGIN
+              LeapYear := FALSE;
+              IF (Year MOD 4) = 0 THEN
+                IF (Year MOD 100) <> 0 THEN
+                  LeapYear := TRUE
+                ELSE
+                  IF (Year MOD 400) = 0 THEN
+                    LeapYear := TRUE;
+
+              IF LeapYear THEN
+                DateOK := Day IN [1..29]
+              ELSE
+                DateOK := Day IN [1..28];
+            END;
+        END;
+
+      IF DateOK THEN
+        OutDate := DMY2DATE(Day,Month,Year);
+    END;
+
+    PROCEDURE TransformNumber@1100285017(InAmount@1100285000 : Text[30];VAR OutAmount@1100285001 : Decimal);
+    VAR
+      TempPos@1100285003 : Integer;
+      NumberofDec@1100285002 : Integer;
+      i@1100285004 : Integer;
+    BEGIN
+      InAmount := DELCHR(InAmount); // remove blank spaces
+
+      IF InAmount = '' THEN BEGIN
+        OutAmount := 0;
+        EXIT;
+      END;
+
+      TempPos := STRPOS(InAmount,','); // Try to find the decimal character
+      IF TempPos = 0 THEN
+        TempPos := STRPOS(InAmount,'.');
+
+      IF TempPos = 0 THEN
+        EVALUATE(OutAmount, InAmount)
+      ELSE BEGIN
+        NumberofDec := STRLEN(InAmount) - TempPos;
+        InAmount := DELCHR(InAmount,'=',',.');
+        EVALUATE(OutAmount,InAmount);
+        FOR i:=1 TO NumberofDec DO
+          OutAmount := OutAmount / 10;
+      END;
+    END;
+
+    PROCEDURE TransformInteger@1100285016(Text@1100285000 : Text[100];VAR OutInt@1100285001 : Integer);
+    BEGIN
+      Text := DELCHR(Text,'=',DELCHR(Text,'=','0123456789'));
+      IF STRLEN(Text) > 0 THEN
+        EVALUATE(OutInt,Text)
+      ELSE
+        OutInt := 0;
+    END;
+
+    PROCEDURE PreImportFunctions@1100285026();
+    VAR
+      VendorIDMgt@1100285000 : Codeunit 12013667;
+      ExWatchMgt@1100285001 : Codeunit 12013685;
+    BEGIN
+      VendorIDMgt.AutoUpdateRSVendors;
+      COMMIT;
+      ExWatchMgt.ImportList(TRUE);
+      COMMIT;
+    END;
+
+    PROCEDURE CalcDirectUnitCost@1100285027(precExfImpLine@1100285000 : Record 12013649) : Decimal;
+    BEGIN
+      //348843
+      IF (precExfImpLine."Line Amount" <> 0) AND (precExfImpLine."Direct Unit Cost" = 0) THEN BEGIN
+        IF precExfImpLine.Quantity <> 0 THEN
+          EXIT(precExfImpLine."Line Amount"/precExfImpLine.Quantity)
+        ELSE
+          EXIT(precExfImpLine."Line Amount");
+      END;
+
+      EXIT(precExfImpLine."Direct Unit Cost");
+    END;
+
+    PROCEDURE FormatConversionHeader@1100285028(VAR ExPurchImpHeader@1100285000 : Record 12013648);
+    VAR
+      OCRFormatConv@1100285001 : Record 12013614;
+      RecRef@1100285002 : RecordRef;
+      FldRef@1100285003 : FieldRef;
+      TempValue@1100285004 : Text[1024];
+      i@1100285005 : Integer;
+      ValueStrLen@1100285007 : Integer;
+      NoMatch@1100285006 : Boolean;
+      ConvDone@1100285008 : Boolean;
+    BEGIN
+      OCRFormatConv.RESET;
+      OCRFormatConv.SETRANGE(Table, OCRFormatConv.Table::Header);
+      OCRFormatConv.SETFILTER("Field No.", '<>%1', 0);
+      IF ExPurchImpHeader."Company-ID" <> '' THEN BEGIN
+        ExFlowSetup.SETRANGE("Company-ID", ExPurchImpHeader."Company-ID");
+        IF ExFlowSetup.FINDFIRST THEN
+          OCRFormatConv.SETFILTER("Company Name", '%|%2', '', ExFlowSetup."Company Name");
+      END
+      ELSE
+        OCRFormatConv.SETFILTER("Company Name", '%|%2', '', COMPANYNAME);
+
+      IF NOT OCRFormatConv.FINDSET THEN
+        EXIT;
+
+      ConvDone := FALSE;
+
+      REPEAT
+        RecRef.GETTABLE(ExPurchImpHeader);
+        FldRef := RecRef.FIELD(OCRFormatConv."Field No.");
+        TempValue := FldRef.VALUE;
+        ValueStrLen := STRLEN(TempValue);
+        IF STRLEN(OCRFormatConv."In Format") = ValueStrLen THEN BEGIN
+          NoMatch := FALSE;
+          i := 1;
+
+          REPEAT
+            NoMatch := TestMatch(OCRFormatConv."In Format",TempValue,i);
+            i := i + 1;
+          UNTIL NoMatch OR (i > ValueStrLen);
+
+          IF NOT NoMatch THEN BEGIN
+            FormatConvertValue(OCRFormatConv,TempValue);
+
+            IF FORMAT(FldRef.VALUE) <> TempValue THEN BEGIN
+              FldRef.VALUE := TempValue;
+              RecRef.MODIFY;
+
+              ConvDone := TRUE;
+            END;
+          END;
+        END;
+      UNTIL OCRFormatConv.NEXT = 0;
+
+      IF ConvDone THEN BEGIN
+        ExPurchImpHeader.GET(ExPurchImpHeader."Import Document No.");
+        ExPurchImpHeader."Format Converted" := TRUE;
+        ExPurchImpHeader.MODIFY;
+      END;
+    END;
+
+    PROCEDURE FormatConversionLine@1100285031(VAR ExPurchImpHeader@1100285009 : Record 12013648;VAR ExPurchImpLine@1100285000 : Record 12013649);
+    VAR
+      OCRFormatConv@1100285001 : Record 12013614;
+      RecRef@1100285002 : RecordRef;
+      FldRef@1100285003 : FieldRef;
+      TempValue@1100285004 : Text[1024];
+      i@1100285005 : Integer;
+      ValueStrLen@1100285007 : Integer;
+      NoMatch@1100285006 : Boolean;
+      ConvDone@1100285008 : Boolean;
+    BEGIN
+      OCRFormatConv.RESET;
+      OCRFormatConv.SETRANGE(Table, OCRFormatConv.Table::Line);
+      OCRFormatConv.SETFILTER("Field No.", '<>%1', 0);
+      IF ExPurchImpHeader."Company-ID" <> '' THEN BEGIN
+        ExFlowSetup.SETRANGE("Company-ID", ExPurchImpHeader."Company-ID");
+        IF ExFlowSetup.FINDFIRST THEN
+          OCRFormatConv.SETFILTER("Company Name", '%|%2', '', ExFlowSetup."Company Name");
+      END
+      ELSE
+        OCRFormatConv.SETFILTER("Company Name", '%|%2', '', COMPANYNAME);
+
+      IF NOT OCRFormatConv.FINDSET THEN
+        EXIT;
+
+      ConvDone := FALSE;
+
+      REPEAT
+        RecRef.GETTABLE(ExPurchImpLine);
+        FldRef := RecRef.FIELD(OCRFormatConv."Field No.");
+        TempValue := FldRef.VALUE;
+        ValueStrLen := STRLEN(TempValue);
+        IF STRLEN(OCRFormatConv."In Format") = ValueStrLen THEN BEGIN
+          NoMatch := FALSE;
+          i := 1;
+
+          REPEAT
+            NoMatch := TestMatch(OCRFormatConv."In Format",TempValue,i);
+            i := i + 1;
+          UNTIL NoMatch OR (i > ValueStrLen);
+
+          IF NOT NoMatch THEN BEGIN
+            FormatConvertValue(OCRFormatConv,TempValue);
+
+            IF FORMAT(FldRef.VALUE) <> TempValue THEN BEGIN
+              FldRef.VALUE := TempValue;
+              RecRef.MODIFY;
+
+              ConvDone := TRUE;
+            END;
+          END;
+        END;
+      UNTIL OCRFormatConv.NEXT = 0;
+
+      IF ConvDone THEN BEGIN
+        ExPurchImpHeader.GET(ExPurchImpHeader."Import Document No.");
+        ExPurchImpHeader."Format Converted" := TRUE;
+        ExPurchImpHeader.MODIFY;
+
+        ExPurchImpLine.GET(ExPurchImpLine."Import Document No.",ExPurchImpLine."Line No.");
+        ExPurchImpLine."Format Converted" := TRUE;
+        ExPurchImpLine.MODIFY;
+      END;
+    END;
+
+    PROCEDURE FormatConvertValue@1100285033(OCRFormatConv@1100285001 : Record 12013614;VAR TempValue@1100285000 : Text[1024]);
+    BEGIN
+      IF OCRFormatConv."Out Format" = '' THEN BEGIN
+        TempValue := '';
+
+        EXIT;
+      END;
+
+      IF (OCRFormatConv."Copy from position" <> 0) AND (OCRFormatConv.Length <> 0) THEN
+        TempValue := COPYSTR(TempValue,OCRFormatConv."Copy from position",OCRFormatConv.Length);
+      IF OCRFormatConv."Delete Chars" <> '' THEN
+        TempValue := DELCHR(TempValue,'=',OCRFormatConv."Delete Chars");
+      IF OCRFormatConv."Add Prefix" <> '' THEN
+        TempValue := OCRFormatConv."Add Prefix" + TempValue;
+    END;
+
+    PROCEDURE TestMatch@1100285029(InFormat@1100285000 : Text[250];TempValue@1100285001 : Text[250];i@1100285002 : Integer) NoMatch : Boolean;
+    BEGIN
+      CASE InFormat[i] OF
+        '[':
+          BEGIN
+            IF NOT (TempValue[i] IN ['A'..'Z']) THEN
+              NoMatch := TRUE;
+          END;
+        ']':
+          BEGIN
+            IF NOT (TempValue[i] IN ['0'..'9']) THEN
+              NoMatch := TRUE;
+          END;
+        ELSE
+          IF InFormat[i] <> TempValue[i] THEN
+            NoMatch := TRUE;
+      END;
+    END;
+
+    PROCEDURE ConvertLineAmount@1100285030(pvarrecExfDocLine@1100285000 : Record 12013588;Amount@1100285001 : Decimal) : Decimal;
+    BEGIN
+      IF pvarrecExfDocLine."Document Type" = pvarrecExfDocLine."Document Type"::"Credit Memo" THEN
+        EXIT(ABS(Amount))
+      ELSE
+        EXIT(Amount);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

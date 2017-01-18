@@ -1,0 +1,545 @@
+OBJECT Codeunit 11012583 AddLinkedPlantTypeStndItemMgt
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      PlantSetupRec@1100525000 : Record 11012550;
+      PlantOrderRec@1100525007 : Record 11012556;
+      CurrPlantOrderLineRec@1100525010 : Record 11012557;
+      PlantRequestRec@1100525008 : Record 11020520;
+      CurrPlantRequestLineRec@1100525015 : Record 11020521;
+      LinkedPlantRec@1100525013 : Record 11012548;
+      PlantStndItemRec@1100525009 : Record 11020519;
+      LinkedPlantPresent@1100525003 : Boolean;
+      StndItemsPresent@1100525002 : Boolean;
+      GeneralConfirm@1100525017 : Boolean;
+      ConfirmDone@1100525018 : Boolean;
+      Confirmed@1100525019 : Boolean;
+      NextLineNoPlant@1100525011 : Integer;
+      NextLineNoRequest@1100525016 : Integer;
+      Gap@1100525014 : Integer;
+      CurrLineQuantity@1100525001 : Decimal;
+      Text001@1100525004 : TextConst 'ENU=Add linked plant types%2 of Plant Type ''%1'' ?';
+      Text002@1100525005 : TextConst 'ENU=Add standard items of Plant Type ''%1'' ?';
+      Text003@1100525006 : TextConst 'ENU=" (incl. standard items)"';
+      Text004@1100525012 : TextConst 'ENU=Add linked plant types and/or items of Plant Type?';
+
+    PROCEDURE InsertOnPlantOrder@1100525000(PlantOrderLineRec@1100525000 : Record 11012557;UpdateStatus@1100525003 : 'OnInsert,OnModify') : Boolean;
+    VAR
+      OldPlantOrderLineRec@1100525002 : Record 11012557;
+      SalesRelOrderRec@1100525004 : Record 11012787;
+      PlantAllowed@1100525001 : Boolean;
+      ItemsAllowed@1100525005 : Boolean;
+    BEGIN
+      WITH CurrPlantOrderLineRec DO BEGIN
+        COPY(PlantOrderLineRec);
+        IF ("Plant Type" = '') OR (Type <> Type::Plant) OR ("Plant Order No." = '') THEN
+          EXIT(FALSE);
+
+        PlantSetupRec.GET;
+        PlantOrderRec.GET("Plant Order No.");
+        //*DP00183.so
+        //IF PlantOrderRec.Type <> PlantOrderRec.Type::Arrival THEN  //* Add linked Plant Types also only for Arrirval (Tom Z.)
+        //  EXIT(FALSE);
+        //*DP00183.eo
+        //*DP00183.sn  //*DP00485.so
+        //IF PlantOrderRec.Type <> PlantOrderRec.Type::Arrival THEN BEGIN //* Add linked Plant Types also only for Arrival (Tom Z.)
+        //                                                                //* So not for Removal (or Neg. corr.)
+        //  OtherDepotToDepot := PlantOrderRec.IsOtherTransferDepotToDepot(); //* Now also for Other-Tranfer Depot-to-Depot, but only
+        //  IF NOT OtherDepotToDepot THEN                                     //* items. Not linked plant and not items of those.
+        //    EXIT(FALSE);
+        //END;
+        //*DP00183.en  //*DP00485.eo
+        //*DP00485.sn (C009444)
+        // Plant now also for Removal and 'Other Transfers' (was only for Arrival)
+        // Item only for Arrival and 'Other Transfer' from Depot to Depot (remains as it was)
+        CASE PlantOrderRec.Type OF
+          PlantOrderRec.Type::Arrival:
+            BEGIN
+              PlantAllowed := TRUE;
+              ItemsAllowed := TRUE;
+            END;
+          PlantOrderRec.Type::Removal:
+            BEGIN
+              //PlantAllowed := TRUE;  //C018365.o
+              PlantAllowed := PlantSetupRec."Add Linked Plant on Removal";  //C018365.n
+              ItemsAllowed := FALSE;
+            END;
+          PlantOrderRec.Type::"Other Transfers":
+            BEGIN
+              //PlantAllowed := TRUE;  //C018365.o
+              PlantAllowed := PlantSetupRec."Add Linked Plant on Removal";  //C018365.n
+              ItemsAllowed := PlantOrderRec.IsOtherTransferDepotToDepot();  // Item only if Depot-to-Depot
+            END;
+          ELSE
+            EXIT(FALSE);
+        END;
+        IF (NOT PlantAllowed) AND (NOT ItemsAllowed) THEN EXIT(FALSE);  //C018365.n
+        //*DP00485.en
+
+        //IF (NOT PlantSetupRec."Extended Picking Procedure") OR OtherDepotToDepot THEN  //*DP00183.c  //*DP00485.o
+        IF (NOT PlantSetupRec."Extended Picking Procedure") OR (PlantOrderRec.Type <> PlantOrderRec.Type::Arrival) THEN //*DP00485.n
+          CurrLineQuantity := Quantity
+        ELSE
+          CurrLineQuantity := "Asked Quantity";
+        IF CurrLineQuantity <= 0 THEN
+          EXIT(FALSE);
+        IF UpdateStatus = UpdateStatus::OnModify THEN BEGIN  //* OnModify, record is not updated yet
+          IF NOT OldPlantOrderLineRec.GET("Plant Order No.", "Line No.") THEN
+            EXIT(FALSE);
+          IF NOT PlantSetupRec."Extended Picking Procedure" THEN BEGIN
+            IF OldPlantOrderLineRec.Quantity <> 0 THEN
+              EXIT(FALSE);
+          END ELSE BEGIN
+            IF OldPlantOrderLineRec."Asked Quantity" <> 0 THEN
+              EXIT(FALSE);
+          END;
+        END;
+
+        //LinkedPlantTypesOrStndardItems("Plant Type",LinkedPlantPresent,StndItemsPresent,OtherDepotToDepot);//*DP00183.c //DP00485.o
+        //*DP00485.sn
+        LinkedPlantTypesOrStndardItems("Plant Type", LinkedPlantPresent, StndItemsPresent);
+        IF NOT PlantAllowed THEN
+          LinkedPlantPresent := FALSE;
+        IF NOT ItemsAllowed THEN
+          StndItemsPresent := FALSE;
+        //*DP00485.en
+        IF (NOT LinkedPlantPresent) AND (NOT StndItemsPresent) THEN
+          EXIT(FALSE);
+
+        //* If create from Sales Rental Order/-Contract (Heras/Mansveld) then invoiced from the Sales Order (in Sales Company).
+        //* Then do not extra items here (should not be given away for free). Same for linked Plant Types (01-07-2010).
+        SalesRelOrderRec.SETCURRENTKEY(Level, "Plant Document No.");
+        SalesRelOrderRec.SETRANGE(Level, SalesRelOrderRec.Level::PlantOrder);
+        SalesRelOrderRec.SETRANGE("Plant Document No.", "Plant Order No.");
+        IF SalesRelOrderRec.FINDFIRST THEN
+          EXIT(FALSE);
+
+        IF NOT ConfirmAdd("Plant Type", LinkedPlantPresent, StndItemsPresent) THEN
+          EXIT(FALSE);
+
+        NextLineNoPlant := 0;
+        IF StndItemsPresent THEN
+          AddStandardItems(DATABASE::"Plant Order Line", "Plant Type", PlantAllowed, 1);
+        IF LinkedPlantPresent THEN
+          AddLinkedPlantTypes(DATABASE::"Plant Order Line", "Plant Type", ItemsAllowed);  //DP00485.c
+        EXIT(TRUE);
+      END;
+    END;
+
+    PROCEDURE InsertOnPlantRequest@1100525001(PlantRequestLineRec@1100525000 : Record 11020521;UpdateStatus@1100525002 : 'OnInsert,OnModify') : Boolean;
+    VAR
+      OldPlantRequestLineRec@1100525001 : Record 11020521;
+      PlantAllowed@1100525003 : Boolean;
+      ItemsAllowed@1100525004 : Boolean;
+    BEGIN
+      WITH CurrPlantRequestLineRec DO BEGIN
+        COPY(PlantRequestLineRec);
+        IF ("Plant Type" = '') OR (Type <> Type::Plant) OR ("Plant Request No." = '') THEN
+          EXIT(FALSE);
+
+        PlantSetupRec.GET;
+        PlantRequestRec.GET("Plant Request No.");
+        //IF PlantOrderRec.Type <> PlantOrderRec.Type::Arrival THEN  //DP00485.o (also PlantOrderRec must be PlantRequestRec !)
+        //  EXIT(FALSE);
+        //*DP00485.sn (C009444)
+        CASE PlantRequestRec.Type OF
+          PlantRequestRec.Type::Arrival:
+            BEGIN
+              PlantAllowed := TRUE;
+              ItemsAllowed := TRUE;
+            END;
+          PlantRequestRec.Type::Removal:
+            BEGIN
+              PlantAllowed := TRUE;
+              ItemsAllowed := FALSE;
+            END;
+          PlantRequestRec.Type::"Other Transfers":
+            BEGIN
+              PlantAllowed := TRUE;
+              ItemsAllowed := FALSE;  // Item only if Depot-to-Depot but not (yet) allowed on request
+            END;
+          ELSE
+            EXIT(FALSE);
+        END;
+        //*DP00485.en
+
+        CurrLineQuantity := Quantity;
+        IF CurrLineQuantity <= 0 THEN
+          EXIT(FALSE);
+        IF UpdateStatus = UpdateStatus::OnModify THEN BEGIN  //* OnModify, record is not updated yet
+          IF NOT OldPlantRequestLineRec.GET("Plant Request No.", "Line No.") THEN
+            EXIT(FALSE);
+          IF OldPlantRequestLineRec.Quantity <> 0 THEN
+            EXIT(FALSE);
+        END;
+
+        //LinkedPlantTypesOrStndardItems("Plant Type", LinkedPlantPresent, StndItemsPresent, FALSE); //*DP00183.c //DP00485.o
+        //*DP00485.sn
+        LinkedPlantTypesOrStndardItems("Plant Type", LinkedPlantPresent, StndItemsPresent);
+        IF NOT PlantAllowed THEN
+          LinkedPlantPresent := FALSE;
+        IF NOT ItemsAllowed THEN
+          StndItemsPresent := FALSE;
+        //*DP00485.en
+        IF (NOT LinkedPlantPresent) AND (NOT StndItemsPresent) THEN
+          EXIT(FALSE);
+
+        IF NOT ConfirmAdd("Plant Type", LinkedPlantPresent, StndItemsPresent) THEN
+          EXIT(FALSE);
+
+        NextLineNoRequest := 0;
+        IF StndItemsPresent THEN
+          AddStandardItems(DATABASE::"Plant Request Line", "Plant Type", PlantAllowed, 1);
+        IF LinkedPlantPresent THEN
+          AddLinkedPlantTypes(DATABASE::"Plant Request Line", "Plant Type", ItemsAllowed);  //DP00485.c
+        EXIT(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE LinkedPlantTypesOrStndardItems@1100525002(PlantType@1100525001 : Code[20];VAR LinkedPlantTypes@1100525002 : Boolean;VAR StandardItems@1100525003 : Boolean);
+    BEGIN
+      LinkedPlantTypes := FALSE;
+      StandardItems := FALSE;
+
+      IF StandardItemsPresent(PlantType) THEN
+        StandardItems := TRUE;
+      //IF OtherDepotToDepot THEN EXIT;  //*DP00183  //DP00485.o
+      SetLinkedPlantTypeFilters(PlantType, LinkedPlantRec);
+      IF LinkedPlantRec.FINDSET(FALSE,FALSE) THEN BEGIN
+        LinkedPlantTypes := TRUE;
+        IF NOT StandardItems THEN BEGIN
+          REPEAT
+            IF StandardItemsPresent(LinkedPlantRec."Plant Type") THEN
+              StandardItems := TRUE;
+          UNTIL (LinkedPlantRec.NEXT = 0) OR StandardItems;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE StandardItemsPresent@1100525003(PlantType@1100525001 : Code[20]) : Boolean;
+    BEGIN
+      IF (PlantType = '') OR (NOT PlantStndItemRec.READPERMISSION) THEN
+        EXIT(FALSE);
+      SetStandardItemFilters(PlantType, PlantStndItemRec);
+      EXIT(NOT PlantStndItemRec.ISEMPTY);
+    END;
+
+    PROCEDURE SetGeneralConfirm@1100525008();
+    BEGIN
+      GeneralConfirm := TRUE;
+      ConfirmDone := FALSE;
+      Confirmed := FALSE;
+    END;
+
+    LOCAL PROCEDURE ConfirmAdd@1100525006(PlantType@1100525002 : Code[20];LinkedPlantTypes@1100525001 : Boolean;StandardItems@1100525000 : Boolean) : Boolean;
+    VAR
+      InclItemTxt@1100525003 : Text[50];
+    BEGIN
+      IF GeneralConfirm THEN BEGIN
+        IF NOT ConfirmDone THEN BEGIN
+          Confirmed := CONFIRM(Text004, TRUE);
+          ConfirmDone := TRUE;
+        END;
+        EXIT(Confirmed);
+      END;
+
+      IF LinkedPlantTypes THEN BEGIN
+        IF StandardItems THEN
+          InclItemTxt := Text003;
+        IF CONFIRM(Text001, TRUE, PlantType, InclItemTxt) THEN
+          EXIT(TRUE);
+      END ELSE BEGIN
+        IF StandardItems THEN BEGIN
+          IF CONFIRM(Text002, TRUE, PlantType) THEN
+            EXIT(TRUE);
+        END;
+      END;
+      EXIT(FALSE);
+    END;
+
+    LOCAL PROCEDURE AddLinkedPlantTypes@1100525004(TableNo@1100525001 : Integer;PlantType@1100525000 : Code[20];ItemsAllowed@1100525002 : Boolean);
+    BEGIN
+      SetLinkedPlantTypeFilters(PlantType, LinkedPlantRec);
+      IF LinkedPlantRec.FINDSET(FALSE,FALSE) THEN BEGIN
+        REPEAT
+          CASE TableNo OF
+            DATABASE::"Plant Order Line":
+              BEGIN
+                InsertPlantOrderLine(CurrPlantOrderLineRec.Type::Plant, TRUE, ItemsAllowed, 1);
+                IF ItemsAllowed THEN  //DP00485.n  (only if allowed)
+                  AddStandardItems(TableNo, LinkedPlantRec."Plant Type", TRUE, LinkedPlantRec.Quantity);
+              END;
+            DATABASE::"Plant Request Line":
+              BEGIN
+                InsertPlantRequestLine(CurrPlantRequestLineRec.Type::Plant, TRUE, ItemsAllowed, 1);
+                IF ItemsAllowed THEN  //DP00485.n  (only if allowed)
+                  AddStandardItems(TableNo, LinkedPlantRec."Plant Type", TRUE, LinkedPlantRec.Quantity);
+              END;
+          END;
+        UNTIL LinkedPlantRec.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE AddStandardItems@1100525005(TableNo@1100525000 : Integer;PlantType@1100525001 : Code[20];PlantAllowed@1100529000 : Boolean;BomFactor@1100529001 : Decimal);
+    BEGIN
+      SetStandardItemFilters(PlantType, PlantStndItemRec);
+      IF PlantStndItemRec.FINDSET(FALSE,FALSE) THEN BEGIN
+        REPEAT
+          CASE TableNo OF
+            DATABASE::"Plant Order Line":
+              //InsertPlantOrderItemLine();
+              InsertPlantOrderLine(CurrPlantOrderLineRec.Type::Item, PlantAllowed, TRUE, BomFactor);
+            DATABASE::"Plant Request Line":
+              InsertPlantRequestLine(CurrPlantRequestLineRec.Type::Item, PlantAllowed, TRUE, BomFactor);
+          END;
+        UNTIL PlantStndItemRec.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertPlantOrderLine@1100525007(LineType@1100529002 : Option;PlantAllowed@1100529001 : Boolean;ItemsAllowed@1100529000 : Boolean;BomFactor@1100529004 : Decimal);
+    VAR
+      PlantOrderLineRec@1100525000 : Record 11012557;
+      NewLineCounter@1100529003 : Integer;
+      QuantityNewLine@1100525001 : Decimal;
+    BEGIN
+      WITH CurrPlantOrderLineRec DO BEGIN
+        IF NextLineNoPlant = 0 THEN BEGIN  //* Insert new lines between current en next line if possible, else at the end
+          //* Note: When this codeunit (function) is called from the OnInsert trigger then current record is not yet in
+          //*       the database but "Line No," is already filled.
+          PlantOrderLineRec.SETRANGE("Plant Order No.", "Plant Order No.");
+          PlantOrderLineRec.SETFILTER("Line No.", '>%1', "Line No.");
+          IF NOT PlantOrderLineRec.FINDFIRST THEN BEGIN
+            Gap := 10000;
+            NextLineNoPlant := "Line No." + Gap;
+          END ELSE BEGIN
+            NewLineCounter := CountNumberOfNewLines("Plant Type", PlantAllowed, ItemsAllowed);
+            Gap := ROUND((PlantOrderLineRec."Line No." - "Line No.") / (NewLineCounter + 1), 1, '<');
+            IF Gap > 0 THEN
+              NextLineNoPlant := "Line No." + Gap
+            ELSE BEGIN
+              Gap := 10000;
+              PlantOrderLineRec.RESET;
+              PlantOrderLineRec.SETRANGE("Plant Order No.", "Plant Order No.");
+              IF PlantOrderLineRec.FINDLAST THEN
+                NextLineNoPlant := PlantOrderLineRec."Line No.";
+              IF NextLineNoPlant < "Line No." THEN
+                NextLineNoPlant := "Line No.";
+              NextLineNoPlant := NextLineNoPlant + Gap;
+            END;
+          END;
+        END;
+
+        PlantOrderLineRec.INIT;
+        PlantOrderLineRec."Plant Order No." := "Plant Order No.";
+        PlantOrderLineRec."Line No." := NextLineNoPlant;
+        PlantOrderLineRec.VALIDATE(Type, LineType);
+        PlantOrderLineRec.InitRecord;
+
+        IF LineType <> Type::Item THEN BEGIN
+          LinkedPlantRec.CALCFIELDS(Bulk);
+          IF NOT LinkedPlantRec.Bulk THEN
+            QuantityNewLine := ROUND(CurrLineQuantity * LinkedPlantRec.Quantity, 1)
+          ELSE
+            QuantityNewLine := ROUND(CurrLineQuantity * LinkedPlantRec.Quantity, 0.00001);
+          PlantOrderLineRec.VALIDATE("Plant Type", LinkedPlantRec."Plant Type");
+          //IF NOT PlantSetupRec."Extended Picking Procedure" THEN  //DP00485.o
+          IF (NOT PlantSetupRec."Extended Picking Procedure") OR (PlantOrderRec.Type <> PlantOrderRec.Type::Arrival) THEN //DP00485.n
+            PlantOrderLineRec.VALIDATE(Quantity, QuantityNewLine)
+          ELSE
+            PlantOrderLineRec.VALIDATE("Asked Quantity", QuantityNewLine);
+          //DP00485.sn (C009444)
+          IF PlantSetupRec."Removal with Qty. to Receive" AND (PlantOrderRec.Type = PlantOrderRec.Type::Removal) THEN
+             PlantOrderLineRec."Qty. to Receive" := PlantOrderLineRec.Quantity;
+          //DP00485.en
+          PlantOrderLineRec."Expected return on" := "Expected return on";
+          //PlantOrderLineRec."From Rate Code" := "From Rate Code";  //*C011770.o
+          //PlantOrderLineRec."To Rate Code" := "To Rate Code";      //*C011770.o
+          //*C011770.sn
+          PlantOrderLineRec."From Rate Code" := DeterminePOLineFromRateCode(PlantOrderLineRec, "From Rate Code");
+          IF (NOT PlantSetupRec."Rate Codes") OR
+             (PlantOrderLineRec."Rental Type" IN
+              [PlantOrderLineRec."Rental Type"::Sales, PlantOrderLineRec."Rental Type"::"Buy Back and Sales"])
+          THEN
+            PlantOrderLineRec."To Rate Code" := ''
+          ELSE
+            PlantOrderLineRec."To Rate Code" := "To Rate Code";
+          //*C011770.en
+          PlantOrderLineRec."Rental Shift" := "Rental Shift";
+          PlantOrderLineRec."Rental Startdate (To Location)" := "Rental Startdate (To Location)";
+          PlantOrderLineRec."Rental Enddate (From Location)" := "Rental Enddate (From Location)";
+        END ELSE BEGIN
+          PlantStndItemRec.CALCFIELDS("Unit of Measure");
+          QuantityNewLine := ROUND(CurrLineQuantity * PlantStndItemRec.Quantity * BomFactor, 0.00001);
+          PlantOrderLineRec.VALIDATE("Item No.", PlantStndItemRec."Item No.");
+          IF (NOT PlantSetupRec."Extended Picking Procedure") OR (PlantOrderRec.Type <> PlantOrderRec.Type::Arrival) THEN //DP00183.n
+            PlantOrderLineRec.VALIDATE(Quantity, QuantityNewLine)
+          ELSE
+            PlantOrderLineRec.VALIDATE("Asked Quantity", QuantityNewLine);
+        END;
+        PlantOrderLineRec."To Employee Company" := "To Employee Company";
+        PlantOrderLineRec."To Employee No." := "To Employee No.";
+        PlantOrderLineRec.Element := Element;
+        PlantOrderLineRec.INSERT(TRUE);
+        NextLineNoPlant := NextLineNoPlant + Gap;
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertPlantRequestLine@1100525013(LineType@1100525001 : Option;PlantAllowed@1100529001 : Boolean;ItemsAllowed@1100529000 : Boolean;BomFactor@1100529002 : Decimal);
+    VAR
+      PlantRequestLineRec@1100525000 : Record 11020521;
+      NewLineCounter@1100525003 : Integer;
+      QuantityNewLine@1100525002 : Decimal;
+    BEGIN
+      WITH CurrPlantRequestLineRec DO BEGIN
+        IF NextLineNoRequest = 0 THEN BEGIN  //* Insert new lines between current en next line if possible, else at the end
+          //* Note: When this codeunit (function) is called from the OnInsert trigger then current record is not yet in
+          //*       the database but "Line No," is already filled.
+          PlantRequestLineRec.SETRANGE("Plant Request No.", "Plant Request No.");
+          PlantRequestLineRec.SETFILTER("Line No.", '>%1', "Line No.");
+          IF NOT PlantRequestLineRec.FINDFIRST THEN BEGIN
+            Gap := 10000;
+            NextLineNoRequest := "Line No." + Gap;
+          END ELSE BEGIN
+            NewLineCounter := CountNumberOfNewLines("Plant Type", PlantAllowed, ItemsAllowed);
+            Gap := ROUND((PlantRequestLineRec."Line No." - "Line No.") / (NewLineCounter + 1), 1, '<');
+            IF Gap > 0 THEN
+              NextLineNoRequest := "Line No." + Gap
+            ELSE BEGIN
+              Gap := 10000;
+              PlantRequestLineRec.RESET;
+              PlantRequestLineRec.SETRANGE("Plant Request No.", "Plant Request No.");
+              IF PlantRequestLineRec.FINDLAST THEN
+                NextLineNoRequest := PlantRequestLineRec."Line No.";
+              IF NextLineNoRequest < "Line No." THEN
+                NextLineNoRequest := "Line No.";
+              NextLineNoRequest := NextLineNoRequest + Gap;
+            END;
+          END;
+        END;
+
+        IF LineType <> Type::Item THEN BEGIN
+          LinkedPlantRec.CALCFIELDS(Bulk);
+          IF NOT LinkedPlantRec.Bulk THEN
+            QuantityNewLine := ROUND(CurrLineQuantity * LinkedPlantRec.Quantity, 1)
+          ELSE
+            QuantityNewLine := ROUND(CurrLineQuantity * LinkedPlantRec.Quantity, 0.00001);
+        END ELSE BEGIN
+          PlantStndItemRec.CALCFIELDS("Unit of Measure");
+          QuantityNewLine := ROUND(Quantity * PlantStndItemRec.Quantity * BomFactor, 0.00001);
+        END;
+        //
+        PlantRequestLineRec.INIT;
+        PlantRequestLineRec."Plant Request No." := "Plant Request No.";
+        PlantRequestLineRec."Line No." := NextLineNoRequest;
+        PlantRequestLineRec.VALIDATE(Type, LineType);
+        IF LineType <> Type::Item THEN
+          PlantRequestLineRec.VALIDATE("Plant Type", LinkedPlantRec."Plant Type")
+        ELSE
+          PlantRequestLineRec.VALIDATE("Item No.", PlantStndItemRec."Item No.");
+        PlantRequestLineRec.VALIDATE(Quantity, QuantityNewLine);
+        PlantRequestLineRec."Rate Code" := "Rate Code";
+        PlantRequestLineRec."Expected return on" := "Expected return on";
+        PlantRequestLineRec.Element := Element;
+        PlantRequestLineRec.INSERT(TRUE);
+        NextLineNoRequest := NextLineNoRequest + Gap;
+      END;
+    END;
+
+    LOCAL PROCEDURE CountNumberOfNewLines@1100525018(PlantType@1100525001 : Code[20];PlantAllowed@1100529000 : Boolean;ItemsAllowed@1100529001 : Boolean) : Integer;
+    VAR
+      LinkedPlantRec2@1100525000 : Record 11012548;
+      PlantStndItemRec2@1100525002 : Record 11020519;
+      Counter@1100525003 : Integer;
+    BEGIN
+      Counter := 0;
+      IF ItemsAllowed THEN BEGIN
+        SetStandardItemFilters(PlantType, PlantStndItemRec2);
+        Counter := Counter + PlantStndItemRec2.COUNT;
+      END;
+      IF PlantAllowed THEN BEGIN
+        SetLinkedPlantTypeFilters(PlantType, LinkedPlantRec2);
+        IF LinkedPlantRec2.FINDSET(FALSE,FALSE) THEN BEGIN
+          Counter := Counter + LinkedPlantRec2.COUNT;
+          IF ItemsAllowed THEN BEGIN
+            REPEAT
+              SetStandardItemFilters(LinkedPlantRec2."Plant Type", PlantStndItemRec2);
+              Counter := Counter + PlantStndItemRec2.COUNT;
+            UNTIL LinkedPlantRec2.NEXT = 0;
+          END;
+        END;
+      END;
+      EXIT(Counter);
+    END;
+
+    LOCAL PROCEDURE SetLinkedPlantTypeFilters@1100525011(PlantType@1100525000 : Code[20];VAR LinkedPlantRec2@1100525001 : Record 11012548);
+    BEGIN
+      LinkedPlantRec2.RESET;
+      LinkedPlantRec2.SETRANGE("Main Plant Type", PlantType);
+      LinkedPlantRec2.SETFILTER("Plant Type", '<>%1', '');
+      LinkedPlantRec2.SETFILTER(Quantity, '<>%1', 0);
+    END;
+
+    LOCAL PROCEDURE SetStandardItemFilters@1100525012(PlantType@1100525000 : Code[20];VAR PlantStndItemRec2@1100525001 : Record 11020519);
+    BEGIN
+      PlantStndItemRec2.RESET;
+      PlantStndItemRec2.SETRANGE("Plant Type", PlantType);
+      PlantStndItemRec2.SETFILTER("Item No.", '<>%1', '');
+      PlantStndItemRec2.SETFILTER(Quantity, '<>%1', 0);
+    END;
+
+    LOCAL PROCEDURE DeterminePOLineFromRateCode@1100525017(POLine@1100525000 : Record 11012557;OrgFromRateCode@1100525001 : Code[10]) : Code[10];
+    VAR
+      PlantInventory@1100525002 : Record 11012555;
+    BEGIN
+      //*C011770
+      IF (NOT PlantSetupRec."Rate Codes") THEN
+        EXIT('');
+
+      PlantInventory.SETRANGE(Removed, FALSE);
+      PlantInventory.SETRANGE(Location, POLine."From Location");
+      PlantInventory.SETRANGE("Plant Type", POLine."Plant Type");
+      IF POLine."No." <> '' THEN
+        PlantInventory.SETRANGE("Plant No.", POLine."No.");
+      PlantInventory.SETFILTER(Quantity, '<>%1', 0);
+      PlantInventory.SETFILTER("Present from", '<=%1', POLine."Transfer Date");
+      PlantInventory.SETRANGE(Sold, FALSE);
+      IF POLine."Rental Type" IN [POLine."Rental Type"::"Buy Back", POLine."Rental Type"::"Buy Back and Sales"] THEN
+        PlantInventory.SETRANGE(Sold, TRUE);
+
+      IF OrgFromRateCode <> '' THEN BEGIN
+        PlantInventory.SETRANGE("Rate Code", OrgFromRateCode);
+        IF NOT PlantInventory.ISEMPTY THEN
+          EXIT(OrgFromRateCode);
+      END;
+      IF POLine."From Rate Code" <> '' THEN BEGIN  // Is default rate code
+        PlantInventory.SETRANGE("Rate Code", POLine."From Rate Code");
+        IF NOT PlantInventory.ISEMPTY THEN
+          EXIT(POLine."From Rate Code");
+      END;
+      EXIT('');
+    END;
+
+    BEGIN
+    {
+      01-07-2010
+      Function on forms (Plant Order/Request subforms) are moved to this function.
+      Was only standard items, now also linked plant types.
+      NOTE: Items only for 'Arrival', explode linked Plant Types also only for 'Arrival' (according the design, Tom Z.)
+    }
+    END.
+  }
+}
+

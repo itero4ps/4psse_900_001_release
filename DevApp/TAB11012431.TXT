@@ -1,0 +1,826 @@
+OBJECT Table 11012431 Project Planning Activity
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    DataCaptionFields=No.,Description;
+    OnInsert=VAR
+               ProjectPlanningActivity@1100485000 : Record 11012431;
+               NextSummary@1100485001 : Record 11012431;
+               ProjectTimeTable@1100528401 : Record 11020684;
+               RecRef@1100528400 : RecordRef;
+             BEGIN
+               TESTFIELD("Project No.");
+               TESTFIELD(Code);
+
+               "No." := "Project No." + Code;
+
+               IF NOT ActivityCodeIsFormatted THEN
+                 CASE Type OF
+                   Type::Activity:
+                     BEGIN
+                       // Find my parent activity (if any)
+                       ProjectPlanningActivity.SETCURRENTKEY(Type, "Project No.", Code);
+                       ProjectPlanningActivity.SETRANGE(Type, ProjectPlanningActivity.Type::Summary);
+                       ProjectPlanningActivity.SETRANGE("Project No.", "Project No.");
+                       ProjectPlanningActivity.SETFILTER(Code, '<%1', Code);
+                       IF NOT ProjectPlanningActivity.FINDLAST THEN
+                         ProjectPlanningActivity."No." := '';
+                       // This record is not even inserted yet, so I'm assuming no budget lines
+                       // refer to it. Therefore we don't need to update any (no validation).
+                       "Parent Activity No." := ProjectPlanningActivity."No.";
+                     END;
+                   Type::Summary:
+                     BEGIN
+                       // Find activities between myself and the next summary (if any)
+                       NextSummary.SETCURRENTKEY(Type, "Project No.", Code);
+                       NextSummary.SETRANGE(Type, NextSummary.Type::Summary);
+                       NextSummary.SETRANGE("Project No.", "Project No.");
+                       NextSummary.SETFILTER(Code, '>%1', Code);
+
+                       ProjectPlanningActivity.SETCURRENTKEY(Type, "Project No.", Code);
+                       ProjectPlanningActivity.SETRANGE(Type, ProjectPlanningActivity.Type::Activity);
+                       ProjectPlanningActivity.SETRANGE("Project No.", "Project No.");
+
+                       CASE NextSummary.FINDFIRST OF
+                         TRUE: ProjectPlanningActivity.SETFILTER(Code, '>%1&<%2', Code, NextSummary.Code);
+                         FALSE: ProjectPlanningActivity.SETFILTER(Code, '>%1', Code);
+                       END;
+
+                       // jhoek.300910.begin
+                       // ProjectPlanningActivity.MODIFYALL("Parent Activity No.", "No.");
+                       IF ProjectPlanningActivity.FINDSET(TRUE, FALSE) THEN
+                         REPEAT
+                           ProjectPlanningActivity."Parent Activity No." := "No.";
+                           ProjectPlanningActivity.UpdateBudgetLineParentActivity("No.");
+                           ProjectPlanningActivity.MODIFY;
+                         UNTIL ProjectPlanningActivity.NEXT = 0;
+                       // jhoek.300910.end
+
+                       // This record is not even inserted yet, so I'm assuming no budget lines
+                       // refer to it. Therefore we don't need to update any (no validation).
+                       "Parent Activity No." := '';
+                     END;
+                 END;
+
+               Job.GET("Project No.");
+               Job.TESTFIELD("Starting Date");
+               // jh081208.begin
+               Job."Modified after Scheduling" := TRUE;
+               Job.MODIFY;
+               // jh081208.end
+
+               GetProjectTimeTable(ProjectTimeTable);
+
+               "Constraint Type" := "Constraint Type"::"Start No Earlier Than";
+               "Constraint Date" :=
+                 CREATEDATETIME(
+                   Job."Starting Date",
+                   ProjectTimeTable.GetWorkFrom(Job."Starting Date"));
+
+               InitStartEndDateAndDuration(ProjectTimeTable);
+
+               CalcHoursPrognosis();
+
+               DeleteCommentLines;
+               CopyCommentLinesFromBaseAct;
+               RecRef.GETTABLE(Rec);
+               "Record ID" := RecRef.RECORDID;
+             END;
+
+    OnModify=BEGIN
+               TESTFIELD("Project No.");
+               TESTFIELD(Code);
+
+               // jh081208.begin
+               Job.GET("Project No.");
+               Job."Modified after Scheduling" := TRUE;
+               Job.MODIFY;
+               // jh081208.end
+
+               CalcHoursPrognosis();
+             END;
+
+    OnDelete=VAR
+               BudgetLine@1100485000 : Record 11012001;
+               ProjectInstallment@1100485001 : Record 11012018;
+               PreviousSummary@1100485002 : Record 11012431;
+               ProjectPlanningActivity@1100485003 : Record 11012431;
+               ReqActCapRec@1100525000 : Record 11125708;
+             BEGIN
+               BudgetLine.SETCURRENTKEY("Project Planning Activity No.");
+               BudgetLine.SETRANGE("Project Planning Activity No.", "No.");
+               IF NOT BudgetLine.ISEMPTY THEN
+                 ERROR(Text005, TABLECAPTION, "No.", BudgetLine.TABLECAPTION);
+
+               ProjectInstallment.SETCURRENTKEY("Project Activity No.");
+               ProjectInstallment.SETRANGE("Project Activity No.", "No.");
+               IF NOT ProjectInstallment.ISEMPTY THEN
+                 ERROR(Text005, TABLECAPTION, "No.", ProjectInstallment.TABLECAPTION);
+
+               DeleteAssignedActCapacities;
+
+               ProjectPlanningConstraint.RESET;
+               ProjectPlanningConstraint.SETRANGE("From Project Activity No.", "No.");
+               ProjectPlanningConstraint.DELETEALL;
+
+               ReqActCapRec.SETRANGE("Project No.", "Project No.");
+               ReqActCapRec.SETRANGE("Activity Code", Code);
+               ReqActCapRec.DELETEALL(TRUE);  //* True, also delete in related tables
+
+               IF Type = Type::Summary THEN BEGIN
+                 IF ActivityCodeIsFormatted THEN
+                   DeleteChildren
+                 ELSE BEGIN
+                   // Find my child activities
+                   ProjectPlanningActivity.SETCURRENTKEY("Parent Activity No.");
+                   ProjectPlanningActivity.SETRANGE("Parent Activity No.", "No.");
+
+                   PreviousSummary.SETCURRENTKEY(Type, "Project No.", Code);
+                   PreviousSummary.SETRANGE(Type, PreviousSummary.Type::Summary);
+                   PreviousSummary.SETRANGE("Project No.", "Project No.");
+                   PreviousSummary.SETFILTER(Code, '<%1', Code);
+                   IF NOT PreviousSummary.FINDLAST THEN
+                     PreviousSummary."No." := '';
+
+                   // jhoek.300910.begin
+                   // ProjectPlanningActivity.MODIFYALL("Parent Activity No.", PreviousSummary."No.");
+                   IF ProjectPlanningActivity.FINDSET(TRUE, FALSE) THEN
+                     REPEAT
+                       ProjectPlanningActivity."Parent Activity No." := PreviousSummary."No.";
+                       ProjectPlanningActivity.UpdateBudgetLineParentActivity(PreviousSummary."No.");
+                       ProjectPlanningActivity.MODIFY;
+                     UNTIL ProjectPlanningActivity.NEXT = 0;
+                   // jhoek.300910.end
+                 END;
+               END;
+
+               // jh081208.begin
+               IF Job.GET("Project No.") THEN BEGIN
+                 Job."Modified after Scheduling" := TRUE;
+                 Job.MODIFY;
+               END;
+               // jh081208.end
+
+               DeleteCommentLines;
+             END;
+
+    OnRename=BEGIN
+               ERROR(Text000);
+             END;
+
+    CaptionML=ENU=Project Planning Activity;
+    LookupPageID=Page11072312;
+    DrillDownPageID=Page11072312;
+  }
+  FIELDS
+  {
+    { 5   ;   ;No.                 ;Code30        ;CaptionML=ENU=No. }
+    { 10  ;   ;Project No.         ;Code20        ;TableRelation=Job.No.;
+                                                   CaptionML=ENU=Project No. }
+    { 20  ;   ;Code                ;Code10        ;TableRelation="Project Planning Base Activity";
+                                                   OnValidate=VAR
+                                                                BaseActRec@1100525000 : Record 11012434;
+                                                                FormatManagement@1100528400 : Codeunit 11012022;
+                                                              BEGIN
+                                                                FormatManagement.CreateProjPlanningActivity("Project No.", Code, Chapter, Paragraph, Level);
+                                                                IF NOT BaseActRec.GET(Code) THEN;
+                                                                IF (Code <> '') THEN BEGIN
+                                                                  IF (Code <> xRec.Code) THEN BEGIN
+                                                                    "No." := "Project No." + Code;
+                                                                    Type := BaseActRec.Type;
+                                                                  END;
+                                                                  IF (Code <> xRec.Code) OR (Description = '') THEN
+                                                                    Description := BaseActRec.Description;
+                                                                END;
+                                                                IF ActivityCodeIsFormatted THEN BEGIN
+                                                                  FillParentActNoBasedOnLevel;
+                                                                  UpdateBudgetLineParentActivity("Parent Activity No.");
+                                                                END;
+                                                              END;
+
+                                                   ValidateTableRelation=No;
+                                                   CaptionML=ENU=Activity Code }
+    { 25  ;   ;Type                ;Option        ;OnValidate=VAR
+                                                                ProjectPlanningActivity@1100485000 : Record 11012431;
+                                                                NextSummary@1100485004 : Record 11012431;
+                                                                PreviousSummary@1100485003 : Record 11012431;
+                                                                ProjectInstallment@1100485001 : Record 11012018;
+                                                                BudgetLine@1100485002 : Record 11012001;
+                                                              BEGIN
+                                                                IF Type <> xRec.Type THEN
+                                                                  CASE xRec.Type OF
+                                                                    xRec.Type::Milestone:
+                                                                      BEGIN
+                                                                        ProjectInstallment.SETCURRENTKEY("Project Activity No.");
+                                                                        ProjectInstallment.SETRANGE("Project Activity No.", "No.");
+                                                                        IF NOT ProjectInstallment.ISEMPTY THEN
+                                                                          ERROR(Text004, FIELDCAPTION(Type), TABLECAPTION, "No.", ProjectInstallment.TABLECAPTION, xRec.Type);
+                                                                      END;
+                                                                    xRec.Type::Activity:
+                                                                      BEGIN
+                                                                        BudgetLine.SETCURRENTKEY("Project Planning Activity No.");
+                                                                        BudgetLine.SETRANGE("Project Planning Activity No.", "No.");
+                                                                        IF NOT BudgetLine.ISEMPTY THEN
+                                                                          ERROR(Text004, FIELDCAPTION(Type), TABLECAPTION, "No.", BudgetLine.TABLECAPTION, xRec.Type);
+                                                                      END;
+                                                                    xRec.Type::Summary:
+                                                                      IF ActivityCodeIsFormatted AND
+                                                                         SummaryActivityHasChildren
+                                                                      THEN
+                                                                         ERROR(Text004, FIELDCAPTION(Type), TABLECAPTION, "No.", TABLECAPTION, xRec.Type);
+                                                                  END;
+
+                                                                IF NOT ActivityCodeIsFormatted AND
+                                                                   (Type <> xRec.Type)
+                                                                THEN BEGIN
+                                                                  CASE Type OF
+                                                                    Type::Milestone, Type::Activity:
+                                                                      BEGIN
+                                                                        ProjectPlanningActivity.SETCURRENTKEY("Parent Activity No.");
+                                                                        ProjectPlanningActivity.SETRANGE("Parent Activity No.", "No.");
+
+                                                                        PreviousSummary.SETCURRENTKEY(Type, "Project No.", Code);
+                                                                        PreviousSummary.SETRANGE(Type, PreviousSummary.Type::Summary);
+                                                                        PreviousSummary.SETRANGE("Project No.", "Project No.");
+                                                                        PreviousSummary.SETFILTER(Code, '<%1', Code);
+                                                                        IF NOT PreviousSummary.FINDLAST THEN
+                                                                          PreviousSummary."No." := '';
+
+                                                                        // jhoek.300910.begin
+                                                                        // ProjectPlanningActivity.MODIFYALL("Parent Activity No.", PreviousSummary."No.");
+                                                                        IF ProjectPlanningActivity.FINDSET(TRUE, FALSE) THEN
+                                                                          REPEAT
+                                                                            ProjectPlanningActivity."Parent Activity No." := PreviousSummary."No.";
+                                                                            ProjectPlanningActivity.UpdateBudgetLineParentActivity(PreviousSummary."No.");
+                                                                            ProjectPlanningActivity.MODIFY;
+                                                                          UNTIL ProjectPlanningActivity.NEXT = 0;
+                                                                        // jhoek.300910.end
+                                                                      END;
+                                                                    Type::Summary:
+                                                                      BEGIN
+                                                                        // Find activities between myself and the next summary (if any)
+                                                                        NextSummary.SETCURRENTKEY(Type, "Project No.", Code);
+                                                                        NextSummary.SETRANGE(Type, NextSummary.Type::Summary);
+                                                                        NextSummary.SETRANGE("Project No.", "Project No.");
+                                                                        NextSummary.SETFILTER(Code, '>%1', Code);
+
+                                                                        ProjectPlanningActivity.SETCURRENTKEY(Type, "Project No.", Code);
+                                                                        ProjectPlanningActivity.SETRANGE(Type, ProjectPlanningActivity.Type::Activity);
+                                                                        ProjectPlanningActivity.SETRANGE("Project No.", "Project No.");
+
+                                                                        CASE NextSummary.FINDFIRST OF
+                                                                          TRUE: ProjectPlanningActivity.SETFILTER(Code, '>%1&<%2', Code, NextSummary.Code);
+                                                                          FALSE: ProjectPlanningActivity.SETFILTER(Code, '>%1', Code);
+                                                                        END;
+
+                                                                        // jhoek.300910.begin
+                                                                        // ProjectPlanningActivity.MODIFYALL("Parent Activity No.", "No.");
+                                                                        IF ProjectPlanningActivity.FINDSET(TRUE, FALSE) THEN
+                                                                          REPEAT
+                                                                            ProjectPlanningActivity."Parent Activity No." := "No.";
+                                                                            ProjectPlanningActivity.UpdateBudgetLineParentActivity("No.");
+                                                                            ProjectPlanningActivity.MODIFY;
+                                                                          UNTIL ProjectPlanningActivity.NEXT = 0;
+                                                                        // jhoek.300910.end
+                                                                        VALIDATE("Parent Activity No.", '');
+                                                                      END;
+                                                                  END;
+                                                                END;
+
+                                                                IF (Type <> xRec.Type) AND (Type IN [Type::Summary, Type::Milestone]) THEN
+                                                                  "Planned Hours" := 0;
+                                                              END;
+
+                                                   CaptionML=ENU=Type;
+                                                   OptionCaptionML=ENU=Activity,Summary,Milestone;
+                                                   OptionString=Activity,Summary,Milestone }
+    { 27  ;   ;Parent Activity No. ;Code30        ;TableRelation="Project Planning Activity".No. WHERE (Project No.=FIELD(Project No.),
+                                                                                                        Type=CONST(Summary));
+                                                   CaptionML=ENU=Parent Activity No.;
+                                                   Editable=No }
+    { 30  ;   ;Description         ;Text50        ;CaptionML=ENU=Description }
+    { 40  ;   ;Budgetted Hours     ;Decimal       ;FieldClass=FlowField;
+                                                   CalcFormula=Sum("Budget Line".Hours WHERE (Project Planning Activity No.=FIELD(No.),
+                                                                                              Project No.=FIELD(Project No.)));
+                                                   CaptionML=ENU=Budgetted Hours;
+                                                   BlankZero=Yes;
+                                                   Editable=No }
+    { 41  ;   ;Total Budgeted Hours (1 Level);Decimal;
+                                                   FieldClass=FlowField;
+                                                   CalcFormula=Sum("Budget Line".Hours WHERE (Proj. Plann. Parent Activ. No.=FIELD(No.),
+                                                                                              Project No.=FIELD(Project No.)));
+                                                   CaptionML=ENU=Total Budgeted Hours (1 Level);
+                                                   BlankZero=Yes;
+                                                   Editable=No }
+    { 45  ;   ;Planned Hours       ;Decimal       ;OnValidate=VAR
+                                                                ProjectTimeTable@1100528401 : Record 11020684;
+                                                              BEGIN
+                                                                CALCFIELDS("Requested Activ. Cap. Exists");
+                                                                IF (NOT "Requested Activ. Cap. Exists") THEN BEGIN
+                                                                  GetProjectTimeTable(ProjectTimeTable);
+                                                                  InitStartEndDateAndDuration(ProjectTimeTable);
+                                                                END;
+                                                                CalcHoursPrognosis;
+                                                                UndoGPPSplit();
+                                                              END;
+
+                                                   CaptionML=ENU=Plan Hours }
+    { 46  ;   ;Total Planned Hours (1 Level);Decimal;
+                                                   FieldClass=FlowField;
+                                                   CalcFormula=Sum("Project Planning Activity"."Planned Hours" WHERE (Project No.=FIELD(Project No.),
+                                                                                                                      Parent Activity No.=FIELD(No.)));
+                                                   CaptionML=ENU=Total Planned Hours (1 Level);
+                                                   BlankZero=Yes;
+                                                   Editable=No }
+    { 50  ;   ;Budgetted Labor     ;Decimal       ;FieldClass=FlowField;
+                                                   CalcFormula=Sum("Budget Line".Amount WHERE (Project Planning Activity No.=FIELD(No.),
+                                                                                               Cost Type=CONST(Labor)));
+                                                   CaptionML=ENU=Budgetted Labor;
+                                                   Editable=No }
+    { 60  ;   ;Budgetted Materials ;Decimal       ;FieldClass=FlowField;
+                                                   CalcFormula=Sum("Budget Line".Amount WHERE (Cost Type=CONST(Material),
+                                                                                               Project Planning Activity No.=FIELD(No.)));
+                                                   CaptionML=ENU=Budgetted Materials;
+                                                   Editable=No }
+    { 65  ;   ;Budgetted Subcontracting;Decimal   ;FieldClass=FlowField;
+                                                   CalcFormula=Sum("Budget Line".Amount WHERE (Cost Type=CONST(Subcontracting),
+                                                                                               Project Planning Activity No.=FIELD(No.)));
+                                                   CaptionML=ENU=Budgetted Subcontracting;
+                                                   Editable=No }
+    { 70  ;   ;Budgetted Plant     ;Decimal       ;FieldClass=FlowField;
+                                                   CalcFormula=Sum("Budget Line".Amount WHERE (Cost Type=CONST(Plant),
+                                                                                               Project Planning Activity No.=FIELD(No.)));
+                                                   CaptionML=ENU=Budgetted Plant;
+                                                   Editable=No }
+    { 80  ;   ;Budgetted Sundry    ;Decimal       ;FieldClass=FlowField;
+                                                   CalcFormula=Sum("Budget Line".Amount WHERE (Cost Type=CONST(Sundry),
+                                                                                               Project Planning Activity No.=FIELD(No.)));
+                                                   CaptionML=ENU=Budgetted Sundry;
+                                                   Editable=No }
+    { 90  ;   ;Total Budget        ;Decimal       ;FieldClass=FlowField;
+                                                   CalcFormula=Sum("Budget Line".Amount WHERE (Project Planning Activity No.=FIELD(No.),
+                                                                                               Project No.=FIELD(Project No.)));
+                                                   CaptionML=ENU=Total Budget;
+                                                   BlankZero=Yes;
+                                                   Editable=No }
+    { 91  ;   ;Overall Total Budget (1 Level);Decimal;
+                                                   FieldClass=FlowField;
+                                                   CalcFormula=Sum("Budget Line".Amount WHERE (Proj. Plann. Parent Activ. No.=FIELD(No.),
+                                                                                               Project No.=FIELD(Project No.)));
+                                                   CaptionML=ENU=Overall Total Budget (1 Level);
+                                                   BlankZero=Yes;
+                                                   Editable=No }
+    { 100 ;   ;Constraint Type     ;Option        ;OnValidate=BEGIN
+                                                                IF ("Constraint Type" <> xRec."Constraint Type") THEN
+                                                                  "Constraint Date" := 0DT;
+                                                              END;
+
+                                                   CaptionML=ENU=Constraint Type;
+                                                   OptionCaptionML=ENU=As Soon As Possible,As Late As Possible,Finish No Later Than,Finish No Earlier Than,Start No Earlier Than,Start No Later Than,Finish On,Start On;
+                                                   OptionString=As Soon As Possible,As Late As Possible,Finish No Later Than,Finish No Earlier Than,Start No Earlier Than,Start No Later Than,Finish On,Start On;
+                                                   Editable=No }
+    { 101 ;   ;Constraint Date     ;DateTime      ;OnValidate=BEGIN
+                                                                CASE "Constraint Type" OF
+                                                                  "Constraint Type"::"As Soon As Possible": TESTFIELD("Constraint Date", 0DT);
+                                                                  "Constraint Type"::"As Late As Possible": TESTFIELD("Constraint Date", 0DT);
+                                                                  "Constraint Type"::"Finish No Later Than": TESTFIELD("Constraint Date");
+                                                                  "Constraint Type"::"Finish No Earlier Than": TESTFIELD("Constraint Date");
+                                                                  "Constraint Type"::"Start No Earlier Than": TESTFIELD("Constraint Date");
+                                                                  "Constraint Type"::"Start No Later Than": TESTFIELD("Constraint Date");
+                                                                  "Constraint Type"::"Finish On": TESTFIELD("Constraint Date");
+                                                                  "Constraint Type"::"Start On": TESTFIELD("Constraint Date");
+                                                                END;
+                                                              END;
+
+                                                   CaptionML=ENU=Constraint Date;
+                                                   Editable=No }
+    { 210 ;   ;Contract Amount     ;Decimal       ;FieldClass=FlowField;
+                                                   CalcFormula=Sum("Project Installment"."Installment Amount (LCY)" WHERE (Project Activity No.=FIELD(No.)));
+                                                   CaptionML=ENU=Contract Amount;
+                                                   Editable=No }
+    { 220 ;   ;Starting Date       ;DateTime      ;OnValidate=VAR
+                                                                ProjectTimeTable@1100528401 : Record 11020684;
+                                                              BEGIN
+                                                                CALCFIELDS("Requested Activ. Cap. Exists");
+                                                                TESTFIELD("Requested Activ. Cap. Exists", FALSE);
+
+                                                                GetProjectTimeTable(ProjectTimeTable);
+
+                                                                "Starting Date" :=
+                                                                  CREATEDATETIME(
+                                                                    DT2DATE("Starting Date"),
+                                                                    ProjectTimeTable.GetWorkFrom(DT2DATE("Starting Date")));
+
+                                                                "Constraint Date" := "Starting Date";
+                                                                CalcEndDateAndDuration;
+                                                                UndoGPPSplit();
+                                                              END;
+
+                                                   CaptionML=ENU=Starting Date }
+    { 230 ;   ;Ending Date         ;DateTime      ;CaptionML=ENU=Ending Date;
+                                                   Editable=No }
+    { 240 ;   ;Completed Perc.     ;Decimal       ;OnValidate=BEGIN
+                                                                CalcHoursPrognosis;
+                                                                IF (Type = Type::Milestone) AND
+                                                                   (("Completed Perc." = 100) XOR (xRec."Completed Perc." = 100))
+                                                                THEN
+                                                                  UpdChargeableOfProjInstallment;
+                                                              END;
+
+                                                   CaptionML=ENU=Completed %;
+                                                   MinValue=0;
+                                                   MaxValue=100;
+                                                   Description=Do not use % (GPP) }
+    { 245 ;   ;Hours Prognosis     ;Decimal       ;OnValidate=BEGIN
+                                                                IF "Completed Perc." = 100 THEN
+                                                                  "Hours Prognosis" := 0;
+                                                                CalcPlannedHours;
+                                                              END;
+
+                                                   CaptionML=ENU=Hours Prognosis }
+    { 246 ;   ;Total Hours Progn. (1 Level);Decimal;
+                                                   FieldClass=FlowField;
+                                                   CalcFormula=Sum("Project Planning Activity"."Hours Prognosis" WHERE (Project No.=FIELD(Project No.),
+                                                                                                                        Parent Activity No.=FIELD(No.)));
+                                                   CaptionML=ENU=Total Hours Progn. (1 Level);
+                                                   BlankZero=Yes;
+                                                   Editable=No }
+    { 250 ;   ;Production Quantity ;Decimal       ;CaptionML=ENU=Production Quantity }
+    { 260 ;   ;Production Unit     ;Code10        ;CaptionML=ENU=Production Unit }
+    { 270 ;   ;Production Rate per day;Decimal    ;CaptionML=ENU=Production Rate per day }
+    { 280 ;   ;Duration            ;Decimal       ;CaptionML=ENU=Duration;
+                                                   MinValue=0;
+                                                   Description=In hours }
+    { 290 ;   ;Requested Hours     ;Decimal       ;FieldClass=FlowField;
+                                                   CalcFormula=Sum("Requested Activ. Cap. by Day".Hours WHERE (Project No.=FIELD(Project No.),
+                                                                                                               Activity Code=FIELD(Code),
+                                                                                                               Resource Type=CONST(Discipline)));
+                                                   CaptionML=ENU=Requested Hours;
+                                                   Editable=No }
+    { 295 ;   ;Assigned Hours      ;Decimal       ;FieldClass=FlowField;
+                                                   CalcFormula=Sum("Assigned Activ. Cap. by Day".Hours WHERE (Project No.=FIELD(Project No.),
+                                                                                                              Activity Code=FIELD(Code),
+                                                                                                              Resource Type=CONST(Employee)));
+                                                   CaptionML=ENU=Assigned Hours;
+                                                   Editable=No }
+    { 300 ;   ;Requested Activ. Cap. Exists;Boolean;
+                                                   FieldClass=FlowField;
+                                                   CalcFormula=Exist("Requested Activity Capacity" WHERE (Project No.=FIELD(Project No.),
+                                                                                                          Activity Code=FIELD(Code)));
+                                                   CaptionML=ENU=Requested Activ. Cap. Exists;
+                                                   Editable=No }
+    { 400 ;   ;Level               ;Integer       ;CaptionML=ENU=Level;
+                                                   Editable=No }
+    { 410 ;   ;Chapter             ;Code20        ;CaptionML=ENU=Chapter;
+                                                   Editable=No }
+    { 420 ;   ;Paragraph           ;Code20        ;CaptionML=ENU=Paragraph;
+                                                   Editable=No }
+    { 430 ;   ;Record ID           ;RecordID      ;CaptionML=ENU=Record ID }
+    { 431 ;   ;Split               ;Boolean       ;CaptionML=ENU=Split;
+                                                   Description=GPP To show a activity in two parts }
+    { 432 ;   ;End Date Realized Part;DateTime    ;CaptionML=ENU=End Date Realized Part;
+                                                   Description=GPP To show a activity in two parts }
+    { 433 ;   ;Realized Part Perc. ;Decimal       ;CaptionML=ENU=Realized Part %;
+                                                   Description=GPP To show a activity in two parts }
+  }
+  KEYS
+  {
+    {    ;No.                                      }
+    {    ;Project No.,Code                        ;SumIndexFields=Planned Hours,Hours Prognosis;
+                                                   Clustered=Yes }
+    {    ;Project No.,Starting Date                }
+    {    ;Type,Project No.,Code                    }
+    {    ;Parent Activity No.                      }
+    {    ;Project No.,Parent Activity No.         ;SumIndexFields=Planned Hours,Hours Prognosis }
+  }
+  FIELDGROUPS
+  {
+  }
+  CODE
+  {
+    VAR
+      Job@1100485004 : Record 11072003;
+      ProjectPlanningConstraint@1100485007 : Record 11012433;
+      Text000@1100528401 : TextConst 'ENU=Rename not allowed.';
+      Text001@1100528402 : TextConst 'ENU=%1 %2 already exists.';
+      Text004@1100485008 : TextConst 'ENU="You cannot change %1 in %2 %3; at least one %4 still refers to this %5."';
+      Text005@1100485009 : TextConst 'ENU="You cannot delete %1 %2; at least one %3 still refers to this %1."';
+      ProjPlanActivityMgt@1100528400 : Codeunit 11125711;
+
+    PROCEDURE UpdateBudgetLineParentActivity@1100525000(ParentActivityNo@1100525000 : Code[30]);
+    VAR
+      BudgetLine@1100525001 : Record 11012001;
+    BEGIN
+      // jhoek.300910.begin
+      BudgetLine.SETCURRENTKEY("Project Planning Activity No.");
+      BudgetLine.SETRANGE("Project Planning Activity No.", "No.");
+      BudgetLine.MODIFYALL("Proj. Plann. Parent Activ. No.", ParentActivityNo);
+      // jhoek.300910.end
+    END;
+
+    PROCEDURE CalcHoursPrognosis@1100528400();
+    VAR
+      ProjectPlanningActivity@1210190000 : Record 11012431;
+    BEGIN
+      IF Type = Type::Activity THEN BEGIN
+        "Hours Prognosis" := "Planned Hours" * (1 - "Completed Perc."/100);
+      END ELSE BEGIN
+        IF (Type = Type::Summary) AND (Rec."Completed Perc." <> xRec."Completed Perc.") THEN BEGIN
+          ProjectPlanningActivity.SETCURRENTKEY("Parent Activity No.");
+          ProjectPlanningActivity.SETRANGE(Type, ProjectPlanningActivity.Type::Activity);
+          ProjectPlanningActivity.SETRANGE("Project No.", "Project No.");
+          ProjectPlanningActivity.SETRANGE("Parent Activity No.", "No.");
+          ProjectPlanningActivity.SETFILTER(Code, '<>%1', Code);
+          IF ProjectPlanningActivity.FINDSET(TRUE, FALSE) THEN BEGIN
+            REPEAT
+              ProjectPlanningActivity.VALIDATE("Completed Perc.", "Completed Perc.");
+              ProjectPlanningActivity.MODIFY;
+            UNTIL ProjectPlanningActivity.NEXT = 0;
+          END;
+          IF ActivityCodeIsFormatted THEN BEGIN
+            //In this case, there can be three levels
+            ProjectPlanningActivity.SETCURRENTKEY("Parent Activity No.");
+            ProjectPlanningActivity.SETRANGE(Type, ProjectPlanningActivity.Type::Summary);
+            ProjectPlanningActivity.SETRANGE("Project No.", "Project No.");
+            ProjectPlanningActivity.SETRANGE("Parent Activity No.", "No.");
+            ProjectPlanningActivity.SETFILTER(Code, '<>%1', Code);
+            IF ProjectPlanningActivity.FINDSET(TRUE, FALSE) THEN BEGIN
+              REPEAT
+                ProjectPlanningActivity.VALIDATE("Completed Perc.", Rec."Completed Perc.");
+                ProjectPlanningActivity.MODIFY;
+              UNTIL ProjectPlanningActivity.NEXT = 0;
+            END;
+          END;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE CalcPlannedHours@1100528401();
+    BEGIN
+      IF "Completed Perc." < 100 THEN
+        "Planned Hours" := "Hours Prognosis" / (1 - "Completed Perc."/100);
+    END;
+
+    LOCAL PROCEDURE DeleteAssignedActCapacities@1100528404();
+    VAR
+      AssignedActivityCapacity@1100528400 : Record 11125710;
+    BEGIN
+      AssignedActivityCapacity.SETRANGE("Project No.", "Project No.");
+      AssignedActivityCapacity.SETRANGE("Activity Code", Code);
+      AssignedActivityCapacity.DELETEALL(TRUE);
+    END;
+
+    PROCEDURE FillPlanHoursFromRequestHours@1100528403();
+    BEGIN
+      CALCFIELDS("Requested Hours");
+      "Planned Hours" := "Requested Hours";
+      MODIFY;
+    END;
+
+    LOCAL PROCEDURE UpdChargeableOfProjInstallment@1100528406();
+    VAR
+      ProjectInstallment@1100528400 : Record 11012018;
+    BEGIN
+      ProjectInstallment.SETCURRENTKEY("Project Activity No.");
+      ProjectInstallment.SETRANGE("Project Activity No.", "No.");
+      ProjectInstallment.SETRANGE("Project No.", "Project No.");
+      IF ProjectInstallment.FINDSET THEN
+        REPEAT
+          ProjectInstallment.SetChargeable("Completed Perc." = 100);
+          ProjectInstallment.MODIFY;
+        UNTIL ProjectInstallment.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE InitStartEndDateAndDuration@1100528408(ProjectTimeTable@1100528402 : Record 11020684);
+    VAR
+      DateOfFirstWorkingDay@1100528400 : Date;
+      ProjActivCapCommonMgt@1100528401 : Codeunit 11125706;
+    BEGIN
+      IF "Starting Date" = 0DT THEN BEGIN
+        Job.GET("Project No.");
+        Job.TESTFIELD("Starting Date");
+        DateOfFirstWorkingDay := ProjActivCapCommonMgt.GetDateOfFirstWorkingDay(Job."Starting Date");
+        "Starting Date" :=
+          CREATEDATETIME(
+            DateOfFirstWorkingDay,
+            ProjectTimeTable.GetWorkFrom(DateOfFirstWorkingDay));
+      END;
+
+      CalcEndDateAndDuration;
+    END;
+
+    LOCAL PROCEDURE CalcEndDateAndDuration@1210190000();
+    BEGIN
+      "Ending Date" := ProjPlanActivityMgt.CalcProjPlanActEndingDateTime("Starting Date", "Planned Hours");
+      Duration := ProjPlanActivityMgt.CalcProjPlanActivityDuration("Starting Date", "Ending Date");
+    END;
+
+    LOCAL PROCEDURE GetProjectTimeTable@1100528411(VAR ProjectTimeTable@1100528401 : Record 11020684);
+    VAR
+      JobsSetup@1100528400 : Record 315;
+    BEGIN
+      JobsSetup.GET;
+      JobsSetup.TESTFIELD("Project Time Table");
+      ProjectTimeTable.GET(JobsSetup."Project Time Table");
+    END;
+
+    LOCAL PROCEDURE FillParentActNoBasedOnLevel@1100528402();
+    VAR
+      ProjectPlanningActivity@1100528400 : Record 11012431;
+    BEGIN
+      CASE Level OF
+        2:
+          BEGIN
+            ProjectPlanningActivity.GET("Project No." + Chapter);
+            ProjectPlanningActivity.TESTFIELD(Type, ProjectPlanningActivity.Type::Summary);
+            "Parent Activity No." := ProjectPlanningActivity."No.";
+          END;
+        3:
+          BEGIN
+            ProjectPlanningActivity.GET("Project No." + Paragraph);
+            ProjectPlanningActivity.TESTFIELD(Type, ProjectPlanningActivity.Type::Summary);
+            "Parent Activity No." := ProjectPlanningActivity."No.";
+          END;
+      END;
+    END;
+
+    PROCEDURE ActivityCodeIsFormatted@1100528407() : Boolean;
+    VAR
+      JobsSetup@1100528400 : Record 315;
+    BEGIN
+      JobsSetup.GET;
+      IF JobsSetup."Planning Activity Format" <> '' THEN
+        EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE DeleteChildren@1100528405();
+    VAR
+      ProjectPlanningActivity@1100528400 : Record 11012431;
+    BEGIN
+      ProjectPlanningActivity.SETRANGE("Project No.", "Project No.");
+      ProjectPlanningActivity.SETRANGE(Level, Level + 1);
+      IF Level >= 1 THEN
+        ProjectPlanningActivity.SETRANGE(Chapter, Chapter);
+      IF Level >= 2 THEN
+        ProjectPlanningActivity.SETRANGE(Paragraph, Paragraph);
+      ProjectPlanningActivity.DELETEALL(TRUE);
+    END;
+
+    LOCAL PROCEDURE SummaryActivityHasChildren@1100528422() : Boolean;
+    VAR
+      ProjectPlanningActivity@1100528400 : Record 11012431;
+    BEGIN
+      ProjectPlanningActivity.SETCURRENTKEY("Parent Activity No.");
+      ProjectPlanningActivity.SETRANGE("Parent Activity No.", "No.");
+      EXIT(NOT ProjectPlanningActivity.ISEMPTY);
+    END;
+
+    PROCEDURE TotalBudgetedHoursAllLevels@1100528410() Result : Decimal;
+    VAR
+      ProjectPlanningActivity@1100528400 : Record 11012431;
+    BEGIN
+      IF Type = Type::Summary THEN BEGIN
+        CALCFIELDS("Total Budgeted Hours (1 Level)");
+        Result := "Total Budgeted Hours (1 Level)";
+        ProjectPlanningActivity.SETRANGE("Project No.", "Project No.");
+        ProjectPlanningActivity.SETRANGE("Parent Activity No.", "No.");
+        IF ProjectPlanningActivity.FINDSET THEN
+          REPEAT
+            Result := Result + ProjectPlanningActivity.TotalBudgetedHoursAllLevels;
+          UNTIL ProjectPlanningActivity.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE TotalPlannedHoursAllLevels@1100528409() Result : Decimal;
+    VAR
+      ProjectPlanningActivity@1100528400 : Record 11012431;
+    BEGIN
+      IF Type = Type::Summary THEN BEGIN
+        CALCFIELDS("Total Planned Hours (1 Level)");
+        Result := "Total Planned Hours (1 Level)";
+        ProjectPlanningActivity.SETRANGE("Project No.", "Project No.");
+        ProjectPlanningActivity.SETRANGE("Parent Activity No.", "No.");
+        IF ProjectPlanningActivity.FINDSET THEN
+          REPEAT
+            Result := Result + ProjectPlanningActivity.TotalPlannedHoursAllLevels;
+          UNTIL ProjectPlanningActivity.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE OverallTotalBudgetAllLevels@1100528412() Result : Decimal;
+    VAR
+      ProjectPlanningActivity@1100528400 : Record 11012431;
+    BEGIN
+      IF Type = Type::Summary THEN BEGIN
+        CALCFIELDS("Overall Total Budget (1 Level)");
+        Result := "Overall Total Budget (1 Level)";
+        ProjectPlanningActivity.SETRANGE("Project No.", "Project No.");
+        ProjectPlanningActivity.SETRANGE("Parent Activity No.", "No.");
+        IF ProjectPlanningActivity.FINDSET THEN
+          REPEAT
+            Result := Result + ProjectPlanningActivity.OverallTotalBudgetAllLevels;
+          UNTIL ProjectPlanningActivity.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE TotalHoursPrognosisAllLevels@1100528413() Result : Decimal;
+    VAR
+      ProjectPlanningActivity@1100528400 : Record 11012431;
+    BEGIN
+      IF Type = Type::Summary THEN BEGIN
+        CALCFIELDS("Total Hours Progn. (1 Level)");
+        Result := "Total Hours Progn. (1 Level)";
+        ProjectPlanningActivity.SETRANGE("Project No.", "Project No.");
+        ProjectPlanningActivity.SETRANGE("Parent Activity No.", "No.");
+        IF ProjectPlanningActivity.FINDSET THEN
+          REPEAT
+            Result := Result + ProjectPlanningActivity.TotalHoursPrognosisAllLevels;
+          UNTIL ProjectPlanningActivity.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE CheckIfProjPlanActNotExists@1100528414(ProjectNo@1100528400 : Code[20];ProjectPlanningActivityCode@1100528402 : Code[10]);
+    VAR
+      ProjectPlanningActivity@1100528401 : Record 11012431;
+      FormatManagement@1100528403 : Codeunit 11012022;
+    BEGIN
+      FormatManagement.FormatElem(ProjectPlanningActivityCode, 20, '');
+      IF ProjectPlanningActivity.GET(ProjectNo + ProjectPlanningActivityCode) THEN
+        ERROR(Text001, TABLECAPTION, ProjectNo + ProjectPlanningActivityCode);
+    END;
+
+    PROCEDURE EditCommentLines@1100529800();
+    VAR
+      CommentLineJobText@1100529800 : Record 11020634;
+      RecRef@1100529801 : RecordRef;
+      RecID@1100529802 : RecordID;
+    BEGIN
+      RecRef.GETTABLE(Rec);
+      RecID := RecRef.RECORDID();
+      CommentLineJobText.EditCommentLines(CommentLineJobText."Table Name"::"Project Planning Activity", RecID);
+    END;
+
+    PROCEDURE CommentLinesExist@1210190011() : Boolean;
+    VAR
+      RecRef@1210190000 : RecordRef;
+      CommentLineJobText@1210190001 : Record 11020634;
+    BEGIN
+      RecRef.GETTABLE(Rec);
+      CommentLineJobText.SETRANGE("Table Name", CommentLineJobText."Table Name"::"Project Planning Activity");
+      CommentLineJobText.SETFILTER("Record ID", FORMAT(RecRef.RECORDID));
+      IF NOT CommentLineJobText.ISEMPTY THEN
+        EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE DeleteCommentLines@1100528415();
+    VAR
+      CommentLineJobText@1100529801 : Record 11020634;
+      RecRef@1100529800 : RecordRef;
+    BEGIN
+      RecRef.GETTABLE(Rec);
+      CommentLineJobText.SETRANGE("Table Name", CommentLineJobText."Table Name"::"Project Planning Activity");
+      CommentLineJobText.SETFILTER("Record ID", FORMAT(RecRef.RECORDID));
+      CommentLineJobText.DELETEALL(TRUE);
+    END;
+
+    LOCAL PROCEDURE CopyCommentLinesFromBaseAct@1100528416();
+    VAR
+      CommentLineJobTextBaseAct@1100529801 : Record 11020634;
+      CommentLineJobText@1100528402 : Record 11020634;
+      ProjectPlanningBaseActivity@1100528401 : Record 11012434;
+      RecRefBaseAct@1100528400 : RecordRef;
+      RecRef@1100528403 : RecordRef;
+    BEGIN
+      ProjectPlanningBaseActivity.Code := Code;
+      RecRefBaseAct.GETTABLE(ProjectPlanningBaseActivity);
+      CommentLineJobTextBaseAct.SETRANGE(
+        "Table Name", CommentLineJobTextBaseAct."Table Name"::"Project Planning Base Activity");
+      CommentLineJobTextBaseAct.SETFILTER("Record ID", FORMAT(RecRefBaseAct.RECORDID));
+      IF CommentLineJobTextBaseAct.FINDSET THEN
+        REPEAT
+          CommentLineJobText := CommentLineJobTextBaseAct;
+          RecRef.GETTABLE(Rec);
+          CommentLineJobText."Table Name" := CommentLineJobText."Table Name"::"Project Planning Activity";
+          CommentLineJobText."Record ID" := RecRef.RECORDID;
+          CommentLineJobText.INSERT;
+        UNTIL CommentLineJobTextBaseAct.NEXT = 0;
+    END;
+
+    PROCEDURE UndoGPPSplit@1100409000();
+    BEGIN
+      Split := FALSE;
+      "End Date Realized Part" := 0DT;
+      "Realized Part Perc." := 0;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

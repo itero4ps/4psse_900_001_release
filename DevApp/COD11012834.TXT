@@ -1,0 +1,312 @@
+OBJECT Codeunit 11012834 Service Surcharge Management
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+
+    PROCEDURE UpdateSOSurchargeBudgetLines@1100528600(IServiceOrder@1100528600 : Record 11012823);
+    VAR
+      ServiceOrderObject@1100528608 : Record 11071724;
+      TmpServiceOrderObject@1100528609 : TEMPORARY Record 11071724;
+      ServiceSurchargeVersion@1100528601 : Record 11071783;
+      ServiceSurchargeLine@1100528604 : Record 11071784;
+      ServiceOrderBudgetLine@1100528602 : Record 11012875;
+      PreviousSurchargeAmount@1100528605 : ARRAY [10] OF Decimal;
+      SurchargeAmount@1100528606 : Decimal;
+      LineNo@1100528607 : Integer;
+    BEGIN
+      ServiceOrderBudgetLine.SETRANGE("Budget Type", ServiceOrderBudgetLine."Budget Type"::Order);
+      ServiceOrderBudgetLine.SETRANGE("Service Order No.", IServiceOrder."No.");
+      ServiceOrderBudgetLine.SETRANGE("Surcharge Line", TRUE);
+      ServiceOrderBudgetLine.SETRANGE(Finished, TRUE);
+      IF NOT ServiceOrderBudgetLine.ISEMPTY THEN
+        EXIT;
+      //  IF NOT CONFIRM(Text000) THEN
+      //    ERROR('');
+      ServiceOrderBudgetLine.SETRANGE(Finished);
+      ServiceOrderBudgetLine.DELETEALL(TRUE);
+
+      IF NOT ServiceSurchargeVersion.GET(ServiceSurchargeVersion.Type::"Service Order",
+        IServiceOrder."No.", IServiceOrder."Source Type", '', '', IServiceOrder."Order Date")
+      THEN
+        EXIT;
+      IF ServiceSurchargeVersion.Expired THEN
+        EXIT;
+
+      ServiceOrderBudgetLine.SETCURRENTKEY("Budget Type", "Service Order No.", "Line No.");
+      ServiceOrderBudgetLine.SETRANGE("Surcharge Line");
+      IF ServiceOrderBudgetLine.FINDLAST THEN
+        LineNo := ServiceOrderBudgetLine."Line No.";
+      LineNo += 10000;
+      ServiceOrderBudgetLine.SETCURRENTKEY("Service Order No.", "Cost Type", "Surcharge Line"); //mg.c, 08-04-2014: C014494
+      ServiceOrderBudgetLine.SETRANGE("Surcharge Line", FALSE); //mg, 08-04-2014: C014494
+
+      TmpServiceOrderObject.INIT;
+      TmpServiceOrderObject."Service Order No." := IServiceOrder."No.";
+      TmpServiceOrderObject.INSERT;
+
+      ServiceOrderObject.SETRANGE("Service Order No.", IServiceOrder."No.");
+      IF ServiceOrderObject.FINDSET THEN
+        REPEAT
+          TmpServiceOrderObject := ServiceOrderObject;
+          TmpServiceOrderObject.INSERT;
+        UNTIL ServiceOrderObject.NEXT = 0;
+
+      IF TmpServiceOrderObject.FINDSET THEN
+        REPEAT
+          CLEAR(PreviousSurchargeAmount);
+          ServiceOrderBudgetLine.SETRANGE("Object No.", TmpServiceOrderObject."Object No.");
+          ServiceOrderBudgetLine.SETRANGE("Maintenance Scheme", TmpServiceOrderObject."Maintenance Scheme");
+
+          ServiceSurchargeLine.SETRANGE(Type, ServiceSurchargeVersion.Type);
+          ServiceSurchargeLine.SETRANGE(Code, ServiceSurchargeVersion.Code);
+          ServiceSurchargeLine.SETRANGE("Source Type", IServiceOrder."Source Type");
+          ServiceSurchargeLine.SETRANGE("Service Type", '');//ServiceSurchargeVersion."Service Type");
+          ServiceSurchargeLine.SETRANGE("Department Code", '');//ServiceSurchargeVersion."Department Code");
+          ServiceSurchargeLine.SETRANGE("Index Date", ServiceSurchargeVersion."Index Date");
+          IF ServiceSurchargeLine.FINDSET THEN
+            REPEAT
+              IF PreviousSurchargeAmount[ServiceSurchargeLine."Cost Type Filter" +1] = 0 THEN BEGIN
+                IF ServiceSurchargeLine."Cost Type Filter" = ServiceSurchargeLine."Cost Type Filter"::" " THEN
+                  ServiceOrderBudgetLine.SETRANGE("Cost Type")
+                ELSE
+                  ServiceOrderBudgetLine.SETRANGE("Cost Type", ServiceSurchargeLine."Cost Type Filter" -1);
+                ServiceOrderBudgetLine.CALCSUMS(Amount);
+                PreviousSurchargeAmount[ServiceSurchargeLine."Cost Type Filter" +1] := ServiceOrderBudgetLine.Amount;
+              END;
+
+              SurchargeAmount := PreviousSurchargeAmount[ServiceSurchargeLine."Cost Type Filter" +1] *
+                ServiceSurchargeLine."Surcharge %" / 100;
+
+              IF SurchargeAmount <> 0 THEN BEGIN
+                ServiceOrderBudgetLine.INIT;
+                ServiceOrderBudgetLine."Budget Type" := ServiceOrderBudgetLine."Budget Type"::Order;
+                ServiceOrderBudgetLine."Service Order No." := IServiceOrder."No.";
+                ServiceOrderBudgetLine.VALIDATE("Object No.", TmpServiceOrderObject."Object No.");
+                ServiceOrderBudgetLine."Maintenance Scheme" := TmpServiceOrderObject."Maintenance Scheme";
+                ServiceOrderBudgetLine."Line No." := LineNo;
+                ServiceOrderBudgetLine."Surcharge Line" := TRUE;
+                LineNo += 10000;
+                ServiceOrderBudgetLine.INSERT(TRUE);
+
+                ServiceOrderBudgetLine.Description := ServiceSurchargeLine.Description;
+                ServiceOrderBudgetLine.Quantity := 1;
+                ServiceOrderBudgetLine.VALIDATE("Cost Type", ServiceSurchargeLine."Cost Type");
+                ServiceOrderBudgetLine.VALIDATE("Cost Object", ServiceSurchargeLine."Cost Object");
+                IF ServiceSurchargeLine."Cost Type" <> ServiceSurchargeLine."Cost Type"::Labor THEN
+                  ServiceOrderBudgetLine.VALIDATE(Price, SurchargeAmount)
+                ELSE BEGIN
+                  ServiceOrderBudgetLine.Price := SurchargeAmount;
+                  ServiceOrderBudgetLine.CalcTotals;
+                END;
+                ServiceOrderBudgetLine.MODIFY(TRUE);
+
+                PreviousSurchargeAmount[ServiceSurchargeLine."Cost Type Filter" +1]  += SurchargeAmount;
+              END;
+            UNTIL ServiceSurchargeLine.NEXT = 0;
+        UNTIL TmpServiceOrderObject.NEXT = 0;
+    END;
+
+    PROCEDURE CopySurchargeLinesToSO@1100525000(IServiceOrder@1100525000 : Record 11012823);
+    VAR
+      ServiceSurchargeVersion@1100525001 : Record 11071783;
+    BEGIN
+      RemoveSurchargeLines(ServiceSurchargeVersion.Type::"Service Order", IServiceOrder."No.",
+        IServiceOrder."Source Type"::Replacement +1, 0D);
+      IF IServiceOrder."Service Contract No." <> '' THEN
+        CopySurchargeLines(ServiceSurchargeVersion.Type::Contract, IServiceOrder."Service Contract No.",
+          IServiceOrder."Source Type", IServiceOrder."Service Type", IServiceOrder."Global Dimension 1 Code", IServiceOrder."Order Date",
+          ServiceSurchargeVersion.Type::"Service Order", IServiceOrder."No.",
+          IServiceOrder."Source Type", '', TRUE, '', TRUE, IServiceOrder."Order Date")
+      ELSE
+        CopySurchargeLines(ServiceSurchargeVersion.Type::Company, '',
+          IServiceOrder."Source Type", IServiceOrder."Service Type", IServiceOrder."Global Dimension 1 Code", IServiceOrder."Order Date",
+          ServiceSurchargeVersion.Type::"Service Order", IServiceOrder."No.",
+          IServiceOrder."Source Type", '', TRUE, '', TRUE, IServiceOrder."Order Date");
+      UpdateSOSurchargeBudgetLines(IServiceOrder);
+    END;
+
+    PROCEDURE CopySurchargeLinesToSC@1100528603(IServiceContract@1100528600 : Record 11012812);
+    VAR
+      ServiceSurchargeVersion@1100528603 : Record 11071783;
+    BEGIN
+      RemoveSurchargeLines(ServiceSurchargeVersion.Type::Contract, IServiceContract."No.",
+        ServiceSurchargeVersion."Source Type"::Replacement +1, 0D);
+      IF IServiceContract."Contract Template Code" <> '' THEN BEGIN
+        ServiceSurchargeVersion.SETRANGE(Type, ServiceSurchargeVersion.Type::"Contract Template");
+        ServiceSurchargeVersion.SETRANGE(Code, IServiceContract."Contract Template Code");
+      END ELSE BEGIN
+        ServiceSurchargeVersion.SETRANGE(Type, ServiceSurchargeVersion.Type::Company);
+        ServiceSurchargeVersion.SETRANGE(Code, '');
+      END;
+      ServiceSurchargeVersion.SETRANGE("Source Type",
+        ServiceSurchargeVersion."Source Type"::Call,
+        ServiceSurchargeVersion."Source Type"::Direct);
+      ServiceSurchargeVersion.SETRANGE(Expired, FALSE);
+      IF NOT ServiceSurchargeVersion.FINDSET THEN
+        EXIT;
+      REPEAT
+        CopySurchargeLines(ServiceSurchargeVersion.Type, ServiceSurchargeVersion.Code,
+          ServiceSurchargeVersion."Source Type", ServiceSurchargeVersion."Service Type",
+          ServiceSurchargeVersion."Department Code", ServiceSurchargeVersion."Index Date",
+          ServiceSurchargeVersion.Type::Contract, IServiceContract."No.",
+          ServiceSurchargeVersion."Source Type"::Replacement +1, ServiceSurchargeVersion."Service Type", TRUE,
+          ServiceSurchargeVersion."Department Code", TRUE, 0D);
+      UNTIL ServiceSurchargeVersion.NEXT = 0;
+    END;
+
+    PROCEDURE CopySurchargeLines@1100528605(FromType@1100528600 : Option;FromCode@1100528601 : Code[20];FromSourceType@1100528603 : Option;FromServiceType@1210190000 : Code[20];FromDepartmentCode@1100528612 : Code[20];FromIndexDate@1100528602 : Date;ToType@1100528604 : Option;ToCode@1100528605 : Code[20];ToSourceType@1100528606 : 'Call,Contract,Direct,,,,Modification,Replacement, ';ToServiceType@1210190001 : Code[20];ForceToServiceType@1100528614 : Boolean;ToDepartmentCode@1100528613 : Code[20];ForceToDepartmentCode@1100528615 : Boolean;ToIndexDate@1100528607 : Date);
+    VAR
+      ServiceSurchargeVersion@1100528608 : Record 11071783;
+      NewServiceSurchargeVersion@1100528610 : Record 11071783;
+      ServiceSurchargeLine@1100528609 : Record 11071784;
+      NewServiceSurchargeLine@1100528611 : Record 11071784;
+    BEGIN
+      ServiceSurchargeVersion.SETRANGE(Type, FromType);
+      ServiceSurchargeVersion.SETRANGE(Code, FromCode);
+      ServiceSurchargeVersion.SETRANGE("Source Type", FromSourceType);
+      ServiceSurchargeVersion.SETRANGE("Service Type", FromServiceType);
+      ServiceSurchargeVersion.SETRANGE("Department Code", FromDepartmentCode);
+      ServiceSurchargeVersion.SETRANGE("Index Date", 0D, FromIndexDate);
+      ServiceSurchargeVersion.SETRANGE(Expired, FALSE);
+      IF FromDepartmentCode <> '' THEN
+        IF NOT ServiceSurchargeVersion.FINDLAST THEN
+           ServiceSurchargeVersion.SETRANGE("Department Code", '');
+      IF NOT ServiceSurchargeVersion.FINDLAST THEN
+        IF FromServiceType <> '' THEN BEGIN
+          ServiceSurchargeVersion.SETRANGE("Service Type", '');
+          ServiceSurchargeVersion.SETRANGE("Department Code", FromDepartmentCode);
+          IF NOT ServiceSurchargeVersion.FINDLAST THEN
+            IF FromDepartmentCode <> '' THEN
+              ServiceSurchargeVersion.SETRANGE("Department Code", '');
+        END;
+      IF ServiceSurchargeVersion.FINDLAST THEN BEGIN
+        NewServiceSurchargeVersion := ServiceSurchargeVersion;
+        NewServiceSurchargeVersion.Type := ToType;
+        NewServiceSurchargeVersion.Code := ToCode;
+        IF ToSourceType <> ToSourceType::" " THEN
+          NewServiceSurchargeVersion."Source Type" := ToSourceType;
+        IF ToIndexDate <> 0D THEN
+          NewServiceSurchargeVersion."Index Date" := ToIndexDate;
+        IF ForceToServiceType OR (ToServiceType <> '') THEN
+          NewServiceSurchargeVersion."Service Type" := ToServiceType;
+        IF ForceToDepartmentCode OR (ToDepartmentCode <> '') THEN
+          NewServiceSurchargeVersion."Department Code" := ToDepartmentCode;
+        NewServiceSurchargeVersion.INSERT(TRUE);
+
+        ServiceSurchargeLine.SETRANGE(Type, ServiceSurchargeVersion.Type);
+        ServiceSurchargeLine.SETRANGE(Code, ServiceSurchargeVersion.Code);
+        ServiceSurchargeLine.SETRANGE("Source Type", ServiceSurchargeVersion."Source Type");
+        ServiceSurchargeLine.SETRANGE("Service Type", ServiceSurchargeVersion."Service Type");
+        ServiceSurchargeLine.SETRANGE("Department Code", ServiceSurchargeVersion."Department Code");
+        ServiceSurchargeLine.SETRANGE("Index Date", ServiceSurchargeVersion."Index Date");
+        IF NOT ServiceSurchargeLine.FINDSET THEN
+          EXIT;
+        REPEAT
+          NewServiceSurchargeLine := ServiceSurchargeLine;
+          NewServiceSurchargeLine.Type := ToType;
+          NewServiceSurchargeLine.Code := ToCode;
+          IF ToSourceType <> ToSourceType::" " THEN
+            NewServiceSurchargeLine."Source Type" := ToSourceType;
+          IF ToIndexDate <> 0D THEN
+            NewServiceSurchargeLine."Index Date" := ToIndexDate;
+          IF ForceToServiceType OR (ToServiceType <> '') THEN
+            NewServiceSurchargeLine."Service Type" := ToServiceType;
+          IF ForceToDepartmentCode OR (ToDepartmentCode <> '') THEN
+            NewServiceSurchargeLine."Department Code" := ToDepartmentCode;
+          NewServiceSurchargeLine.INSERT(TRUE);
+        UNTIL ServiceSurchargeLine.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE RemoveSurchargeLines@1100528610(FromType@1100528603 : Option;FromCode@1100528602 : Code[20];FromSourceType@1100528601 : 'Call,Contract,Direct,,,,Modification,Replacement, ';FromIndexDate@1100528600 : Date);
+    VAR
+      ServiceSurchargeVersion@1100528604 : Record 11071783;
+    BEGIN
+      ServiceSurchargeVersion.SETRANGE(Type, FromType);
+      ServiceSurchargeVersion.SETRANGE(Code, FromCode);
+      IF FromSourceType <> FromSourceType::" " THEN
+        ServiceSurchargeVersion.SETRANGE("Source Type", FromSourceType);
+      IF FromIndexDate <> 0D THEN
+        ServiceSurchargeVersion.SETRANGE("Index Date", FromIndexDate);
+      IF NOT ServiceSurchargeVersion.ISEMPTY THEN
+        ServiceSurchargeVersion.DELETEALL(TRUE);
+    END;
+
+    PROCEDURE CalculateSCSurchargeAmount@1100528602(IContractNo@1100528600 : Code[20];ISourceType@1100528607 : Option;IIndexDate@1100528601 : Date;ILaborAmount@1100528608 : Decimal;IMaterialAmount@1100528609 : Decimal;ISubcontractingAmount@1100528610 : Decimal;IPlantAmount@1100528611 : Decimal;ISundryAmount@1100528612 : Decimal;ITotalAmount@1100528602 : Decimal) : Decimal;
+    VAR
+      ServiceSurchargeVersion@1100528603 : Record 11071783;
+      ServiceSurchargeLine@1100528604 : Record 11071784;
+      ServiceContract@1100528614 : Record 11012812;
+      CostPriceAmount@1100528620 : ARRAY [10] OF Decimal;
+      PreviousSurchargeAmount@1100528605 : ARRAY [10] OF Decimal;
+      SurchargeAmount@1100528606 : Decimal;
+      TotalSurchargeAmount@1100528613 : Decimal;
+    BEGIN
+      IF IContractNo = '' THEN BEGIN
+        ServiceSurchargeVersion.SETRANGE(Type, ServiceSurchargeVersion.Type::Company);
+        ServiceSurchargeVersion.SETRANGE(Code, '');
+        ServiceSurchargeVersion.SETRANGE("Service Type", ServiceContract."Service Type");
+        ServiceSurchargeVersion.SETRANGE("Department Code", ServiceContract."Global Dimension 1 Code");
+      END ELSE BEGIN
+        ServiceSurchargeVersion.SETRANGE(Type, ServiceSurchargeVersion.Type::Contract);
+        ServiceSurchargeVersion.SETRANGE(Code, IContractNo);
+        ServiceContract.GET(IContractNo);
+        ServiceSurchargeVersion.SETRANGE("Service Type", ServiceContract."Service Type");
+        ServiceSurchargeVersion.SETRANGE("Department Code", ServiceContract."Global Dimension 1 Code");
+      END;
+      ServiceSurchargeVersion.SETRANGE("Source Type", ISourceType);
+      ServiceSurchargeVersion.SETRANGE("Index Date", 0D, IIndexDate);
+      ServiceSurchargeVersion.SETRANGE(Expired, FALSE);
+      IF NOT ServiceSurchargeVersion.FINDLAST THEN
+        ServiceSurchargeVersion.SETRANGE("Department Code", '');
+      IF NOT ServiceSurchargeVersion.FINDLAST THEN
+        ServiceSurchargeVersion.SETRANGE("Service Type", '');
+      IF NOT ServiceSurchargeVersion.FINDLAST THEN
+        EXIT;
+
+      ServiceSurchargeLine.SETRANGE(Type, ServiceSurchargeVersion.Type);
+      ServiceSurchargeLine.SETRANGE(Code, ServiceSurchargeVersion.Code);
+      ServiceSurchargeLine.SETRANGE("Source Type", ServiceSurchargeVersion."Source Type");
+      ServiceSurchargeLine.SETRANGE("Service Type", ServiceSurchargeVersion."Service Type");
+      ServiceSurchargeLine.SETRANGE("Department Code", ServiceSurchargeVersion."Department Code");
+      ServiceSurchargeLine.SETRANGE("Index Date", ServiceSurchargeVersion."Index Date");
+      IF NOT ServiceSurchargeLine.FINDSET THEN
+        EXIT;
+
+      CostPriceAmount[ServiceSurchargeLine."Cost Type Filter"::" " +1] := ITotalAmount;
+      CostPriceAmount[ServiceSurchargeLine."Cost Type Filter"::Labor +1] := ILaborAmount;
+      CostPriceAmount[ServiceSurchargeLine."Cost Type Filter"::Material +1] := IMaterialAmount;
+      CostPriceAmount[ServiceSurchargeLine."Cost Type Filter"::Subcontracting +1] := ISubcontractingAmount;
+      CostPriceAmount[ServiceSurchargeLine."Cost Type Filter"::Plant +1] := IPlantAmount;
+      CostPriceAmount[ServiceSurchargeLine."Cost Type Filter"::Sundry +1] := ISundryAmount;
+
+      REPEAT
+        SurchargeAmount := (CostPriceAmount[ServiceSurchargeLine."Cost Type Filter" +1] +
+          PreviousSurchargeAmount[ServiceSurchargeLine."Cost Type Filter" +1]) *
+          ServiceSurchargeLine."Surcharge %" / 100;
+        TotalSurchargeAmount += SurchargeAmount;
+        PreviousSurchargeAmount[ServiceSurchargeLine."Cost Type Filter" +1] += SurchargeAmount;
+        IF ServiceSurchargeLine."Cost Type Filter" <> ServiceSurchargeLine."Cost Type Filter"::" " THEN
+          PreviousSurchargeAmount[ServiceSurchargeLine."Cost Type Filter"::" " +1] += SurchargeAmount;
+      UNTIL ServiceSurchargeLine.NEXT = 0;
+
+      EXIT(TotalSurchargeAmount);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

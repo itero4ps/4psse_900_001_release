@@ -1,0 +1,136 @@
+OBJECT Codeunit 11012327 PlantWebservice
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+
+    PROCEDURE GetPlantRentalAmount@1100525001(LocationCode@1100525010 : Code[20];CustomerNo@1100525005 : Code[20];PlantType@1100525004 : Code[20];PlantNo@1100525003 : Code[10];StartDate@1100525002 : Date;EndDate@1100525001 : Date;Quantity@1100525000 : Decimal) RentalAmount : Decimal;
+    VAR
+      PlantSetup@1100525023 : Record 11012550;
+      PlantTypeRec@1100525024 : Record 11012551;
+      PlantLocation@1100525022 : Record 11012554;
+      Currency@1100525021 : Record 4;
+      SearchRate@1100525020 : Codeunit 11012567;
+      CalculateRentalPeriodsCU@1100525019 : Codeunit 11012568;
+      RateType@1100525018 : Option;
+      RentalStartDate@1100525017 : Date;
+      RentalEndDate@1100525016 : Date;
+      NewRateDate@1100525015 : Date;
+      NewDiscDate@1100530000 : Date;
+      DiscEndDate@1100530001 : Date;
+      RateModified@1100525014 : Boolean;
+      NumberRentalDays@1100525013 : Decimal;
+      NumberRentalPeriods@1100525012 : Decimal;
+      NoRentalPeriods@1100525011 : Decimal;
+      RemainingPeriodsToInvoice@1100525009 : Decimal;
+      ExtraRentalDays@1100525008 : Decimal;
+      UnitPrice@1100525007 : Decimal;
+      LineDiscountPerc@1100525006 : Decimal;
+    BEGIN
+      PlantSetup.GET;
+      IF NOT PlantTypeRec.GET(PlantType) THEN
+        PlantTypeRec.INIT;
+      IF PlantLocation.GET(LocationCode) THEN;
+      Currency.InitRoundingPrecision;
+
+      //Count Number of Rental Periods
+      IF EndDate >= StartDate THEN BEGIN
+        NumberRentalPeriods :=
+          CalculateRentalPeriodsCU.NumberRentalPeriods(PlantLocation,StartDate,EndDate,PlantType,PlantNo,RateType);
+
+        IF NOT (PlantLocation."Rate Type" IN [PlantLocation."Rate Type"::Week, PlantLocation."Rate Type"::Month]) THEN
+          NumberRentalDays := NumberRentalPeriods
+        ELSE
+          NumberRentalDays := EndDate - StartDate + 1;  //* Bij wk/mnd worden alle dagen geteld, zie 'CalculateRentalPeriodsCU'
+      END;
+      IF PlantTypeRec."Minimum Number of Rental Days" > 0 THEN BEGIN
+        IF NumberRentalDays < PlantTypeRec."Minimum Number of Rental Days" THEN
+          ExtraRentalDays := PlantTypeRec."Minimum Number of Rental Days" - NumberRentalDays;
+
+        IF (ExtraRentalDays <> 0) THEN BEGIN
+          CASE PlantLocation."Rate Type" OF
+            PlantLocation."Rate Type"::Day:
+              NumberRentalPeriods := NumberRentalPeriods + ExtraRentalDays;
+            PlantLocation."Rate Type"::Week:
+              NumberRentalPeriods := NumberRentalPeriods + ROUND((ExtraRentalDays / 7), 0.00001);
+            PlantLocation."Rate Type"::Month:
+              NumberRentalPeriods := NumberRentalPeriods + ROUND(
+                CalculateRentalPeriodsCU.NumberRentalMonths(EndDate + 1, EndDate + ExtraRentalDays), 0.00001);
+          END;
+          IF EndDate < StartDate THEN
+            EndDate := StartDate + ExtraRentalDays - 1
+          ELSE
+            EndDate := EndDate + ExtraRentalDays - 1;
+        END;
+      END;
+      IF NumberRentalPeriods = 0 THEN
+        EXIT;
+
+      RemainingPeriodsToInvoice := NumberRentalPeriods;
+      RentalStartDate := StartDate;
+
+      REPEAT
+        RateModified := SearchRate.RentalRateModifiedInPeriod(
+          PlantLocation.Code, PlantType, PlantNo,
+          RentalStartDate, EndDate, NewRateDate);
+        //*C-026618.sn
+        IF RateModified THEN
+          DiscEndDate := NewRateDate - 1
+        ELSE
+          DiscEndDate := EndDate;
+        IF SearchRate.RentalDiscountModifiedInPeriod(
+          PlantLocation.Code, '', PlantType, PlantNo,
+          RentalStartDate, DiscEndDate, NewDiscDate)
+        THEN BEGIN
+          IF RateModified THEN BEGIN
+            IF NewDiscDate < NewRateDate THEN
+              NewRateDate := NewDiscDate;
+          END ELSE BEGIN
+            RateModified := TRUE;
+            NewRateDate := NewDiscDate;
+          END;
+        END;
+        //*C-026618.en
+        IF RateModified THEN BEGIN
+          RentalEndDate := NewRateDate - 1;
+          NoRentalPeriods :=
+            CalculateRentalPeriodsCU.NumberRentalPeriods(
+              PlantLocation,RentalStartDate,RentalEndDate,
+              PlantType, PlantNo, RateType);
+        END ELSE BEGIN
+          RentalEndDate := EndDate;
+          NoRentalPeriods := RemainingPeriodsToInvoice;
+        END;
+        RemainingPeriodsToInvoice := RemainingPeriodsToInvoice - NoRentalPeriods;
+
+        IF NoRentalPeriods <> 0 THEN BEGIN
+          UnitPrice := ROUND(SearchRate.Rate
+            (PlantLocation.Code,PlantType,PlantNo,'',RentalStartDate,0,2,''),Currency."Unit-Amount Rounding Precision");
+
+          LineDiscountPerc :=
+            SearchRate.RentalDiscount(PlantLocation.Code,CustomerNo,PlantType,PlantNo,RentalStartDate);
+
+          RentalAmount := RentalAmount +
+            ROUND(ROUND(Quantity * UnitPrice * NoRentalPeriods,Currency."Amount Rounding Precision") * (1 -
+            LineDiscountPerc /100),Currency."Amount Rounding Precision");
+        END;
+        RentalStartDate := RentalEndDate + 1;
+      UNTIL (NOT RateModified) OR (RemainingPeriodsToInvoice = 0) OR (RentalStartDate > EndDate);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

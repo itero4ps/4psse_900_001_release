@@ -1,0 +1,715 @@
+OBJECT Codeunit 11012865 Appointment Management
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      TmpOccupiedTimeBuffer@1100528600 : TEMPORARY Record 11071809;
+      LastEntryNo@1100528602 : Integer;
+      OccupiedType@1100528601 : ' ,Base Calendar,Employee Time Table,Pause,Service Time Table,Employee Absence,Planned Service Order,Maintenance Proposal,Reserved for Calls,Outside Maintenance Window';
+
+    PROCEDURE RebuildSOAvailAppointmBlocks@1100528600(IServiceOrderNo@1100528603 : Code[20]);
+    VAR
+      ServiceOrder@1100528604 : Record 11012823;
+      PlanningAgreement@1100528602 : Record 11071729;
+      SOAppointmentBlock@1100528600 : Record 11071965;
+      ServiceClusterSeq@1100528605 : Record 11071966;
+      SeekDate@1100528601 : Date;
+    BEGIN
+      ServiceOrder.GET(IServiceOrderNo);
+      IF ServiceOrder."Starting Date" <> ServiceOrder."Ending Date" THEN
+        EXIT;
+      IF NOT ServiceClusterSeq.GET(
+        GetClusterContractNo(ServiceOrder."Service Contract No."), ServiceOrder."Service Cluster", ServiceOrder."Service Cluster Seqn.")
+      THEN
+        EXIT;
+      SOAppointmentBlock.SETRANGE("Service Order No.", IServiceOrderNo);
+      SOAppointmentBlock.DELETEALL(TRUE);
+
+      IF ServiceClusterSeq."Last Possible Change Date" <> 0D THEN
+        IF TODAY > ServiceClusterSeq."Last Possible Change Date" THEN
+          EXIT;
+
+      RebuildClusterSeqn(
+        GetClusterContractNo(ServiceOrder."Service Contract No."), ServiceOrder."Service Cluster", ServiceOrder."Service Cluster Seqn.");
+
+      FOR SeekDate := ServiceClusterSeq."Execution Period Start Date" TO ServiceClusterSeq."Execution Period Ending Date" DO BEGIN
+        PlanningAgreement.SETFILTER(Type, '%1|%2', PlanningAgreement.Type::"Appointment Letter", PlanningAgreement.Type::Both);
+        IF PlanningAgreement.FINDSET THEN
+          REPEAT
+            SOAppointmentBlock.INIT;
+            SOAppointmentBlock."Service Order No." := IServiceOrderNo;
+            SOAppointmentBlock."Appointment Date" := SeekDate;
+            SOAppointmentBlock.VALIDATE("Planning Agreement Code", PlanningAgreement.Code);
+            SOAppointmentBlock.Available :=
+              IsAppointBlockAvailable(IServiceOrderNo, SeekDate, PlanningAgreement."Starting Time", PlanningAgreement."Ending Time");
+            SOAppointmentBlock.INSERT(TRUE);
+
+            SOAppointmentBlock.VALIDATE("Planning Agreement Code", '');
+            IF NOT SOAppointmentBlock.INSERT(TRUE) THEN
+              IF SOAppointmentBlock.Available THEN
+                SOAppointmentBlock.MODIFY(TRUE);
+          UNTIL PlanningAgreement.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE RebuildClusterSeqn@1100528601(IServiceContractNo@1100528600 : Code[20];IClusterNo@1100528601 : Code[10];IClusterSeqn@1100528602 : Integer);
+    VAR
+      ServiceContractClusterSeq@1100528603 : Record 11071966;
+      SeekDate@1100528605 : Date;
+    BEGIN
+      IF NOT ServiceContractClusterSeq.GET(IServiceContractNo, IClusterNo, IClusterSeqn) THEN
+        EXIT;
+      // Refresh after 1 minute
+      IF FORMAT(ServiceContractClusterSeq."Last Rebuild") <> '' THEN
+        IF (CURRENTDATETIME - ServiceContractClusterSeq."Last Rebuild") / 1000 / 60 < 1 THEN
+          EXIT;
+
+      FOR SeekDate := ServiceContractClusterSeq."Execution Period Start Date" TO
+                      ServiceContractClusterSeq."Execution Period Ending Date"
+      DO
+        RebuildClusterSeqnByDate(IServiceContractNo, IClusterNo, IClusterSeqn, SeekDate);
+
+      ServiceContractClusterSeq."Last Rebuild" := CURRENTDATETIME;
+      ServiceContractClusterSeq.MODIFY(TRUE);
+    END;
+
+    PROCEDURE RebuildClusterSeqnByDate@1100528622(IServiceContractNo@1100528605 : Code[20];IClusterNo@1100528604 : Code[10];IClusterSeqn@1100528603 : Integer;ISeekDate@1100528600 : Date);
+    VAR
+      ServiceContractClusterSeq@1100528601 : Record 11071966;
+      SCClusterEmployee@1100528602 : Record 11071967;
+    BEGIN
+      ServiceContractClusterSeq.GET(IServiceContractNo, IClusterNo, IClusterSeqn);
+      IF ServiceContractClusterSeq.Subcontractor = '' THEN BEGIN
+        SCClusterEmployee.SETRANGE("Service Contract No.", ServiceContractClusterSeq."Service Contract No.");
+        SCClusterEmployee.SETRANGE("Cluster Code", ServiceContractClusterSeq."Cluster Code");
+        SCClusterEmployee.SETRANGE("Seq. No.", ServiceContractClusterSeq."Seq. No.");
+        IF SCClusterEmployee.FINDSET THEN
+          REPEAT
+            RebuildClusterSeqnByEmplDate(SCClusterEmployee."Service Contract No.", SCClusterEmployee."Cluster Code",
+              SCClusterEmployee."Seq. No.", SCClusterEmployee."Resource No.", ISeekDate);
+          UNTIL SCClusterEmployee.NEXT = 0;
+      END ELSE
+        RebuildClusterSeqnByEmplDate(SCClusterEmployee."Service Contract No.", SCClusterEmployee."Cluster Code",
+          SCClusterEmployee."Seq. No.", ServiceContractClusterSeq.Subcontractor, ISeekDate);
+    END;
+
+    PROCEDURE RebuildClusterSeqnByEmplDate@1100528605(IServiceContractNo@1100528600 : Code[20];IClusterNo@1100528601 : Code[10];IClusterSeqn@1100528602 : Integer;IResourceNo@1100528606 : Code[20];ISeekDate@1100528607 : Date);
+    VAR
+      ServiceContractClusterSeq@1100528603 : Record 11071966;
+      AvailableClusterSeqnBlock@1100528604 : Record 11071968;
+    BEGIN
+      IF NOT ServiceContractClusterSeq.GET(IServiceContractNo, IClusterNo, IClusterSeqn) THEN
+        EXIT;
+
+      FillOccupiedTimeBuffer(ISeekDate, IResourceNo);
+
+      AvailableClusterSeqnBlock.SETRANGE("Service Contract No.", IServiceContractNo);
+      AvailableClusterSeqnBlock.SETRANGE("Cluster Code", IClusterNo);
+      AvailableClusterSeqnBlock.SETRANGE("Cluster Seq. No.", IClusterSeqn);
+      AvailableClusterSeqnBlock.SETRANGE("Resource No.", IResourceNo);
+      AvailableClusterSeqnBlock.SETRANGE("Available Date", ISeekDate);
+      AvailableClusterSeqnBlock.DELETEALL(TRUE);
+
+      TmpOccupiedTimeBuffer.SETFILTER("Unoccupied Hours", '>%1', 0);
+      IF TmpOccupiedTimeBuffer.FINDSET THEN
+        REPEAT
+          AvailableClusterSeqnBlock.INIT;
+          AvailableClusterSeqnBlock."Service Contract No." := IServiceContractNo;
+          AvailableClusterSeqnBlock."Cluster Code" := IClusterNo;
+          AvailableClusterSeqnBlock."Cluster Seq. No." := IClusterSeqn;
+          AvailableClusterSeqnBlock."Seq. No." := 0;
+          AvailableClusterSeqnBlock."Resource No." := IResourceNo;
+          AvailableClusterSeqnBlock."Available Date" := ISeekDate;
+          AvailableClusterSeqnBlock."Available Block Start" := TmpOccupiedTimeBuffer."Ending Time";
+          AvailableClusterSeqnBlock."Available Block End" :=
+            TmpOccupiedTimeBuffer."Ending Time" + ROUND(TmpOccupiedTimeBuffer."Unoccupied Hours" * 1000 * 60 * 60, 1);
+          AvailableClusterSeqnBlock."Available Hours" := TmpOccupiedTimeBuffer."Unoccupied Hours";
+          AvailableClusterSeqnBlock.INSERT(TRUE);
+        UNTIL TmpOccupiedTimeBuffer.NEXT = 0;
+    END;
+
+    PROCEDURE IsAppointBlockAvailable@1100528607(IServiceOrderNo@1100528602 : Code[20];ISeekDate@1100528605 : Date;IStartingTime@1100528600 : Time;IEndingTime@1100528601 : Time) : Boolean;
+    VAR
+      ServiceOrder@1100528603 : Record 11012823;
+      ServiceContractClusterSeq@1100528607 : Record 11071966;
+      AvailableClusterSeqnBlock@1100528608 : Record 11071968;
+      BudgetHours@1100528604 : Decimal;
+      AvailableHours@1100528606 : Decimal;
+    BEGIN
+      BudgetHours := GetServiceOrderBudgetHours(IServiceOrderNo);
+      IF BudgetHours = -1 THEN
+        EXIT(FALSE);
+      IF NOT ServiceOrder.GET(IServiceOrderNo) THEN
+        EXIT(FALSE);
+      IF NOT ServiceContractClusterSeq.GET(
+        GetClusterContractNo(ServiceOrder."Service Contract No."), ServiceOrder."Service Cluster", ServiceOrder."Service Cluster Seqn.")
+      THEN
+        EXIT(FALSE);
+
+      AvailableClusterSeqnBlock.SETRANGE("Service Contract No.", GetClusterContractNo(ServiceOrder."Service Contract No."));
+      AvailableClusterSeqnBlock.SETRANGE("Cluster Code", ServiceOrder."Service Cluster");
+      AvailableClusterSeqnBlock.SETRANGE("Cluster Seq. No.", ServiceOrder."Service Cluster Seqn.");
+      AvailableClusterSeqnBlock.SETRANGE("Available Date", ISeekDate);
+      AvailableClusterSeqnBlock.SETFILTER("Available Block Start", '<=%1', IEndingTime);
+      AvailableClusterSeqnBlock.SETFILTER("Available Block End", '>=%1', IStartingTime);
+      AvailableClusterSeqnBlock.SETFILTER("Available Hours", '>=%1', BudgetHours);
+      IF AvailableClusterSeqnBlock.FINDSET THEN
+        REPEAT
+          AvailableHours := AvailableClusterSeqnBlock."Available Hours";
+          IF IStartingTime > AvailableClusterSeqnBlock."Available Block Start" THEN
+            AvailableHours -= (IStartingTime - AvailableClusterSeqnBlock."Available Block Start") / 1000 / 60 / 60;
+          IF IEndingTime < AvailableClusterSeqnBlock."Available Block End" THEN
+            AvailableHours -= (AvailableClusterSeqnBlock."Available Block End" - IEndingTime) / 1000 / 60 / 60;
+          IF BudgetHours <= AvailableHours THEN
+            EXIT(TRUE);
+        UNTIL AvailableClusterSeqnBlock.NEXT = 0;
+    END;
+
+    PROCEDURE GetServiceOrderBudgetHours@1100528613(IServiceOrderNo@1100528601 : Code[20]) : Decimal;
+    VAR
+      ServiceOrder@1100528600 : Record 11012823;
+    BEGIN
+      IF NOT ServiceOrder.GET(IServiceOrderNo) THEN
+        EXIT;
+      ServiceOrder.CALCFIELDS("Budget Hours");
+      IF ServiceOrder."Budget Hours" <> 0 THEN
+        EXIT(ServiceOrder."Budget Hours");
+      IF ServiceOrder."Starting Date" <> ServiceOrder."Ending Date" THEN
+        EXIT(-1);
+      IF (ServiceOrder."Starting Time" <> 0T) AND (ServiceOrder."Ending Time" <> 0T) THEN
+        EXIT((ServiceOrder."Ending Time" - ServiceOrder."Starting Time") / (60 * 60 * 1000));
+    END;
+
+    PROCEDURE ReplanServiceOrder@1100528604(IServiceOrderNo@1100528600 : Code[20];INewAppointmentDate@1100528602 : Date;INewAppointementCode@1100528601 : Code[10]) : Boolean;
+    VAR
+      ServiceOrder@1100528603 : Record 11012823;
+      WorkOrder@1100528613 : Record 11229279;
+      AvailableClusterSeqnBlock@1100528604 : Record 11071968;
+      PlanningAgreement@1100528607 : Record 11071729;
+      ResourceWOP@1100528612 : Record 11229278;
+      BudgetHours@1100528605 : Decimal;
+      PreviousStartingDate@1100528606 : Date;
+      StartingTime@1100528611 : Time;
+      NewStartingTime@1100528610 : Time;
+      EndingTime@1100528609 : Time;
+      NewResourceNo@1100528608 : Code[20];
+    BEGIN
+      IF NOT ServiceOrder.GET(IServiceOrderNo) THEN
+        EXIT(FALSE);
+      BudgetHours := GetServiceOrderBudgetHours(IServiceOrderNo);
+      IF BudgetHours = -1 THEN
+        EXIT(FALSE);
+      IF NOT CanReplanServiceOrder(IServiceOrderNo) THEN
+        EXIT(FALSE);
+      IF (INewAppointmentDate = ServiceOrder."Starting Date") AND
+         (INewAppointementCode = GetPlanningAgreementCode(IServiceOrderNo))
+      THEN
+        EXIT(FALSE);
+
+      RebuildClusterSeqnByDate(GetClusterContractNo(ServiceOrder."Service Contract No."), ServiceOrder."Service Cluster",
+        ServiceOrder."Service Cluster Seqn.", INewAppointmentDate);
+      PlanningAgreement.GET(INewAppointementCode);
+      AvailableClusterSeqnBlock.SETRANGE("Service Contract No.", GetClusterContractNo(ServiceOrder."Service Contract No."));
+      AvailableClusterSeqnBlock.SETRANGE("Cluster Code", ServiceOrder."Service Cluster");
+      AvailableClusterSeqnBlock.SETRANGE("Cluster Seq. No.", ServiceOrder."Service Cluster Seqn.");
+      AvailableClusterSeqnBlock.SETRANGE("Available Date", INewAppointmentDate);
+      AvailableClusterSeqnBlock.SETFILTER("Available Hours", '>=%1', BudgetHours);
+      AvailableClusterSeqnBlock.SETFILTER("Available Block Start", '<%1', PlanningAgreement."Ending Time");
+      AvailableClusterSeqnBlock.SETFILTER("Available Block End", '>%1', PlanningAgreement."Starting Time");
+      IF AvailableClusterSeqnBlock.FINDSET THEN
+        REPEAT
+          StartingTime := PlanningAgreement."Starting Time";
+          EndingTime := PlanningAgreement."Ending Time";
+          CASE TRUE OF
+            PlanningAgreement."Starting Time" < AvailableClusterSeqnBlock."Available Block Start":
+              StartingTime := AvailableClusterSeqnBlock."Available Block Start";
+            PlanningAgreement."Ending Time" > AvailableClusterSeqnBlock."Available Block End":
+              EndingTime := AvailableClusterSeqnBlock."Available Block End";
+          END;
+          IF EndingTime - StartingTime >= BudgetHours * 60 * 60 * 1000 THEN BEGIN
+            NewStartingTime := StartingTime;
+            NewResourceNo := AvailableClusterSeqnBlock."Resource No.";
+      //      NewSubcontractorNo := AvailableClusterSeqnBlock."Subcontractor No. OLD";
+          END;
+        UNTIL (AvailableClusterSeqnBlock.NEXT = 0) OR (NewStartingTime <> 0T);
+      IF NewStartingTime = 0T THEN
+        EXIT(FALSE);
+
+      PreviousStartingDate := ServiceOrder."Starting Date";
+
+      WorkOrder.SETCURRENTKEY("Source Company", "Source Type", "Source No.");
+      WorkOrder.SETRANGE("Source Company", COMPANYNAME);
+      WorkOrder.SETRANGE("Source Type", WorkOrder."Source Type"::ServiceOrder);
+      WorkOrder.SETRANGE("Source No.", ServiceOrder."No.");
+      WorkOrder.DELETEALL(TRUE);
+
+      ServiceOrder.FIND('=');
+      IF INewAppointmentDate <> ServiceOrder."Starting Date" THEN BEGIN
+        ServiceOrder.VALIDATE("First Possible Starting Date", 0D);
+        ServiceOrder.VALIDATE("First Possible Starting Time", 0T);
+        ServiceOrder.VALIDATE("Last Possible Ending Time", 0T);
+        ServiceOrder.VALIDATE("Ending Date", 0D);
+        ServiceOrder.VALIDATE("Starting Date", INewAppointmentDate);
+        ServiceOrder.VALIDATE("Ending Date", INewAppointmentDate);
+      END;
+      ServiceOrder.VALIDATE("Ending Time", 0T);
+      ServiceOrder.VALIDATE("Starting Time", NewStartingTime);
+      ServiceOrder.VALIDATE("Ending Time", ServiceOrder."Starting Time" + BudgetHours * 60 * 60 * 1000);
+
+      IF NOT ResourceWOP.GET(NewResourceNo) THEN
+        ResourceWOP.INIT;
+      CASE ResourceWOP.Type OF
+        ResourceWOP.Type::Employee:
+          ServiceOrder.VALIDATE("Employee No.", NewResourceNo);
+        ResourceWOP.Type::Subcontractor:
+          ServiceOrder.VALIDATE(Subcontractor, NewResourceNo);
+      END;
+      ServiceOrder.MODIFY(TRUE);
+      ServiceOrder.UpdateWorkOrder(TRUE);
+
+      IF PreviousStartingDate <> ServiceOrder."Starting Date" THEN
+        RebuildClusterSeqnByDate(GetClusterContractNo(ServiceOrder."Service Contract No."), ServiceOrder."Service Cluster",
+          ServiceOrder."Service Cluster Seqn.", PreviousStartingDate);
+      RebuildClusterSeqnByDate(GetClusterContractNo(ServiceOrder."Service Contract No."), ServiceOrder."Service Cluster",
+        ServiceOrder."Service Cluster Seqn.", INewAppointmentDate);
+
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE CanReplanServiceOrder@1100528606(IServiceOrderNo@1100528600 : Code[20]) : Boolean;
+    VAR
+      ServiceContractClusterSeq@1100528603 : Record 11071966;
+      ServiceOrder@1100528601 : Record 11012823;
+    BEGIN
+      IF NOT ServiceOrder.GET(IServiceOrderNo) THEN
+        EXIT(FALSE);
+      IF NOT ServiceContractClusterSeq.GET(
+        ServiceOrder."Service Contract No.", ServiceOrder."Service Cluster", ServiceOrder."Service Cluster Seqn.")
+      THEN
+        EXIT(FALSE);
+      IF ServiceContractClusterSeq."Last Possible Change Date" = 0D THEN
+        EXIT(TRUE);
+      EXIT(ServiceContractClusterSeq."Last Possible Change Date" >= TODAY);
+    END;
+
+    PROCEDURE GetPlanningAgreementCode@1100528624(IServiceOrderNo@1100528601 : Code[20]) : Code[10];
+    VAR
+      ServiceOrder@1100528602 : Record 11012823;
+      PlanningAgreement@1100528600 : Record 11071729;
+    BEGIN
+      IF NOT ServiceOrder.GET(IServiceOrderNo) THEN
+        EXIT;
+      PlanningAgreement.SETFILTER(Type, '%1|%2', PlanningAgreement.Type::"Appointment Letter", PlanningAgreement.Type::Both);
+      PlanningAgreement.SETFILTER("Starting Time", '<=%1', ServiceOrder."Starting Time");
+      PlanningAgreement.SETFILTER("Ending Time", '>=%1', ServiceOrder."Starting Time");
+      IF PlanningAgreement.FINDLAST THEN
+        EXIT(PlanningAgreement.Code);
+    END;
+
+    PROCEDURE GetMaintAppointLink@1100528612(IServiceOrderNo@1100528601 : Code[20];IType@1100528600 : 'Confirmation,Change') : Text[250];
+    VAR
+      ServPortSetup@1100528602 : Record 11126065;
+      AppointmentMgtSPTWS@1100528604 : Codeunit 11012864;
+      ActionText@1100528603 : Text[30];
+    BEGIN
+      IF NOT ServPortSetup.FINDFIRST THEN
+        EXIT;
+
+      CASE IType OF
+        IType::Confirmation:
+          ActionText := 'confirmation';
+        IType::Change:
+          ActionText := 'change';
+      END;
+
+      EXIT(STRSUBSTNO('%1/CallAppointment.aspx?action=%2&SO=%3&hash=%4',
+        ServPortSetup."URL Site Root", ActionText, IServiceOrderNo, AppointmentMgtSPTWS.GetMaintAppointmentHash(IServiceOrderNo)));
+    END;
+
+    PROCEDURE GetFullHTMLMaintAppointLink@1100528611(IServiceOrderNo@1100528601 : Code[20];IType@1100528600 : 'Confirmation,Change';ILinkText@1100528602 : Text[50]) : Text[250];
+    VAR
+      ServPortSetup@1100528603 : Record 11126065;
+    BEGIN
+      IF NOT ServPortSetup.FINDFIRST THEN
+        EXIT;
+      EXIT(STRSUBSTNO('<a href="%1">%2</a>', GetMaintAppointLink(IServiceOrderNo, IType), ILinkText));
+    END;
+
+    PROCEDURE "----"@1100528602();
+    BEGIN
+    END;
+
+    LOCAL PROCEDURE FillOccupiedTimeBuffer@1100528610(IDate@1100528601 : Date;IResourceNo@1100528606 : Code[20]);
+    VAR
+      CompanyInformation@1100528602 : Record 79;
+      EmployeeTimeTable@1100528600 : Record 11012923;
+      ServiceSetup@1100528608 : Record 11012800;
+      BaseCalendar@1100528607 : Record 11072014;
+      EmployeeAbsence@1100528609 : Record 5207;
+      ServiceOrder@1100528611 : Record 11012823;
+      Resource@1100529001 : Record 11229278;
+      WorkOrder@1100528612 : Record 11229279;
+      CompanyPlanGroup@1100528616 : Record 11229300;
+      CalendarManagement@1100528604 : Codeunit 7600;
+      NonWorking@1100528603 : Boolean;
+      Description@1100528605 : Text[30];
+      DOW@1100528610 : Integer;
+      StartingTime@1100528614 : Time;
+      EndingTime@1100528615 : Time;
+      EmployeeNo@1100529000 : Code[20];
+      SetupCompanyName@1100528613 : Text[30];
+    BEGIN
+      IF IResourceNo <> '' THEN BEGIN
+        IF Resource.GET(IResourceNo) THEN
+          IF Resource.Type = Resource.Type::Employee THEN
+            EmployeeNo := Resource."Source No.";
+      END;
+      IF (EmployeeNo <> '') AND (COMPANYNAME <> Resource.Company) THEN BEGIN
+        EmployeeTimeTable.CHANGECOMPANY(Resource.Company);
+        EmployeeAbsence.CHANGECOMPANY(Resource.Company);
+      END;
+      SetupCompanyName := CompanyPlanGroup.GetSetupCompanyOfCurrentCompanyPlanGroup();
+      IF SetupCompanyName <> COMPANYNAME THEN BEGIN
+        CompanyInformation.CHANGECOMPANY(SetupCompanyName);
+        BaseCalendar.CHANGECOMPANY(SetupCompanyName);
+      END;
+
+      TmpOccupiedTimeBuffer.RESET;
+      TmpOccupiedTimeBuffer.DELETEALL(TRUE);
+      ResetOccupiedTimeBufferFilter(TmpOccupiedTimeBuffer);
+      TmpOccupiedTimeBuffer.SETRANGE("Starting Date", IDate);
+      IF NOT TmpOccupiedTimeBuffer.ISEMPTY THEN
+        EXIT;
+
+      CompanyInformation.GET;
+      NonWorking := CalendarManagement.CheckDateStatus(CompanyInformation."Base Calendar Code", IDate, Description);
+      IF NonWorking THEN BEGIN
+        InsertOccupiedTimeEntry(IDate, 0T, 235959T, OccupiedType::"Base Calendar");
+        EXIT;
+      END;
+
+      DOW := DATE2DWY(IDate, 1);
+      EmployeeTimeTable.SETRANGE("Employee No.", EmployeeNo);
+      EmployeeTimeTable.SETFILTER("Effective Date", '..%1', IDate);
+      IF (EmployeeNo <> '') AND EmployeeTimeTable.FINDLAST THEN BEGIN
+        CASE DOW OF
+          1:
+            BEGIN
+              IF EmployeeTimeTable."Monday Work From" <> 0T THEN BEGIN
+                InsertOccupiedTimeEntry(IDate, 0T, EmployeeTimeTable."Monday Work From", OccupiedType::"Employee Time Table");
+                InsertOccupiedTimeEntry(IDate, EmployeeTimeTable."Monday Work Until", 235959T, OccupiedType::"Employee Time Table");
+              END ELSE
+                InsertOccupiedTimeEntry(IDate, 0T, 235959T, OccupiedType::"Employee Time Table");
+              IF (EmployeeTimeTable."Monday Pause From" <> 0T) AND (EmployeeTimeTable."Monday Pause Until" <> 0T) THEN
+                InsertOccupiedTimeEntry(
+                  IDate, EmployeeTimeTable."Monday Pause From", EmployeeTimeTable."Monday Pause Until", OccupiedType::Pause);
+            END;
+          2:
+            BEGIN
+              IF EmployeeTimeTable."Tuesday Work From" <> 0T THEN BEGIN
+                InsertOccupiedTimeEntry(IDate, 0T, EmployeeTimeTable."Tuesday Work From", OccupiedType::"Employee Time Table");
+                InsertOccupiedTimeEntry(IDate, EmployeeTimeTable."Tuesday Work Until", 235959T, OccupiedType::"Employee Time Table");
+              END ELSE
+                InsertOccupiedTimeEntry(IDate, 0T, 235959T, OccupiedType::"Employee Time Table");
+              IF (EmployeeTimeTable."Tuesday Pause From" <> 0T) AND (EmployeeTimeTable."Tuesday Pause Until" <> 0T) THEN
+                InsertOccupiedTimeEntry(
+                  IDate, EmployeeTimeTable."Tuesday Pause From", EmployeeTimeTable."Tuesday Pause Until", OccupiedType::Pause);
+            END;
+          3:
+            BEGIN
+              IF EmployeeTimeTable."Wednesday Work From" <> 0T THEN BEGIN
+                InsertOccupiedTimeEntry(IDate, 0T, EmployeeTimeTable."Wednesday Work From", OccupiedType::"Employee Time Table");
+                InsertOccupiedTimeEntry(IDate, EmployeeTimeTable."Wednesday Work Until", 235959T, OccupiedType::"Employee Time Table");
+              END ELSE
+                InsertOccupiedTimeEntry(IDate, 0T, 235959T, OccupiedType::"Employee Time Table");
+              IF (EmployeeTimeTable."Wednesday Pause From" <> 0T) AND (EmployeeTimeTable."Wednesday Pause Until" <> 0T) THEN
+                InsertOccupiedTimeEntry(
+                  IDate, EmployeeTimeTable."Wednesday Pause From", EmployeeTimeTable."Wednesday Pause Until", OccupiedType::Pause);
+            END;
+          4:
+            BEGIN
+              IF EmployeeTimeTable."Thursday Work From" <> 0T THEN BEGIN
+                InsertOccupiedTimeEntry(IDate, 0T, EmployeeTimeTable."Thursday Work From", OccupiedType::"Employee Time Table");
+                InsertOccupiedTimeEntry(IDate, EmployeeTimeTable."Thursday Work Until", 235959T, OccupiedType::"Employee Time Table");
+              END ELSE
+                InsertOccupiedTimeEntry(IDate, 0T, 235959T, OccupiedType::"Employee Time Table");
+              IF (EmployeeTimeTable."Thursday Pause From" <> 0T) AND (EmployeeTimeTable."Thursday Pause Until" <> 0T) THEN
+                InsertOccupiedTimeEntry(
+                  IDate, EmployeeTimeTable."Thursday Pause From", EmployeeTimeTable."Thursday Pause Until", OccupiedType::Pause);
+            END;
+          5:
+            BEGIN
+              IF EmployeeTimeTable."Friday Work From" <> 0T THEN BEGIN
+                InsertOccupiedTimeEntry(IDate, 0T, EmployeeTimeTable."Friday Work From", OccupiedType::"Employee Time Table");
+                InsertOccupiedTimeEntry(IDate, EmployeeTimeTable."Friday Work Until", 235959T, OccupiedType::"Employee Time Table");
+              END ELSE
+                InsertOccupiedTimeEntry(IDate, 0T, 235959T, OccupiedType::"Employee Time Table");
+              IF (EmployeeTimeTable."Friday Pause From" <> 0T) AND (EmployeeTimeTable."Friday Pause Until" <> 0T) THEN
+                InsertOccupiedTimeEntry(
+                  IDate, EmployeeTimeTable."Friday Pause From", EmployeeTimeTable."Friday Pause Until", OccupiedType::Pause);
+            END;
+          6:
+            BEGIN
+              IF EmployeeTimeTable."Saturday Work From" <> 0T THEN BEGIN
+                InsertOccupiedTimeEntry(IDate, 0T, EmployeeTimeTable."Saturday Work From", OccupiedType::"Employee Time Table");
+                InsertOccupiedTimeEntry(IDate, EmployeeTimeTable."Saturday Work Until", 235959T, OccupiedType::"Employee Time Table");
+              END ELSE
+                InsertOccupiedTimeEntry(IDate, 0T, 235959T, OccupiedType::"Employee Time Table");
+              IF (EmployeeTimeTable."Saturday Pause From" <> 0T) AND (EmployeeTimeTable."Saturday Pause Until" <> 0T) THEN
+                InsertOccupiedTimeEntry(
+                  IDate, EmployeeTimeTable."Saturday Pause From", EmployeeTimeTable."Saturday Pause Until", OccupiedType::Pause);
+            END;
+          7:
+            BEGIN
+              IF EmployeeTimeTable."Sunday Work From" <> 0T THEN BEGIN
+                InsertOccupiedTimeEntry(IDate, 0T, EmployeeTimeTable."Sunday Work From", OccupiedType::"Employee Time Table");
+                InsertOccupiedTimeEntry(IDate, EmployeeTimeTable."Sunday Work Until", 235959T, OccupiedType::"Employee Time Table");
+              END ELSE
+                InsertOccupiedTimeEntry(IDate, 0T, 235959T, OccupiedType::"Employee Time Table");
+              IF (EmployeeTimeTable."Sunday Pause From" <> 0T) AND (EmployeeTimeTable."Sunday Pause Until" <> 0T) THEN
+                InsertOccupiedTimeEntry(
+                  IDate, EmployeeTimeTable."Sunday Pause From", EmployeeTimeTable."Sunday Pause Until", OccupiedType::Pause);
+            END;
+        END;
+      END ELSE BEGIN
+        CompanyInformation.GET;
+        IF BaseCalendar.GET(CompanyInformation."Base Calendar Code") THEN BEGIN
+          CASE DOW OF
+            1:
+              BEGIN
+                IF BaseCalendar."Monday Work From" <> 0T THEN BEGIN
+                  InsertOccupiedTimeEntry(IDate, 0T, BaseCalendar."Monday Work From", OccupiedType::"Employee Time Table");
+                  InsertOccupiedTimeEntry(IDate, BaseCalendar."Monday Work Until", 235959T, OccupiedType::"Employee Time Table");
+                END ELSE
+                  InsertOccupiedTimeEntry(IDate, 0T, 235959T, OccupiedType::"Employee Time Table");
+                IF (BaseCalendar."Monday Pause From" <> 0T) AND (BaseCalendar."Monday Pause Until" <> 0T) THEN
+                  InsertOccupiedTimeEntry(
+                    IDate, BaseCalendar."Monday Pause From", BaseCalendar."Monday Pause Until", OccupiedType::Pause);
+              END;
+            2:
+              BEGIN
+                IF BaseCalendar."Tuesday Work From" <> 0T THEN BEGIN
+                  InsertOccupiedTimeEntry(IDate, 0T, BaseCalendar."Tuesday Work From", OccupiedType::"Employee Time Table");
+                  InsertOccupiedTimeEntry(IDate, BaseCalendar."Tuesday Work Until", 235959T, OccupiedType::"Employee Time Table");
+                END ELSE
+                  InsertOccupiedTimeEntry(IDate, 0T, 235959T, OccupiedType::"Employee Time Table");
+                IF (BaseCalendar."Tuesday Pause From" <> 0T) AND (BaseCalendar."Tuesday Pause Until" <> 0T) THEN
+                  InsertOccupiedTimeEntry(
+                    IDate, BaseCalendar."Tuesday Pause From", BaseCalendar."Tuesday Pause Until", OccupiedType::Pause);
+              END;
+            3:
+              BEGIN
+                IF BaseCalendar."Wednesday Work From" <> 0T THEN BEGIN
+                  InsertOccupiedTimeEntry(IDate, 0T, BaseCalendar."Wednesday Work From", OccupiedType::"Employee Time Table");
+                  InsertOccupiedTimeEntry(
+                   IDate, BaseCalendar."Wednesday Work Until", 235959T, OccupiedType::"Employee Time Table");
+                END ELSE
+                  InsertOccupiedTimeEntry(IDate, 0T, 235959T, OccupiedType::"Employee Time Table");
+                IF (BaseCalendar."Wednesday Pause From" <> 0T) AND (BaseCalendar."Wednesday Pause Until" <> 0T) THEN
+                  InsertOccupiedTimeEntry(
+                    IDate, BaseCalendar."Wednesday Pause From", BaseCalendar."Wednesday Pause Until", OccupiedType::Pause);
+              END;
+            4:
+              BEGIN
+                IF BaseCalendar."Thursday Work From" <> 0T THEN BEGIN
+                  InsertOccupiedTimeEntry(IDate, 0T, BaseCalendar."Thursday Work From", OccupiedType::"Employee Time Table");
+                  InsertOccupiedTimeEntry(
+                    IDate, BaseCalendar."Thursday Work Until", 235959T, OccupiedType::"Employee Time Table");
+                END ELSE
+                  InsertOccupiedTimeEntry(IDate, 0T, 235959T, OccupiedType::"Employee Time Table");
+                IF (BaseCalendar."Thursday Pause From" <> 0T) AND (BaseCalendar."Thursday Pause Until" <> 0T) THEN
+                  InsertOccupiedTimeEntry(
+                    IDate, BaseCalendar."Thursday Pause From", BaseCalendar."Thursday Pause Until", OccupiedType::Pause);
+              END;
+            5:
+              BEGIN
+                IF BaseCalendar."Friday Work From" <> 0T THEN BEGIN
+                  InsertOccupiedTimeEntry(IDate, 0T, BaseCalendar."Friday Work From", OccupiedType::"Employee Time Table");
+                  InsertOccupiedTimeEntry(IDate, BaseCalendar."Friday Work Until", 235959T, OccupiedType::"Employee Time Table");
+                END ELSE
+                  InsertOccupiedTimeEntry(IDate, 0T, 235959T, OccupiedType::"Employee Time Table");
+                IF (BaseCalendar."Friday Pause From" <> 0T) AND (BaseCalendar."Friday Pause Until" <> 0T) THEN
+                  InsertOccupiedTimeEntry(
+                    IDate, BaseCalendar."Friday Pause From", BaseCalendar."Friday Pause Until", OccupiedType::Pause);
+              END;
+            6:
+              BEGIN
+                IF BaseCalendar."Saturday Work From" <> 0T THEN BEGIN
+                  InsertOccupiedTimeEntry(IDate, 0T, BaseCalendar."Saturday Work From", OccupiedType::"Employee Time Table");
+                  InsertOccupiedTimeEntry(
+                    IDate, BaseCalendar."Saturday Work Until", 235959T, OccupiedType::"Employee Time Table");
+                END ELSE
+                  InsertOccupiedTimeEntry(IDate, 0T, 235959T, OccupiedType::"Employee Time Table");
+                IF (BaseCalendar."Saturday Pause From" <> 0T) AND (BaseCalendar."Saturday Pause Until" <> 0T) THEN
+                  InsertOccupiedTimeEntry(
+                    IDate, BaseCalendar."Saturday Pause From", BaseCalendar."Saturday Pause Until", OccupiedType::Pause);
+              END;
+            7:
+              BEGIN
+                IF BaseCalendar."Sunday Work From" <> 0T THEN BEGIN
+                  InsertOccupiedTimeEntry(IDate, 0T, BaseCalendar."Sunday Work From", OccupiedType::"Employee Time Table");
+                  InsertOccupiedTimeEntry(IDate, BaseCalendar."Sunday Work Until", 235959T, OccupiedType::"Employee Time Table");
+                END ELSE
+                  InsertOccupiedTimeEntry(IDate, 0T, 235959T, OccupiedType::"Employee Time Table");
+                IF (BaseCalendar."Sunday Pause From" <> 0T) AND (BaseCalendar."Sunday Pause Until" <> 0T) THEN
+                  InsertOccupiedTimeEntry(
+                    IDate, BaseCalendar."Sunday Pause From", BaseCalendar."Sunday Pause Until", OccupiedType::Pause);
+              END;
+          END;
+        END;
+      END;
+
+      IF EmployeeNo <> '' THEN BEGIN
+        EmployeeAbsence.SETCURRENTKEY("Employee No.", "From Date");
+        EmployeeAbsence.SETRANGE("Employee No.", EmployeeNo);
+        EmployeeAbsence.SETFILTER("From Date", '<=%1', IDate);
+        EmployeeAbsence.SETFILTER("To Date", '>=%1', IDate);
+        IF EmployeeAbsence.FINDFIRST THEN BEGIN
+          IF EmployeeAbsence."From Date" < IDate THEN
+            StartingTime := 0T
+          ELSE
+            StartingTime := EmployeeAbsence."From Time";
+          IF EmployeeAbsence."To Date" > IDate THEN
+            EndingTime := 0T
+          ELSE
+            EndingTime := EmployeeAbsence."Until Time";
+          EmployeeAbsence.CALCFIELDS(Plannable);
+          IF NOT EmployeeAbsence.Plannable THEN
+            InsertOccupiedTimeEntry(IDate, StartingTime, EndingTime, OccupiedType::"Employee Absence");
+        END;
+      END;
+
+      RemoveDoubleOccTimeEntries(IDate);
+      UpdateUnoccupiedTimeEntries(IDate);
+
+      WorkOrder.SETCURRENTKEY("Resource No.");
+      WorkOrder.SETRANGE("Resource No.", IResourceNo);
+      WorkOrder.SETRANGE("Source Type", WorkOrder."Source Type"::ServiceOrder);
+      WorkOrder.SETFILTER("Starting Date/Time", '<=%1', DATI2VARIANT(IDate, 235959.999T));
+      WorkOrder.SETFILTER("Ending Date/Time", '>=%1', DATI2VARIANT(IDate, 0T));
+      IF WorkOrder.FINDSET THEN
+        REPEAT
+          IF DT2DATE(WorkOrder."Starting Date/Time") < IDate THEN
+            StartingTime := 0T
+          ELSE
+            StartingTime := DT2TIME(WorkOrder."Starting Date/Time");
+          IF DT2DATE(WorkOrder."Ending Date/Time") > IDate THEN
+            EndingTime := 0T
+          ELSE
+            EndingTime := DT2TIME(WorkOrder."Ending Date/Time");
+          IF WorkOrder."Source Company" <> COMPANYNAME THEN
+            ServiceOrder.CHANGECOMPANY(WorkOrder."Source Company");
+          ServiceOrder.GET(WorkOrder."Source No.");
+          IF ServiceOrder.Status = ServiceOrder.Status::Open THEN
+            InsertOccupiedTimeEntry(IDate, StartingTime, EndingTime, OccupiedType::"Planned Service Order");
+        UNTIL WorkOrder.NEXT = 0;
+
+      RemoveDoubleOccTimeEntries(IDate);
+      UpdateUnoccupiedTimeEntries(IDate);
+    END;
+
+    LOCAL PROCEDURE InsertOccupiedTimeEntry@1100528608(IStartingDate@1100528600 : Date;IStartTime@1100528601 : Time;IEndTime@1100528603 : Time;IOccupiedType@1100528605 : Option);
+    BEGIN
+      TmpOccupiedTimeBuffer.INIT;
+      LastEntryNo += 1;
+      TmpOccupiedTimeBuffer."Entry No." := LastEntryNo;
+      TmpOccupiedTimeBuffer."Starting Date" := IStartingDate;
+      TmpOccupiedTimeBuffer."Starting Time" := IStartTime;
+      IF (IStartTime = IEndTime) AND (IStartTime = 0T) THEN
+        TmpOccupiedTimeBuffer."Ending Time" := 235959T
+      ELSE
+        TmpOccupiedTimeBuffer."Ending Time" := IEndTime;
+      TmpOccupiedTimeBuffer."Occupied Type" := IOccupiedType;
+      TmpOccupiedTimeBuffer.INSERT(TRUE);
+    END;
+
+    PROCEDURE RemoveDoubleOccTimeEntries@1100528609(IStartingDate@1100528602 : Date);
+    VAR
+      TmpOccupiedTimeBuffer2@1100528603 : TEMPORARY Record 11071809;
+      StartingTime@1100528600 : Time;
+      EndingTime@1100528601 : Time;
+    BEGIN
+      TmpOccupiedTimeBuffer2.COPY(TmpOccupiedTimeBuffer, TRUE);
+      ResetOccupiedTimeBufferFilter(TmpOccupiedTimeBuffer2);
+      TmpOccupiedTimeBuffer2.SETRANGE("Starting Date", IStartingDate);
+      IF TmpOccupiedTimeBuffer2.FINDFIRST THEN
+        REPEAT
+          IF TmpOccupiedTimeBuffer2."Ending Time" > EndingTime THEN BEGIN
+            IF TmpOccupiedTimeBuffer2."Starting Time" > EndingTime THEN
+              StartingTime := TmpOccupiedTimeBuffer2."Starting Time";
+            EndingTime := TmpOccupiedTimeBuffer2."Ending Time";
+          END
+          ELSE
+          IF TmpOccupiedTimeBuffer2."Ending Time" <= EndingTime THEN BEGIN
+            TmpOccupiedTimeBuffer2.Deleted := TRUE;
+            TmpOccupiedTimeBuffer2.MODIFY;
+          END;
+        UNTIL TmpOccupiedTimeBuffer2.NEXT = 0;
+    END;
+
+    PROCEDURE UpdateUnoccupiedTimeEntries@1100528615(IStartingDate@1100528602 : Date);
+    VAR
+      TmpOccupiedTimeBuffer2@1100528605 : TEMPORARY Record 11071809;
+      LastOccupiedTimeBuffer@1100528601 : TEMPORARY Record 11071809;
+      EndingTime@1100528600 : Time;
+      TimeDuration@1100528603 : Integer;
+    BEGIN
+      EndingTime := 0T;
+      LastOccupiedTimeBuffer.COPY(TmpOccupiedTimeBuffer, TRUE);
+      TmpOccupiedTimeBuffer2.COPY(TmpOccupiedTimeBuffer, TRUE);
+      ResetOccupiedTimeBufferFilter(TmpOccupiedTimeBuffer2);
+      TmpOccupiedTimeBuffer2.SETRANGE("Starting Date", IStartingDate);
+      IF TmpOccupiedTimeBuffer2.FINDSET THEN BEGIN
+        REPEAT
+          IF EndingTime > 0T THEN BEGIN
+            IF TmpOccupiedTimeBuffer2."Starting Time" >= EndingTime THEN
+              TimeDuration := TmpOccupiedTimeBuffer2."Starting Time" - EndingTime
+            ELSE
+              TimeDuration := 0;
+            LastOccupiedTimeBuffer."Unoccupied Hours" := TimeDuration / 1000 / 60 / 60;
+            LastOccupiedTimeBuffer.MODIFY;
+          END;
+          EndingTime := TmpOccupiedTimeBuffer2."Ending Time";
+          LastOccupiedTimeBuffer := TmpOccupiedTimeBuffer2;
+        UNTIL TmpOccupiedTimeBuffer2.NEXT = 0;
+        TimeDuration := 235959T - EndingTime;
+        LastOccupiedTimeBuffer."Unoccupied Hours" := TimeDuration / 1000 / 60 / 60;
+        LastOccupiedTimeBuffer.MODIFY;
+      END;
+    END;
+
+    PROCEDURE ResetOccupiedTimeBufferFilter@1100528614(VAR OBuffer@1100528600 : TEMPORARY Record 11071809);
+    BEGIN
+      OBuffer.RESET;
+      OBuffer.SETCURRENTKEY("Starting Date", "Starting Time");
+      OBuffer.SETRANGE(Deleted, FALSE);
+    END;
+
+    PROCEDURE GetClusterContractNo@1100528617(IServiceContractNo@1100528600 : Code[20]) : Code[20];
+    VAR
+      ServiceContract@1100528601 : Record 11012812;
+    BEGIN
+      ServiceContract.GET(IServiceContractNo);
+      IF ServiceContract."Use Contract Clusters" THEN
+        EXIT(IServiceContractNo)
+      ELSE
+        EXIT;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

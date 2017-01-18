@@ -1,0 +1,317 @@
+OBJECT Codeunit 1509 Notification Entry Dispatcher
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00;
+  }
+  PROPERTIES
+  {
+    TableNo=472;
+    Permissions=TableData 91=r,
+                TableData 1511=rimd,
+                TableData 1514=rimd,
+                TableData 9500=rimd;
+    OnRun=VAR
+            JobQueueLogEntry@1000 : Record 474;
+            LastRunDateTime@1001 : DateTime;
+          BEGIN
+            JobQueueLogEntry.SETRANGE(Status,JobQueueLogEntry.Status::Success);
+            JobQueueLogEntry.SETRANGE("Object ID to Run",CODEUNIT::"Notification Entry Dispatcher");
+            IF JobQueueLogEntry.FINDLAST THEN
+              LastRunDateTime := JobQueueLogEntry."Start Date/Time";
+            Dispatch(LastRunDateTime);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      NotificationMailSubjectTxt@1005 : TextConst 'ENU="Microsoft Dynamics NAV Notification "';
+      NotificationManagement@1002 : Codeunit 1510;
+      SMTPSetupErr@1000 : TextConst 'ENU=The SMTP Setup does not exist.';
+
+    LOCAL PROCEDURE Dispatch@2(LastRunDateTime@1003 : DateTime);
+    VAR
+      UserSetup@1000 : Record 91;
+      UserIDsbyNotificationType@1001 : Query 1511;
+    BEGIN
+      UserIDsbyNotificationType.OPEN;
+
+      WHILE UserIDsbyNotificationType.READ DO BEGIN
+        UserSetup.GET(UserIDsbyNotificationType.Recipient_User_ID);
+        IF ScheduledNotificationsExist(LastRunDateTime,UserSetup."User ID",UserIDsbyNotificationType.Type) THEN
+          DispatchForNotificationType(UserIDsbyNotificationType.Type,UserSetup);
+      END;
+    END;
+
+    LOCAL PROCEDURE DispatchForNotificationType@30(NotificationType@1007 : 'New Record,Approval,Overdue';UserSetup@1000 : Record 91);
+    VAR
+      NotificationEntry@1002 : Record 1511;
+      NotificationTemplate@1004 : Record 1510;
+      NonAggregatedNotifications@1005 : Boolean;
+    BEGIN
+      NotificationEntry.SETRANGE("Recipient User ID",UserSetup."User ID");
+      NotificationEntry.SETRANGE(Type,NotificationType);
+
+      IF NOT NotificationEntry.FINDFIRST THEN
+        EXIT;
+
+      FilterToActiveNotificationEntries(NotificationEntry);
+
+      GetNotificationTemplate(NotificationTemplate,NonAggregatedNotifications,UserSetup."User ID",NotificationType);
+
+      CASE NotificationTemplate."Notification Method" OF
+        NotificationTemplate."Notification Method"::"E-mail":
+          ApplyEmailTemplateAndDispatch(NotificationEntry,NotificationTemplate,NonAggregatedNotifications,UserSetup);
+        NotificationTemplate."Notification Method"::Note:
+          ApplyNoteTemplateAndDispatch(NotificationEntry,NotificationTemplate);
+      END;
+    END;
+
+    LOCAL PROCEDURE ScheduledNotificationsExist@3(LastRunDateTime@1003 : DateTime;RecipientUserID@1000 : Code[50];NotificationType@1002 : Option) : Boolean;
+    VAR
+      NotificationSchedule@1001 : Record 1513;
+    BEGIN
+      IF NOT NotificationSchedule.GET(RecipientUserID,NotificationType) THEN
+        EXIT(TRUE); // No rules are set up, send immediately
+
+      EXIT(NotificationSchedule.ScheduledAt(CURRENTDATETIME,LastRunDateTime));
+    END;
+
+    LOCAL PROCEDURE ApplyEmailTemplateAndDispatch@5(VAR NotificationEntry@1003 : Record 1511;NotificationTemplate@1002 : Record 1510;NonAggregatedNotifications@1001 : Boolean;UserSetup@1000 : Record 91);
+    VAR
+      NotificationBody@1005 : Text;
+      AggregatedNotificationBody@1004 : Text;
+    BEGIN
+      IF NonAggregatedNotifications THEN BEGIN
+        REPEAT
+          NotificationBody := GetNonAggregatedEmailMessageBody(NotificationEntry,NotificationTemplate);
+          IF SendEmail(NotificationBody,UserSetup) THEN
+            MoveNotificationEntryToSentNotificationEntries(
+              NotificationEntry,NotificationBody,NonAggregatedNotifications,NotificationTemplate."Notification Method")
+          ELSE BEGIN
+            NotificationEntry.VALIDATE("Error Message",GETLASTERRORTEXT);
+            CLEARLASTERROR;
+            NotificationEntry.MODIFY(TRUE);
+          END;
+        UNTIL NotificationEntry.NEXT = 0;
+      END ELSE BEGIN
+        AggregatedNotificationBody := GetAggregatedEmailMessageBody(NotificationEntry,NotificationTemplate);
+        IF SendEmail(AggregatedNotificationBody,UserSetup) THEN
+          MoveNotificationEntryToSentNotificationEntries(
+            NotificationEntry,AggregatedNotificationBody,NonAggregatedNotifications,NotificationTemplate."Notification Method")
+        ELSE BEGIN
+          NotificationEntry.MODIFYALL("Error Message",GETLASTERRORTEXT,TRUE);
+          CLEARLASTERROR;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE ApplyNoteTemplateAndDispatch@8(VAR NotificationEntry@1003 : Record 1511;NotificationTemplate@1002 : Record 1510);
+    VAR
+      NotificationBody@1005 : Text;
+      NotificationHeader@1001 : Text;
+      NotificationFooter@1000 : Text;
+    BEGIN
+      ApplyTemplateHeaderAndFooter(NotificationHeader,NotificationFooter,NotificationTemplate,NotificationEntry);
+
+      REPEAT
+        ApplyTemplate(NotificationBody,NotificationTemplate,NotificationEntry);
+        IF AddNote(NotificationEntry,NotificationHeader + NotificationBody + NotificationFooter) THEN
+          MoveNotificationEntryToSentNotificationEntries(
+            NotificationEntry,NotificationHeader + NotificationBody + NotificationFooter,FALSE,
+            NotificationTemplate."Notification Method"::Note);
+      UNTIL NotificationEntry.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE GetNotificationTemplate@15(VAR NotificationTemplate@1000 : Record 1510;VAR NonAggregatedNotifications@1005 : Boolean;UserID@1003 : Code[50];NotificationType@1001 : 'New Record,Approval,Overdue');
+    VAR
+      NotificationSetup@1002 : Record 1512;
+    BEGIN
+      IF NOT NotificationSetup.GET(UserID,NotificationType) THEN
+        IF NOT NotificationSetup.GET('',NotificationType) THEN BEGIN
+          NotificationManagement.CreateDefaultNotificationSetup(NotificationType);
+          NotificationSetup.GET('',NotificationType);
+        END;
+
+      NonAggregatedNotifications := NotificationSetup."Non-Aggregated Notifications";
+
+      IF NOT NotificationTemplate.GET(NotificationSetup."Notification Template Code") THEN BEGIN
+        NotificationManagement.CreateDefaultNotificationTemplate(NotificationTemplate,NotificationType);
+        NotificationSetup.VALIDATE("Notification Template Code",NotificationTemplate.Code);
+        NotificationSetup.MODIFY(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE ApplyTemplate@24(VAR NotificationBody@1004 : Text;NotificationTemplate@1000 : Record 1510;NotificationEntry@1002 : Record 1511);
+    BEGIN
+      NotificationBody := NotificationTemplate.GetNotificationBody;
+      NotificationManagement.PopulateNotificationTemplateWithRecordInfo(NotificationBody,NotificationEntry);
+      NotificationManagement.PopulateNotificationTemplateWithRecIndependentInfo(NotificationBody,NotificationEntry);
+    END;
+
+    [TryFunction]
+    LOCAL PROCEDURE SendEmail@4(Body@1004 : Text;UserSetup@1001 : Record 91);
+    VAR
+      EmailItem@1000 : Record 9500;
+      MailManagement@1002 : Codeunit 9520;
+      DotNetExceptionHandler@1003 : Codeunit 1291;
+      OutStream@1005 : OutStream;
+    BEGIN
+      EmailItem.Init;
+      EmailItem."From Name" := COMPANYNAME;
+      EmailItem.Subject := NotificationMailSubjectTxt;
+      EmailItem."Send to" := UserSetup."E-Mail";
+      EmailItem.Body.CREATEOUTSTREAM(OutStream);
+      OutStream.WRITE(Body);
+
+      IF MailManagement.IsSMTPEnabled AND MailManagement.IsEnabled THEN BEGIN
+        MailManagement.InitializeFrom(TRUE,FALSE);
+        IF NOT MailManagement.Send(EmailItem) THEN BEGIN
+          DotNetExceptionHandler.Collect;
+          ERROR(DotNetExceptionHandler.GetMessage);
+        END;
+      END ELSE
+        ERROR(SMTPSetupErr);
+    END;
+
+    LOCAL PROCEDURE ApplyTemplateHeaderAndFooter@10(VAR NotificationHeader@1000 : Text;VAR NotificationFooter@1001 : Text;NotificationTemplate@1002 : Record 1510;NotificationEntry@1003 : Record 1511);
+    BEGIN
+      NotificationHeader := NotificationTemplate.GetNotificationHeader;
+      NotificationFooter := NotificationTemplate.GetNotificationFooter;
+      NotificationManagement.PopulateNotificationTemplateWithRecIndependentInfo(NotificationHeader,NotificationEntry);
+      NotificationManagement.PopulateNotificationTemplateWithRecIndependentInfo(NotificationFooter,NotificationEntry);
+    END;
+
+    LOCAL PROCEDURE AddNote@6(NotificationEntry@1008 : Record 1511;Body@1009 : Text) : Boolean;
+    VAR
+      RecordLink@1001 : Record 2000000068;
+      DataTypeManagement@1006 : Codeunit 701;
+      PageManagement@1005 : Codeunit 700;
+      RecRef@1007 : RecordRef;
+      Link@1000 : Text;
+    BEGIN
+      DataTypeManagement.GetRecordRef(NotificationEntry."Triggered By Record",RecRef);
+      IF NOT RecRef.HASFILTER THEN
+        RecRef.SETRECFILTER;
+
+      WITH RecordLink DO BEGIN
+        INIT;
+        "Link ID" := 0;
+        "Record ID" := NotificationEntry."Triggered By Record";
+        Link := GETURL(DEFAULTCLIENTTYPE,COMPANYNAME,OBJECTTYPE::Page,PageManagement.GetPageID(RecRef),RecRef,TRUE);
+        URL1 := COPYSTR(Link,1,MAXSTRLEN(URL1));
+        IF STRLEN(Link) > MAXSTRLEN(URL1) THEN
+          URL2 := COPYSTR(Link,MAXSTRLEN(URL1) + 1,MAXSTRLEN(URL2));
+        Description := COPYSTR(FORMAT(NotificationEntry."Triggered By Record"),1,250);
+        Type := Type::Note;
+        WriteNoteText(RecordLink,Body);
+        Created := CURRENTDATETIME;
+        "User ID" := NotificationEntry."Created By";
+        Company := COMPANYNAME;
+        Notify := TRUE;
+        "To User ID" := NotificationEntry."Recipient User ID";
+        EXIT(INSERT(TRUE));
+      END;
+
+      EXIT(FALSE);
+    END;
+
+    LOCAL PROCEDURE WriteNoteText@7(VAR RecordLink@1000 : Record 2000000068;Note@1001 : Text);
+    VAR
+      SystemUTF8Encoder@1011 : DotNet "'mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Text.UTF8Encoding";
+      SystemByteArray@1010 : DotNet "'mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Array";
+      OStr@1008 : OutStream;
+      c1@1005 : Byte;
+      c2@1004 : Byte;
+      x@1003 : Integer;
+      y@1002 : Integer;
+      i@1009 : Integer;
+    BEGIN
+      SystemUTF8Encoder := SystemUTF8Encoder.UTF8Encoding;
+      SystemByteArray := SystemUTF8Encoder.GetBytes(Note);
+
+      RecordLink.Note.CREATEOUTSTREAM(OStr);
+      x := SystemByteArray.Length DIV 128;
+      IF x > 1 THEN
+        y := SystemByteArray.Length - 128 * (x - 1)
+      ELSE
+        y := SystemByteArray.Length;
+      c1 := y;
+      OStr.WRITE(c1);
+      IF x > 0 THEN BEGIN
+        c2 := x;
+        OStr.WRITE(c2);
+      END;
+      FOR i := 0 TO SystemByteArray.Length - 1 DO BEGIN
+        c1 := SystemByteArray.GetValue(i);
+        OStr.WRITE(c1);
+      END;
+    END;
+
+    PROCEDURE GetAggregatedEmailMessageBody@9(VAR NotificationEntry@1003 : Record 1511;NotificationTemplate@1002 : Record 1510) AggregatedNotificationBody : Text;
+    VAR
+      NotificationBody@1000 : Text;
+      NotificationHeader@1004 : Text;
+      NotificationFooter@1001 : Text;
+    BEGIN
+      ApplyTemplateHeaderAndFooter(NotificationHeader,NotificationFooter,NotificationTemplate,NotificationEntry);
+
+      REPEAT
+        ApplyTemplate(NotificationBody,NotificationTemplate,NotificationEntry);
+        AggregatedNotificationBody += NotificationBody;
+      UNTIL NotificationEntry.NEXT = 0;
+
+      EXIT(NotificationHeader + AggregatedNotificationBody + NotificationFooter);
+    END;
+
+    PROCEDURE GetNonAggregatedEmailMessageBody@1(VAR NotificationEntry@1003 : Record 1511;NotificationTemplate@1002 : Record 1510) : Text;
+    VAR
+      NotificationHeader@1001 : Text;
+      NotificationFooter@1000 : Text;
+      NotificationBody@1004 : Text;
+    BEGIN
+      ApplyTemplateHeaderAndFooter(NotificationHeader,NotificationFooter,NotificationTemplate,NotificationEntry);
+
+      ApplyTemplate(NotificationBody,NotificationTemplate,NotificationEntry);
+
+      EXIT(NotificationHeader + NotificationBody + NotificationFooter);
+    END;
+
+    LOCAL PROCEDURE MoveNotificationEntryToSentNotificationEntries@11(VAR NotificationEntry@1000 : Record 1511;NotificationBody@1001 : Text;NonAggregatedNotifications@1002 : Boolean;NotificationMethod@1005 : Option);
+    VAR
+      SentNotificationEntry@1003 : Record 1514;
+      InitialSentNotificationEntry@1006 : Record 1514;
+    BEGIN
+      IF NonAggregatedNotifications THEN BEGIN
+        SentNotificationEntry.NewRecord(NotificationEntry,NotificationBody,NotificationMethod);
+        NotificationEntry.DELETE(TRUE);
+      END ELSE BEGIN
+        IF NotificationEntry.FINDSET THEN BEGIN
+          InitialSentNotificationEntry.NewRecord(NotificationEntry,NotificationBody,NotificationMethod);
+          WHILE NotificationEntry.NEXT <> 0 DO BEGIN
+            SentNotificationEntry.NewRecord(NotificationEntry,NotificationBody,NotificationMethod);
+            SentNotificationEntry.VALIDATE("Aggregated with Entry",InitialSentNotificationEntry.ID);
+            SentNotificationEntry.MODIFY(TRUE);
+          END;
+        END;
+        NotificationEntry.DELETEALL(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE FilterToActiveNotificationEntries@22(VAR NotificationEntry@1000 : Record 1511);
+    BEGIN
+      REPEAT
+        NotificationEntry.MARK(TRUE);
+      UNTIL NotificationEntry.NEXT = 0;
+      NotificationEntry.MARKEDONLY(TRUE);
+      NotificationEntry.FINDSET;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

@@ -1,0 +1,188 @@
+OBJECT Codeunit 1206 Pmt Export Mgt Gen. Jnl Line
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00;
+  }
+  PROPERTIES
+  {
+    TableNo=81;
+    Permissions=TableData 25=rm,
+                TableData 81=rm,
+                TableData 1226=rimd;
+    OnRun=BEGIN
+            ExportJournalPaymentFile(Rec);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      ExportAgainQst@1002 : TextConst 'ENU=One or more of the selected lines has already been exported. Do you want to export it again?';
+      ProgressMsg@1001 : TextConst 'ENU=Processing line no. #1######.';
+      HasErrorsErr@1008 : TextConst 'ENU=The file export has one or more errors. For each of the lines to be exported, resolve any errors that are displayed in the File Export Errors FactBox.';
+      PaymentExportMgt@1003 : Codeunit 1210;
+
+    PROCEDURE ExportJournalPaymentFileYN@2(VAR GenJnlLine@1001 : Record 81);
+    BEGIN
+      GenJnlLine.SETRANGE("Journal Template Name",GenJnlLine."Journal Template Name");
+      GenJnlLine.SETRANGE("Journal Batch Name",GenJnlLine."Journal Batch Name");
+      IF GenJnlLine.IsExportedToPaymentFile THEN
+        IF NOT CONFIRM(ExportAgainQst) THEN
+          EXIT;
+      ExportJournalPaymentFile(GenJnlLine);
+    END;
+
+    PROCEDURE ExportJournalPaymentFile@118(VAR GenJnlLine@1001 : Record 81);
+    VAR
+      BankAccount@1000 : Record 270;
+      CreditTransferRegister@1004 : Record 1205;
+    BEGIN
+      BankAccount.GET(GenJnlLine."Bal. Account No.");
+      CreditTransferRegister.CreateNew(BankAccount."Payment Export Format",GenJnlLine."Bal. Account No.");
+      COMMIT;
+
+      CheckGenJnlLine(GenJnlLine);
+      ExportGenJnlLine(GenJnlLine,CreditTransferRegister);
+    END;
+
+    LOCAL PROCEDURE CheckGenJnlLine@9(VAR GenJnlLine@1000 : Record 81);
+    VAR
+      GenJnlLine2@1001 : Record 81;
+    BEGIN
+      GenJnlLine.DeletePaymentFileBatchErrors;
+      GenJnlLine2.COPYFILTERS(GenJnlLine);
+      IF GenJnlLine2.FINDSET THEN
+        REPEAT
+          CODEUNIT.RUN(CODEUNIT::"Payment Export Gen. Jnl Check",GenJnlLine2);
+        UNTIL GenJnlLine2.NEXT = 0;
+
+      IF GenJnlLine2.HasPaymentFileErrorsInBatch THEN BEGIN
+        COMMIT;
+        ERROR(HasErrorsErr);
+      END;
+    END;
+
+    PROCEDURE ExportGenJnlLine@15(VAR GenJnlLine@1000 : Record 81;VAR CreditTransferRegister@1007 : Record 1205);
+    VAR
+      GenJnlLine2@1004 : Record 81;
+      DataExch@1001 : Record 1220;
+      CreditTransferEntry@1006 : Record 1206;
+      Window@1002 : Dialog;
+      LineNo@1003 : Integer;
+    BEGIN
+      GenJnlLine2.COPYFILTERS(GenJnlLine);
+      GenJnlLine2.FINDSET;
+
+      PaymentExportMgt.CreateDataExch(DataExch,GenJnlLine2."Bal. Account No.");
+      GenJnlLine2.MODIFYALL("Data Exch. Entry No.",DataExch."Entry No.");
+
+      Window.OPEN(ProgressMsg);
+      REPEAT
+        LineNo += 1;
+        Window.UPDATE(1,LineNo);
+
+        CreateGenJnlDataExchLine(DataExch."Entry No.",GenJnlLine2,LineNo);
+
+        CreditTransferEntry.CreateNew(CreditTransferRegister."No.",LineNo,
+          GenJnlLine2."Account Type",GenJnlLine2."Account No.",GenJnlLine2.GetAppliesToDocEntryNo,
+          GenJnlLine2."Posting Date",GenJnlLine2."Currency Code",GenJnlLine2.Amount,'',
+          GenJnlLine2."Recipient Bank Account",GenJnlLine2."Message to Recipient");
+      UNTIL GenJnlLine2.NEXT = 0;
+      Window.CLOSE;
+
+      PaymentExportMgt.ExportToFile(DataExch."Entry No.");
+
+      CODEUNIT.RUN(CODEUNIT::"Exp. User Feedback Gen. Jnl.",DataExch);
+    END;
+
+    LOCAL PROCEDURE CreateGenJnlDataExchLine@16(DataExchEntryNo@1000 : Integer;GenJnlLine@1001 : Record 81;LineNo@1002 : Integer);
+    VAR
+      TempPaymentExportData@1004 : TEMPORARY Record 1226;
+    BEGIN
+      WITH GenJnlLine DO BEGIN
+        PreparePaymentExportDataJnl(TempPaymentExportData,GenJnlLine,DataExchEntryNo,LineNo);
+        PaymentExportMgt.CreatePaymentLines(TempPaymentExportData);
+      END;
+    END;
+
+    PROCEDURE PreparePaymentExportDataJnl@12(VAR TempPaymentExportData@1000 : TEMPORARY Record 1226;GenJnlLine@1001 : Record 81;DataExchEntryNo@1003 : Integer;LineNo@1007 : Integer);
+    VAR
+      GeneralLedgerSetup@1009 : Record 98;
+      Vendor@1006 : Record 23;
+      VendorBankAccount@1008 : Record 288;
+      PaymentMethod@1010 : Record 289;
+      BankAccount@1002 : Record 270;
+      BankExportImportSetup@1004 : Record 1200;
+    BEGIN
+      GeneralLedgerSetup.GET;
+      Vendor.GET(GenJnlLine."Account No.");
+
+      WITH TempPaymentExportData DO BEGIN
+        BankAccount.GET(GenJnlLine."Bal. Account No.");
+        BankAccount.GetBankExportImportSetup(BankExportImportSetup);
+        SetPreserveNonLatinCharacters(BankExportImportSetup."Preserve Non-Latin Characters");
+
+        INIT;
+        "Data Exch Entry No." := DataExchEntryNo;
+        "Sender Bank Account Code" := GenJnlLine."Bal. Account No.";
+
+        IF VendorBankAccount.GET(GenJnlLine."Account No.",GenJnlLine."Recipient Bank Account") THEN BEGIN
+          IF BankAccount."Country/Region Code" = VendorBankAccount."Country/Region Code" THEN BEGIN
+            Amount := GenJnlLine."Amount (LCY)";
+            "Currency Code" := GeneralLedgerSetup."LCY Code";
+          END ELSE BEGIN
+            Amount := GenJnlLine.Amount;
+            "Currency Code" := GeneralLedgerSetup.GetCurrencyCode(GenJnlLine."Currency Code");
+          END;
+
+          "Recipient Bank Acc. No." :=
+            COPYSTR(VendorBankAccount.GetBankAccountNo,1,MAXSTRLEN("Recipient Bank Acc. No."));
+          "Recipient Reg. No." := VendorBankAccount."Bank Branch No.";
+          "Recipient Acc. No." := VendorBankAccount."Bank Account No.";
+          "Recipient Bank Country/Region" := VendorBankAccount."Country/Region Code";
+          "Recipient Bank Name" := COPYSTR(VendorBankAccount.Name,1,35);
+          "Recipient Bank Address" := COPYSTR(VendorBankAccount.Address,1,35);
+          "Recipient Bank City" := COPYSTR(VendorBankAccount."Post Code" + VendorBankAccount.City,1,35);
+          "Recipient Bank BIC" := VendorBankAccount."SWIFT Code";
+        END ELSE
+          IF GenJnlLine."Creditor No." <> '' THEN BEGIN
+            Amount := GenJnlLine."Amount (LCY)";
+            "Currency Code" := GeneralLedgerSetup."LCY Code";
+          END;
+
+        "Recipient Name" := COPYSTR(Vendor.Name,1,35);
+        "Recipient Address" := COPYSTR(Vendor.Address,1,35);
+        "Recipient City" := COPYSTR(Vendor."Post Code" + ' ' + Vendor.City,1,35);
+        "Transfer Date" := GenJnlLine."Posting Date";
+        "Message to Recipient 1" := COPYSTR(GenJnlLine."Message to Recipient",1,35);
+        "Message to Recipient 2" := COPYSTR(GenJnlLine."Message to Recipient",36,70);
+        "Document No." := GenJnlLine."Document No.";
+        "Applies-to Ext. Doc. No." := GenJnlLine."Applies-to Ext. Doc. No.";
+        "Short Advice" := GenJnlLine."Applies-to Ext. Doc. No.";
+        "Line No." := LineNo;
+        "Payment Reference" := GenJnlLine."Payment Reference";
+        IF PaymentMethod.GET(GenJnlLine."Payment Method Code") THEN
+          "Data Exch. Line Def Code" := PaymentMethod."Pmt. Export Line Definition";
+        "Recipient Creditor No." := GenJnlLine."Creditor No.";
+        INSERT(TRUE);
+      END;
+    END;
+
+    PROCEDURE EnableExportToServerTempFile@27(SilentServerMode@1000 : Boolean;ServerFileExtension@1001 : Text[3]);
+    BEGIN
+      PaymentExportMgt.EnableExportToServerTempFile(SilentServerMode,ServerFileExtension);
+    END;
+
+    PROCEDURE GetServerTempFileName@29() : Text[1024];
+    BEGIN
+      EXIT(PaymentExportMgt.GetServerTempFileName);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

@@ -1,0 +1,1505 @@
+OBJECT Codeunit 11072079 Approval Management (SiB)
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text001@1100525000 : TextConst 'ENU=On %1 invoice line(s) is ''%2'' and/or ''%3 not filled';
+      Text002@1100525003 : TextConst 'ENU=%1 ''%2'' not present';
+      Text003@1100525004 : TextConst 'ENU=, compare with approved not possible';
+      Text004@1100525001 : TextConst 'ENU=Invoiced quantity/unit %1/%2 is unequal to approved quantiy/unit %3/%4';
+      Text005@1100525002 : TextConst 'ENU=%1 %2 (%3%) is unequal to %2 (%4%) of the invoice line';
+      SiBSetup@1100525009 : Record 11072650;
+      GLSetup@1100525006 : Record 98;
+      InvMessAccepted@1100525005 : Boolean;
+      Text006@1100525007 : TextConst 'ENU=No price found for trade item ''%1-%2''';
+      Text007@1100525008 : TextConst 'ENU=Calculated amount (%1) based on item data differs from line amount (%2)';
+      UnitCodeTxt@1210190000 : Code[10];
+      ExternalDocument@1100525011 : Text[250];
+
+    PROCEDURE DispatchNoteApprovedIsDeliver@1100525000(VAR iDispatchNoteLineRec@1100525001 : Record 11072652);
+    VAR
+      lvDispatchNoteLineRec@1100525000 : Record 11072652;
+      lvText000@1100525003 : TextConst 'ENU=Fill ''Approved'' with ''Delivered'' on all lines?';
+      lvText001@1100525002 : TextConst 'ENU=Fill ''Approved'' with ''Delivered'' on all marked lines?';
+    BEGIN
+      //* Fill the 'Approved Quantity' of the Dispatch Note Lines with the 'Delivered Quantity' (if marked then only marked lines).
+      WITH lvDispatchNoteLineRec DO BEGIN
+        COPY(iDispatchNoteLineRec);
+        IF FINDSET(TRUE,FALSE) THEN BEGIN
+          REPEAT
+            IF "Approved Quantity" <> "Delivered Quantity" THEN BEGIN
+              "Approved Quantity" := "Delivered Quantity";
+              MODIFY;
+            END;
+          UNTIL NEXT = 0
+        END;
+      END;
+    END;
+
+    PROCEDURE RunApproveDispatchNote@1100525001(VAR VarRec@1100525000 : Record 11072651);
+    VAR
+      lvDispatchNoteRec@1100525001 : Record 11072651;
+      lvDispatchNoteLineRec@1100525004 : Record 11072652;
+      lvText000@1100525003 : TextConst 'ENU=Approve Dispatch Note ''%1''?';
+      lvLines@1100525005 : Integer;
+      lvUnequal@1100525006 : Integer;
+      lvText001@1100525007 : TextConst 'ENU=For %1 of %2 lines ''Approved'' is unequal to ''Delivered''.\Approve Dispatch Note ''%3''?';
+      lvText002@1100528900 : TextConst 'ENU=At least 1 of next fields should be filled: %1, %2, %3, %4, %5';
+    BEGIN
+      WITH lvDispatchNoteRec DO BEGIN
+        COPY(VarRec);
+
+        lvDispatchNoteLineRec.SETRANGE("Dispatch Note No.", "No.");
+        IF lvDispatchNoteLineRec.FINDSET(FALSE,FALSE) THEN BEGIN
+          REPEAT
+            //DP00065.sn
+            IF (lvDispatchNoteLineRec."Project No." = '') AND
+               (lvDispatchNoteLineRec."Service Order No." = '') AND
+               (lvDispatchNoteLineRec."Plant Type" = '') AND  //db, 04-02-14: T004213
+               (lvDispatchNoteLineRec."Location Code" = '') AND  //db, 14-10-14: C017265
+               (lvDispatchNoteLineRec."G/L Account" = '') THEN
+              ERROR(lvText002,
+                lvDispatchNoteLineRec.FIELDCAPTION("Project No."),
+                lvDispatchNoteLineRec.FIELDCAPTION("Service Order No."),
+                lvDispatchNoteLineRec.FIELDCAPTION("Plant Type"),  //db, 04-02-14: T004213
+                lvDispatchNoteLineRec.FIELDCAPTION("Location Code"),  //db, 14-10-14: C017265
+                lvDispatchNoteLineRec.FIELDCAPTION("G/L Account"));
+            //DP00065.en
+            lvLines := lvLines + 1;
+            IF lvDispatchNoteLineRec."Approved Quantity" <> lvDispatchNoteLineRec."Delivered Quantity" THEN
+              lvUnequal := lvUnequal + 1;
+          UNTIL lvDispatchNoteLineRec.NEXT = 0
+        END;
+        IF lvUnequal = 0 THEN BEGIN
+          IF NOT CONFIRM(lvText000, TRUE, "No.") THEN
+            ERROR('');
+        END ELSE BEGIN
+          IF NOT CONFIRM(lvText001, TRUE, lvUnequal, lvLines, "No.") THEN
+            ERROR('');
+        END;
+
+        TESTFIELD("No.");
+        TESTFIELD(Approved, FALSE);
+        //DP00065.sn
+        //TESTFIELD("Project No.");
+        //lvProjRec.GET("Project No.");
+        //DP00065.en
+        VALIDATE(Approved, TRUE);  //* With 'Validate', so also 'Approved by' And 'Approved Date/Time' will be filled.
+        //DP00065.sn
+        IF NOT CreatePurchOrder(lvDispatchNoteRec) THEN
+          MatchPurchOrder(lvDispatchNoteRec);
+        //DP00065.en
+        MODIFY;
+      END;
+      VarRec := lvDispatchNoteRec;
+    END;
+
+    PROCEDURE RunCheckInvoice@1100525002(Rec@1100525000 : Record 11072653);
+    BEGIN
+      GLSetup.GET;
+      CheckInvoice(Rec);
+      ShowInvoiceMessages(Rec."No.", FALSE);
+    END;
+
+    PROCEDURE RunApproveInvoice@1100525003(VAR VarRec@1100525000 : Record 11072653);
+    VAR
+      lvInvoiceRec@1100525001 : Record 11072653;
+      lvInvMessRec@1100525002 : Record 11072655;
+      lvText000@1100525003 : TextConst 'ENU=Approve invoice ''%1''?';
+      lvText001@1100525004 : TextConst 'ENU=%1 ''%2'' is created. Show?';
+      lvPurchHeaderRec@1100525005 : Record 38;
+      PurchSetup@1100528900 : Record 312;
+      PurchInvoiceHeader@1100528901 : Record 122;
+      PurchCreditHeader@1100528902 : Record 124;
+      ApprPurchInvoices@1100529000 : Page 11012066;
+      ApprCredMemos@1100529001 : Page 11012068;
+    BEGIN
+      GLSetup.GET;
+      WITH lvInvoiceRec DO BEGIN
+        COPY(VarRec);
+        CheckInvoice(lvInvoiceRec);
+        InvMessAccepted := FALSE;
+        ShowInvoiceMessages("No.", TRUE);
+        lvInvMessRec.SETRANGE("Invoice No.", "No.");
+        IF lvInvMessRec.FINDFIRST THEN BEGIN
+          IF NOT InvMessAccepted THEN
+            ERROR('');
+        END ELSE BEGIN
+          IF NOT CONFIRM(lvText000, TRUE, "No.") THEN
+            ERROR('');
+        END;
+
+        GET("No.");
+        IF RestartUnfinishedApproval(lvInvoiceRec) = FALSE THEN  //db, 18-09-14: C017265
+          CreatePurchInvoice(lvInvoiceRec);
+
+        VALIDATE(Approved, TRUE);  //* With 'Validate', so also 'Approved by' And 'Approved Date/Time' will be filled.
+        MODIFY;
+
+        COMMIT;  //* First 'Commit' before the 'Confirm'
+        IF CONFIRM(lvText001, TRUE, lvInvoiceRec."Purch. Invoice Type", lvInvoiceRec."Purchase Invoice No.") THEN BEGIN
+          PurchSetup.GET;
+          IF PurchSetup."Approve Purchase Invoices" THEN BEGIN  //DP00065
+            IF "Purch. Invoice Type" <> "Purch. Invoice Type"::CreditMemo THEN BEGIN
+              PurchInvoiceHeader.SETRANGE("No.", "Purchase Invoice No.");
+              ApprPurchInvoices.SETTABLEVIEW(PurchInvoiceHeader);
+              IF PurchInvoiceHeader.FINDFIRST THEN
+                ApprPurchInvoices.SetJournalTemplate(PurchInvoiceHeader."Journal Template");
+              ApprPurchInvoices.RUNMODAL;
+            END ELSE BEGIN
+              PurchCreditHeader.SETRANGE("No.", "Purchase Invoice No.");
+              ApprCredMemos.SETTABLEVIEW(PurchCreditHeader);
+              IF PurchCreditHeader.FINDFIRST THEN
+                ApprCredMemos.SetJournalTemplate(PurchCreditHeader."Journal Template");
+              ApprCredMemos.RUNMODAL;
+            END;
+          END ELSE BEGIN
+            lvPurchHeaderRec.FILTERGROUP(9);
+            IF "Purch. Invoice Type" <> "Purch. Invoice Type"::CreditMemo THEN
+              lvPurchHeaderRec.SETRANGE("Document Type", lvPurchHeaderRec."Document Type"::Invoice)
+            ELSE
+              lvPurchHeaderRec.SETRANGE("Document Type", lvPurchHeaderRec."Document Type"::"Credit Memo");
+            lvPurchHeaderRec.FILTERGROUP(0);
+            lvPurchHeaderRec.SETRANGE("No.", "Purchase Invoice No.");
+            IF "Purch. Invoice Type" <> "Purch. Invoice Type"::CreditMemo THEN
+              PAGE.RUNMODAL(PAGE::"Purchase Invoice", lvPurchHeaderRec)
+            ELSE
+              PAGE.RUNMODAL(PAGE::"Purchase Credit Memo", lvPurchHeaderRec);
+          END;
+        END;
+      END;
+      VarRec := lvInvoiceRec;
+    END;
+
+    LOCAL PROCEDURE CheckInvoice@1100525009(iInvoiceRec@1100525000 : Record 11072653);
+    VAR
+      lvInvoiceLineRec@1100525002 : Record 11072654;
+      lvDispatchNoteRec@1100525005 : Record 11072651;
+      lvDispatchNoteLineRec@1100525004 : Record 11072652;
+      lvVendRec@1100525006 : Record 23;
+      lvVendRelRec@1100525011 : Record 11012313;
+      lvProjRec@1100525003 : Record 11072003;
+      lvDimValRec@1100525001 : Record 349;
+      lvTradeItemRec@1100525007 : Record 11012317;
+      lvVATPostingSetupRec@1100525008 : Record 325;
+      lvServiceOrder@1100525013 : Record 11012823;
+      lvPlantTypeRec@1100525014 : Record 11012551;
+      lvPlantNumberRec@1100525015 : Record 11012552;
+      lvDimMgtCU@1100525009 : Codeunit 408;
+      lvCounterNotFilledDispatch@1100525012 : Integer;
+      lvVatPercHeader@1100525010 : Decimal;
+      VendorCode@1100528900 : Code[20];
+      HelpTxt@1100525016 : Text[30];
+      PurchaseLine@1100525017 : Record 39;
+      Item@1100525018 : Record 27;
+      TradeItem@1100525019 : Record 11012317;
+      ProjSetup@1100525020 : Record 315;
+    BEGIN
+      WITH iInvoiceRec DO BEGIN
+        DeleteInvoiceMessages("No.");
+
+        TESTFIELD("No.");
+        TESTFIELD(Approved, FALSE);
+        TESTFIELD("Vendor No.");
+        //DP00065.sn
+        CALCFIELDS("GLN Alternative Vendor");
+        IF "GLN Alternative Vendor" <> '' THEN
+          VendorCode := "GLN Alternative Vendor"
+        ELSE
+          VendorCode := "GLN Vendor";
+        IF VendorCode <> '' THEN BEGIN
+          lvVendRelRec.GET(VendorCode);
+          lvVendRelRec.TESTFIELD("Vendor (Purchase)");
+          TESTFIELD("Vendor No.", lvVendRelRec."Vendor (Purchase)");
+        END;
+        //DP00065.en
+        lvVendRec.GET("Vendor No.");
+        TESTFIELD("VAT Bus. Posting Group");
+        TESTFIELD("VAT Prod. Posting Group");
+        lvVATPostingSetupRec.GET("VAT Bus. Posting Group", "VAT Prod. Posting Group");
+        lvVatPercHeader := lvVATPostingSetupRec."VAT %";
+      END;
+
+      WITH lvInvoiceLineRec DO BEGIN
+        SETRANGE("Invoice No.", iInvoiceRec."No.");
+        IF FINDSET(FALSE,FALSE) THEN BEGIN
+          lvCounterNotFilledDispatch := 0;
+          REPEAT
+            IF NOT IsInvoiceTextLine() THEN BEGIN
+              IF ("Project No." <> '') OR ("Service Order No." <> '') OR ("Plant Type" <> '') THEN BEGIN  //db, 04-02-14: T004213
+                //* check Project, Service Order or Plant Type is filled; Cost Object is mandatory: so WIP account can be determined
+                IF "Project No." <> '' THEN BEGIN
+                  lvProjRec.GET("Project No.");
+                  lvProjRec.CheckProjectStatus(1);  //db, 08-02-16
+                  ProjSetup.GET;
+                  IF ProjSetup."Posting Element Mandatory" THEN   //db, 08-02-16
+                    TESTFIELD(Element);
+                END;
+                IF "Service Order No." <> '' THEN BEGIN
+                  lvServiceOrder.GET("Service Order No.");
+                  lvServiceOrder.CheckStatus(1);  //db, 08-02-16
+                END;
+                //db.sn, 04-02-14: T004213
+                IF "Plant Type" <> '' THEN
+                  lvPlantTypeRec.GET("Plant Type");
+                IF "Plant No." <> '' THEN
+                  lvPlantNumberRec.GET("Plant Type","Plant No.");
+                //db.en, 04-02-14: T004213
+                TESTFIELD("Cost Object");
+                lvDimMgtCU.GetDimValueRec(2, "Cost Object", lvDimValRec, TRUE, '');
+              END ELSE BEGIN
+                IF "Item No." = '' THEN  //DP00065
+                  TESTFIELD("G/L Account");
+                IF "Item No." <> '' THEN
+                  TESTFIELD("Location Code");  //db, 14-10-14: C017265
+                IF "Cost Object" <> '' THEN
+                  lvDimMgtCU.GetDimValueRec(2, "Cost Object", lvDimValRec, TRUE, '');
+              END;
+
+              //db.sn, 08-02-16
+              IF "Trade Item" <> '' THEN BEGIN
+                TradeItem.GET("Vendor (Trade Item)", "Trade Item");
+                TradeItem.TESTFIELD(Expired,FALSE);
+              END ELSE BEGIN
+                IF "Item No." <> '' THEN BEGIN
+                  Item.GET("Item No.");
+                  Item.TESTFIELD(Blocked,FALSE);
+                END;
+              END;
+              //db.en, 08-02-16
+
+              IF Department <> '' THEN
+                lvDimMgtCU.GetDimValueRec(1, Department, lvDimValRec, TRUE, '');
+
+              IF VatPostingGroupsOnLineLevel(lvInvoiceLineRec) THEN BEGIN
+                //* If on line level then both must be filed on this level.
+                TESTFIELD("VAT Bus. Posting Group");
+                TESTFIELD("VAT Prod. Posting Group");
+                lvVATPostingSetupRec.GET("VAT Bus. Posting Group", "VAT Prod. Posting Group");
+              END;
+
+              IF "No Dispatch Required" = '0' THEN BEGIN                   //**evdb.n
+                IF ("Dispatch Note No." = '') OR ("Dispatch Note Line No." = 0) THEN BEGIN
+                  lvCounterNotFilledDispatch := lvCounterNotFilledDispatch + 1;
+                END ELSE BEGIN
+                  IF NOT lvDispatchNoteRec.GET("Dispatch Note No.") THEN BEGIN
+                    CreateInvoiceMessage("Invoice No.", "Line No.",
+                      STRSUBSTNO(Text002, FIELDCAPTION("Dispatch Note No."), "Dispatch Note No.") + Text003);
+                  END ELSE BEGIN
+                    lvDispatchNoteRec.TESTFIELD(Approved);
+                    IF NOT lvDispatchNoteLineRec.GET("Dispatch Note No.", "Dispatch Note Line No.") THEN BEGIN
+                      lvDispatchNoteLineRec.INIT;
+                      CreateInvoiceMessage("Invoice No.", "Line No.",
+                        STRSUBSTNO(Text002,
+                          FIELDCAPTION("Dispatch Note Line No."),
+                          "Dispatch Note No." + '-' + FORMAT("Dispatch Note Line No.")) + Text003);
+                    END ELSE BEGIN
+                      IF ("Invoiced Quantity" <> lvDispatchNoteLineRec."Approved Quantity") OR
+                         ("Unit of Measure Code" <> lvDispatchNoteLineRec."Unit of Measure Code")
+                      THEN BEGIN
+                        CreateInvoiceMessage("Invoice No.", "Line No.",
+                          STRSUBSTNO(Text004,
+                            "Invoiced Quantity", "Unit of Measure Code",
+                            lvDispatchNoteLineRec."Approved Quantity", lvDispatchNoteLineRec."Unit of Measure Code"));
+                      END;
+                    END;
+                  END;
+                END;
+              END;
+              IF "Order Line No. Buyer" <> 0 THEN BEGIN  //db, 04-06-15
+                IF NOT PurchaseLine.GET(PurchaseLine."Document Type"::Order, "Order No. Buyer", "Order Line No. Buyer" ) THEN BEGIN
+                  HelpTxt := "Order No. Buyer" + '-' + STRSUBSTNO('%1', "Order Line No. Buyer");
+                  CreateInvoiceMessage("Invoice No.", "Line No.", STRSUBSTNO(Text002, PurchaseLine.TABLECAPTION, HelpTxt));
+                END;
+              END;
+              IF ("Item No. Vendor" <> '') OR ("GTIN Item" <> '') THEN BEGIN
+                IF NOT CheckTradeItem(lvTradeItemRec, VendorCode, "Item No. Vendor", "GTIN Item") THEN BEGIN  //DP00065
+                  IF ("Item No. Vendor" <> '') THEN
+                    CreateInvoiceMessage("Invoice No.", "Line No.",
+                      STRSUBSTNO(Text002, FIELDCAPTION("Item No. Vendor"), VendorCode + ' - ' + "Item No. Vendor"));  //DP00065
+                END ELSE BEGIN
+                  IF "Invoiced Quantity" > 0 THEN
+                    CheckInvoiceLinePriceDiscount(iInvoiceRec, lvInvoiceLineRec, lvTradeItemRec);
+                END;
+              END;
+              IF VatPostingGroupsOnLineLevel(lvInvoiceLineRec) THEN BEGIN
+                IF lvVATPostingSetupRec."VAT %" <> "VAT %" THEN BEGIN
+                  CreateInvoiceMessage("Invoice No.", "Line No.", STRSUBSTNO(Text005,
+                    lvVATPostingSetupRec.TABLECAPTION, FIELDCAPTION("VAT %"), lvVATPostingSetupRec."VAT %", "VAT %"));
+                END;
+              END ELSE BEGIN
+                IF lvVatPercHeader <> "VAT %" THEN BEGIN
+                  CreateInvoiceMessage("Invoice No.", "Line No.", STRSUBSTNO(Text005,
+                    lvVATPostingSetupRec.TABLECAPTION, FIELDCAPTION("VAT %"), lvVatPercHeader, "VAT %"));
+                END;
+              END;
+            END;
+          UNTIL NEXT = 0;
+          IF lvCounterNotFilledDispatch > 0 THEN BEGIN
+            CreateInvoiceMessage("Invoice No.", "Line No.",
+              STRSUBSTNO(Text001, FIELDCAPTION("Dispatch Note No."), FIELDCAPTION("Dispatch Note Line No.")) + Text003);
+          END;
+        END;
+      END;
+    END;
+
+    PROCEDURE CheckInvoiceLinePriceDiscount@1100525010(iInvoiceRec@1100525002 : Record 11072653;iInvoiceLineRec@1100525001 : Record 11072654;iTradeItemRec@1100525004 : Record 11012317);
+    VAR
+      lvPriceHistRec@1100525000 : Record 11012315;
+      lvNetAmt@1100525005 : Decimal;
+      VendorCode@1100528900 : Code[20];
+    BEGIN
+      WITH iInvoiceLineRec DO BEGIN
+        //DP00065.sn
+        iInvoiceRec.CALCFIELDS("GLN Alternative Vendor");
+        IF iInvoiceRec."GLN Alternative Vendor" <> '' THEN
+          VendorCode := iInvoiceRec."GLN Alternative Vendor"
+        ELSE
+          VendorCode := iInvoiceRec."GLN Vendor";
+        //DP00065.en
+        lvPriceHistRec.SETRANGE(Vendor, VendorCode);  //DP00065
+        lvPriceHistRec.SETRANGE("Item Code", "Item No. Vendor");
+        lvPriceHistRec.SETFILTER("Starting Date", '..%1', "Delivery Date");
+        IF NOT lvPriceHistRec.FINDLAST THEN BEGIN
+          CreateInvoiceMessage("Invoice No.", "Line No.", STRSUBSTNO(Text006, VendorCode, "Item No. Vendor"));  //DP00065
+          EXIT;
+        END;
+        //DP00065.so
+        //lvTradeItemDiscRec.SETRANGE("GLN Vendor", VendorCode);
+        //lvTradeItemDiscRec.SETRANGE("Item No. Vendor", "Item No. Vendor");
+        //lvTradeItemDiscRec.SETRANGE("Starting Date", lvPriceHistRec."Starting Date"); // Read with same date as were price is found!
+        //lvTradeItemDiscRec.SETRANGE(Code, "Discount/Surcharge Code");
+        //lvTradeItemDiscRec.SETRANGE("Minimum Quantity", 0, "Invoiced Quantity");
+        //lvTradeItemDiscRec.SETRANGE(Status, lvTradeItemDiscRec.Status::"1");
+        //IF lvTradeItemDiscRec.FINDLAST THEN BEGIN
+        //  lvDiscSurchAmt := lvTradeItemDiscRec.Amount;  //* With same "Price ID" and "Quantity Per Price" as the price
+        //  lvDiscSurchPerc := lvTradeItemDiscRec.Percentage;
+        //  IF lvTradeItemDiscRec.Type = lvTradeItemDiscRec.Type::"0" THEN BEGIN
+        //    IF lvDiscSurchAmt <> 0 THEN
+        //      lvDiscSurchAmt := -lvDiscSurchAmt;
+        //    IF lvDiscSurchPerc <> 0 THEN
+        //      lvDiscSurchPerc := -lvDiscSurchPerc;
+        //  END;
+        //  IF (lvDiscSurchAmt = 0) AND (lvDiscSurchPerc <> 0) THEN
+        //    lvDiscSurchAmt := (lvDiscSurchPerc / 100.0) * lvPriceHistRec."Gross Price";
+        //END;
+        //DP00065.eo
+        //lvNetAmt := (lvPriceHistRec."Gross Price" - lvDiscSurchAmt) / lvPriceHistRec."Quantity Per Price" * "Invoiced Quantity";
+        //* 07-03-12 No test on divide by zero, next to that below it will be divided again by 'Quantity Per Price'
+        //* Over there a test on divide by zero is done. For that reason line below disabled and replace by new line (without divide).
+        //lvNetAmt := (lvPriceHistRec."Nett Price") / lvPriceHistRec."Quantity Per Price" * "Invoiced Quantity";  //db, 02-02-12: M32838
+        lvNetAmt := (lvPriceHistRec."Nett Price") * "Invoiced Quantity";  //07-03-12
+        IF lvPriceHistRec."Quantity Per Price" <> 0 THEN
+          lvNetAmt := lvNetAmt / lvPriceHistRec."Quantity Per Price";
+        IF (iTradeItemRec."Nett Price" = 0) THEN BEGIN //DP00928.sn
+          iTradeItemRec.GetActualPrice(iInvoiceLineRec."Delivery Date", '', '');
+          lvNetAmt := iTradeItemRec."Nett Price";
+        END; //DP00928.en
+        IF (iTradeItemRec."Factor Price-Purchase Unit" <> 0) AND
+           (lvPriceHistRec."Price ID" <> "Unit of Measure Code")             // "Unit of Measure" is the invoiced unit
+        THEN BEGIN
+          IF ("Unit of Measure Code" = iTradeItemRec."Order ID") THEN
+            lvNetAmt := lvNetAmt * iTradeItemRec."Factor Price-Purchase Unit";
+          //ELSE ?  what if factor=0?
+        END;
+        //lvNetAmt := ROUND(lvNetAmt, 0.01); //DP00928.o
+        lvNetAmt := ROUND(lvNetAmt * iInvoiceLineRec."Invoiced Quantity", 0.01); //DP00928.n
+        IF (lvNetAmt < iInvoiceLineRec."Nett Line Amount"-0.01) OR (lvNetAmt > iInvoiceLineRec."Nett Line Amount"+0.01) THEN
+          CreateInvoiceMessage("Invoice No.", "Line No.", STRSUBSTNO(Text007, lvNetAmt, iInvoiceLineRec."Nett Line Amount"));
+      END;
+    END;
+
+    PROCEDURE CreatePurchInvoice@1100525013(VAR ioInvoiceRec@1100525000 : Record 11072653);
+    VAR
+      lvPurchHeaderRec@1100525002 : Record 38;
+      lvInvoiceLineRec@1100528903 : Record 11072654;
+      lvDispatchNoteRec@1100528904 : Record 11072651;
+      lvVendorRec@1100528902 : Record 23;
+      PurchSetup@1100528900 : Record 312;
+      PurchPost@1100528901 : Codeunit 90;
+      PurchInvHeader@1100528906 : Record 122;
+      PurchCreditHeader@1100528905 : Record 124;
+      DocType@1100528907 : Integer;
+      DocNo@1100528908 : Code[20];
+      BankAccountRec@1100525001 : Record 288;
+      LenBankAccount@1100525003 : Integer;
+      LenCheck@1100525004 : Integer;
+    BEGIN
+      //* Do not use all field from the imported invoice (header/line) table, because for some fields the setups in
+      //* Navision are leading (AO). see also comment in codeunit 11072076.
+      PurchSetup.GET;  //DP00065
+      SiBSetup.GET; //DP00065
+
+      WITH ioInvoiceRec DO BEGIN
+        lvPurchHeaderRec.INIT;
+        IF "Total Invoice Amount" >= 0 THEN
+          lvPurchHeaderRec."Document Type" := lvPurchHeaderRec."Document Type"::Invoice
+        ELSE
+          lvPurchHeaderRec."Document Type" := lvPurchHeaderRec."Document Type"::"Credit Memo";
+        lvPurchHeaderRec."No." := '';
+        lvPurchHeaderRec."No. Series" := SiBSetup."Invoice Nos. (Purch. Invoice)";  //DP00065
+        lvPurchHeaderRec."Order Type (SiB)" := lvPurchHeaderRec."Order Type (SiB)"::Invoice;  //DP00065
+        lvPurchHeaderRec.INSERT(TRUE);
+        lvPurchHeaderRec.TESTFIELD("No.");
+
+        "Purchase Invoice No." := lvPurchHeaderRec."No.";
+        IF lvPurchHeaderRec."Document Type" = lvPurchHeaderRec."Document Type"::Invoice THEN
+          "Purch. Invoice Type" := "Purch. Invoice Type"::Invoice
+        ELSE
+          "Purch. Invoice Type" := "Purch. Invoice Type"::CreditMemo;
+
+        lvPurchHeaderRec.VALIDATE("Buy-from Vendor No.", "Vendor No.");
+        IF "Invoice Date" <> 0D THEN  //DP00065
+          lvPurchHeaderRec.VALIDATE("Document Date", "Invoice Date");
+        IF "Posting Date" <> 0D THEN  //DP00065
+          lvPurchHeaderRec.VALIDATE("Posting Date", "Posting Date");
+        lvPurchHeaderRec."Ext. Document ID" := "Ext. Document ID";  //28-01-14: T004213 (document with same name as xml-file)
+        lvPurchHeaderRec."Your Reference" := "Our Reference";
+        IF "On Hold" <> '' THEN
+          lvPurchHeaderRec.VALIDATE("On Hold", "On Hold");  //DP00065
+        IF "Approvement Initials" <> '' THEN
+          lvPurchHeaderRec.VALIDATE("Approvement Initials", "Approvement Initials");  //db, 05-09-14: C017265
+
+        //db.sn, 21-03-13: C006265
+        IF PurchSetup."Bank Account Check" THEN BEGIN
+        END;
+        //db.en, 21-03-13: C006265
+
+        lvPurchHeaderRec.VALIDATE("Invoice Lines Input", (PurchSetup."Approve Purchase Invoices"=FALSE));  //DP00065
+        IF ("Amount B-Account" <> 0) THEN BEGIN
+          lvVendorRec.GET("Vendor No.");
+          lvVendorRec.TESTFIELD("Default Payment Agreement");
+          lvPurchHeaderRec.VALIDATE("Subcontracting Invoice", TRUE);
+          lvPurchHeaderRec.VALIDATE("Contribution Percentage Labor", 100);
+          lvPurchHeaderRec.VALIDATE("Labor Amount", "Amount B-Account");
+        END ELSE
+          lvPurchHeaderRec.VALIDATE("Subcontracting Invoice", FALSE);
+        lvPurchHeaderRec.VALIDATE("Amounts only", FALSE);
+        IF lvPurchHeaderRec."Document Type" = lvPurchHeaderRec."Document Type"::Invoice THEN
+          lvPurchHeaderRec."Vendor Invoice No." := "No."
+        ELSE
+          lvPurchHeaderRec."Vendor Cr. Memo No." := "No.";
+
+        IF ("Currency Code" <> '') AND ("Currency Code" <> GLSetup."LCY Code") THEN
+          lvPurchHeaderRec.VALIDATE("Currency Code", "Currency Code");
+        lvPurchHeaderRec.VALIDATE("VAT Bus. Posting Group", "VAT Bus. Posting Group");
+        lvPurchHeaderRec.VALIDATE("VAT Prod. Posting Group", "VAT Prod. Posting Group");
+
+        lvPurchHeaderRec.VALIDATE("Amount incl. VAT", "Total Invoice Amount");
+        //DP00065.sn (34418.n / 34418.o)
+        //IF PurchSetup."Approve Purchase Invoices" THEN BEGIN
+        //  SiBSetup.TESTFIELD("Approval Template");
+        //  lvPurchHeaderRec."Inv.Appr.Journal Template" := SiBSetup."Approval Template";
+        //END;
+        //DP00065.en
+        lvPurchHeaderRec.MODIFY(TRUE);
+        LinkInvoiceDocument(ioInvoiceRec, lvPurchHeaderRec); //DP00881
+        //DP00065.sn (34418)
+        IF PurchSetup."Approve Purchase Invoices" THEN
+          lvPurchHeaderRec.TESTFIELD("Inv.Appr.Journal Template");
+        //DP00065.en
+      END;
+
+      //DP00065.sn
+      WITH lvInvoiceLineRec DO BEGIN
+        //function GetReceiptLines based on "Related Purch. Order No."; fill info by Dispatch Note: assumed to be 1 document on invoice
+        SETRANGE("Invoice No.", ioInvoiceRec."No.");
+        SETFILTER("Dispatch Note No.", '<>%1', '');
+        IF FINDFIRST THEN BEGIN
+          IF lvDispatchNoteRec.GET("Dispatch Note No.") THEN BEGIN
+            lvPurchHeaderRec."Related Purch. Order No." := lvDispatchNoteRec."Related Purch. Order No.";
+            lvPurchHeaderRec.MODIFY(TRUE);
+          END;
+        END;
+      END;
+
+      IF PurchSetup."Approve Purchase Invoices" THEN BEGIN
+        PurchPost.RUN(lvPurchHeaderRec);
+        IF lvPurchHeaderRec.Amount < 0 THEN BEGIN
+          PurchCreditHeader.SETCURRENTKEY("Pre-Assigned No.");
+          PurchCreditHeader.SETRANGE("Pre-Assigned No.", lvPurchHeaderRec."No.");
+          PurchCreditHeader.SETRANGE("Related Purch. Order No.", lvPurchHeaderRec."Related Purch. Order No.");
+          IF NOT PurchCreditHeader.FINDLAST THEN EXIT;
+          DocType := 1;
+          DocNo := PurchCreditHeader."No.";
+        END ELSE BEGIN
+          PurchInvHeader.SETCURRENTKEY("Pre-Assigned No.");
+          PurchInvHeader.SETRANGE("Pre-Assigned No.", lvPurchHeaderRec."No.");
+          PurchInvHeader.SETRANGE("Related Purch. Order No.", lvPurchHeaderRec."Related Purch. Order No.");
+          IF NOT PurchInvHeader.FINDLAST THEN EXIT;
+          DocType := 0; //option in codeunit 11012023 (0=invoice, 1=credit)
+          DocNo := PurchInvHeader."No.";
+        END;
+        GetReceiptLines(lvPurchHeaderRec, DocType, DocNo, TRUE);
+        MatchPurchApproval(ioInvoiceRec, DocType, DocNo, lvPurchHeaderRec."Inv.Appr.Journal Template");  //34418.c
+      END ELSE BEGIN
+        GetReceiptLines(lvPurchHeaderRec, 0, '', FALSE);
+        MatchPurchInvoice(ioInvoiceRec, lvPurchHeaderRec);
+      END;
+      //DP00065.en
+    END;
+
+    PROCEDURE CreatePurchInvoiceLine@1100528913(PurchHeaderRec@1100528900 : Record 38;VAR PurchLineRec@1100528902 : Record 39;NextLine@1100528901 : Integer;DescLine@1100528903 : Text[50]);
+    BEGIN
+      //DP00065
+      PurchLineRec.INIT;
+      PurchLineRec."Document Type" := PurchHeaderRec."Document Type";
+      PurchLineRec."Document No." := PurchHeaderRec."No.";
+      PurchLineRec."Line No." := NextLine;
+      PurchLineRec.Description := DescLine;
+      PurchLineRec.INSERT(TRUE);
+    END;
+
+    PROCEDURE UpdatePurchInvoiceLine@1100528912(InvoiceRec@1100528901 : Record 11072653;InvoiceLineRec@1100528911 : Record 11072654;PurchLineRec@1100528908 : Record 39;LineMatched@1100528912 : Boolean);
+    VAR
+      lvTradeItemRec@1100528910 : Record 11012317;
+      lvDiscAmt@1100528907 : Decimal;
+      lvDiscPerc@1100528906 : Decimal;
+      lvUnitCode@1100528905 : Code[10];
+      ItemMgt@1100528904 : Codeunit 11012033;
+      HelpTxt@1100528903 : Text[50];
+      VendorCode@1100528902 : Code[20];
+    BEGIN
+      //DP00065
+      InvoiceRec.CALCFIELDS("GLN Alternative Vendor");
+      IF InvoiceRec."GLN Alternative Vendor" <> '' THEN
+        VendorCode := InvoiceRec."GLN Alternative Vendor"
+      ELSE
+        VendorCode := InvoiceRec."GLN Vendor";
+
+      WITH InvoiceLineRec DO BEGIN
+        IF IsInvoiceTextLine() THEN BEGIN
+          PurchLineRec.Type := PurchLineRec.Type::" ";
+          PurchLineRec.Description := COPYSTR(Description, 1, MAXSTRLEN(PurchLineRec.Description));
+        END ELSE BEGIN
+          IF NOT LineMatched THEN BEGIN
+            PurchLineRec.Type := PurchLineRec.Type::"G/L Account";
+            IF ("Project No." + "Service Order No." + "Plant Type" = '') THEN BEGIN  //db, 04-02-14: T004213
+              PurchLineRec.VALIDATE("No.", "G/L Account");
+            END ELSE BEGIN
+              IF "Project No." <> '' THEN
+                PurchLineRec.VALIDATE("Job No.", "Project No.");
+              IF Element <> '' THEN
+                PurchLineRec.VALIDATE(Element, Element);
+              IF "Service Order No." <> '' THEN
+                PurchLineRec.VALIDATE("Service Order No.", "Service Order No.");
+              //db.sn, 04-02-14: T004213
+              IF "Plant Type" <> '' THEN
+                PurchLineRec.VALIDATE("Plant Type", "Plant Type");
+              IF "Plant No." <> '' THEN
+                PurchLineRec.VALIDATE("Plant No.", "Plant No.");
+              IF "Cost Component Plant" <> '' THEN
+                PurchLineRec.VALIDATE("Cost Component Plant", "Cost Component Plant");
+              //db.en, 04-02-14: T004213
+            END;
+          END;
+          //*C-018789.sn
+          HelpTxt := '';
+          IF ("Item No. Vendor" <> '') OR ("GTIN Item" <> '') THEN BEGIN
+            IF CheckTradeItem(lvTradeItemRec, VendorCode, "Item No. Vendor", "GTIN Item") THEN BEGIN
+              PurchLineRec.VALIDATE("Vendor (Trade Item)", lvTradeItemRec.Vendor);
+              IF ("Item No. Vendor" <> '') THEN
+                PurchLineRec.VALIDATE("Trade Item", "Item No. Vendor")
+              ELSE
+                PurchLineRec.VALIDATE("Trade Item", "GTIN Item");
+            END ELSE BEGIN
+              HelpTxt := GetHelpTxt("Item No. Vendor", "GTIN Item");
+            END;
+          END;
+          //*C-018789.en
+          IF "Trade Item" <> '' THEN BEGIN
+            PurchLineRec."Vendor (Trade Item)" := "Vendor (Trade Item)";
+            PurchLineRec.VALIDATE("Trade Item", "Trade Item");
+          END ELSE BEGIN
+            IF "Basic Item" <> '' THEN BEGIN
+              PurchLineRec.Manufacturer := Manufacturer;
+              PurchLineRec.VALIDATE("Basic Item", "Basic Item");
+            END ELSE BEGIN
+              IF "Item No." <> '' THEN
+                PurchLineRec.VALIDATE("Item No.", "Item No.");
+            END;
+          END;
+
+          IF ("Cost Object" <> '') AND ("Cost Object" <> PurchLineRec."Shortcut Dimension 2 Code") THEN
+            PurchLineRec.VALIDATE("Shortcut Dimension 2 Code", "Cost Object");
+          IF Department <> '' THEN
+            PurchLineRec.VALIDATE("Shortcut Dimension 1 Code", Department);
+
+          PurchLineRec.VALIDATE(Quantity, "Invoiced Quantity");
+          lvUnitCode := ItemMgt.CheckUnitConversion("Unit of Measure Code");
+          //IF lvUnitCode = '' THEN
+          //  lvUnitCode := "Unit of Measure Code";
+          //IF (PurchLineRec."Unit of Measure Code" <> lvUnitCode) THEN
+          //  PurchLineRec.VALIDATE("Unit of Measure Code", lvUnitCode);
+          IF PurchLineRec."Unit of Measure Code" = '' THEN
+            PurchLineRec.VALIDATE("Unit of Measure Code", lvUnitCode);  //db, 02-02-12: M32830
+
+          IF PurchLineRec."Line Discount %" <> 0 THEN
+            PurchLineRec.VALIDATE("Line Discount %", 0);
+          lvDiscAmt := "Discount/Surcharge Amount";
+          lvDiscPerc := "Discount/Surcharge %";
+          IF "Discount/Surcharge Type" = "Discount/Surcharge Type"::Surcharge THEN BEGIN
+            IF lvDiscAmt <> 0 THEN
+              lvDiscAmt := -lvDiscAmt;
+            IF lvDiscPerc <> 0 THEN
+              lvDiscPerc := -lvDiscPerc;
+          END;
+          IF "Price Base Quantity" <> 0 THEN
+            PurchLineRec.VALIDATE("Direct Unit Cost", Price / "Price Base Quantity")
+          ELSE
+            PurchLineRec.VALIDATE("Direct Unit Cost", Price);
+          IF lvDiscAmt <> 0 THEN
+            PurchLineRec.VALIDATE("Line Discount Amount", lvDiscAmt)
+          ELSE BEGIN
+            IF lvDiscPerc <> 0 THEN
+              PurchLineRec.VALIDATE("Line Discount %", lvDiscPerc);
+          END;
+          PurchLineRec.VALIDATE("Line Amount", "Nett Line Amount");
+
+          IF NOT VatPostingGroupsOnLineLevel(InvoiceLineRec) THEN BEGIN
+            PurchLineRec.VALIDATE("VAT Bus. Posting Group", InvoiceRec."VAT Bus. Posting Group");
+            PurchLineRec.VALIDATE("VAT Prod. Posting Group", InvoiceRec."VAT Prod. Posting Group");
+          END ELSE BEGIN
+            PurchLineRec.VALIDATE("VAT Bus. Posting Group", "VAT Bus. Posting Group");
+            PurchLineRec.VALIDATE("VAT Prod. Posting Group", "VAT Prod. Posting Group");
+          END;
+          IF Description <> '' THEN
+            PurchLineRec.Description := COPYSTR(Description, 1, MAXSTRLEN(PurchLineRec.Description));
+          IF HelpTxt <> '' THEN
+            PurchLineRec."Description 2" := COPYSTR(HelpTxt, 1, MAXSTRLEN(PurchLineRec."Description 2"));
+        END;
+        PurchLineRec.MODIFY(TRUE);
+      END;
+    END;
+
+    PROCEDURE VatPostingGroupsOnLineLevel@1100525008(iInvoiceLineRec@1100525000 : Record 11072654) : Boolean;
+    BEGIN
+      EXIT((iInvoiceLineRec."VAT Bus. Posting Group" <> '') OR (iInvoiceLineRec."VAT Prod. Posting Group" <> ''));
+    END;
+
+    LOCAL PROCEDURE DeleteInvoiceMessages@1100525004(iInvoiceNo@1100525001 : Code[20]);
+    VAR
+      lvInvMessRec@1100525000 : Record 11072655;
+    BEGIN
+      lvInvMessRec.SETRANGE("Invoice No.", iInvoiceNo);
+      lvInvMessRec.DELETEALL;
+      COMMIT;
+    END;
+
+    LOCAL PROCEDURE CreateInvoiceMessage@1100525005(iInvoiceNo@1100525001 : Code[20];iInvoiceLine@1100525002 : Integer;iMessText@1100525003 : Text[250]);
+    VAR
+      lvInvMessRec@1100525000 : Record 11072655;
+      lvNextLineNo@1100525004 : Integer;
+    BEGIN
+      WITH lvInvMessRec DO BEGIN
+        SETRANGE("Invoice No.", iInvoiceNo);
+        SETRANGE("Invoice Line No.", iInvoiceLine);
+        IF FINDLAST THEN
+          lvNextLineNo := "Line No.";
+        lvNextLineNo := lvNextLineNo + 1;
+
+        INIT;
+        "Invoice No." := iInvoiceNo;
+        "Invoice Line No." := iInvoiceLine;
+        "Line No." := lvNextLineNo;
+        Message := iMessText;
+        INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE ShowInvoiceMessages@1100525006(iInvoiceNo@1100525001 : Code[20];iPostMode@1100525002 : Boolean);
+    VAR
+      lvInvMessRec@1100525000 : Record 11072655;
+      lvInvMessFrm@1100409000 : Page 11072659;
+    BEGIN
+      WITH lvInvMessRec DO BEGIN
+        FILTERGROUP(9);
+        SETRANGE("Invoice No.", iInvoiceNo);
+        FILTERGROUP(0);
+        IF FINDFIRST THEN BEGIN
+          COMMIT;
+          IF NOT iPostMode THEN
+            PAGE.RUNMODAL(0, lvInvMessRec)
+          ELSE BEGIN
+            lvInvMessFrm.SETTABLEVIEW(lvInvMessRec);
+            lvInvMessFrm.LOOKUPMODE(TRUE);  //* Show 'Cancel' button
+            lvInvMessFrm.SetPostMode();
+            lvInvMessFrm.RUNMODAL;
+            InvMessAccepted := lvInvMessFrm.GetAccepted();
+          END;
+        END;
+      END;
+    END;
+
+    PROCEDURE CheckTradeItem@1100525014(VAR TradeItemRec@1100525000 : Record 11012317;GlnVendor@1100525001 : Code[20];ItemNoVend@1100525002 : Code[20];GtinItem@1100525003 : Code[20]) : Boolean;
+    BEGIN
+      //*C-018789  IF ItemNo-Vendor is empty then read with GTIN-Item
+      IF ItemNoVend <> '' THEN BEGIN
+        IF TradeItemRec.GET(GlnVendor, ItemNoVend) THEN
+          EXIT(TRUE);
+      END ELSE BEGIN
+        IF GtinItem <> '' THEN BEGIN
+          SiBSetup.GET;
+          IF SiBSetup."Fill Item No. With GTIN Item" THEN BEGIN
+            IF TradeItemRec.GET(GlnVendor, GtinItem) THEN
+              EXIT(TRUE);
+          END;
+        END;
+      END;
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE CreatePurchOrder@1210190000(VAR ioDispatchNoteRec@1100525000 : Record 11072651) : Boolean;
+    VAR
+      lvPurchHeaderRec@1100525002 : Record 38;
+      lvPurchLineRec@1100525001 : Record 39;
+      lvDispatchLineRec@1210190001 : Record 11072652;
+      lvTradeItemRec@1100525004 : Record 11012317;
+      lvNextLineNo@1100525005 : Integer;
+      lvUnitCode@1100525008 : Code[10];
+      ItemMgt@1210190000 : Codeunit 11012033;
+      HelpTxt@1100528900 : Text[250];
+      VendorCode@1100528901 : Code[20];
+    BEGIN
+      //DP00065
+      IF lvPurchHeaderRec.GET(lvPurchHeaderRec."Document Type"::Order, ioDispatchNoteRec."Related Purch. Order No.") THEN BEGIN
+        lvPurchLineRec.SETRANGE("Document Type", lvPurchHeaderRec."Document Type");
+        lvPurchLineRec.SETRANGE("Document No.", ioDispatchNoteRec."Related Purch. Order No.");
+        IF lvPurchLineRec.FINDFIRST THEN EXIT(FALSE);
+      END;
+
+      SiBSetup.GET;
+      WITH ioDispatchNoteRec DO BEGIN
+        CALCFIELDS("GLN Alternative Vendor");
+        IF "GLN Alternative Vendor" <> '' THEN
+          VendorCode := "GLN Alternative Vendor"
+        ELSE
+          VendorCode := "GLN Vendor";
+
+        IF ioDispatchNoteRec."Related Purch. Order No." = '' THEN BEGIN
+          lvPurchHeaderRec.INIT;
+          lvPurchHeaderRec."Document Type" := lvPurchHeaderRec."Document Type"::Order;
+          lvPurchHeaderRec."No." := '';
+          lvPurchHeaderRec."No. Series" := SiBSetup."Order Nos. (Dispatch Notes)";
+          lvPurchHeaderRec."Order Type (SiB)" := lvPurchHeaderRec."Order Type (SiB)"::DispatchNote;
+          lvPurchHeaderRec.INSERT(TRUE);
+          "Related Purch. Order No." := lvPurchHeaderRec."No.";
+
+          lvPurchHeaderRec.TESTFIELD("No.");
+          lvPurchHeaderRec.VALIDATE("Buy-from Vendor No.", DetermineVendor);
+          lvPurchHeaderRec.VALIDATE("Document Date", Date);
+          lvPurchHeaderRec.VALIDATE("Posting Date", WORKDATE);
+          IF "Service Order No." <> '' THEN BEGIN  //db, 07-10-14: C017265
+            lvPurchHeaderRec.VALIDATE("Service Order No.", "Service Order No.");
+          END;
+          IF "Project No." <> '' THEN BEGIN
+            IF DispatchLineOtherSpecFilled("No.", "Project No.") = FALSE THEN
+              lvPurchHeaderRec.VALIDATE("Job No.", "Project No.");
+          END;
+          lvPurchHeaderRec.Deliver := lvPurchHeaderRec.Deliver::" ";
+          lvPurchHeaderRec."Ship To Location" := '';
+          lvPurchHeaderRec."Ship-to Name" := "Name Delivery";
+          lvPurchHeaderRec."Ship-to Name 2" := '';
+          lvPurchHeaderRec."Ship-to Address" := "Address Delivery";
+          lvPurchHeaderRec."Ship-to Address 2" := '';
+          lvPurchHeaderRec."Ship-to Post Code" := "Post Code Delivery";
+          lvPurchHeaderRec."Ship-to City" := "City Delivery";
+          lvPurchHeaderRec."Ship-to Country/Region Code" := "Country Delivery";
+          lvPurchHeaderRec."Ship-to Contact" := '';
+          lvPurchHeaderRec.MODIFY(TRUE);
+        END;
+      END;
+
+      WITH lvDispatchLineRec DO BEGIN
+        SETRANGE("Dispatch Note No.", ioDispatchNoteRec."No.");
+        IF FINDSET(TRUE,FALSE) THEN BEGIN
+          REPEAT
+            lvPurchLineRec.INIT;
+            lvPurchLineRec."Document Type" := lvPurchHeaderRec."Document Type";
+            lvPurchLineRec."Document No." := lvPurchHeaderRec."No.";
+            lvPurchLineRec."Line No." := lvNextLineNo + 10000;
+            lvNextLineNo := lvPurchLineRec."Line No.";
+
+            lvPurchLineRec.Type := lvPurchLineRec.Type::"G/L Account";
+            IF ("Project No." + "Service Order No." + "Plant Type" = '') THEN BEGIN  //db, 04-02-14: T004213
+              IF "Item No." <> '' THEN BEGIN  //db, 07-10-14: C017265
+                lvPurchLineRec.Type := lvPurchLineRec.Type::Item;
+                lvPurchLineRec.VALIDATE("No.", "Item No.");
+                lvPurchLineRec."Location Code" := "Location Code";
+                lvPurchLineRec."Bin Code" := "Bin Code";
+              END ELSE BEGIN
+                lvPurchLineRec.VALIDATE("No.", "G/L Account");
+              END;
+            END ELSE BEGIN
+              IF "Project No." <> '' THEN
+                lvPurchLineRec.VALIDATE("Job No.", "Project No.");
+              IF Element <> '' THEN
+                lvPurchLineRec.VALIDATE(Element, Element);
+              IF "Service Order No." <> '' THEN
+                lvPurchLineRec.VALIDATE("Service Order No.", "Service Order No.");
+              //db.sn, 04-02-14: T004213
+              IF "Plant Type" <> '' THEN
+                lvPurchLineRec.VALIDATE("Plant Type", "Plant Type");
+              IF "Plant No." <> '' THEN
+                lvPurchLineRec.VALIDATE("Plant No.", "Plant No.");
+              IF "Cost Component Plant" <> '' THEN
+                lvPurchLineRec.VALIDATE("Cost Component Plant", "Cost Component Plant");
+              //db.en, 04-02-14: T004213
+            END;
+
+            IF "Plant Type" = '' THEN BEGIN  //db, 14-10-14: C017265 (ignore item-data if plant type filled)
+              HelpTxt := '';
+              IF ("Item No. Vendor" <> '') OR ("GTIN Item" <> '') THEN BEGIN
+                IF CheckTradeItem(lvTradeItemRec, VendorCode, "Item No. Vendor", "GTIN Item") THEN BEGIN
+                  lvPurchLineRec."Vendor (Trade Item)" := lvTradeItemRec.Vendor;
+                  lvPurchLineRec.VALIDATE("Trade Item", lvTradeItemRec."Item Code");
+                END ELSE BEGIN
+                  HelpTxt := GetHelpTxt("Item No. Vendor", "GTIN Item");
+                END;
+              END;
+              IF "Trade Item" <> '' THEN BEGIN
+                lvPurchLineRec."Vendor (Trade Item)" := "Vendor (Trade Item)";
+                lvPurchLineRec.VALIDATE("Trade Item", "Trade Item");
+              END ELSE BEGIN
+                IF "Basic Item" <> '' THEN BEGIN
+                  lvPurchLineRec.Manufacturer := Manufacturer;
+                  lvPurchLineRec.VALIDATE("Basic Item", "Basic Item");
+                END ELSE BEGIN
+                  IF "Item No." <> '' THEN
+                    lvPurchLineRec.VALIDATE("Item No.", "Item No.");
+                END;
+              END;
+            END;
+
+            IF ("Cost Object" <> '') AND ("Cost Object" <> lvPurchLineRec."Shortcut Dimension 2 Code") THEN
+              lvPurchLineRec.VALIDATE("Shortcut Dimension 2 Code", "Cost Object");
+            IF Department <> '' THEN
+              lvPurchLineRec.VALIDATE("Shortcut Dimension 1 Code", Department);
+
+            lvPurchLineRec.VALIDATE(Quantity, "Approved Quantity");
+            lvPurchLineRec.VALIDATE("Qty. to Receive", "Approved Quantity");  //Match not depending on Direct Posting
+
+            lvUnitCode := ItemMgt.CheckUnitConversion("Unit of Measure Code");
+            //db: 02-02-12: M32830
+            //-Quantity DispatchNoteLine assumed to be defined on PurchUnit.
+            //-Unit/Price already validated by ItemCode; assign Unit only for missing items or lines based on CostObject
+            //IF lvUnitCode = '' THEN
+            //  lvUnitCode := "Unit of Measure Code";
+            //IF (lvPurchLineRec."Unit of Measure Code" <> lvUnitCode) THEN
+            //  lvPurchLineRec.VALIDATE("Unit of Measure Code", lvUnitCode);
+            IF lvPurchLineRec."Unit of Measure Code" = '' THEN
+              lvPurchLineRec.VALIDATE("Unit of Measure Code", lvUnitCode);  //db, 02-02-12: M32830
+            IF Description <> '' THEN
+              lvPurchLineRec.Description := COPYSTR(Description, 1, MAXSTRLEN(lvPurchLineRec.Description));
+            IF HelpTxt <> '' THEN
+              lvPurchLineRec."Description 2" := COPYSTR(HelpTxt, 1, MAXSTRLEN(lvPurchLineRec."Description 2"));
+            lvPurchLineRec.INSERT(TRUE);
+
+            "Line Matched" := TRUE;
+            MODIFY;
+          UNTIL NEXT = 0;
+        END;
+      END;
+
+      ProcessPurchOrder(lvPurchHeaderRec);
+
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE DispatchLineOtherSpecFilled@1100528900(iDispatchNote@1100528900 : Code[20];iProject@1100528902 : Code[20]) : Boolean;
+    VAR
+      lvDispatchLineRec@1100528901 : Record 11072652;
+    BEGIN
+      //DP00065
+      WITH lvDispatchLineRec DO BEGIN
+        RESET;
+        SETRANGE("Dispatch Note No.", iDispatchNote);
+        SETFILTER("Project No.", '<>%1&<>%2', '', iProject);
+        IF FINDFIRST THEN EXIT(TRUE);
+
+        RESET;
+        SETRANGE("Dispatch Note No.", iDispatchNote);
+        SETFILTER("Service Order No.", '<>%1', '');
+        IF FINDFIRST THEN EXIT(TRUE);
+
+        //db.sn, 04-02-14: T004213
+        RESET;
+        SETRANGE("Dispatch Note No.", iDispatchNote);
+        SETFILTER("Plant Type", '<>%1', '');
+        IF FINDFIRST THEN EXIT(TRUE);
+        //db.en, 04-02-14: T004213
+
+        RESET;
+        SETRANGE("Dispatch Note No.", iDispatchNote);
+        SETFILTER("G/L Account", '<>%1', '');
+        IF FINDFIRST THEN EXIT(TRUE);
+      END;
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE MatchPurchOrder@1100528901(VAR ioDispatchNoteRec@1100528900 : Record 11072651);
+    VAR
+      lvDispatchLineRec@1100528902 : Record 11072652;
+      lvPurchHeaderRec@1100528904 : Record 38;
+      lvPurchLineRec@1100528901 : Record 39;
+      LineMatched@1100528903 : Boolean;
+      TmpPurchLineRec@1100528905 : TEMPORARY Record 39;
+    BEGIN
+      //DP00065
+      WITH lvDispatchLineRec DO BEGIN
+        SETRANGE("Dispatch Note No.", ioDispatchNoteRec."No.");
+        SETRANGE("Line Matched" , FALSE);
+        IF FINDSET(TRUE,FALSE) THEN BEGIN
+          REPEAT
+            LineMatched := FALSE;
+            lvPurchLineRec.SETRANGE("Document Type", lvPurchLineRec."Document Type"::Order);
+            lvPurchLineRec.SETRANGE("Document No.", ioDispatchNoteRec."Related Purch. Order No.");
+            IF lvPurchLineRec.FINDSET THEN BEGIN
+              REPEAT
+                //db, 04-02-14: T004213 (check Plant Type)
+                IF ((lvPurchLineRec."Job No." = "Project No.") AND
+                    (lvPurchLineRec."Service Order No." = "Service Order No.") AND
+                    (lvPurchLineRec."Plant Type" = "Plant Type")) OR
+                   ((lvPurchLineRec.Type = lvPurchLineRec.Type::"G/L Account") AND (lvPurchLineRec."No." = "G/L Account") AND
+                    (lvPurchLineRec."Job No." + lvPurchLineRec."Service Order No." + lvPurchLineRec."Plant Type"= '')) OR
+                   ((lvPurchLineRec.Type = lvPurchLineRec.Type::Item) AND (lvPurchLineRec."No." = "Item No.")) THEN
+                BEGIN
+                  IF (lvPurchLineRec."Trade Item"  <> '') THEN BEGIN
+                    IF (lvPurchLineRec."Trade Item"  = "Trade Item") AND
+                       (lvPurchLineRec."Vendor (Trade Item)"  = "Vendor (Trade Item)") THEN
+                      LineMatched := TRUE;
+                  END ELSE BEGIN
+                    IF (lvPurchLineRec."Basic Item"  <> '') THEN BEGIN
+                      IF (lvPurchLineRec."Basic Item"  = "Basic Item") AND
+                         (lvPurchLineRec.Manufacturer  = Manufacturer) THEN
+                        LineMatched := TRUE;
+                    END ELSE BEGIN
+                      IF (lvPurchLineRec."Item No."  <> '') THEN BEGIN
+                        IF (lvPurchLineRec."Item No."  = "Item No.") THEN
+                          LineMatched := TRUE;
+                      END ELSE BEGIN
+                        //diff length (50/100); description 2 may be filled with HelpTxt
+                        IF (COPYSTR(lvPurchLineRec.Description, 1, MAXSTRLEN(lvPurchLineRec.Description)) =
+                            COPYSTR(Description, 1, MAXSTRLEN(lvPurchLineRec.Description))) THEN
+                          LineMatched := TRUE;
+                      END;
+                    END;
+                  END;
+                END;
+                IF LineMatched THEN BEGIN
+                  lvPurchLineRec.VALIDATE("Qty. to Receive", "Approved Quantity");
+                  lvPurchLineRec."Modified by" := USERID; //DP00469
+                  lvPurchLineRec."Last Date Modified" := TODAY;//DP00469
+                  lvPurchLineRec.MODIFY;
+                  TmpPurchLineRec := lvPurchLineRec;
+                  TmpPurchLineRec."Input by" := USERID; //DP00469
+                  TmpPurchLineRec."Input Date" := TODAY; //DP00469
+                  IF TmpPurchLineRec.INSERT THEN;
+                END;
+              UNTIL (lvPurchLineRec.NEXT = 0) OR LineMatched;
+            END;
+            IF LineMatched THEN BEGIN
+              "Line Matched" := LineMatched;
+              MODIFY;
+            END;
+          UNTIL NEXT = 0;
+        END;
+      END;
+
+      IF TmpPurchLineRec.FINDFIRST THEN BEGIN
+        lvPurchLineRec.SETRANGE("Document Type", lvPurchLineRec."Document Type"::Order);
+        lvPurchLineRec.SETRANGE("Document No.", ioDispatchNoteRec."Related Purch. Order No.");
+        IF lvPurchLineRec.FINDSET(TRUE, FALSE) THEN BEGIN
+          REPEAT
+            IF NOT TmpPurchLineRec.GET(lvPurchLineRec."Document Type", lvPurchLineRec."Document No.", lvPurchLineRec."Line No.") THEN
+            BEGIN
+              lvPurchLineRec.VALIDATE("Qty. to Receive", 0);
+              lvPurchLineRec."Modified by" := USERID; //DP00469
+              lvPurchLineRec."Last Date Modified" := TODAY;//DP00469
+              lvPurchLineRec.MODIFY;
+            END;
+          UNTIL lvPurchLineRec.NEXT = 0;
+        END;
+        TmpPurchLineRec.DELETEALL;
+      END;
+
+      COMMIT;
+      lvPurchHeaderRec.SETRANGE("Document Type", lvPurchHeaderRec."Document Type"::Order);
+      lvPurchHeaderRec.SETRANGE("No.", ioDispatchNoteRec."Related Purch. Order No.");
+      PAGE.RUNMODAL(PAGE::"Purchase Order", lvPurchHeaderRec);
+    END;
+
+    PROCEDURE ProcessPurchOrder@1100528903(PurchHeaderRec@1100528900 : Record 38);
+    VAR
+      PurchPostYN@1100528901 : Codeunit 91;
+      lvText000@1100528902 : TextConst 'ENU=Receipt posted';
+    BEGIN
+      //DP00065: copy from Purchase Order Receipt Card
+      PurchPostYN.SetSelectionOnlyReceipt;
+      PurchPostYN.RUN(PurchHeaderRec);
+      COMMIT;
+      PurchHeaderRec.CheckInwardLines(PurchHeaderRec."No.",TRUE);
+      MESSAGE(lvText000);
+    END;
+
+    PROCEDURE GetHelpTxt@1100528905(ItemCode@1100528900 : Code[20];GtinCode@1100528902 : Code[20]) HelpTxt : Text[50];
+    VAR
+      lvText000@1100528903 : TextConst 'ENU=Item: %1';
+      lvText001@1100528901 : TextConst 'ENU=GTIN: %1';
+    BEGIN
+      //DP00065
+      IF (ItemCode <> '') THEN
+        HelpTxt := STRSUBSTNO(lvText000, ItemCode);
+      IF (GtinCode <> '') THEN BEGIN
+        IF HelpTxt <> '' THEN
+          HelpTxt := HelpTxt + ';';
+        HelpTxt := HelpTxt + STRSUBSTNO(lvText001, GtinCode);
+      END;
+      EXIT(HelpTxt);
+    END;
+
+    PROCEDURE GetReceiptLines@1100525015(VAR PurchHeader@1100525000 : Record 38;iDocType@1100528904 : Integer;iDocNo@1100528903 : Code[20];iApprove@1100528900 : Boolean);
+    VAR
+      PurchRcptLine@1100525001 : Record 121;
+      PurchReceiptCU@1100525002 : Codeunit 74;
+      PurchApprovalCU@1100528901 : Codeunit 11012023;
+    BEGIN
+      //DP00065: copy from function of codeunit 11012792 (Process ICF Invoice)
+      IF PurchHeader."Related Purch. Order No." = '' THEN EXIT;  //db, 12-01-12
+
+      PurchRcptLine.RESET;
+      PurchRcptLine.SETCURRENTKEY("Order No.", "Order Line No.");
+      PurchRcptLine.SETRANGE("Order No.", PurchHeader."Related Purch. Order No.");
+      IF NOT PurchRcptLine.FINDSET THEN EXIT;   //db, 12-01-12
+      REPEAT
+        PurchRcptLine.MARK := TRUE;
+      UNTIL PurchRcptLine.NEXT = 0;
+      PurchRcptLine.MARKEDONLY(TRUE);
+
+      PurchRcptLine.SETCURRENTKEY("Buy-from Vendor No.","Document No.");
+      PurchRcptLine.SETRANGE("Buy-from Vendor No.", PurchHeader."Buy-from Vendor No.");
+
+      IF iApprove THEN BEGIN
+        PurchApprovalCU.SetPurchHeader(iDocType, iDocNo);
+        PurchApprovalCU.CreateInvLines(PurchRcptLine);
+      END ELSE BEGIN
+        PurchReceiptCU.SetPurchHeader(PurchHeader);
+        PurchReceiptCU.CreateInvLines(PurchRcptLine);
+      END;
+    END;
+
+    PROCEDURE MatchPurchInvoice@1100528906(InvoiceRec@1100528901 : Record 11072653;PurchHeaderRec@1100528900 : Record 38);
+    VAR
+      lvPurchLineRec@1100528902 : Record 39;
+      lvInvoiceLineRec@1100528904 : Record 11072654;
+      PurchLineRec1@1100528910 : Record 39;
+      PurchLineRec2@1100528909 : Record 39;
+      DescLine@1100528908 : Text[50];
+      LastLine@1100528903 : Integer;
+      NextLine@1100528906 : Integer;
+      LineMatched@1100528905 : Boolean;
+      FirstTime@1100528907 : Boolean;
+    BEGIN
+      lvPurchLineRec.SETRANGE("Document Type", PurchHeaderRec."Document Type");
+      lvPurchLineRec.SETRANGE("Document No.", PurchHeaderRec."No.");
+      IF lvPurchLineRec.FINDLAST THEN
+        LastLine := lvPurchLineRec."Line No.";
+
+      FirstTime := TRUE;
+
+      WITH lvInvoiceLineRec DO BEGIN
+        SETRANGE("Invoice No.", InvoiceRec."No.");
+        IF FINDSET(FALSE,FALSE) THEN BEGIN
+          REPEAT
+            LineMatched := FALSE;
+            lvPurchLineRec.SETFILTER("Line No.", '..%1', LastLine);
+            IF lvPurchLineRec.FINDSET THEN BEGIN
+              REPEAT
+                //db, 04-02-14: T004213 (check Plant Type)
+                IF ((lvPurchLineRec."Job No." = "Project No.") AND
+                    (lvPurchLineRec."Service Order No." = "Service Order No.") AND
+                    (lvPurchLineRec."Plant Type" = "Plant Type")) OR
+                   ((lvPurchLineRec.Type = lvPurchLineRec.Type::"G/L Account") AND (lvPurchLineRec."No." = "G/L Account") AND
+                    (lvPurchLineRec."Job No." + lvPurchLineRec."Service Order No." + lvPurchLineRec."Plant Type" = '')) OR
+                   ((lvPurchLineRec.Type = lvPurchLineRec.Type::Item) AND (lvPurchLineRec."No." = "Item No.")) THEN
+                BEGIN
+                  LineMatched := "Line Matched";  //db, 04-06-15
+                  IF NOT LineMatched THEN BEGIN   //manual check by user on page: "Order (Line) No. Buyer" exist as Purchase Line
+                    IF (lvPurchLineRec."Trade Item"  <> '') THEN BEGIN
+                      IF (lvPurchLineRec."Trade Item"  = "Trade Item") AND
+                         (lvPurchLineRec."Vendor (Trade Item)"  = "Vendor (Trade Item)") THEN
+                        LineMatched := TRUE;
+                    END ELSE BEGIN
+                      IF (lvPurchLineRec."Basic Item"  <> '') THEN BEGIN
+                        IF (lvPurchLineRec."Basic Item"  = "Basic Item") AND
+                           (lvPurchLineRec.Manufacturer  = Manufacturer) THEN
+                          LineMatched := TRUE;
+                      END ELSE BEGIN
+                        IF (lvPurchLineRec."Item No."  <> '') THEN BEGIN
+                          IF (lvPurchLineRec."Item No."  = "Item No.") THEN
+                            LineMatched := TRUE;
+                        END ELSE BEGIN
+                          //diff length (50/100); description 2 may be filled with HelpTxt
+                          IF (COPYSTR(lvPurchLineRec.Description, 1, MAXSTRLEN(lvPurchLineRec.Description)) =
+                              COPYSTR(Description, 1, MAXSTRLEN(lvPurchLineRec.Description))) THEN
+                            LineMatched := TRUE;
+                        END;
+                      END;
+                    END;
+                  END;
+                  IF LineMatched THEN
+                    LineMatched := CheckInvoiceMargin("Nett Line Amount", lvPurchLineRec."Line Amount");  //db, 07-02-12: M32549
+                    IF (lvPurchLineRec.Quantity <> "Invoiced Quantity") THEN
+                      LineMatched := FALSE;
+                  IF LineMatched THEN
+                    PurchLineRec1 := lvPurchLineRec;
+                END;
+              UNTIL (lvPurchLineRec.NEXT = 0) OR LineMatched;
+            END;
+            IF LineMatched THEN BEGIN
+              UpdatePurchInvoiceLine(InvoiceRec, lvInvoiceLineRec, PurchLineRec1, LineMatched);
+            END ELSE BEGIN
+              IF FirstTime THEN BEGIN
+                DescLine := InvoiceRec.TABLECAPTION + ': ' + InvoiceRec."No.";
+                NextLine := LastLine + 10000;
+                CreatePurchInvoiceLine(PurchHeaderRec, PurchLineRec2, NextLine, DescLine);
+                FirstTime := FALSE;
+                DescLine := '';
+              END;
+              NextLine := NextLine + 10000;
+              CreatePurchInvoiceLine(PurchHeaderRec, PurchLineRec2, NextLine, DescLine);
+              UpdatePurchInvoiceLine(InvoiceRec, lvInvoiceLineRec, PurchLineRec2, LineMatched);
+            END;
+          UNTIL lvInvoiceLineRec.NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE MatchPurchApproval@1100528909(InvoiceRec@1100528901 : Record 11072653;iDocType@1100528911 : Integer;iDocNo@1100528912 : Code[20];JnlTemplName@1210190000 : Code[10]);
+    VAR
+      lvApprLineRec@1100528902 : Record 11012032;
+      lvInvoiceLineRec@1100528904 : Record 11072654;
+      ApprLineRec1@1100528910 : Record 11012032;
+      ApprLineRec2@1100528909 : Record 11012032;
+      DescLine@1100528908 : Text[50];
+      LastLine@1100528903 : Integer;
+      NextLine@1100528906 : Integer;
+      LineMatched@1100528905 : Boolean;
+      FirstTime@1100528907 : Boolean;
+    BEGIN
+      //DP00065
+      //SiBSetup.GET;  //34418.o
+      //SiBSetup.TESTFIELD("Approval Template");  //34418.o
+
+      //lvApprLineRec.SETRANGE("Journal Template Name", SiBSetup."Approval Template");  //34418.o
+      lvApprLineRec.SETRANGE("Journal Template Name", JnlTemplName);  //34418.n
+      lvApprLineRec.SETRANGE("Document Type", iDocType);
+      lvApprLineRec.SETRANGE("Document No.", iDocNo);
+      IF lvApprLineRec.FINDLAST THEN
+        LastLine := lvApprLineRec."Line No.";
+
+      FirstTime := TRUE;
+
+      WITH lvInvoiceLineRec DO BEGIN
+        SETRANGE("Invoice No.", InvoiceRec."No.");
+        IF FINDSET(FALSE,FALSE) THEN BEGIN
+          REPEAT
+            LineMatched := FALSE;
+            lvApprLineRec.SETFILTER("Line No.", '..%1', LastLine);
+            IF lvApprLineRec.FINDSET THEN BEGIN
+              REPEAT
+                //db, 04-02-14: T004213 (check Plant Type)
+                IF ((lvApprLineRec."Project No." = "Project No.") AND
+                    (lvApprLineRec."Service Order No." = "Service Order No.") AND
+                    (lvApprLineRec."Plant Type" = "Plant Type")) OR
+                   ((lvApprLineRec.Type = lvApprLineRec.Type::"Account (G/L)") AND (lvApprLineRec."Account No." = "G/L Account")) THEN
+                BEGIN
+                  IF (lvApprLineRec."Trade Item"  <> '') THEN BEGIN
+                    IF (lvApprLineRec."Trade Item"  = "Trade Item") AND
+                       (lvApprLineRec."Vendor (Trade Item)"  = "Vendor (Trade Item)") THEN
+                      LineMatched := TRUE;
+                  END ELSE BEGIN
+                    IF (lvApprLineRec."Basic Item"  <> '') THEN BEGIN
+                      IF (lvApprLineRec."Basic Item"  = "Basic Item") AND
+                         (lvApprLineRec.Manufacturer  = Manufacturer) THEN
+                        LineMatched := TRUE;
+                    END ELSE BEGIN
+                      IF (lvApprLineRec."Item No."  <> '') THEN BEGIN
+                        IF (lvApprLineRec."Item No."  = "Item No.") THEN
+                          LineMatched := TRUE;
+                      END ELSE BEGIN
+                        //diff length (50/100); description 2 may be filled with HelpTxt
+                        IF (COPYSTR(lvApprLineRec.Description, 1, MAXSTRLEN(lvApprLineRec.Description)) =
+                            COPYSTR(Description, 1, MAXSTRLEN(lvApprLineRec.Description))) THEN
+                          LineMatched := TRUE;
+                      END;
+                    END;
+                  END;
+                  IF LineMatched THEN
+                    LineMatched := CheckInvoiceMargin("Nett Line Amount", lvApprLineRec.Amount);  //db, 07-02-12: M32549
+                    IF (lvApprLineRec.Quantity <> "Invoiced Quantity") THEN
+                      LineMatched := FALSE;
+                  IF LineMatched THEN
+                    ApprLineRec1 := lvApprLineRec;
+                END;
+              UNTIL (lvApprLineRec.NEXT = 0) OR LineMatched;
+            END;
+            IF LineMatched THEN BEGIN
+              UpdateApprovalLine(InvoiceRec, lvInvoiceLineRec, ApprLineRec1, LineMatched);
+            END ELSE BEGIN
+              IF FirstTime THEN BEGIN
+                DescLine := InvoiceRec.TABLECAPTION + ': ' + InvoiceRec."No.";
+                NextLine := LastLine + 10000;
+                CreateApprovalLine(iDocType, iDocNo, ApprLineRec2, NextLine, DescLine, JnlTemplName);  //34418.c
+                FirstTime := FALSE;
+                DescLine := '';
+              END;
+              NextLine := NextLine + 10000;
+              CreateApprovalLine(iDocType, iDocNo, ApprLineRec2, NextLine, DescLine, JnlTemplName);  //34418.c
+              UpdateApprovalLine(InvoiceRec, lvInvoiceLineRec, ApprLineRec2, LineMatched);
+            END;
+          UNTIL lvInvoiceLineRec.NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE CreateApprovalLine@1100528904(iDocType@1100528904 : Integer;iDocNo@1100528905 : Code[20];VAR ApprLineRec@1100528902 : Record 11012032;NextLine@1100528901 : Integer;DescLine@1100528903 : Text[50];JnlTemplName@1210190000 : Code[10]);
+    BEGIN
+      //DP00065
+      //SiBSetup.GET;  //34418.o
+      //SiBSetup.TESTFIELD("Approval Template");  //34418.o
+
+      ApprLineRec.INIT;
+      //ApprLineRec."Journal Template Name" := SiBSetup."Approval Template";  //34418.o
+      ApprLineRec."Journal Template Name" := JnlTemplName;  //34418.n
+      ApprLineRec."Document Type" := iDocType;
+      ApprLineRec."Document No." := iDocNo;
+      ApprLineRec."Line No." := NextLine;
+      ApprLineRec.Description := DescLine;
+      ApprLineRec.INSERT(TRUE);
+    END;
+
+    PROCEDURE UpdateApprovalLine@1100528907(InvoiceRec@1100528901 : Record 11072653;InvoiceLineRec@1100528911 : Record 11072654;ApprLineRec@1100528908 : Record 11012032;LineMatched@1100528912 : Boolean);
+    VAR
+      lvTradeItemRec@1100528900 : Record 11012317;
+      lvUnitCode@1100528905 : Code[10];
+      ItemMgt@1100528904 : Codeunit 11012033;
+      HelpTxt@1100528903 : Text[50];
+      VendorCode@1100528902 : Code[20];
+    BEGIN
+      //DP00065
+      InvoiceRec.CALCFIELDS("GLN Alternative Vendor");
+      IF InvoiceRec."GLN Alternative Vendor" <> '' THEN
+        VendorCode := InvoiceRec."GLN Alternative Vendor"
+      ELSE
+        VendorCode := InvoiceRec."GLN Vendor";
+
+      WITH InvoiceLineRec DO BEGIN
+        IF IsInvoiceTextLine() THEN BEGIN
+          ApprLineRec.Description := COPYSTR(Description, 1, MAXSTRLEN(ApprLineRec.Description));
+        END ELSE BEGIN
+          IF NOT LineMatched THEN BEGIN
+            IF ("Project No." + "Service Order No." + "Plant Type" = '') THEN BEGIN  //db, 04-02-14: T004213
+              ApprLineRec.VALIDATE("Account No.", "G/L Account");
+            END ELSE BEGIN
+              IF "Project No." <> '' THEN
+                ApprLineRec.VALIDATE("Project No.", "Project No.");
+              IF Element <> '' THEN
+                ApprLineRec.VALIDATE(Element, Element);
+              IF "Service Order No." <> '' THEN
+                ApprLineRec.VALIDATE("Service Order No.", "Service Order No.");
+              //db.sn, 04-02-14: T004213
+              IF "Plant Type" <> '' THEN
+                ApprLineRec.VALIDATE("Plant Type", "Plant Type");
+              IF "Plant No." <> '' THEN
+                ApprLineRec.VALIDATE("Plant No.", "Plant No.");
+              IF "Cost Component Plant" <> '' THEN
+                ApprLineRec.VALIDATE("Cost Component Plant", "Cost Component Plant");
+              //db.en, 04-02-14: T004213
+            END;
+          END;
+          //*C-018789.sn
+          HelpTxt := '';
+          IF ("Item No. Vendor" <> '') OR ("GTIN Item" <> '') THEN BEGIN
+            IF CheckTradeItem(lvTradeItemRec, VendorCode, "Item No. Vendor", "GTIN Item") THEN BEGIN
+              ApprLineRec.VALIDATE("Vendor (Trade Item)", lvTradeItemRec.Vendor);
+              IF ("Item No. Vendor" <> '') THEN
+                ApprLineRec.VALIDATE("Trade Item", "Item No. Vendor")
+              ELSE
+                ApprLineRec.VALIDATE("Trade Item", "GTIN Item");
+            END ELSE BEGIN
+              HelpTxt := GetHelpTxt("Item No. Vendor", "GTIN Item");
+            END;
+          END;
+          //*C-018789.en
+          IF "Trade Item" <> '' THEN BEGIN
+            ApprLineRec."Vendor (Trade Item)" := "Vendor (Trade Item)";
+            ApprLineRec.VALIDATE("Trade Item", "Trade Item");
+          END ELSE BEGIN
+            IF "Basic Item" <> '' THEN BEGIN
+              ApprLineRec.Manufacturer := Manufacturer;
+              ApprLineRec.VALIDATE("Basic Item", "Basic Item");
+            END ELSE BEGIN
+              IF "Item No." <> '' THEN
+                ApprLineRec.VALIDATE("Item No.", "Item No.");
+            END;
+          END;
+
+          IF ("Cost Object" <> '') AND ("Cost Object" <> ApprLineRec."Shortcut Dimension 2 Code") THEN
+            ApprLineRec.VALIDATE("Shortcut Dimension 2 Code", "Cost Object");
+          IF Department <> '' THEN
+            ApprLineRec.VALIDATE("Shortcut Dimension 1 Code", Department);
+
+          ApprLineRec.VALIDATE(Quantity, "Invoiced Quantity");
+          lvUnitCode := ItemMgt.CheckUnitConversion("Unit of Measure Code");
+          //IF lvUnitCode = '' THEN
+          //  lvUnitCode := "Unit of Measure Code";
+          //IF (ApprLineRec."Unit of Measure Code" <> lvUnitCode) THEN
+          //  ApprLineRec.VALIDATE("Unit of Measure Code", lvUnitCode);
+          IF ApprLineRec."Unit of Measure Code" = '' THEN BEGIN
+            IF (ApprLineRec."Qty. per Unit of Measure" = 0) THEN //GS1-INSBOU003.n
+              ApprLineRec."Qty. per Unit of Measure" := 1; //GS1-INSBOU003.n
+            ApprLineRec.VALIDATE("Unit of Measure Code", lvUnitCode);  //db, 02-02-12: M32830
+          END;
+          //lvDiscAmt := "Discount/Surcharge Amount";
+          //lvDiscPerc := "Discount/Surcharge %";
+          //IF "Discount/Surcharge Type" = "Discount/Surcharge Type"::Surcharge THEN BEGIN
+          //  IF lvDiscAmt <> 0 THEN
+          //    lvDiscAmt := -lvDiscAmt;
+          //  IF lvDiscPerc <> 0 THEN
+          //    lvDiscPerc := -lvDiscPerc;
+          //END;
+          IF "Price Base Quantity" <> 0 THEN
+            ApprLineRec.VALIDATE(Price, Price / "Price Base Quantity")
+          ELSE
+            ApprLineRec.VALIDATE(Price, Price);
+          ApprLineRec.VALIDATE(Amount, "Nett Line Amount");
+
+          IF NOT VatPostingGroupsOnLineLevel(InvoiceLineRec) THEN BEGIN
+            ApprLineRec.VALIDATE("VAT Bus. Posting Group", InvoiceRec."VAT Bus. Posting Group");
+            ApprLineRec.VALIDATE("VAT Prod. Posting Group", InvoiceRec."VAT Prod. Posting Group");
+          END ELSE BEGIN
+            ApprLineRec.VALIDATE("VAT Bus. Posting Group", "VAT Bus. Posting Group");
+            ApprLineRec.VALIDATE("VAT Prod. Posting Group", "VAT Prod. Posting Group");
+          END;
+          IF Description <> '' THEN
+            ApprLineRec.Description := COPYSTR(Description, 1, MAXSTRLEN(ApprLineRec.Description));
+          IF HelpTxt <> '' THEN
+            ApprLineRec."Description 2" := COPYSTR(HelpTxt, 1, MAXSTRLEN(ApprLineRec."Description 2"));
+        END;
+        ApprLineRec.MODIFY(TRUE);
+      END;
+    END;
+
+    PROCEDURE CheckInvoiceMargin@1100485000(OrigAmnt@1100528900 : Decimal;DestAmnt@1100528901 : Decimal) : Boolean;
+    VAR
+      PurchSetup@1100528902 : Record 312;
+      lvPriceDiff@1100485000 : Decimal;
+    BEGIN
+      //DP00065
+      //db, 07-02-12: M32549 (copy from ICF-function table 39)
+      lvPriceDiff := ABS(DestAmnt - OrigAmnt);
+      IF lvPriceDiff <> 0 THEN BEGIN
+        PurchSetup.GET;
+        IF (PurchSetup."Margin Amount (Detail)" = 0) AND (PurchSetup."Margin % (Detail)" = 0) THEN
+          EXIT(FALSE);
+        IF PurchSetup."Margin Amount (Detail)" <> 0 THEN
+          IF lvPriceDiff > PurchSetup."Margin Amount (Detail)" THEN
+            EXIT(FALSE);
+        IF PurchSetup."Margin % (Detail)" <> 0 THEN
+          IF (100 * lvPriceDiff/DestAmnt) > PurchSetup."Margin % (Detail)" THEN
+            EXIT(FALSE);
+      END;
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE RestartUnfinishedApproval@1100525017(VAR ioInvoiceRec@1100525000 : Record 11072653) : Boolean;
+    VAR
+      PurchSetup@1100525003 : Record 312;
+      VendorLedgerEntry@1100525002 : Record 25;
+      PurchInvHeader@1100525004 : Record 122;
+      PurchCreditMemoHeader@1100525009 : Record 124;
+      PurchHeader@1100525007 : Record 38;
+      InvApprLine@1100525008 : Record 11012032;
+      DocType@1100525005 : Integer;
+      DocNo@1100525006 : Code[20];
+      DocDate@1100525001 : Date;
+    BEGIN
+      //db, 18-09-14: C017265
+      PurchSetup.GET;
+
+      WITH ioInvoiceRec DO BEGIN
+        //db.sn, 06-03-15: C021797
+        DocDate := "Invoice Date";
+        IF DocDate = 0D THEN DocDate := "Posting Date";
+        IF DocDate = 0D THEN DocDate := TODAY;
+        //db.en, 06-03-15: C021797
+        VendorLedgerEntry.SETCURRENTKEY("External Document No.");
+        VendorLedgerEntry.SETRANGE("External Document No.","No.");
+        VendorLedgerEntry.SETRANGE("Vendor No.","Vendor No.");
+        VendorLedgerEntry.SETRANGE("Document Date",CALCDATE('<-CY>',DocDate),CALCDATE('<CY>', DocDate));  //db, 06-03-15: C021797
+        IF VendorLedgerEntry.FINDFIRST THEN BEGIN
+          DocNo := VendorLedgerEntry."Document No.";
+          IF VendorLedgerEntry."Document Type" = VendorLedgerEntry."Document Type"::"Credit Memo" THEN
+            DocType := 1;  //(0=invoice, 1=credit)
+          IF PurchSetup."Approve Purchase Invoices" THEN BEGIN
+            InvApprLine.SETRANGE("Document Type", DocType);
+            InvApprLine.SETRANGE("Document No.", DocNo);
+            IF NOT InvApprLine.FINDFIRST THEN BEGIN
+              IF DocType = 1 THEN BEGIN
+                IF NOT PurchCreditMemoHeader.GET(DocNo) THEN EXIT(FALSE);
+                PurchHeader.TRANSFERFIELDS(PurchCreditMemoHeader);
+                PurchHeader."Document Type" := PurchHeader."Document Type"::"Credit Memo"
+              END ELSE BEGIN
+                IF NOT PurchInvHeader.GET(DocNo) THEN EXIT(FALSE);
+                PurchHeader.TRANSFERFIELDS(PurchInvHeader);
+                PurchHeader."Document Type" := PurchHeader."Document Type"::Invoice;
+              END;
+              "Purch. Invoice Type" := DocType+1;
+              "Purchase Invoice No." := DocNo;
+              GetReceiptLines(PurchHeader, DocType, DocNo, TRUE);
+              MatchPurchApproval(ioInvoiceRec, DocType, DocNo, PurchHeader."Inv.Appr.Journal Template");
+              EXIT(TRUE);
+            END;
+          END;
+        END;
+      END;
+
+      EXIT(FALSE);
+    END;
+
+    LOCAL PROCEDURE LinkInvoiceDocument@1100528300(InvoiceSiB@1100528300 : Record 11072653;PurchaseHeader@1100528301 : Record 38);
+    VAR
+      DocumentProperties@1100528303 : Record 11012746;
+      DocumentLinkManagement@1100528304 : Codeunit 11012401;
+      RecRef@1100528302 : RecordRef;
+    BEGIN
+      RecRef.GETTABLE(InvoiceSiB);
+      DocumentLinkManagement.GetDocumentsComp(DocumentProperties, RecRef, COMPANYNAME);
+      IF (NOT DocumentProperties.FINDSET) THEN
+        EXIT;
+
+      RecRef.GETTABLE(PurchaseHeader);
+      REPEAT
+        DocumentLinkManagement.CreateOneDocumentLink(DocumentProperties, RecRef.RECORDID);
+      UNTIL (DocumentProperties.NEXT = 0);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

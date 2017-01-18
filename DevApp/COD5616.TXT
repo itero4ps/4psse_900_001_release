@@ -1,0 +1,581 @@
+OBJECT Codeunit 5616 Depreciation Calculation
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 5601=r,
+                TableData 5604=r,
+                TableData 11072085=r;
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1000 : TextConst 'ENU="%1 %2 = %3 in %4 %5 = %6"';
+
+    PROCEDURE DeprDays@1(StartingDate@1000 : Date;EndingDate@1001 : Date;Year365Days@1008 : Boolean) : Integer;
+    VAR
+      StartingDay@1002 : Integer;
+      EndingDay@1003 : Integer;
+      StartingMonth@1004 : Integer;
+      EndingMonth@1005 : Integer;
+      StartingYear@1006 : Integer;
+      EndingYear@1007 : Integer;
+    BEGIN
+      // Both days are inclusive
+      IF EndingDate < StartingDate THEN
+        EXIT(0);
+      IF (StartingDate = 0D) OR (EndingDate = 0D) THEN
+        EXIT(0);
+      IF Year365Days THEN
+        EXIT(DeprDays365(StartingDate,EndingDate));
+      StartingDay := DATE2DMY(StartingDate,1);
+      EndingDay := DATE2DMY(EndingDate,1);
+      StartingMonth := DATE2DMY(StartingDate,2);
+      EndingMonth := DATE2DMY(EndingDate,2);
+      StartingYear := DATE2DMY(StartingDate,3);
+      EndingYear := DATE2DMY(EndingDate,3);
+      IF DATE2DMY(StartingDate,1) = 31 THEN
+        StartingDay := 30;
+      IF DATE2DMY(EndingDate + 1,1) = 1 THEN
+        EndingDay := 30;
+
+      EXIT(1 + EndingDay - StartingDay + 30 * (EndingMonth - StartingMonth) +
+        360 * (EndingYear - StartingYear));
+    END;
+
+    PROCEDURE ToMorrow@3(ThisDate@1000 : Date;Year365Days@1001 : Boolean) : Date;
+    BEGIN
+      IF Year365Days THEN
+        EXIT(ToMorrow365(ThisDate));
+      ThisDate := ThisDate + 1;
+      IF DATE2DMY(ThisDate,1) = 31 THEN
+        ThisDate := ThisDate + 1;
+      EXIT(ThisDate);
+    END;
+
+    PROCEDURE Yesterday@4(ThisDate@1000 : Date;Year365Days@1001 : Boolean) : Date;
+    BEGIN
+      IF Year365Days THEN
+        EXIT(Yesterday365(ThisDate));
+      IF ThisDate = 0D THEN
+        EXIT(0D);
+      IF DATE2DMY(ThisDate,1) = 31 THEN
+        ThisDate := ThisDate - 1;
+      ThisDate := ThisDate - 1;
+      EXIT(ThisDate);
+    END;
+
+    PROCEDURE SetFAFilter@21(VAR FALedgEntry@1000 : Record 5601;FANo@1001 : Code[20];DeprBookCode@1002 : Code[10];FAPostingTypeOrder@1003 : Boolean);
+    BEGIN
+      WITH FALedgEntry DO BEGIN
+        RESET;
+        IF FAPostingTypeOrder THEN BEGIN
+          SETCURRENTKEY(
+            "FA No.","Depreciation Book Code",
+            "FA Posting Category","FA Posting Type","FA Posting Date");
+          SETRANGE("FA Posting Category","FA Posting Category"::" ");
+        END ELSE
+          SETCURRENTKEY("FA No.","Depreciation Book Code","FA Posting Date");
+        SETRANGE("FA No.",FANo);
+        SETRANGE("Depreciation Book Code",DeprBookCode);
+      END;
+    END;
+
+    PROCEDURE CalcEntryAmounts@18(FANo@1000 : Code[20];DeprBookCode@1001 : Code[10];StartingDate@1002 : Date;EndingDate@1003 : Date;VAR EntryAmounts@1004 : ARRAY [4] OF Decimal);
+    VAR
+      FALedgEntry@1005 : Record 5601;
+      I@1006 : Integer;
+    BEGIN
+      IF EndingDate = 0D THEN
+        EndingDate := 99991231D;
+      WITH FALedgEntry DO BEGIN
+        SetFAFilter(FALedgEntry,FANo,DeprBookCode,TRUE);
+        SETRANGE("FA Posting Date",StartingDate,EndingDate);
+        SETRANGE("Part of Book Value",TRUE);
+        FOR I := 1 TO 4 DO BEGIN
+          CASE I OF
+            1:
+              SETRANGE("FA Posting Type","FA Posting Type"::"Write-Down");
+            2:
+              SETRANGE("FA Posting Type","FA Posting Type"::Appreciation);
+            3:
+              SETRANGE("FA Posting Type","FA Posting Type"::"Custom 1");
+            4:
+              SETRANGE("FA Posting Type","FA Posting Type"::"Custom 2");
+          END;
+          CALCSUMS(Amount);
+          EntryAmounts[I] := Amount;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE GetLastEntryDates@20(FANo@1000 : Code[20];DeprBookCode@1001 : Code[10];VAR EntryDates@1002 : ARRAY [4] OF Date);
+    VAR
+      FALedgEntry@1003 : Record 5601;
+      i@1004 : Integer;
+    BEGIN
+      CLEAR(EntryDates);
+      WITH FALedgEntry DO BEGIN
+        SetFAFilter(FALedgEntry,FANo,DeprBookCode,TRUE);
+        FOR i := 1 TO 4 DO BEGIN
+          CASE i OF
+            1:
+              SETRANGE("FA Posting Type","FA Posting Type"::"Write-Down");
+            2:
+              SETRANGE("FA Posting Type","FA Posting Type"::Appreciation);
+            3:
+              SETRANGE("FA Posting Type","FA Posting Type"::"Custom 1");
+            4:
+              SETRANGE("FA Posting Type","FA Posting Type"::"Custom 2");
+          END;
+          IF GetPartOfCalculation(0,i - 1,DeprBookCode) THEN BEGIN
+            IF FIND('-') THEN
+              REPEAT
+                IF "Part of Book Value" OR "Part of Depreciable Basis" THEN
+                  IF "FA Posting Date" > EntryDates[i] THEN
+                    EntryDates[i] := CheckEntryDate(FALedgEntry,i - 1);
+              UNTIL NEXT = 0;
+          END;
+        END;
+      END;
+    END;
+
+    PROCEDURE UseDeprStartingDate@6(FANo@1000 : Code[20];DeprBookCode@1001 : Code[10]) : Boolean;
+    VAR
+      FALedgEntry@1002 : Record 5601;
+      EntryDates@1003 : ARRAY [4] OF Date;
+      i@1004 : Integer;
+    BEGIN
+      SetFAFilter(FALedgEntry,FANo,DeprBookCode,TRUE);
+      FALedgEntry.SETRANGE("FA Posting Type",FALedgEntry."FA Posting Type"::Depreciation);
+      IF FALedgEntry.FIND('-') THEN
+        EXIT(FALSE);
+
+      GetLastEntryDates(FANo,DeprBookCode,EntryDates);
+      FOR i := 1 TO 4 DO
+        IF EntryDates[i] > 0D THEN
+          EXIT(FALSE);
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE GetFirstDeprDate@5(FANo@1000 : Code[20];DeprBookCode@1001 : Code[10];Year365Days@1006 : Boolean) : Date;
+    VAR
+      FALedgEntry@1002 : Record 5601;
+      EntryDates@1003 : ARRAY [4] OF Date;
+      LocalDate@1004 : Date;
+      i@1005 : Integer;
+    BEGIN
+      WITH FALedgEntry DO BEGIN
+        SetFAFilter(FALedgEntry,FANo,DeprBookCode,TRUE);
+        SETFILTER("Reason Code",'<>%1','EXIT-CORR'); //**4PS.n Trigger 'Correctie exitorder',zie ook CU 5642+11012559 (melding 7037)
+        SETRANGE("FA Posting Type","FA Posting Type"::"Acquisition Cost");
+        IF FIND('+') THEN
+          IF "FA Posting Date" > LocalDate THEN
+            LocalDate := "FA Posting Date";
+        SETRANGE("FA Posting Type","FA Posting Type"::"Salvage Value");
+        IF FIND('+') THEN
+          IF "FA Posting Date" > LocalDate THEN
+            LocalDate := "FA Posting Date";
+        SETRANGE("FA Posting Type","FA Posting Type"::Depreciation);
+        IF FIND('+') THEN
+          IF ToMorrow("FA Posting Date",Year365Days) > LocalDate THEN
+            LocalDate := ToMorrow("FA Posting Date",Year365Days);
+        GetLastEntryDates(FANo,DeprBookCode,EntryDates);
+        FOR i := 1 TO 4 DO
+          IF EntryDates[i] > LocalDate THEN
+            LocalDate := EntryDates[i];
+        SETRANGE("Reason Code");  //**4PS.n (melding 7037)
+      END;
+      EXIT(LocalDate);
+    END;
+
+    PROCEDURE GetMinusBookValue@17(FANo@1000 : Code[20];DeprBookCode@1001 : Code[10];StartingDate@1002 : Date;EndingDate@1003 : Date) : Decimal;
+    VAR
+      EntryAmounts@1004 : ARRAY [4] OF Decimal;
+      Amount@1005 : Decimal;
+      i@1006 : Integer;
+    BEGIN
+      CalcEntryAmounts(FANo,DeprBookCode,StartingDate,EndingDate,EntryAmounts);
+      FOR i := 1 TO 4 DO
+        IF NOT GetPartOfCalculation(0,i - 1,DeprBookCode) THEN
+          Amount := Amount + EntryAmounts[i];
+      EXIT(Amount);
+    END;
+
+    LOCAL PROCEDURE CalcMaxDepr@16(DeprBookCode@1000 : Code[10];BookValue@1001 : Decimal;SalvageValue@1002 : Decimal;EndingBookValue@1003 : Decimal) : Decimal;
+    VAR
+      MaxDepr@1005 : Decimal;
+    BEGIN
+      IF SalvageValue <> 0 THEN
+        EndingBookValue := 0;
+      MaxDepr := -(BookValue + SalvageValue - EndingBookValue);
+      IF MaxDepr > 0 THEN
+        MaxDepr := 0;
+      EXIT(MaxDepr);
+    END;
+
+    PROCEDURE AdjustDepr@11(DeprBookCode@1000 : Code[10];VAR Depreciation@1001 : Decimal;BookValue@1002 : Decimal;SalvageValue@1003 : Decimal;EndingBookValue@1004 : Decimal;FinalRoundingAmount@1005 : Decimal);
+    VAR
+      DeprBook@1006 : Record 5611;
+      MaxDepr@1007 : Decimal;
+    BEGIN
+      IF FinalRoundingAmount = 0 THEN BEGIN
+        DeprBook.GET(DeprBookCode);
+        FinalRoundingAmount := DeprBook."Default Final Rounding Amount";
+      END;
+      Depreciation := CalcRounding(DeprBookCode,Depreciation);
+      IF Depreciation >= 0 THEN
+        Depreciation := 0
+      ELSE BEGIN
+        IF SalvageValue <> 0 THEN
+          EndingBookValue := 0;
+        MaxDepr := BookValue + SalvageValue - EndingBookValue;
+        IF MaxDepr + Depreciation < FinalRoundingAmount THEN
+          Depreciation := -MaxDepr;
+        IF Depreciation > 0 THEN
+          Depreciation := 0;
+      END;
+    END;
+
+    PROCEDURE AdjustCustom1@19(DeprBookCode@1000 : Code[10];VAR DeprAmount@1001 : Decimal;VAR Custom1Amount@1002 : Decimal;BookValue@1003 : Decimal;SalvageValue@1004 : Decimal;EndingBookValue@1005 : Decimal;FinalRoundingAmount@1006 : Decimal);
+    VAR
+      DeprBook@1007 : Record 5611;
+      MaxDepr@1008 : Decimal;
+    BEGIN
+      IF DeprAmount > 0 THEN
+        DeprAmount := 0;
+      IF Custom1Amount > 0 THEN
+        Custom1Amount := 0;
+
+      DeprAmount := CalcRounding(DeprBookCode,DeprAmount);
+      Custom1Amount := CalcRounding(DeprBookCode,Custom1Amount);
+
+      IF FinalRoundingAmount = 0 THEN BEGIN
+        DeprBook.GET(DeprBookCode);
+        FinalRoundingAmount := DeprBook."Default Final Rounding Amount";
+      END;
+
+      IF Custom1Amount < 0 THEN BEGIN
+        MaxDepr := CalcMaxDepr(DeprBookCode,BookValue,SalvageValue,EndingBookValue);
+        IF Custom1Amount <= MaxDepr THEN BEGIN
+          Custom1Amount := MaxDepr;
+          DeprAmount := 0;
+        END;
+        IF DeprAmount >= 0 THEN
+          AdjustDepr(
+            DeprBookCode,Custom1Amount,BookValue,SalvageValue,EndingBookValue,FinalRoundingAmount);
+        BookValue := BookValue + Custom1Amount;
+      END;
+      IF DeprAmount < 0 THEN BEGIN
+        MaxDepr := CalcMaxDepr(DeprBookCode,BookValue,SalvageValue,EndingBookValue);
+        IF DeprAmount <= MaxDepr THEN
+          DeprAmount := MaxDepr;
+        IF DeprAmount < 0 THEN
+          AdjustDepr(
+            DeprBookCode,DeprAmount,BookValue,SalvageValue,EndingBookValue,FinalRoundingAmount);
+      END;
+
+      IF DeprAmount > 0 THEN
+        DeprAmount := 0;
+      IF Custom1Amount > 0 THEN
+        Custom1Amount := 0;
+    END;
+
+    PROCEDURE GetSign@9(BookValue@1000 : Decimal;DeprBasis@1001 : Decimal;SalvageValue@1002 : Decimal;MinusBookValue@1003 : Decimal) : Integer;
+    BEGIN
+      IF (SalvageValue <= 0) AND (DeprBasis >= 0) AND
+         (BookValue >= 0) AND (MinusBookValue <= 0)
+      THEN
+        EXIT(1);
+      IF (SalvageValue >= 0) AND (DeprBasis <= 0) AND
+         (BookValue <= 0) AND (MinusBookValue >= 0)
+      THEN
+        EXIT(-1);
+      EXIT(0);
+    END;
+
+    PROCEDURE GetCustom1Sign@8(BookValue@1000 : Decimal;AcquisitionCost@1001 : Decimal;Custom1@1002 : Decimal;SalvageValue@1003 : Decimal;MinusBookValue@1004 : Decimal) : Integer;
+    BEGIN
+      IF (SalvageValue <= 0) AND (AcquisitionCost >= 0) AND
+         (BookValue >= 0) AND (Custom1 <= 0) AND (MinusBookValue <= 0)
+      THEN
+        EXIT(1);
+      IF (SalvageValue >= 0) AND (AcquisitionCost <= 0) AND
+         (BookValue <= 0) AND (Custom1 >= 0) AND (MinusBookValue >= 0)
+      THEN
+        EXIT(-1);
+      EXIT(0);
+    END;
+
+    PROCEDURE GetNewSigns@14(VAR BookValue@1000 : Decimal;VAR DeprBasis@1001 : Decimal;VAR SalvageValue@1002 : Decimal;VAR MinusBookValue@1003 : Decimal);
+    BEGIN
+      BookValue := -BookValue;
+      DeprBasis := -DeprBasis;
+      SalvageValue := -SalvageValue;
+      MinusBookValue := -MinusBookValue;
+    END;
+
+    PROCEDURE GetNewCustom1Signs@15(VAR BookValue@1000 : Decimal;VAR AcquisitionCost@1001 : Decimal;VAR Custom1@1002 : Decimal;VAR SalvageValue@1003 : Decimal;VAR MinusBookValue@1004 : Decimal);
+    BEGIN
+      BookValue := -BookValue;
+      AcquisitionCost := -AcquisitionCost;
+      Custom1 := -Custom1;
+      SalvageValue := -SalvageValue;
+      MinusBookValue := -MinusBookValue;
+    END;
+
+    PROCEDURE CalcRounding@10(DeprBookCode@1000 : Code[10];DeprAmount@1001 : Decimal) : Decimal;
+    VAR
+      DeprBook@1002 : Record 5611;
+    BEGIN
+      WITH DeprBook DO BEGIN
+        GET(DeprBookCode);
+        IF "Use Rounding in Periodic Depr." THEN
+          EXIT(ROUND(DeprAmount,1));
+
+        EXIT(ROUND(DeprAmount));
+      END;
+    END;
+
+    PROCEDURE CalculateDeprInPeriod@12(FANo@1000 : Code[20];DeprBookCode@1001 : Code[10];EndingDate@1002 : Date;CalculatedDepr@1003 : Decimal;Sign@1004 : Integer;VAR NewBookValue@1005 : Decimal;VAR DeprBasis@1006 : Decimal;VAR SalvageValue@1007 : Decimal;VAR MinusBookValue@1008 : Decimal);
+    VAR
+      FALedgEntry@1009 : Record 5601;
+    BEGIN
+      WITH FALedgEntry DO BEGIN
+        SETCURRENTKEY("FA No.","Depreciation Book Code","Part of Book Value","FA Posting Date");
+        SETRANGE("Depreciation Book Code",DeprBookCode);
+        SETRANGE("FA No.",FANo);
+        SETRANGE("FA Posting Date",0D,EndingDate);
+        SETRANGE("Part of Book Value",TRUE);
+        CALCSUMS(Amount);
+        NewBookValue := Sign * Amount + CalculatedDepr;
+        SETRANGE("Part of Book Value");
+        SETCURRENTKEY("FA No.","Depreciation Book Code","Part of Depreciable Basis","FA Posting Date");
+        SETRANGE("Part of Depreciable Basis",TRUE);
+        CALCSUMS(Amount);
+        DeprBasis := Sign * Amount;
+        SETRANGE("Part of Depreciable Basis");
+        SETCURRENTKEY(
+          "FA No.","Depreciation Book Code",
+          "FA Posting Category","FA Posting Type","FA Posting Date");
+        SETRANGE("FA Posting Category","FA Posting Category"::" ");
+        SETRANGE("FA Posting Type","FA Posting Type"::"Salvage Value");
+        CALCSUMS(Amount);
+        SalvageValue := Sign * Amount;
+        MinusBookValue := Sign * GetMinusBookValue(FANo,DeprBookCode,0D,EndingDate);
+      END;
+    END;
+
+    PROCEDURE GetDeprPeriod@13(FANo@1000 : Code[20];DeprBookCode@1001 : Code[10];UntilDate@1002 : Date;VAR StartingDate@1003 : Date;VAR EndingDate@1004 : Date;VAR NumberOfDays@1005 : Integer;Year365Days@1009 : Boolean);
+    VAR
+      FALedgEntry@1006 : Record 5601;
+      FADeprBook@1007 : Record 5612;
+      UsedDeprStartingDate@1008 : Boolean;
+    BEGIN
+      FADeprBook.GET(FANo,DeprBookCode);
+      WITH FALedgEntry DO BEGIN
+        // Calculate Starting Date
+        IF StartingDate = 0D THEN BEGIN
+          SetFAFilter(FALedgEntry,FANo,DeprBookCode,TRUE);
+          SETRANGE("FA Posting Type","FA Posting Type"::Depreciation);
+          IF FIND('+') THEN
+            StartingDate := ToMorrow("FA Posting Date",Year365Days)
+          ELSE BEGIN
+            StartingDate := FADeprBook."Depreciation Starting Date";
+            UsedDeprStartingDate := TRUE;
+          END;
+        END ELSE
+          StartingDate := ToMorrow(EndingDate,Year365Days);
+
+        // Calculate Ending Date
+        EndingDate := 0D;
+        SetFAFilter(FALedgEntry,FANo,DeprBookCode,FALSE);
+        IF NOT UsedDeprStartingDate THEN
+          SETFILTER("FA Posting Date",'%1..',StartingDate + 1);
+        IF FIND('-') THEN
+          REPEAT
+            IF "Part of Book Value" OR "Part of Depreciable Basis" THEN BEGIN
+              IF ("FA Posting Type" = "FA Posting Type"::"Acquisition Cost") OR
+                 ("FA Posting Type" = "FA Posting Type"::"Salvage Value")
+              THEN BEGIN
+                IF NOT UsedDeprStartingDate THEN
+                  EndingDate := "FA Posting Date";
+              END ELSE
+                IF GetPartOfDeprCalculation(FALedgEntry) THEN
+                  EndingDate := "FA Posting Date";
+              EndingDate := Yesterday(EndingDate,Year365Days);
+              IF EndingDate < StartingDate THEN
+                EndingDate := 0D;
+            END;
+          UNTIL (NEXT = 0) OR (EndingDate > 0D);
+      END;
+      IF EndingDate = 0D THEN
+        EndingDate := UntilDate;
+      NumberOfDays := DeprDays(StartingDate,EndingDate,Year365Days);
+    END;
+
+    PROCEDURE DeprInFiscalYear@7(FANo@1000 : Code[20];DeprBookCode@1001 : Code[10];StartingDate@1002 : Date) : Decimal;
+    VAR
+      FALedgEntry@1003 : Record 5601;
+      FADateCalc@1004 : Codeunit 5617;
+      LocalAmount@1005 : Decimal;
+      EntryAmounts@1006 : ARRAY [4] OF Decimal;
+      FiscalYearBegin@1007 : Date;
+      i@1008 : Integer;
+    BEGIN
+      FiscalYearBegin := FADateCalc.GetFiscalYear(DeprBookCode,StartingDate);
+      WITH FALedgEntry DO BEGIN
+        SetFAFilter(FALedgEntry,FANo,DeprBookCode,TRUE);
+        SETFILTER("FA Posting Date",'%1..',FiscalYearBegin);
+        SETRANGE("FA Posting Type","FA Posting Type"::Depreciation);
+        SETRANGE("Part of Book Value",TRUE);
+        SETRANGE("Reclassification Entry",FALSE);
+        CALCSUMS(Amount);
+        LocalAmount := Amount;
+        CalcEntryAmounts(FANo,DeprBookCode,FiscalYearBegin,0D,EntryAmounts);
+        FOR i := 1 TO 4 DO
+          IF GetPartOfCalculation(2,i - 1,DeprBookCode) THEN
+            LocalAmount := LocalAmount + EntryAmounts[i];
+      END;
+      EXIT(LocalAmount);
+    END;
+
+    PROCEDURE GetPartOfCalculation@2(Type@1000 : 'IncludeInDeprCalc,IncludeInGainLoss,DepreciationType,ReverseType';PostingType@1001 : 'Write-Down,Appreciation,Custom 1,Custom 2';DeprBookCode@1002 : Code[10]) : Boolean;
+    VAR
+      FAPostingTypeSetup@1003 : Record 5604;
+    BEGIN
+      WITH FAPostingTypeSetup DO BEGIN
+        CASE PostingType OF
+          PostingType::"Write-Down":
+            GET(DeprBookCode,"FA Posting Type"::"Write-Down");
+          PostingType::Appreciation:
+            GET(DeprBookCode,"FA Posting Type"::Appreciation);
+          PostingType::"Custom 1":
+            GET(DeprBookCode,"FA Posting Type"::"Custom 1");
+          PostingType::"Custom 2":
+            GET(DeprBookCode,"FA Posting Type"::"Custom 2");
+        END;
+
+        IF Type = Type::IncludeInDeprCalc THEN
+          EXIT("Include in Depr. Calculation");
+        IF Type = Type::IncludeInGainLoss THEN
+          EXIT("Include in Gain/Loss Calc.");
+        IF Type = Type::DepreciationType THEN
+          EXIT("Depreciation Type");
+        IF Type = Type::ReverseType THEN
+          EXIT("Reverse before Disposal");
+      END;
+    END;
+
+    LOCAL PROCEDURE GetPartOfDeprCalculation@26(VAR FALedgEntry@1000 : Record 5601) : Boolean;
+    VAR
+      i@1001 : Integer;
+    BEGIN
+      WITH FALedgEntry DO BEGIN
+        CASE "FA Posting Type" OF
+          "FA Posting Type"::"Write-Down":
+            i := 1;
+          "FA Posting Type"::Appreciation:
+            i := 2;
+          "FA Posting Type"::"Custom 1":
+            i := 3;
+          "FA Posting Type"::"Custom 2":
+            i := 4;
+        END;
+        IF i = 0 THEN
+          EXIT(FALSE);
+
+        EXIT(GetPartOfCalculation(0,i - 1,"Depreciation Book Code"));
+      END;
+    END;
+
+    PROCEDURE FAName@22(VAR FA@1000 : Record 5600;DeprBookCode@1001 : Code[10]) : Text[200];
+    VAR
+      DeprBook@1002 : Record 5611;
+    BEGIN
+      IF DeprBookCode = '' THEN
+        EXIT(STRSUBSTNO('%1 %2 = %3',FA.TABLECAPTION,FA.FIELDCAPTION("No."),FA."No."));
+
+      EXIT(
+        STRSUBSTNO(
+          Text000,
+          FA.TABLECAPTION,FA.FIELDCAPTION("No."),FA."No.",
+          DeprBook.TABLECAPTION,DeprBook.FIELDCAPTION(Code),DeprBookCode));
+    END;
+
+    LOCAL PROCEDURE DeprDays365@27(StartingDate@1000 : Date;EndingDate@1001 : Date) : Integer;
+    VAR
+      StartingYear@1002 : Integer;
+      EndingYear@1003 : Integer;
+      ActualYear@1004 : Integer;
+      LeapDate@1005 : Date;
+      LeapDays@1006 : Integer;
+    BEGIN
+      StartingYear := DATE2DMY(StartingDate,3);
+      EndingYear := DATE2DMY(EndingDate,3);
+      LeapDays := 0;
+      IF (DATE2DMY(StartingDate,1) = 29) AND (DATE2DMY(StartingDate,2) = 2) AND
+         (DATE2DMY(EndingDate,1) = 29) AND (DATE2DMY(EndingDate,2) = 2)
+      THEN
+        LeapDays := -1;
+
+      ActualYear := StartingYear;
+      WHILE ActualYear <= EndingYear DO BEGIN
+        LeapDate := (DMY2DATE(28,2,ActualYear) + 1);
+        IF DATE2DMY(LeapDate,1) = 29 THEN BEGIN
+          IF (LeapDate >= StartingDate) AND (LeapDate <= EndingDate) THEN
+            LeapDays := LeapDays + 1;
+        END;
+        ActualYear := ActualYear + 1;
+      END;
+      EXIT((EndingDate - StartingDate) + 1 - LeapDays);
+    END;
+
+    LOCAL PROCEDURE ToMorrow365@25(ThisDate@1000 : Date) : Date;
+    BEGIN
+      ThisDate := ThisDate + 1;
+      IF (DATE2DMY(ThisDate,1) = 29) AND (DATE2DMY(ThisDate,2) = 2) THEN
+        ThisDate := ThisDate + 1;
+      EXIT(ThisDate);
+    END;
+
+    LOCAL PROCEDURE Yesterday365@24(ThisDate@1000 : Date) : Date;
+    BEGIN
+      IF ThisDate = 0D THEN
+        EXIT(0D);
+      IF (DATE2DMY(ThisDate,1) = 29) AND (DATE2DMY(ThisDate,2) = 2) THEN
+        ThisDate := ThisDate - 1;
+      ThisDate := ThisDate - 1;
+      EXIT(ThisDate);
+    END;
+
+    LOCAL PROCEDURE CheckEntryDate@23(FALedgerEntry@1000 : Record 5601;FAPostingType@1001 : Option) : Date;
+    BEGIN
+      WITH FALedgerEntry DO BEGIN
+        IF IsDepreciationTypeEntry("Depreciation Book Code",FAPostingType) THEN
+          EXIT("FA Posting Date" + 1);
+        EXIT("FA Posting Date");
+      END;
+    END;
+
+    LOCAL PROCEDURE IsDepreciationTypeEntry@28(DeprBookCode@1000 : Code[10];FAPostingType@1002 : Option) : Boolean;
+    VAR
+      FAPostingTypeSetup@1001 : Record 5604;
+    BEGIN
+      FAPostingTypeSetup.GET(DeprBookCode,FAPostingType);
+      EXIT(FAPostingTypeSetup."Depreciation Type");
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

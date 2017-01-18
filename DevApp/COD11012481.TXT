@@ -1,0 +1,214 @@
+OBJECT Codeunit 11012481 Electronic Order Processing
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+            //for testing #CC000729
+            //SplitDeliveryAddPuchLine(1, 'KZ001', 60020, 1, 3, TODAY);
+            //SplitDeliveryAddPuchLine0D(1, 'KZ001', 60020, 2, 137);
+
+            //for testing C015346
+            //FillGS1QuanReceived('POR1400027',TRUE); //Alleen regel 1
+            //FillGS1QuanReceived('POR1400027',FALSE); //Alle regels
+            ChangePurchaseHeaderStatus(1,'POR1400027',1);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1100528400 : TextConst 'ENU=%1 not found (%2 - %3).';
+      Text001@1210190000 : TextConst 'ENU=%1 %2  line %3 not found for SplitDelivery AddLine.';
+
+    PROCEDURE ChangePurchaseHeaderStatus@1100528401(DocumentType@1100528400 : 'Quote,Order';DocumentNo@1100528401 : Code[20];DocumentStatus@1100528402 : 'Open,Released');
+    VAR
+      PurchaseHeader@1100528404 : Record 38;
+      ReleasePurchaseDocument@1100528403 : Codeunit 415;
+    BEGIN
+      IF (NOT PurchaseHeader.GET(DocumentType, DocumentNo)) THEN
+        ERROR(Text000, PurchaseHeader.TABLECAPTION, DocumentType, DocumentNo);
+
+      CASE DocumentStatus OF
+        DocumentStatus::Open:
+          ReleasePurchaseDocument.PerformManualReopen(PurchaseHeader);
+        DocumentStatus::Released:
+          ReleasePurchaseDocument.PerformManualRelease(PurchaseHeader);
+      END;
+
+      PostGS1Confirmation(PurchaseHeader); //C015346
+    END;
+
+    PROCEDURE SplitDeliveryAddPuchLine0D@1210190000(DocumentType@1210190003 : 'Quote,Order';DocumentNo@1210190004 : Code[20];OrigLineNo@1210190000 : Integer;SequenceNo@1210190005 : Integer;Quantity@1210190001 : Decimal) : Text[100];
+    BEGIN
+      EXIT(SplitDeliveryAddPuchLine(DocumentType, DocumentNo, OrigLineNo, SequenceNo, Quantity, 0D));
+    END;
+
+    PROCEDURE SplitDeliveryAddPuchLine@1210190002(DocumentType@1210190003 : 'Quote,Order';DocumentNo@1210190004 : Code[20];OrigLineNo@1210190000 : Integer;SequenceNo@1210190005 : Integer;Quantity@1210190001 : Decimal;DeliveryDate@1210190002 : Date) : Text[100];
+    VAR
+      PurchaseLine@1210190006 : Record 39;
+      NewPurchaseLine@1210190007 : Record 39;
+      PurchaseLineExtension@1210190008 : Record 11020644;
+    BEGIN
+      IF (NOT SplitDeliverySetZero(DocumentType, DocumentNo, OrigLineNo)) THEN
+        EXIT(STRSUBSTNO(Text001, DocumentType, DocumentNo, OrigLineNo));
+
+      PurchaseLine.GET(DocumentType, DocumentNo, OrigLineNo);
+
+      NewPurchaseLine.COPY(PurchaseLine);
+      NewPurchaseLine."Line No." := OrigLineNo + (SequenceNo * 10);
+      //kzwerver, 120628, sn, C000729
+      NewPurchaseLine."Input by" := USERID; //DP00469
+      NewPurchaseLine."Input Date" := TODAY; //DP00469
+      NewPurchaseLine.INSERT;
+
+      //IF (TradeItem.GET(NewPurchaseLine."Vendor (Trade Item)", NewPurchaseLine."Trade Item")) THEN BEGIN
+      //  IF (ETIMUnit.GET(TradeItem."Application ID")) THEN
+      //    NewPurchaseLine.VALIDATE("Unit of Measure Code", ETIMUnit."Unit (NAV)")
+      //  ELSE
+      //    NewPurchaseLine.VALIDATE("Unit of Measure Code", TradeItem."Application ID");
+      //  NewPurchaseLine.VALIDATE("Qty. per Unit of Measure", 1);
+      //END;
+      //IF (PurchaseLine."Qty. per Unit of Measure" <> 0) THEN
+      //  NewPurchaseLine.VALIDATE("Direct Unit Cost",
+      //    PurchaseLine."Direct Unit Cost" / PurchaseLine."Qty. per Unit of Measure");
+      //kzwerver, 120628, en, C000729
+
+      NewPurchaseLine.VALIDATE(Quantity, Quantity);
+      NewPurchaseLine."Promised Receipt Date" := DeliveryDate;
+
+      NewPurchaseLine.UpdateGS1PurcheseOrderLog;
+      NewPurchaseLine."Modified by" := USERID; //DP00469
+      NewPurchaseLine."Last Date Modified" := TODAY;//DP00469
+      NewPurchaseLine.MODIFY; //kzwerver, 120628, c, C000729
+
+      IF (PurchaseLineExtension.GET(DocumentType, DocumentNo, OrigLineNo)) THEN
+        PurchaseLineExtension.CopyPurchLineExtension(DocumentType, DocumentNo, OrigLineNo,
+          DocumentType, DocumentNo, NewPurchaseLine."Line No.");
+
+      PurchaseLineExtension."GS1 Quantity Confirmed" := Quantity;
+      PurchaseLineExtension.UpdatePurchLineExtension(DocumentType, DocumentNo, NewPurchaseLine."Line No.");
+
+      EXIT('ok');
+    END;
+
+    LOCAL PROCEDURE SplitDeliverySetZero@1210190001(DocumentType@1210190002 : 'Quote,Order';DocumentNo@1210190001 : Code[20];OrigLineNo@1210190000 : Integer) : Boolean;
+    VAR
+      PurchaseLine@1210190003 : Record 39;
+    BEGIN
+      IF (NOT PurchaseLine.GET(DocumentType, DocumentNo, OrigLineNo)) THEN
+        EXIT(FALSE);
+
+      PurchaseLine.VALIDATE(Quantity, 0);
+      PurchaseLine.UpdateGS1PurcheseOrderLog;
+      PurchaseLine."Modified by" := USERID; //DP00469
+      PurchaseLine."Last Date Modified" := TODAY;//DP00469
+      PurchaseLine.MODIFY;
+      EXIT(TRUE)
+    END;
+
+    LOCAL PROCEDURE DeletePurchaseOrderLine@1210190003(DocumentType@1210190002 : 'Quote,Order';DocumentNo@1210190001 : Code[20];OrigLineNo@1210190000 : Integer) : Boolean;
+    VAR
+      PurchaseLine@1210190003 : Record 39;
+    BEGIN
+      IF (NOT PurchaseLine.GET(DocumentType, DocumentNo, OrigLineNo)) THEN
+        EXIT(FALSE);
+
+      PurchaseLine.DELETE(TRUE);
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE PostGS1Confirmation@1100528500(VAR PurchHeader@1100528511 : Record 38);
+    VAR
+      PurchLine@1100528504 : Record 39;
+      PurchLineExtension@1100528502 : Record 11020644;
+      DocumentPhase@1100528507 : Record 11020418;
+      PurchPlanPhase@1100528505 : Record 11020417;
+      PurchSetup@1100528510 : Record 312;
+      PurchPostViaJobQueue@1100528509 : Codeunit 98;
+      PurchPlanMgt@1100528506 : Codeunit 11012242;
+      PostOrder@1100528503 : Boolean;
+      PhaseAction@1100528508 : 'Consent,Print,ICMStatus,Word,Confirm,OrderStatus,QuoteStatus,Manual,E-mail,GS1,GS1Posting';
+    BEGIN
+      //C015346
+
+      //Check if fit for posting
+      IF (PurchHeader."Document Type" <> PurchHeader."Document Type"::Order) OR
+         (PurchHeader.Status = PurchHeader.Status::Closed) OR
+         (PurchHeader."Purchase Plan" = '') THEN
+        EXIT;
+
+      DocumentPhase.SETRANGE("Document Type",PurchHeader."Document Type");
+      DocumentPhase.SETRANGE("Document No.",PurchHeader."No.");
+      DocumentPhase.SETRANGE("Purchase Plan",PurchHeader."Purchase Plan");
+      DocumentPhase.SETFILTER(Status, '>%1',DocumentPhase.Status::"Not Active");
+      IF NOT DocumentPhase.FINDLAST THEN
+        EXIT;
+
+      PurchPlanPhase.GET(PurchHeader."Purchase Plan",DocumentPhase."Phase No.");
+      IF NOT PurchPlanPhase."Activates Posting GS1 Confirm." THEN
+        EXIT;
+
+      //Set To Receive on Purchase Lines
+      PurchLineExtension.SETRANGE("Document Type",PurchLineExtension."Document Type"::Order);
+      PurchLineExtension.SETRANGE("Document No.",PurchHeader."No.");
+      IF PurchLineExtension.FINDSET THEN
+        REPEAT
+          IF PurchLineExtension."GS1 Quantity Confirmed" > 0 THEN BEGIN
+            PurchLine.GET(PurchLineExtension."Document Type",PurchLineExtension."Document No.",PurchLineExtension."Line No.");
+            IF PurchLineExtension."GS1 Quantity Confirmed" > PurchLine."Quantity Received" THEN BEGIN
+              PurchLine.VALIDATE("Qty. to Receive",PurchLineExtension."GS1 Quantity Confirmed" - PurchLine."Quantity Received");
+              PurchLine.MODIFY(TRUE);
+              PostOrder := TRUE;
+            END;
+          END;
+        UNTIL PurchLineExtension.NEXT = 0;
+
+      //Post and finish phase (if all is posted)
+      IF PostOrder THEN BEGIN
+        PurchHeader.FIND;
+        PurchHeader.Receive := TRUE;
+
+        PurchSetup.GET;
+        IF PurchSetup."Post with Job Queue" THEN
+          PurchPostViaJobQueue.EnqueuePurchDoc(PurchHeader)
+        ELSE
+          CODEUNIT.RUN(CODEUNIT::"Purch.-Post",PurchHeader);
+
+        IF DocumentPhase.FIND THEN
+          PurchPlanMgt.FinishPhase(PurchHeader,PhaseAction::GS1Posting,0);
+      END;
+    END;
+
+    LOCAL PROCEDURE FillGS1QuanReceived@1100528501(DocumentNo@1100528500 : Code[20];FirstLineOnly@1100528501 : Boolean);
+    VAR
+      PurchLine@1100528503 : Record 39;
+      PurchLineExtension@1100528502 : Record 11020644;
+    BEGIN
+      //C015346
+      //This function is for testing purpose only
+      PurchLine.SETRANGE("Document Type",PurchLine."Document Type"::Order);
+      PurchLine.SETRANGE("Document No.",DocumentNo);
+      IF PurchLine.FINDSET THEN
+        REPEAT
+          IF NOT PurchLineExtension.GET(PurchLine."Document Type",PurchLine."Document No.",PurchLine."Line No.") THEN BEGIN
+            PurchLineExtension.INIT;
+            PurchLineExtension."Document Type" := PurchLine."Document Type";
+            PurchLineExtension."Document No." := PurchLine."Document No.";
+            PurchLineExtension."Line No." := PurchLine."Line No.";
+            PurchLineExtension."GS1 Quantity Confirmed" := PurchLine."Outstanding Quantity";
+            PurchLineExtension.INSERT;
+          END;
+        UNTIL (PurchLine.NEXT = 0) OR FirstLineOnly;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

@@ -1,0 +1,289 @@
+OBJECT Table 7190 Sales Shipment Buffer
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW18.00;
+  }
+  PROPERTIES
+  {
+    CaptionML=ENU=Sales Shipment Buffer;
+  }
+  FIELDS
+  {
+    { 1   ;   ;Document No.        ;Code20        ;TableRelation="Sales Invoice Header";
+                                                   CaptionML=ENU=Document No. }
+    { 2   ;   ;Line No.            ;Integer       ;CaptionML=ENU=Line No. }
+    { 3   ;   ;Entry No.           ;Integer       ;CaptionML=ENU=Entry No. }
+    { 5   ;   ;Type                ;Option        ;CaptionML=ENU=Type;
+                                                   OptionCaptionML=ENU=" ,G/L Account,Item,Resource,Fixed Asset,Charge (Item)";
+                                                   OptionString=[ ,G/L Account,Item,Resource,Fixed Asset,Charge (Item)] }
+    { 6   ;   ;No.                 ;Code20        ;TableRelation=IF (Type=CONST(G/L Account)) "G/L Account"
+                                                                 ELSE IF (Type=CONST(Item)) Item
+                                                                 ELSE IF (Type=CONST(Resource)) Resource
+                                                                 ELSE IF (Type=CONST(Fixed Asset)) "Fixed Asset"
+                                                                 ELSE IF (Type=CONST("Charge (Item)")) "Item Charge";
+                                                   CaptionML=ENU=No. }
+    { 7   ;   ;Quantity            ;Decimal       ;CaptionML=ENU=Quantity }
+    { 8   ;   ;Posting Date        ;Date          ;CaptionML=ENU=Posting Date }
+  }
+  KEYS
+  {
+    {    ;Document No.,Line No.,Entry No.         ;SumIndexFields=Quantity;
+                                                   Clustered=Yes }
+    {    ;Document No.,Line No.,Posting Date       }
+  }
+  FIELDGROUPS
+  {
+  }
+  CODE
+  {
+    VAR
+      NextEntryNo@1000 : Integer;
+
+    PROCEDURE GetLinesForSalesInvoiceLine@1(VAR SalesInvoiceLine@1000 : Record 113;VAR SalesInvoiceHeader@1002 : Record 112);
+    VAR
+      ValueEntry@1001 : Record 5802;
+    BEGIN
+      CASE SalesInvoiceLine.Type OF
+        SalesInvoiceLine.Type::Item:
+          GenerateBufferFromValueEntry(
+            ValueEntry."Document Type"::"Sales Invoice",
+            SalesInvoiceLine."Document No.",
+            SalesInvoiceLine."Line No.",
+            SalesInvoiceLine.Type,
+            SalesInvoiceLine."No.",
+            SalesInvoiceHeader."Posting Date",
+            SalesInvoiceLine."Quantity (Base)",
+            SalesInvoiceLine."Qty. per Unit of Measure");
+        SalesInvoiceLine.Type::"G/L Account",SalesInvoiceLine.Type::Resource,
+        SalesInvoiceLine.Type::"Charge (Item)",SalesInvoiceLine.Type::"Fixed Asset":
+          GenerateBufferFromShipment(SalesInvoiceLine,SalesInvoiceHeader);
+      END;
+    END;
+
+    PROCEDURE GetLinesForSalesCreditMemoLine@2(SalesCrMemoLine@1000 : Record 115;SalesCrMemoHeader@1002 : Record 114);
+    VAR
+      ValueEntry@1001 : Record 5802;
+    BEGIN
+      CASE SalesCrMemoLine.Type OF
+        SalesCrMemoLine.Type::Item:
+          GenerateBufferFromValueEntry(
+            ValueEntry."Document Type"::"Sales Credit Memo",
+            SalesCrMemoLine."Document No.",
+            SalesCrMemoLine."Line No.",
+            SalesCrMemoLine.Type,
+            SalesCrMemoLine."No.",
+            SalesCrMemoHeader."Posting Date",
+            -SalesCrMemoLine."Quantity (Base)",
+            SalesCrMemoLine."Qty. per Unit of Measure");
+        SalesCrMemoLine.Type::"G/L Account",SalesCrMemoLine.Type::Resource,
+        SalesCrMemoLine.Type::"Charge (Item)",SalesCrMemoLine.Type::"Fixed Asset":
+          GenerateBufferFromReceipt(SalesCrMemoLine,SalesCrMemoHeader);
+      END;
+    END;
+
+    LOCAL PROCEDURE GenerateBufferFromValueEntry@3(ValueEntryDocType@1002 : Option;DocNo@1005 : Code[20];DocLineNo@1006 : Integer;LineType@1010 : Option;ItemNo@1008 : Code[20];PostingDate@1007 : Date;QtyBase@1011 : Decimal;QtyPerUOM@1009 : Decimal);
+    VAR
+      ValueEntry@1000 : Record 5802;
+      ItemLedgerEntry@1001 : Record 32;
+      TotalQuantity@1003 : Decimal;
+      Quantity@1004 : Decimal;
+    BEGIN
+      TotalQuantity := QtyBase;
+      ValueEntry.SETRANGE("Document Type",ValueEntryDocType);
+      ValueEntry.SETRANGE("Document No.",DocNo);
+      ValueEntry.SETRANGE("Document Line No.",DocLineNo);
+      ValueEntry.SETRANGE("Posting Date",PostingDate);
+      ValueEntry.SETRANGE("Item Charge No.",'');
+      ValueEntry.SETRANGE("Item No.",ItemNo);
+      IF ValueEntry.FIND('-') THEN
+        REPEAT
+          IF ItemLedgerEntry.GET(ValueEntry."Item Ledger Entry No.") THEN BEGIN
+            IF QtyPerUOM <> 0 THEN
+              Quantity := ROUND(ValueEntry."Invoiced Quantity" / QtyPerUOM,0.00001)
+            ELSE
+              Quantity := ValueEntry."Invoiced Quantity";
+            AddBufferEntry(
+              ABS(Quantity),
+              ItemLedgerEntry."Posting Date",
+              ItemLedgerEntry."Document No.",
+              DocLineNo,LineType,ItemNo);
+            TotalQuantity := TotalQuantity + ValueEntry."Invoiced Quantity";
+          END;
+        UNTIL (ValueEntry.NEXT = 0) OR (TotalQuantity = 0);
+    END;
+
+    LOCAL PROCEDURE GenerateBufferFromShipment@8(SalesInvoiceLine2@1000 : Record 113;SalesInvoiceHeader2@1007 : Record 112);
+    VAR
+      SalesInvoiceHeader@1001 : Record 112;
+      SalesInvoiceLine@1002 : Record 113;
+      SalesShipmentHeader@1006 : Record 110;
+      SalesShipmentLine@1004 : Record 111;
+      TotalQuantity@1003 : Decimal;
+      Quantity@1005 : Decimal;
+    BEGIN
+      TotalQuantity := 0;
+      SalesInvoiceHeader.SETFILTER("No.",'..%1',SalesInvoiceHeader2."No.");
+      SalesInvoiceHeader.SETRANGE("Order No.",SalesInvoiceHeader2."Order No.");
+      IF SalesInvoiceHeader.FIND('-') THEN
+        REPEAT
+          SalesInvoiceLine.SETRANGE("Document No.",SalesInvoiceHeader."No.");
+          SalesInvoiceLine.SETRANGE("Line No.",SalesInvoiceLine2."Line No.");
+          SalesInvoiceLine.SETRANGE(Type,SalesInvoiceLine2.Type);
+          SalesInvoiceLine.SETRANGE("No.",SalesInvoiceLine2."No.");
+          SalesInvoiceLine.SETRANGE("Unit of Measure Code",SalesInvoiceLine2."Unit of Measure Code");
+          IF SalesInvoiceLine.FIND('-') THEN
+            REPEAT
+              TotalQuantity := TotalQuantity + SalesInvoiceLine.Quantity;
+            UNTIL SalesInvoiceLine.NEXT = 0;
+        UNTIL SalesInvoiceHeader.NEXT = 0;
+
+      SalesShipmentLine.SETRANGE("Order No.",SalesInvoiceHeader2."Order No.");
+      SalesShipmentLine.SETRANGE("Order Line No.",SalesInvoiceLine2."Line No.");
+      SalesShipmentLine.SETRANGE("Line No.",SalesInvoiceLine2."Line No.");
+      SalesShipmentLine.SETRANGE(Type,SalesInvoiceLine2.Type);
+      SalesShipmentLine.SETRANGE("No.",SalesInvoiceLine2."No.");
+      SalesShipmentLine.SETRANGE("Unit of Measure Code",SalesInvoiceLine2."Unit of Measure Code");
+      SalesShipmentLine.SETFILTER(Quantity,'<>%1',0);
+
+      IF SalesShipmentLine.FIND('-') THEN
+        REPEAT
+          IF SalesInvoiceHeader2."Get Shipment Used" THEN
+            CorrectShipment(SalesShipmentLine);
+          IF ABS(SalesShipmentLine.Quantity) <= ABS(TotalQuantity - SalesInvoiceLine2.Quantity) THEN
+            TotalQuantity := TotalQuantity - SalesShipmentLine.Quantity
+          ELSE BEGIN
+            IF ABS(SalesShipmentLine.Quantity) > ABS(TotalQuantity) THEN
+              SalesShipmentLine.Quantity := TotalQuantity;
+            Quantity :=
+              SalesShipmentLine.Quantity - (TotalQuantity - SalesInvoiceLine2.Quantity);
+
+            TotalQuantity := TotalQuantity - SalesShipmentLine.Quantity;
+            SalesInvoiceLine.Quantity := SalesInvoiceLine.Quantity - Quantity;
+
+            IF SalesShipmentHeader.GET(SalesShipmentLine."Document No.") THEN
+              AddBufferEntry(
+                Quantity,
+                SalesShipmentHeader."Posting Date",
+                SalesShipmentHeader."No.",
+                SalesInvoiceLine2."Line No.",
+                SalesInvoiceLine2.Type,
+                SalesInvoiceLine2."No.");
+          END;
+        UNTIL (SalesShipmentLine.NEXT = 0) OR (TotalQuantity = 0);
+    END;
+
+    LOCAL PROCEDURE GenerateBufferFromReceipt@10(SalesCrMemoLine@1000 : Record 115;SalesCrMemoHeader@1007 : Record 114);
+    VAR
+      SalesCrMemoHeader2@1001 : Record 114;
+      SalesCrMemoLine2@1002 : Record 115;
+      ReturnReceiptHeader@1006 : Record 6660;
+      ReturnReceiptLine@1004 : Record 6661;
+      TotalQuantity@1003 : Decimal;
+      Quantity@1005 : Decimal;
+    BEGIN
+      IF SalesCrMemoHeader."Return Order No." = '' THEN
+        EXIT;
+
+      TotalQuantity := 0;
+      SalesCrMemoHeader2.SETCURRENTKEY("Return Order No.");
+      SalesCrMemoHeader2.SETFILTER("No.",'..%1',SalesCrMemoHeader."No.");
+      SalesCrMemoHeader2.SETRANGE("Return Order No.",SalesCrMemoHeader."Return Order No.");
+      IF SalesCrMemoHeader2.FIND('-') THEN
+        REPEAT
+          SalesCrMemoLine2.SETRANGE("Document No.",SalesCrMemoHeader2."No.");
+          SalesCrMemoLine2.SETRANGE("Line No.",SalesCrMemoLine."Line No.");
+          SalesCrMemoLine2.SETRANGE(Type,SalesCrMemoLine.Type);
+          SalesCrMemoLine2.SETRANGE("No.",SalesCrMemoLine."No.");
+          SalesCrMemoLine2.SETRANGE("Unit of Measure Code",SalesCrMemoLine."Unit of Measure Code");
+          SalesCrMemoLine2.CALCSUMS(Quantity);
+          TotalQuantity := TotalQuantity + SalesCrMemoLine2.Quantity;
+        UNTIL SalesCrMemoHeader2.NEXT = 0;
+
+      ReturnReceiptLine.SETCURRENTKEY("Return Order No.","Return Order Line No.");
+      ReturnReceiptLine.SETRANGE("Return Order No.",SalesCrMemoHeader."Return Order No.");
+      ReturnReceiptLine.SETRANGE("Return Order Line No.",SalesCrMemoLine."Line No.");
+      ReturnReceiptLine.SETRANGE("Line No.",SalesCrMemoLine."Line No.");
+      ReturnReceiptLine.SETRANGE(Type,SalesCrMemoLine.Type);
+      ReturnReceiptLine.SETRANGE("No.",SalesCrMemoLine."No.");
+      ReturnReceiptLine.SETRANGE("Unit of Measure Code",SalesCrMemoLine."Unit of Measure Code");
+      ReturnReceiptLine.SETFILTER(Quantity,'<>%1',0);
+
+      IF ReturnReceiptLine.FIND('-') THEN
+        REPEAT
+          IF SalesCrMemoHeader."Get Return Receipt Used" THEN
+            CorrectReceipt(ReturnReceiptLine);
+          IF ABS(ReturnReceiptLine.Quantity) <= ABS(TotalQuantity - SalesCrMemoLine.Quantity) THEN
+            TotalQuantity := TotalQuantity - ReturnReceiptLine.Quantity
+          ELSE BEGIN
+            IF ABS(ReturnReceiptLine.Quantity) > ABS(TotalQuantity) THEN
+              ReturnReceiptLine.Quantity := TotalQuantity;
+            Quantity :=
+              ReturnReceiptLine.Quantity - (TotalQuantity - SalesCrMemoLine.Quantity);
+
+            SalesCrMemoLine.Quantity := SalesCrMemoLine.Quantity - Quantity;
+            TotalQuantity := TotalQuantity - ReturnReceiptLine.Quantity;
+
+            IF ReturnReceiptHeader.GET(ReturnReceiptLine."Document No.") THEN
+              AddBufferEntry(
+                Quantity,
+                ReturnReceiptHeader."Posting Date",
+                ReturnReceiptHeader."No.",
+                SalesCrMemoLine."Line No.",
+                SalesCrMemoLine.Type,
+                SalesCrMemoLine."No.");
+          END;
+        UNTIL (ReturnReceiptLine.NEXT = 0) OR (TotalQuantity = 0);
+    END;
+
+    LOCAL PROCEDURE AddBufferEntry@4(QtyOnShipment@1002 : Decimal;PostingDate@1003 : Date;ShipmentNo@1000 : Code[20];DocLineNo@1001 : Integer;LineType@1004 : Option;ItemNo@1005 : Code[20]);
+    BEGIN
+      SETRANGE("Document No.",ShipmentNo);
+      SETRANGE("Line No.",DocLineNo);
+      SETRANGE("Posting Date",PostingDate);
+      IF FINDFIRST THEN BEGIN
+        Quantity += QtyOnShipment;
+        MODIFY;
+        EXIT;
+      END;
+
+      NextEntryNo := NextEntryNo + 1;
+      "Document No." := ShipmentNo;
+      "Line No." := DocLineNo;
+      "Entry No." := NextEntryNo;
+      Type := LineType;
+      "No." := ItemNo;
+      Quantity := QtyOnShipment;
+      "Posting Date" := PostingDate;
+      INSERT;
+    END;
+
+    LOCAL PROCEDURE CorrectShipment@7(VAR SalesShipmentLine@1001 : Record 111);
+    VAR
+      SalesInvoiceLine@1000 : Record 113;
+    BEGIN
+      SalesInvoiceLine.SETCURRENTKEY("Shipment No.","Shipment Line No.");
+      SalesInvoiceLine.SETRANGE("Shipment No.",SalesShipmentLine."Document No.");
+      SalesInvoiceLine.SETRANGE("Shipment Line No.",SalesShipmentLine."Line No.");
+      SalesInvoiceLine.CALCSUMS(Quantity);
+      SalesShipmentLine.Quantity := SalesShipmentLine.Quantity - SalesInvoiceLine.Quantity;
+    END;
+
+    LOCAL PROCEDURE CorrectReceipt@11(VAR ReturnReceiptLine@1001 : Record 6661);
+    VAR
+      SalesCrMemoLine@1000 : Record 115;
+    BEGIN
+      SalesCrMemoLine.SETCURRENTKEY("Return Receipt No.","Return Receipt Line No.");
+      SalesCrMemoLine.SETRANGE("Return Receipt No.",ReturnReceiptLine."Document No.");
+      SalesCrMemoLine.SETRANGE("Return Receipt Line No.",ReturnReceiptLine."Line No.");
+      SalesCrMemoLine.CALCSUMS(Quantity);
+      ReturnReceiptLine.Quantity := ReturnReceiptLine.Quantity - SalesCrMemoLine.Quantity;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

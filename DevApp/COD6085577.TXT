@@ -1,0 +1,460 @@
+OBJECT Codeunit 6085577 Document Importer
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=DCW17.00.00.4.04;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+            DownloadDocuments;
+            ImportDocuments;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      DocModMgt@1160040004 : Codeunit 6085613;
+      XmlLib@1000000020 : Codeunit 6085573;
+      Window@161024014 : Dialog;
+      Status@1000000017 : 'File Imported,File Already Imported,Do Not Import';
+      Text001@6085580 : TextConst 'ENU=Importing OCR Files\%1 #1###################\@2@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@';
+      Text002@161024016 : TextConst 'ENU=No files imported.';
+      Text003@161024012 : TextConst 'ENU=%1 documents have been moved to other companies';
+      Text004@161024015 : TextConst 'ENU=%1 files have been imported.';
+      Text005@1160040000 : TextConst 'ENU=Downloading files from Continia Online';
+      Text006@1160040001 : TextConst 'ENU=Custom imports have been run for the following document categories:';
+      Text007@1160040002 : TextConst 'ENU=1 file has been imported.';
+      Text008@1160040005 : TextConst 'ENU=Merging files from same E-mail';
+      MovedFiles@1160040006 : Integer;
+
+    PROCEDURE DownloadDocuments@1160040001();
+    VAR
+      CODC@1160040001 : Codeunit 6085617;
+    BEGIN
+      IF NOT CODC.IsCloudActive(FALSE) THEN
+        EXIT;
+
+      IF GUIALLOWED THEN
+        Window.OPEN(Text005);
+
+      CODC.GetNewDocuments;
+
+      IF GUIALLOWED THEN
+        Window.CLOSE;
+    END;
+
+    PROCEDURE ImportDocuments@1000000000();
+    VAR
+      DCSetup@1160040001 : Record 6085573;
+      DocCat@161024016 : Record 6085575;
+      Files@1000000003 : Record 2000000022;
+      Document@161024020 : Record 6085590;
+      TempDoc@1160040006 : TEMPORARY Record 6085756;
+      CaptureMgt@1160040003 : Codeunit 6085576;
+      FileSysMgt@1160040002 : Codeunit 6085584;
+      DocNo@161024021 : Code[20];
+      Name@161024015 : Text[50];
+      Path@1000000004 : Text[1024];
+      DestPath@161024019 : Text[1024];
+      NewFilename@1160040000 : Text[1024];
+      MessageText@1160040004 : Text[1024];
+      CustomImportText@1160040005 : Text[1024];
+      i@161024013 : Integer;
+      ImportedFiles@161024012 : Integer;
+      RecCount@161024014 : Integer;
+    BEGIN
+      DCSetup.GET;
+      DCSetup.TESTFIELD("TIFF File Path");
+      DCSetup.TESTFIELD("PDF File Path");
+
+      Document.LOCKTABLE;
+
+      IF GUIALLOWED THEN
+        Window.OPEN(CaptureMgt.Replace(Text001,'%1',DocCat.TABLECAPTION,FALSE));
+
+      DocModMgt.SetHideWindow(TRUE);
+
+      DocCat.SETRANGE("Scanning Allowed",TRUE);
+      IF DocCat.FINDSET THEN
+        REPEAT
+          IF GUIALLOWED THEN
+            Window.UPDATE(1,DocCat.Code);
+
+          DocCat.UpdateCounters;
+
+          IF DocCat."Codeunit ID: Import Files" IN [0,CODEUNIT::"Document Importer"] THEN BEGIN
+            IF DocCat."Archive E-mails on Document" THEN
+              DCSetup.TESTFIELD("E-mail File Path");
+
+            Path := DocCat.GetCategoryPath(2);
+            IF FileSysMgt.DirectoryExists(Path) THEN BEGIN
+              RecCount := FileSysMgt.GetFilesInDir(Path,'tiff');
+
+              Files.SETRANGE(Path,Path);
+              Files.SETRANGE("Is a file",TRUE);
+              Files.SETFILTER(Name,'*.tiff');
+              IF Files.FINDSET THEN
+                REPEAT
+                  IF GUIALLOWED THEN BEGIN
+                    i := i + 1;
+                    Window.UPDATE(2,CalcProgress(RecCount,i));
+                  END;
+
+                  Name := COPYSTR(Files.Name,1,STRLEN(Files.Name) - STRLEN('.tiff'));
+                  Status := ImportDocument(DocCat.Code,Path,Name,DocNo);
+                  Document.GET(DocNo);
+
+                  COMMIT; // Make sure that the document is committed before we move around with the files.
+
+                  IF Status IN [Status::"File Imported",Status::"File Already Imported"] THEN BEGIN
+                    MoveFile(Path + '\' + Name + '.tiff',Document.GetTIFServerFileName);
+                    MoveFile(Path + '\' + Name + '.PDF',Document.GetPDFServerFileName);
+
+                    IF FILE.EXISTS(Path + '\' + Name + '.eml') THEN BEGIN
+                      IF DocCat."Archive E-mails on Document" THEN BEGIN
+
+                        NewFilename := Document.GetEMailServerFileName;
+                        IF NOT FILE.EXISTS(NewFilename) THEN
+                          MoveFile(Path + '\' + Name + '.eml',NewFilename);
+                       END;
+
+                      IF FILE.ERASE(Path + '\' + Name + '.eml') THEN;
+                    END;
+
+                    FILE.ERASE(Path + '\' + Name + '.xml');
+                  END;
+
+                  IF Status = Status::"File Imported" THEN BEGIN
+                    IF NOT IsMergeEmail(TempDoc,Document) THEN
+                      MovedFiles := MovedFiles + MoveDocument(Document,FALSE);
+
+                    ImportedFiles += 1;
+                  END;
+                UNTIL Files.NEXT = 0;
+            END;
+          END ELSE BEGIN
+            CODEUNIT.RUN(DocCat."Codeunit ID: Import Files");
+            CustomImportText := CustomImportText + '\' +  DocCat.Code;
+          END;
+        UNTIL DocCat.NEXT = 0;
+
+      IF GUIALLOWED THEN
+        Window.CLOSE;
+
+      MergeAndProcessEmail(TempDoc);
+
+      IF GUIALLOWED THEN BEGIN
+        IF ImportedFiles > 0 THEN BEGIN
+          IF ImportedFiles > 1 THEN
+            MessageText := STRSUBSTNO(Text004,ImportedFiles)
+          ELSE
+            MessageText := STRSUBSTNO(Text007);
+        END ELSE
+          MessageText := Text002;
+
+        IF MovedFiles > 0 THEN
+          MessageText := MessageText + '\' + STRSUBSTNO(Text003,MovedFiles);
+
+        IF CustomImportText <> '' THEN
+          MessageText := MessageText + '\' + STRSUBSTNO(Text006,CustomImportText);
+
+        MESSAGE(MessageText);
+      END;
+    END;
+
+    PROCEDURE ImportDocument@1000000001(DocCatCode@1000000003 : Code[20];Path@1000000000 : Text[1024];Filename@1000000001 : Text[250];VAR DocNo@1000000018 : Code[20]) : Integer;
+    VAR
+      DocCat@1160040000 : Record 6085575;
+      Document@1000000002 : Record 6085590;
+      Page@1000000012 : Record 6085591;
+      TempWord@1000000022 : TEMPORARY Record 6085592;
+      Word@1000000013 : Record 6085592;
+      DateParserMgt@6085575 : Codeunit 6085586;
+      XmlDoc@1000000004 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      EmailNode@6085574 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      PagesNodeList@1000000005 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+      PageNode@1000000007 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      i@1000000009 : Integer;
+    BEGIN
+      Document.SETCURRENTKEY(Filename);
+      Document.SETRANGE(Filename,Filename);
+      IF Document.FINDFIRST THEN BEGIN
+        DocNo := Document."No.";
+        EXIT(Status::"File Already Imported");
+      END;
+
+      XmlDoc := XmlDoc.XmlDocument;
+      XmlDoc.Load(Path + '\' + Filename + '.xml');
+      PagesNodeList := XmlDoc.DocumentElement.SelectSingleNode('Pages').SelectNodes('Page');
+      FOR i := 0 TO PagesNodeList.Count - 1 DO BEGIN
+        PageNode := PagesNodeList.Item(i);
+
+        LoadWordsToTempTable(i+1,Word.Type::Text,PageNode.SelectSingleNode('Words').SelectNodes('Word'),TempWord);
+        LoadWordsToTempTable(i+1,Word.Type::Barcode,PageNode.SelectSingleNode('Barcodes').SelectNodes('Barcode'),TempWord);
+      END;
+
+      DocCat.GET(DocCatCode);
+
+      DocNo := '';
+      IF NOT TryFindDocumentSeparator(DocCat,TempWord,DocNo) THEN
+        EXIT(Status::"Do Not Import");
+
+      Document.INIT;
+      Document."No." := DocNo;
+      Document.INSERT(TRUE);
+      Document."Document Category Code" := DocCat.Code;
+      Document.Filename := Filename;
+      EmailNode := XmlDoc.DocumentElement.SelectSingleNode('Email');
+      IF NOT ISNULL(EmailNode) THEN
+        IF DocCat."Archive E-mails on Document" THEN BEGIN
+          Document."From E-Mail Address" := COPYSTR(XmlLib.GetNodeText(EmailNode,'FromAddress'),1,MAXSTRLEN(Document."From E-Mail Address"));
+          Document."From E-Mail Name" := COPYSTR(XmlLib.GetNodeText(EmailNode,'FromName'),1,MAXSTRLEN(Document."From E-Mail Name"));
+          Document."To E-Mail Address" := COPYSTR(XmlLib.GetNodeText(EmailNode,'ToAddress'),1,MAXSTRLEN(Document."To E-Mail Address"));
+          Document."To E-Mail Name" := COPYSTR(XmlLib.GetNodeText(EmailNode,'ToName'),1,MAXSTRLEN(Document."To E-Mail Name"));
+          DateParserMgt.ParseUTC(XmlLib.GetNodeText(EmailNode,'Date'));
+          Document."E-mail Date" :=  DateParserMgt.GetDatetime;
+          Document."E-Mail Inbox Subfolder" := COPYSTR(XmlLib.GetNodeText(EmailNode,'InboxSubfolder'),1,MAXSTRLEN(Document."E-Mail Inbox Subfolder"));
+          Document."E-Mail Subject" := COPYSTR(XmlLib.GetNodeText(EmailNode,'Subject'),1,MAXSTRLEN(Document."E-Mail Subject"));
+          Document."E-Mail GUID" := XmlLib.GetNodeGuid(EmailNode,'Guid');
+        END;
+      Document.MODIFY(TRUE);
+
+      FOR i := 0 TO PagesNodeList.Count - 1 DO BEGIN
+        PageNode := PagesNodeList.Item(i);
+        Page.INIT;
+        Page."Document No." := Document."No.";
+        Page."Page No." := i + 1;
+        Page."Original Filename" := COPYSTR(XmlLib.GetNodeText(PageNode,'OriginalFilename'),1,MAXSTRLEN(Page."Original Filename"));
+        Page.Height := XmlLib.Text2Int(XmlLib.GetNodeText(PageNode,'Height'));
+        Page.Width := XmlLib.Text2Int(XmlLib.GetNodeText(PageNode,'Width'));
+
+        CASE XmlLib.GetNodeText(PageNode,'TiffColorMode') OF
+          'BlackWhite':
+            Page."TIFF Image Color Mode" := Page."TIFF Image Color Mode"::"Black & White";
+          'Gray':
+            Page."TIFF Image Color Mode" := Page."TIFF Image Color Mode"::Gray;
+          'Color':
+            Page."TIFF Image Color Mode" := Page."TIFF Image Color Mode"::Color;
+        END;
+        Page."TIFF Image Resolution" := XmlLib.Text2Int(XmlLib.GetNodeText(PageNode,'TiffResolution'));
+
+        Page.INSERT(TRUE);
+
+        TempWord.RESET;
+        TempWord.SETRANGE("Page No.",Page."Page No.");
+        IF TempWord.FINDSET THEN
+          REPEAT
+            Word.TRANSFERFIELDS(TempWord);
+            Word."Document No." := Document."No.";
+            Word."Page No." := Page."Page No.";
+            Word."Entry No." := 0;
+            Word.INSERT(TRUE);
+
+            IF Word.Bottom > Page."Bottom Word Pos." THEN
+              Page."Bottom Word Pos." := Word.Bottom;
+          UNTIL TempWord.NEXT = 0;
+
+        Page.MODIFY;
+      END;
+
+      CLEAR(XmlDoc);
+
+      DocNo := Document."No.";
+      EXIT(Status::"File Imported");
+    END;
+
+    PROCEDURE LoadWordsToTempTable@1000000005(PageNo@1000000001 : Integer;Type@1000000005 : Integer;NodeList@1000000000 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";VAR TempWord@1000000002 : Record 6085592);
+    VAR
+      Node@1000000003 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      i@1000000004 : Integer;
+    BEGIN
+      FOR i := 0 TO NodeList.Count - 1 DO BEGIN
+        Node := NodeList.Item(i);
+
+        TempWord.INIT;
+        TempWord."Page No." := PageNo;
+        TempWord."Entry No." := TempWord."Entry No." + 1;
+        TempWord.Type := Type;
+        TempWord.Word := COPYSTR(XmlLib.GetNodeText(Node,'Text'),1,MAXSTRLEN(TempWord.Word));
+        TempWord."Barcode Type" := XmlLib.GetNodeText(Node,'Type');
+        TempWord.Top := XmlLib.Text2Int(XmlLib.GetNodeText(Node,'Top'));
+        TempWord.Left := XmlLib.Text2Int(XmlLib.GetNodeText(Node,'Left'));
+        TempWord.Bottom := XmlLib.Text2Int(XmlLib.GetNodeText(Node,'Bottom'));
+        TempWord.Right := XmlLib.Text2Int(XmlLib.GetNodeText(Node,'Right'));
+        TempWord.INSERT;
+      END;
+    END;
+
+    PROCEDURE TryFindDocumentSeparator@1000000007(VAR DocCat@1000000001 : Record 6085575;VAR TempWord@1000000000 : Record 6085592;VAR DocNo@1000000005 : Code[20]) : Boolean;
+    VAR
+      DocSep@1000000002 : Record 6085577;
+      RegEx@1000000003 : Codeunit 6085585;
+      SearchForDocNo@1000000004 : Boolean;
+    BEGIN
+      IF NOT DocCat."Distribution Group" THEN
+        DocSep.SETRANGE("Document Category Code",DocCat.Code);
+
+      DocSep.SETRANGE("Use as Document No.",TRUE);
+      SearchForDocNo := NOT DocSep.ISEMPTY;
+      DocSep.SETRANGE("Use as Document No.");
+
+      IF DocSep.FINDSET THEN
+        REPEAT
+          TempWord.SETRANGE(Type,DocSep.Type);
+          IF TempWord.FINDSET THEN
+            REPEAT
+              IF RegEx.MatchValue(TempWord.Word,DocSep.Pattern,TRUE) = TempWord.Word THEN BEGIN
+                DocCat.GET(DocSep."Document Category Code");
+
+                IF DocSep."Use as Document No." THEN BEGIN
+                  DocNo := TempWord.Word;
+                  EXIT(TRUE);
+                END;
+
+                IF NOT SearchForDocNo THEN
+                  EXIT(TRUE);
+
+                IF DocSep.NEXT = 0 THEN
+                  EXIT(TRUE)
+                ELSE
+                  DocSep.NEXT(-1);
+              END;
+            UNTIL TempWord.NEXT = 0;
+
+        UNTIL DocSep.NEXT = 0;
+
+      EXIT(NOT DocCat."Distribution Group");
+    END;
+
+    PROCEDURE CalcProgress@161024017(VAR TotalCount@161024012 : Integer;VAR Index@161024013 : Integer) : Integer;
+    BEGIN
+      EXIT(ROUND(Index / TotalCount * 10000,1,'>'));
+    END;
+
+    PROCEDURE MoveFile@1160040000(FromPath@1160040000 : Text[1024];ToPath@1160040001 : Text[1024]);
+    BEGIN
+      IF FILE.EXISTS(ToPath) THEN
+        FILE.ERASE(ToPath);
+      FILE.COPY(FromPath,ToPath);
+      FILE.ERASE(FromPath);
+    END;
+
+    PROCEDURE MoveDocument@1160040007(Document@1160040001 : Record 6085590;SkipAutoSplit@1160040005 : Boolean) NoOfDocMoved : Integer;
+    VAR
+      DocCat@1160040002 : Record 6085575;
+      Document2@1160040000 : Record 6085590;
+      Page@1160040003 : Record 6085591;
+      AutoSplitPage@1160040009 : TEMPORARY Record 6085766;
+      DocMoveToComp@1160040006 : Codeunit 6085758;
+      CaptureEngine@1160040004 : Codeunit 6085575;
+    BEGIN
+      IF NOT SkipAutoSplit THEN
+        DocModMgt.AutoSplitDocument(Document,AutoSplitPage);
+
+      DocCat.GET(Document."Document Category Code");
+
+      IF DocCat."Auto Move to Company" THEN BEGIN
+        IF DocMoveToComp.AutoCopyDocument(Document) THEN
+          NoOfDocMoved := 1;
+
+        IF AutoSplitPage.FINDSET THEN
+          REPEAT
+            Document2.GET(AutoSplitPage."Document No.");
+            IF DocMoveToComp.AutoCopyDocument(Document2) THEN
+              NoOfDocMoved := NoOfDocMoved + 1;
+          UNTIL AutoSplitPage.NEXT = 0;
+      END;
+
+      IF DocCat."Process New Files Automatic" THEN BEGIN
+        IF Document.FIND('=') THEN BEGIN
+          CaptureEngine.SetHideWindow(TRUE);
+          CaptureEngine.CaptureDocument(Document);
+        END;
+
+        IF AutoSplitPage.FINDSET THEN
+          REPEAT
+            IF Document2.GET(AutoSplitPage."Document No.") THEN
+              CaptureEngine.CaptureDocument(Document2);
+          UNTIL AutoSplitPage.NEXT = 0;
+      END;
+
+      COMMIT;
+
+      IF DocCat."Register Documents Automatic." THEN BEGIN
+        IF Document.FIND('=') THEN
+          Document.Register(TRUE);
+
+        IF AutoSplitPage.FINDSET THEN
+          REPEAT
+            IF Document2.GET(AutoSplitPage."Document No.") THEN
+              Document2.Register(TRUE);
+          UNTIL AutoSplitPage.NEXT = 0;
+      END;
+
+      EXIT(NoOfDocMoved);
+    END;
+
+    PROCEDURE MergeAndProcessEmail@1160040013(VAR TempDoc@1160040000 : TEMPORARY Record 6085756);
+    VAR
+      Document@1160040001 : Record 6085590;
+      DocModMgt@1160040003 : Codeunit 6085613;
+      PrevEmailGUID@1160040004 : GUID;
+      EmptyGUID@1160040002 : GUID;
+    BEGIN
+      IF TempDoc.ISEMPTY THEN
+        EXIT;
+
+      IF GUIALLOWED THEN
+        Window.OPEN(Text008);
+
+      IF TempDoc.FINDSET THEN
+        REPEAT
+          IF Document.GET(TempDoc."No.") THEN
+            DocModMgt.MergeEmail(Document);
+
+          MovedFiles := MovedFiles + MoveDocument(Document,TRUE);
+        UNTIL TempDoc.NEXT = 0;
+
+      IF GUIALLOWED THEN
+        Window.CLOSE;
+    END;
+
+    PROCEDURE IsMergeEmail@1160040014(VAR TempDoc@1160040001 : TEMPORARY Record 6085756;VAR Document@1160040002 : Record 6085590) : Boolean;
+    VAR
+      IsEmpty@1160040004 : Boolean;
+      EntryNo@1160040005 : Integer;
+      EmptyGUID@1160040000 : GUID;
+    BEGIN
+      IF Document."E-Mail GUID" = EmptyGUID THEN
+        EXIT;
+
+      TempDoc.SETRANGE("E-Mail GUID",Document."E-Mail GUID");
+      IsEmpty := TempDoc.ISEMPTY;
+      TempDoc.RESET;
+      IF NOT IsEmpty THEN
+        EXIT(TRUE);
+
+      IF NOT DocModMgt.IsMergeEmail(Document) THEN
+        EXIT;
+
+      IF TempDoc.FINDLAST THEN
+        EntryNo := TempDoc."Entry No." + 1
+      ELSE
+        EntryNo := 1;
+
+      TempDoc.INIT;
+      TempDoc."Entry No." := EntryNo;
+      TempDoc."No." := Document."No.";
+      TempDoc."E-Mail GUID" := Document."E-Mail GUID";
+      TempDoc.INSERT(TRUE);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

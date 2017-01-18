@@ -1,0 +1,1313 @@
+OBJECT Codeunit 11012143 Sales Rental - Logistics Mgt
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      ProjSetupRec@1100485004 : Record 315;
+      PlantSetupRec@1100485000 : Record 11012550;
+      Text000@1100485009 : TextConst 'ENU=Attention:';
+      Text001@1100485008 : TextConst 'ENU=Project No. is not filled, there will be created a new project.';
+      Text002@1100485007 : TextConst 'ENU=Project No. is not filled, there will be created a new project.';
+      Text003@1100485001 : TextConst 'ENU=No Line present.';
+      Text004@1100485002 : TextConst 'ENU=or %1 must be filled';
+      Text005@1100485005 : TextConst 'ENU=Offer Amount %1 is not equal to total amount %2 of alternative %3, first distribute offer amount over the lines.';
+      SalesQuoteLine@1100525002 : Record 37;
+      SalesLine@1100525003 : Record 37;
+      PlantMgtCompRec@1100525004 : Record 11020586;
+      ItemCheckAvail@1100525001 : Codeunit 311;
+      PlantNextOrderLineNo@1100485006 : Integer;
+      Text006@1100485003 : TextConst 'ENU=No %1 selected for the project, project can not be created.';
+
+    PROCEDURE RunRentalQuoteToRentalOrder@1100485002(VAR Rec@1100485000 : Record 36);
+    VAR
+      lvQuoteHeadRec@1100485012 : Record 36;
+      lvOrderHeadRec@1100485002 : Record 36;
+      lvSalesQuoteToOrderCU@1100485001 : Codeunit 86;
+      lvCustCheckCreditLimitCU@1100485011 : Codeunit 312;
+      lvConfirmText@1100485003 : Text[1024];
+      lvText001@1100485009 : TextConst 'ENU=" (alternative %1)"';
+      lvText002@1100485005 : TextConst 'ENU=Do you want to convert the quote%1 to an order?';
+      lvText003@1100485004 : TextConst 'ENU=Quote %1 has been changed to order %2.';
+      lvAlternText@1100485010 : Text[30];
+    BEGIN
+      lvQuoteHeadRec.COPY(Rec);
+
+      WITH lvQuoteHeadRec DO BEGIN
+        TESTFIELD("No.");
+        TESTFIELD("Document Type","Document Type"::Quote);
+
+        ProjSetupRec.GET;
+        PlantMgtCompRec."Plant Company" := PlantMgtCompRec.GetPlantCompanySalesRental(TRUE);
+
+        IF "Elected Alternative No." > 0 THEN
+          lvAlternText := STRSUBSTNO(lvText001, "Elected Alternative No.");
+        lvConfirmText := lvConfirmText + STRSUBSTNO(lvText002,lvAlternText);
+        IF NOT CONFIRM(lvConfirmText,FALSE) THEN
+          EXIT;
+
+        IF CheckCustomerCreated(TRUE) THEN
+          GET("Document Type","No.")
+        ELSE
+          EXIT;
+
+        CheckSalesHeader(lvQuoteHeadRec);
+        CheckSalesLines(lvQuoteHeadRec);
+
+        IF GUIALLOWED THEN BEGIN
+          //* Check On Credit Limit and Item availability are done here in stead of cu 86.
+          //* That's because cu 86 executes a formrunmodal. That conflicts with the insert of
+          //* of project/plant location. Adding a commit before executing cu 86 is not an option.
+          CALCFIELDS("Amount Including VAT");
+          lvCustCheckCreditLimitCU.SalesHeaderCheck(lvQuoteHeadRec);
+
+          SalesQuoteLine.SETRANGE("Document Type","Document Type");
+          SalesQuoteLine.SETRANGE("Document No.","No.");
+          SalesQuoteLine.SETRANGE(Type,SalesQuoteLine.Type::Item);
+          SalesQuoteLine.SETFILTER("No.",'<>%1','');
+          IF SalesQuoteLine.FIND('-') THEN
+            REPEAT
+              IF (SalesQuoteLine."Outstanding Quantity" > 0) THEN BEGIN
+                SalesLine := SalesQuoteLine;
+                SalesLine."Location Code" := "Location Code Logistics";
+                SalesLine.VALIDATE("Reserved Qty. (Base)",0);
+                SalesLine."Line No." := 0;
+                ItemCheckAvail.SetCompany(PlantMgtCompRec."Plant Company");
+                ItemCheckAvail.SalesLineCheck(SalesLine);
+              END;
+            UNTIL SalesQuoteLine.NEXT = 0;
+        END;
+        CreateProjectAndPlantLocation(lvQuoteHeadRec);
+
+        lvSalesQuoteToOrderCU.SetHideValidationDialog(TRUE);
+        lvSalesQuoteToOrderCU.RUN(lvQuoteHeadRec);
+        lvSalesQuoteToOrderCU.GetSalesOrderHeader(lvOrderHeadRec);
+
+        IF (lvOrderHeadRec."Selection Code" = lvQuoteHeadRec."No.") AND (lvOrderHeadRec."Selection Code" <> '') THEN BEGIN
+          lvOrderHeadRec."Selection Code" := lvOrderHeadRec."No.";
+          lvOrderHeadRec.VALIDATE("Selection Code is Current Doc.");
+          lvOrderHeadRec.MODIFY;
+          ReplaceSelectionCode(lvQuoteHeadRec."Selection Code", lvOrderHeadRec."Selection Code" );
+        END;
+
+        MESSAGE(lvText003,"No.",lvOrderHeadRec."No.");
+
+        IF ("Document Type" = "Document Type"::Quote) AND
+           ("Sales Document Type" = "Sales Document Type"::"Sales Logistics Separated") THEN
+          DeleteTodoByQuote("No.");
+
+      END;
+
+      Rec := lvQuoteHeadRec;
+    END;
+
+    PROCEDURE RunReleaseRentalQoute@1100485008(VAR Rec@1100485000 : Record 36);
+    VAR
+      lvQuoteHeadRec@1100485001 : Record 36;
+    BEGIN
+      lvQuoteHeadRec.COPY(Rec);
+
+      WITH lvQuoteHeadRec DO BEGIN
+        TESTFIELD("No.");
+        TESTFIELD("Document Type","Document Type"::Quote);
+        TESTFIELD(Status, Status::Open);
+
+        CheckSalesHeader(lvQuoteHeadRec);
+        CheckSalesLines(lvQuoteHeadRec);
+
+        Status := Status::Released;
+        MODIFY;
+
+      END;
+
+      Rec := lvQuoteHeadRec;
+    END;
+
+    PROCEDURE RunReleaseRentalOrder@1100485010(VAR Rec@1100485000 : Record 36);
+    VAR
+      lvOrderHeadRec@1100485001 : Record 36;
+      lvConfirmText@1100485002 : Text[1024];
+      lvText001@1100485003 : TextConst 'ENU=Do you want torelease the order?';
+    BEGIN
+      lvOrderHeadRec.COPY(Rec);
+
+      WITH lvOrderHeadRec DO BEGIN
+        TESTFIELD("No.");
+        TESTFIELD("Document Type","Document Type"::Order);
+        TESTFIELD(Status, Status::Open);
+
+        IF ("Job No." = '') OR ("Plant Location Code" = '') THEN BEGIN
+          lvConfirmText := Text000 + '\';
+          IF "Job No." = '' THEN
+            lvConfirmText := lvConfirmText + Text001 + '\';
+          IF "Plant Location Code" = '' THEN
+            lvConfirmText := lvConfirmText + Text002 + '\';
+          lvConfirmText := lvConfirmText + ' \';
+        END;
+        lvConfirmText := lvConfirmText + lvText001;
+        IF NOT CONFIRM(lvConfirmText,FALSE) THEN
+          EXIT;
+
+        ProjSetupRec.GET;
+        PlantMgtCompRec."Plant Company" := PlantMgtCompRec.GetPlantCompanySalesRental(TRUE);
+
+        CheckSalesHeader(lvOrderHeadRec);
+        CheckSalesLines(lvOrderHeadRec);
+
+        CreateProjectAndPlantLocation(lvOrderHeadRec);
+        ProcessReleaseRentalOrder(lvOrderHeadRec);
+      END;
+
+      Rec := lvOrderHeadRec;
+    END;
+
+    PROCEDURE CheckLicenseSalesLogisticsSepa@1100485014();
+    BEGIN
+      //* Volgens de DB methode, door aanroepen van deze functie kan getest worden of men licentie heeft voor deze granule.
+    END;
+
+    LOCAL PROCEDURE CheckSalesHeader@1100485007(ISalesHeadRec@1100485000 : Record 36);
+    BEGIN
+      WITH ISalesHeadRec DO BEGIN
+        //* Hier niet testen of project en materieellocatie gevuld, want deze worden dan aangemaakt.
+        TESTFIELD("Sell-to Customer No.");
+        TESTFIELD("Bill-to Customer No.");
+        TESTFIELD("Plant Depot Logistics");
+        TESTFIELD("Location Code Logistics");
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckSalesLines@1100485003(ISalesHeadRec@1100485000 : Record 36);
+    VAR
+      lvSalesLine@1100485001 : Record 37;
+      lvOffAmtRec@1100485003 : Record 11012786;
+      lvTotalAmt@1100485002 : Decimal;
+    BEGIN
+      lvSalesLine.SETRANGE("Document Type", ISalesHeadRec."Document Type");
+      lvSalesLine.SETRANGE("Document No.", ISalesHeadRec."No.");
+      IF ISalesHeadRec."Document Type" = ISalesHeadRec."Document Type"::Quote THEN BEGIN
+        lvSalesLine.SETRANGE(Optional, FALSE);
+        lvSalesLine.SETRANGE("Alternative No.", ISalesHeadRec."Elected Alternative No.");
+      END;
+      IF NOT lvSalesLine.FINDSET(FALSE,FALSE) THEN
+        ERROR(Text003);
+
+      REPEAT
+        IF NOT
+          ((lvSalesLine."Removal Order" <> '') AND
+           (lvSalesLine."Arrival Date" = 0D)) THEN
+        BEGIN
+          //Generated Sales Lines are skipped
+          IF lvSalesLine.Type = lvSalesLine.Type::" " THEN BEGIN
+            lvSalesLine.TESTFIELD("Item No.", '');
+            lvSalesLine.TESTFIELD("Plant Type", '');
+            lvSalesLine.TESTFIELD(Quantity, 0);
+            lvSalesLine.TESTFIELD("Unit of Measure Code", '');
+            lvSalesLine.TESTFIELD("Unit Price", 0);
+          END ELSE BEGIN
+            IF lvSalesLine."Relate to" <> lvSalesLine."Relate to"::Transport THEN BEGIN  //* Check extra tansport cost
+              IF (lvSalesLine."Item No." = '') AND (lvSalesLine."Plant Type" = '') THEN
+                lvSalesLine.FIELDERROR("Item No.", STRSUBSTNO(Text004,lvSalesLine.FIELDCAPTION("Plant Type")));
+            END ELSE BEGIN
+              lvSalesLine.TESTFIELD("Shortcut Dimension 2 Code");
+              lvSalesLine.TESTFIELD("Item No.", '');
+              lvSalesLine.TESTFIELD("Plant Type", '');
+            END;
+            lvSalesLine.TESTFIELD(Quantity);
+            lvSalesLine.TESTFIELD("Unit of Measure Code");
+            IF (lvSalesLine."Removal Order Type" = 0) AND (NOT lvSalesLine.ItemIsRemovalOnly) AND
+               (lvSalesLine."Relate to" <> lvSalesLine."Relate to"::Transport)
+            THEN
+              lvSalesLine.TESTFIELD("Arrival Date");
+          END;
+          lvTotalAmt := lvTotalAmt + lvSalesLine."Line Amount";
+        END;
+      UNTIL lvSalesLine.NEXT = 0;
+
+      IF ISalesHeadRec."Document Type" = ISalesHeadRec."Document Type"::Quote THEN BEGIN
+        IF lvOffAmtRec.GET(lvOffAmtRec."Document Type"::Quote,
+          ISalesHeadRec."No.", ISalesHeadRec."Elected Alternative No.")
+        THEN BEGIN
+          IF lvTotalAmt <> lvOffAmtRec."Offer Amount" THEN
+            ERROR(Text005, lvOffAmtRec."Offer Amount", lvTotalAmt, lvOffAmtRec."Alternative No.");
+        END;
+      END;
+    END;
+
+    PROCEDURE ProcessReleaseRentalOrder@1100485011(VAR VarOrderHeadRec@1100485000 : Record 36);
+    VAR
+      lvRemovalLine@1100485001 : Record 11012789;
+    BEGIN
+      WITH VarOrderHeadRec DO BEGIN
+        ValidateNewProjectOnSalesLines(VarOrderHeadRec);
+
+        AddForCreatePlantOrders("No.", 1);
+
+        lvRemovalLine.SETRANGE("Document No.", "No.");
+        lvRemovalLine.SETRANGE(Status, lvRemovalLine.Status::Released);
+        IF lvRemovalLine.FINDFIRST THEN
+          IF (lvRemovalLine.Type = lvRemovalLine.Type::Removal) OR
+             ((lvRemovalLine.Type = lvRemovalLine.Type::Sale) AND
+              (lvRemovalLine."Removal Order Type" <> lvRemovalLine."Removal Order Type"::"Plant Order"))
+          THEN
+            AddForCreatePlantOrders("No.", 2);
+
+        Status := Status::Released;
+        MODIFY;
+      END;
+    END;
+
+    PROCEDURE CreateProjectAndPlantLocation@1100485004(VAR VarSalesHeadRec@1100485000 : Record 36);
+    BEGIN
+      WITH VarSalesHeadRec DO BEGIN
+        IF "Job No." = '' THEN BEGIN
+          CreateProject(VarSalesHeadRec);
+          TESTFIELD("Job No.");
+        END ELSE
+          UpdateProjectAddress(VarSalesHeadRec);
+        IF "Plant Location Code" = '' THEN BEGIN
+          CreatePlantLocationFromProject(VarSalesHeadRec);
+          TESTFIELD("Plant Location Code");
+        END ELSE
+          UpdatePlantLocationAddress(VarSalesHeadRec);
+        MODIFY;
+      END;
+    END;
+
+    LOCAL PROCEDURE CreateProject@1100485000(VAR VarSalesHeadRec@1100485001 : Record 36);
+    VAR
+      lvProjRec@1100485000 : Record 11072003;
+      lvProjPrinRec@1100485002 : Record 11012005;
+      lvNoSeriesRelationshipRec@1100485003 : Record 310;
+    BEGIN
+      lvProjRec.INIT;
+      lvProjRec."No." := '';
+      IF ProjSetupRec."Job Nos." <> '' THEN BEGIN
+        lvNoSeriesRelationshipRec.SETRANGE(Code, ProjSetupRec."Job Nos.");
+        IF lvNoSeriesRelationshipRec.FINDFIRST THEN BEGIN
+          lvProjRec.AssistEdit(lvProjRec);
+          IF lvProjRec."No. Series" = '' THEN
+            ERROR(Text006, lvProjRec.FIELDCAPTION("No. Series"));
+          IF lvProjRec."No." = '' THEN
+            EXIT;
+        END;
+      END;
+      lvProjRec.INSERT(TRUE);
+      IF lvProjRec."No." = '' THEN
+        EXIT;
+      lvProjRec.VALIDATE("Settlement Method", lvProjRec."Settlement Method"::"Cost Plus");
+      lvProjRec.VALIDATE("Project Status", lvProjRec."Project Status"::Production);
+      lvProjRec.MODIFY;
+
+      lvProjPrinRec.INIT;
+      lvProjPrinRec.VALIDATE("Project No.", lvProjRec."No.");
+      lvProjPrinRec.VALIDATE(Principal, VarSalesHeadRec."Sell-to Customer No.");
+      lvProjPrinRec.INSERT(TRUE);
+      lvProjPrinRec.VALIDATE("Cost Plus Customer", TRUE);
+      lvProjPrinRec.MODIFY;
+
+      lvProjRec.VALIDATE("Bill-to Customer No.", lvProjPrinRec.Principal);
+      lvProjRec.VALIDATE(Description,VarSalesHeadRec."Ship-to Name");
+      //IF VarSalesHeadRec."Ship-to Address" <> '' THEN  //16149.o
+        FillProjectAddress(lvProjRec, VarSalesHeadRec);
+      lvProjRec.MODIFY;
+
+      VarSalesHeadRec."Job No." := lvProjRec."No.";
+    END;
+
+    PROCEDURE UpdateProjectAddress@1100485024(ISalesHeader@1100485001 : Record 36);
+    VAR
+      lvProjRec@1100485000 : Record 11072003;
+    BEGIN
+      //IF ISalesHeader."Ship-to Address" <> '' THEN BEGIN  //16149.o
+        lvProjRec.GET(ISalesHeader."Job No.");
+        FillProjectAddress(lvProjRec, ISalesHeader);
+        lvProjRec.MODIFY;
+      //END;  //16149.o
+    END;
+
+    PROCEDURE FillProjectAddress@1100485026(VAR VarProjRec@1100485001 : Record 11072003;ISalesHeader@1100485002 : Record 36);
+    BEGIN
+      VarProjRec.Address := ISalesHeader."Ship-to Address";
+      VarProjRec."Address 2" := ISalesHeader."Ship-to Address 2";
+      VarProjRec.City := ISalesHeader."Ship-to City";
+      VarProjRec.Contact := ISalesHeader."Ship-to Contact";
+      VarProjRec."Post Code" := ISalesHeader."Ship-to Post Code";
+      VarProjRec."Country/Region Code" := ISalesHeader."Ship-to Country/Region Code";
+      VarProjRec."Phone No." := ISalesHeader."Ship-to Phone No.";
+    END;
+
+    LOCAL PROCEDURE CreatePlantLocationFromProject@1100485001(VAR VarSalesHeadRec@1100485000 : Record 36);
+    VAR
+      lvProjRec@1100485002 : Record 11072003;
+      lvPlantLocRec@1100485001 : Record 11012554;
+    BEGIN
+      //* Vanuit het verkoopbedrijf toevoegen in het logistiek bedrijf.
+      VarSalesHeadRec.TESTFIELD("Job No.");
+      PlantMgtCompRec."Plant Company" := PlantMgtCompRec.GetPlantCompanySalesRental(TRUE);  //* Check 1 plant company
+      lvProjRec.GET(VarSalesHeadRec."Job No.");
+      VarSalesHeadRec."Plant Location Code" := lvProjRec.CreatePlantLocation(lvProjRec, PlantMgtCompRec."Plant Company", TRUE);
+
+      //Add Ship-to Contact. Field not available in Project Table
+      lvPlantLocRec.CHANGECOMPANY(PlantMgtCompRec."Plant Company");
+      IF lvPlantLocRec.GET(VarSalesHeadRec."Plant Location Code") THEN BEGIN
+        lvPlantLocRec."Description 2" := VarSalesHeadRec."Ship-to Name 2";
+        lvPlantLocRec.Contact := VarSalesHeadRec."Ship-to Contact";
+        lvPlantLocRec.MODIFY(TRUE);
+      END;
+    END;
+
+    PROCEDURE UpdatePlantLocationAddress@1100485023(ISalesHeader@1100485001 : Record 36);
+    VAR
+      lvPlantLocRec@1100485000 : Record 11012554;
+    BEGIN
+      lvPlantLocRec.CHANGECOMPANY(PlantMgtCompRec."Plant Company");
+      lvPlantLocRec.GET(ISalesHeader."Plant Location Code");
+
+      lvPlantLocRec.Address := ISalesHeader."Ship-to Address";
+      lvPlantLocRec."Address 2" :=  ISalesHeader."Ship-to Address 2";
+      lvPlantLocRec.City := ISalesHeader."Ship-to City";
+      lvPlantLocRec."Post Code" :=ISalesHeader."Ship-to Post Code";
+      lvPlantLocRec."Country/Region Code" := ISalesHeader."Ship-to Country/Region Code";
+      lvPlantLocRec.Contact := ISalesHeader."Ship-to Contact";
+      lvPlantLocRec."Phone No." := ISalesHeader."Ship-to Phone No.";
+      lvPlantLocRec.MODIFY;
+    END;
+
+    PROCEDURE AddForCreatePlantOrders@1100485005(ISalesOrderNo@1100485000 : Code[20];ICreateType@1100485002 : Integer);
+    VAR
+      lvCreatePORec@1100485001 : Record 11012787;
+      lvCreate@1100485003 : Option;
+    BEGIN
+      //* Vanuit het verkoopbedrijf toevoegen in het logistiek bedrijf, dus geen 'VALIDATE'/'INSERT/MODIFY(TRUE)' gebruiken!
+      //* ICreateType: 1=Arrival, 2=Removal
+
+      WITH lvCreatePORec DO BEGIN
+        IF ICreateType <> 2 THEN
+          lvCreate := Create::Arrival
+        ELSE
+          lvCreate := Create::Removal;
+
+        ProjSetupRec.GET;
+        PlantMgtCompRec."Plant Company" := PlantMgtCompRec.GetPlantCompanySalesRental(TRUE);
+        CHANGECOMPANY(PlantMgtCompRec."Plant Company");
+        IF GET(Level::SalesOrder, COMPANYNAME, ISalesOrderNo, '', lvCreate) THEN BEGIN
+          "Sales Released on" := CURRENTDATETIME;
+          "Plant Order Created" := 0;  //*19105
+          MODIFY;
+        END ELSE BEGIN
+          INIT;
+          Level := Level::SalesOrder;
+          "Sales Company Name" := COMPANYNAME;
+          "Sales Order No." := ISalesOrderNo;
+          "Plant Document No." := '';
+          Create := lvCreate;
+          "Sales Released on" := CURRENTDATETIME;
+          "Plant Order Created" := 0;  //*19105
+          INSERT;
+        END;
+      END;
+    END;
+
+    PROCEDURE RunCreatePlantorders@1100485006(VAR VarCreatePORec@1100485001 : Record 11012787;IArrival@1100485009 : Boolean;IRemoval@1100485014 : Boolean;IDateUpto@1100485015 : Date);
+    VAR
+      lvCreatePORec@1100485000 : Record 11012787;
+      lvSalesHeadRec@1100485002 : Record 36;
+      lvSalesLine@1100485003 : Record 37;
+      lvPlantOrderRec@1100485007 : Record 11012556;
+      lvPlOrderRec@1100485008 : Record 11012556;
+      lvExitOrderRec@1100485017 : Record 11012559;
+      lvTmpSortSalesLine@1100485004 : TEMPORARY Record 11012579;
+      lvRemovalLine@1100485019 : Record 11012789;
+      lvPrevDate@1100485006 : Date;
+      lvOK@1100485005 : Boolean;
+      lvDeleteCreatePO@1100485016 : Boolean;
+      lvRemovalCreated@1100525000 : Boolean;
+      lvNoOfPO@1100485012 : Integer;
+      lvFirstPO@1100485010 : Code[20];
+      lvLastPO@1100485011 : Code[20];
+      lvText001@1100485013 : TextConst 'ENU=%1 Plant Order(s) created %2';
+      lvExitOrderNo@1100485020 : Code[20];
+      lvText002@1100485018 : TextConst 'ENU=Exit Order %1 is created';
+      lvPrevLocCode@1100485021 : Code[20];
+    BEGIN
+      //* Materieelorder aanmaken vanuit en in het logistiek bedrijf van verkooporders in het verkoopbedrijf.
+
+      IF (NOT IArrival) AND (NOT IRemoval) THEN
+        EXIT;
+
+      lvNoOfPO := 0;
+      lvFirstPO := '';
+      lvLastPO := '';
+      lvExitOrderNo := '';
+      PlantSetupRec.GET;
+
+      lvCreatePORec.LOCKTABLE;  //*19105
+      lvCreatePORec.COPY(VarCreatePORec);  //* Incl. filters, filters moeten dus voor aanroep gezet worden
+      lvCreatePORec.SETRANGE(Level, lvCreatePORec.Level::SalesOrder);  //* In elk geval alleen dit niveau
+
+      IF IArrival THEN BEGIN
+        lvCreatePORec.SETRANGE(Create, lvCreatePORec.Create::Arrival);
+
+        IF lvCreatePORec.FINDSET(TRUE,FALSE) THEN BEGIN
+          REPEAT
+            lvSalesHeadRec.CHANGECOMPANY(lvCreatePORec."Sales Company Name");
+            lvOK := lvSalesHeadRec.GET(lvSalesHeadRec."Document Type"::Order, lvCreatePORec."Sales Order No.");
+            IF (NOT lvOK) OR (lvSalesHeadRec.Status <> lvSalesHeadRec.Status::Released) OR
+               (lvSalesHeadRec."Sales Document Type" <> lvSalesHeadRec."Sales Document Type"::"Sales Logistics Separated")
+            THEN
+              lvCreatePORec.DELETE  //* Ook verwijderen als niet (meer) 'Vrijgegeven'!
+            ELSE BEGIN
+              lvTmpSortSalesLine.RESET;
+              lvTmpSortSalesLine.DELETEALL;
+              //
+              lvSalesLine.CHANGECOMPANY(lvCreatePORec."Sales Company Name");
+              lvSalesLine.SETRANGE("Document Type", lvSalesHeadRec."Document Type"::Order);
+              lvSalesLine.SETRANGE("Document No.", lvSalesHeadRec."No.");
+              lvSalesLine.SETFILTER(Type, '<>0');
+              lvSalesLine.SETFILTER("Arrival Date", '>%1', 0D); //This skips Generated and Removal Only Sales Lines
+              IF lvSalesLine.FINDSET(TRUE,FALSE) THEN BEGIN
+                REPEAT
+                  IF (lvSalesLine."Plant Type" <> '') OR (lvSalesLine."Item No." <> '') THEN BEGIN
+                    IF (lvSalesLine."Arrival Date" <= IDateUpto) THEN BEGIN
+                      //IF (lvSalesLine."Arrival Order" <> '') THEN  //*19105.o
+                      IF (lvSalesLine."Arrival Order" <> '') AND (lvCreatePORec."Plant Order Created" = 0) THEN  //*19105.n
+                        IF lvPlOrderRec.GET(lvSalesLine."Arrival Order") THEN BEGIN
+                          IF NOT lvPlOrderRec.Posted AND (lvPlOrderRec.Status = lvPlOrderRec.Status::Open) THEN BEGIN
+                            //If Plant Order already exists remove it and create a new one
+                            lvPlOrderRec.DELETE(TRUE);
+                            lvSalesLine."Arrival Order" := '';
+                          END;
+                        END ELSE
+                          lvSalesLine."Arrival Order" := '';
+
+                      IF lvSalesLine."Arrival Order" = '' THEN BEGIN
+                        lvTmpSortSalesLine.INIT;
+                        lvTmpSortSalesLine.Location := lvSalesLine."Plant Location Address Code";
+                        lvTmpSortSalesLine."Line No." := lvSalesLine."Line No.";
+                        lvTmpSortSalesLine."Starting Date" := lvSalesLine."Arrival Date";
+                        lvTmpSortSalesLine.INSERT;
+                      END;
+                    END;
+                  END;
+                UNTIL lvSalesLine.NEXT = 0;
+              END;
+              //
+              lvTmpSortSalesLine.SETCURRENTKEY(Location, "Starting Date");
+              IF lvTmpSortSalesLine.FINDSET(FALSE,FALSE) THEN BEGIN
+                lvPrevDate := 0D;
+                lvPrevLocCode := '';
+                lvPlantOrderRec."No." := '';
+                REPEAT
+                  lvSalesLine.GET(lvSalesHeadRec."Document Type",lvSalesHeadRec."No.",lvTmpSortSalesLine."Line No.");
+                  IF (lvSalesLine."Arrival Date" <> lvPrevDate) OR
+                     (lvSalesLine."Plant Location Address Code" <> lvPrevLocCode) OR
+                     (lvPlantOrderRec."No." = '') THEN
+                  BEGIN
+                    CreateArrivalPlantOrder(lvSalesHeadRec, lvSalesLine, lvPlantOrderRec, lvCreatePORec."Sales Company Name");
+      //              CreatePlantOrderCommentLines(
+      //                lvCreatePORec."Sales Company Name", lvCreatePORec."Sales Order No.", lvPlantOrderRec."No.");
+                    lvCreatePORec.AddSalesOrderPlantRelation(
+                      lvCreatePORec, lvPlantOrderRec."No.", 1, lvSalesHeadRec."Plant Location Code");
+                    lvPrevDate := lvSalesLine."Arrival Date";
+                    lvPrevLocCode := lvSalesLine."Plant Location Address Code";
+                    lvNoOfPO := lvNoOfPO + 1;
+                    IF lvFirstPO = '' THEN lvFirstPO := lvPlantOrderRec."No.";
+                    lvLastPO := lvPlantOrderRec."No.";
+                  END;
+                  IF lvSalesLine."Plant Type" <> '' THEN
+                    CreatePlantOrderLineArrival(lvSalesHeadRec, lvSalesLine, lvPlantOrderRec)
+                  ELSE
+                    CreatePlantOrderItemLineArriv(lvSalesHeadRec, lvSalesLine, lvPlantOrderRec);
+                  lvSalesLine."Arrival Order Type" := lvSalesLine."Arrival Order Type"::"Plant Order";
+                  lvSalesLine."Arrival Order" := lvPlantOrderRec."No.";
+                  lvSalesLine.MODIFY;
+                UNTIL lvTmpSortSalesLine.NEXT = 0;
+              END;
+              //
+              //* Als voor alle verhuurregels de aanvoerorder(s) zijn aangemaakt dan record 'lvCreatePORec' verwijderen
+              lvDeleteCreatePO := TRUE;
+              IF lvSalesLine.FINDSET(FALSE,FALSE) THEN BEGIN
+                REPEAT
+                  IF (lvSalesLine."Arrival Order" = '') OR (NOT lvPlOrderRec.GET(lvSalesLine."Arrival Order")) THEN
+                    lvDeleteCreatePO := FALSE;
+                UNTIL (lvSalesLine.NEXT = 0) OR (NOT lvDeleteCreatePO);
+              END;
+              IF lvDeleteCreatePO THEN
+                lvCreatePORec.DELETE
+              ELSE BEGIN  //*19105.sn
+                IF (lvCreatePORec."Plant Order Created" <> lvCreatePORec."Plant Order Created"::Partly) AND (lvNoOfPO > 0) THEN BEGIN
+                  lvCreatePORec."Plant Order Created" := lvCreatePORec."Plant Order Created"::Partly;
+                  lvCreatePORec.MODIFY;
+                END;
+              END;        //*19105.en
+            END;
+          UNTIL lvCreatePORec.NEXT = 0;
+        END;
+      END;
+
+      IF IRemoval THEN BEGIN
+        lvCreatePORec.SETRANGE(Create, lvCreatePORec.Create::Removal);
+
+        IF lvCreatePORec.FINDSET(TRUE,FALSE) THEN BEGIN
+          REPEAT
+            lvSalesHeadRec.CHANGECOMPANY(lvCreatePORec."Sales Company Name");
+            lvOK := lvSalesHeadRec.GET(lvSalesHeadRec."Document Type"::Order, lvCreatePORec."Sales Order No.");
+            IF (NOT lvOK) OR (lvSalesHeadRec.Status <> lvSalesHeadRec.Status::Released) OR
+               (lvSalesHeadRec."Sales Document Type" <> lvSalesHeadRec."Sales Document Type"::"Sales Logistics Separated")
+            THEN
+              lvCreatePORec.DELETE  //* Ook verwijderen als niet (meer) 'Vrijgegeven'!
+            ELSE BEGIN
+              lvSalesLine.CHANGECOMPANY(lvCreatePORec."Sales Company Name");
+              lvRemovalLine.CHANGECOMPANY(lvCreatePORec."Sales Company Name");
+              lvRemovalLine.RESET;
+              lvRemovalLine.SETCURRENTKEY(
+                "Document No.", Type, "Removal Date", "Plant Location Address Code");
+              lvRemovalLine.SETRANGE("Document No.", lvSalesHeadRec."No.");
+              lvRemovalLine.SETRANGE(Type, lvRemovalLine.Type::Removal);  //* Afvoer
+              lvRemovalLine.SETFILTER("Removal Date", '..%1', IDateUpto);
+              lvRemovalLine.SETRANGE(Status, lvRemovalLine.Status::Released);
+              IF lvRemovalLine.FINDSET(TRUE,FALSE) THEN BEGIN
+                lvPrevDate := 0D;
+                lvPrevLocCode := '';
+                lvPlantOrderRec."No." := '';
+                REPEAT
+                  //*13673.sn
+                  //IF (lvRemovalLine."Removal Order No." <> '') THEN BEGIN  //*19105.o
+                  IF (lvRemovalLine."Removal Order No." <> '') AND (lvCreatePORec."Plant Order Created" = 0) THEN BEGIN  //*19105.n
+                    IF lvPlOrderRec.GET(lvRemovalLine."Removal Order No.") THEN BEGIN
+                      IF NOT lvPlOrderRec.Posted AND (lvPlOrderRec.Status = lvPlOrderRec.Status::Open) THEN BEGIN
+                        //If Plant Order already exists remove it and create a new one
+                        lvPlOrderRec.ShipResetSalesRemovalLines(TRUE);
+                        lvPlOrderRec.DELETE(TRUE);
+                        lvPlOrderRec.ShipResetSalesRemovalLines(FALSE);
+                        lvRemovalLine."Removal Order No." := '';
+                      END;
+                    END ELSE
+                      lvRemovalLine."Removal Order No." := '';  //* PO is already deleted on a previous removal line
+                  END;
+                  IF (lvRemovalLine."Removal Order No." = '') THEN BEGIN
+                  //*13673.en
+                    lvSalesLine.GET(lvSalesHeadRec."Document Type",lvSalesHeadRec."No.",lvRemovalLine."Document Line No.");
+                    IF (lvRemovalLine."Removal Date" <> lvPrevDate) OR
+                       (lvRemovalLine."Plant Location Address Code" <> lvPrevLocCode) OR
+                       (lvPlantOrderRec."No." = '') THEN
+                    BEGIN
+                      CreateRemovalPlantOrder(lvSalesHeadRec, lvRemovalLine, lvPlantOrderRec,lvCreatePORec."Sales Company Name");
+      //              CreatePlantOrderCommentLines(
+      //                lvCreatePORec."Sales Company Name", lvCreatePORec."Sales Order No.", lvPlantOrderRec."No.");
+                      lvCreatePORec.AddSalesOrderPlantRelation(
+                        lvCreatePORec, lvPlantOrderRec."No.", 1, lvSalesHeadRec."Plant Location Code");
+                      PlantNextOrderLineNo := 10000;
+                      lvPrevDate := lvRemovalLine."Removal Date";
+                      lvPrevLocCode := lvRemovalLine."Plant Location Address Code";
+                      lvNoOfPO := lvNoOfPO + 1;
+                      IF lvFirstPO = '' THEN lvFirstPO := lvPlantOrderRec."No.";
+                      lvLastPO := lvPlantOrderRec."No.";
+                      lvRemovalCreated := TRUE;  //*19105
+                    END;
+                    IF lvSalesLine."Plant Type" <> '' THEN
+                      CreatePlantOrderLineRemoval(lvSalesHeadRec, lvSalesLine, lvRemovalLine, lvPlantOrderRec)
+                    ELSE
+                      CreatePlantOrderItemLineRemov(lvSalesHeadRec, lvSalesLine, lvRemovalLine, lvPlantOrderRec);
+                    lvRemovalLine."Removal Order Type" := lvRemovalLine."Removal Order Type"::"Plant Order";
+                    lvRemovalLine."Removal Order No." := lvPlantOrderRec."No.";
+                    lvRemovalLine.Status := lvRemovalLine.Status::Processed;
+                    lvRemovalLine.MODIFY;
+                  END;  //*13673.n
+                UNTIL lvRemovalLine.NEXT = 0;
+              END;
+              //
+              lvRemovalLine.SETRANGE(Type, lvRemovalLine.Type::Sale);  //* Verkoop via exit order
+
+              IF lvRemovalLine.FINDSET(TRUE,FALSE) THEN BEGIN
+                lvExitOrderRec."No." := '';
+                REPEAT
+                  IF lvRemovalLine."Removal Order Type" <> lvRemovalLine."Removal Order Type"::"Plant Order" THEN BEGIN
+                    lvSalesLine.GET(lvSalesHeadRec."Document Type",lvSalesHeadRec."No.",lvRemovalLine."Document Line No.");
+      //per verkoopordr hoeft maar 1 exit ordr aangemaakt te worden want op de exitregel is een afwijkende exit-datum mogelijk
+                    IF (lvExitOrderRec."No." = '') THEN BEGIN
+                      CreatePlantExitOrder(lvSalesHeadRec, lvRemovalLine."Removal Date", lvExitOrderRec);
+                      lvCreatePORec.AddSalesOrderPlantRelation(
+                        lvCreatePORec, lvExitOrderRec."No.", 2, lvSalesHeadRec."Plant Location Code");
+                      PlantNextOrderLineNo := 10000;
+                      lvExitOrderNo := lvExitOrderRec."No.";
+                    END;
+                    CreateExitOrderLine(lvSalesHeadRec, lvSalesLine, lvRemovalLine, lvExitOrderRec);
+                    lvRemovalLine."Removal Order Type" := lvRemovalLine."Removal Order Type"::"Exit-order";
+                    lvRemovalLine."Removal Order No." := lvExitOrderRec."No.";
+                  END;
+                  lvRemovalLine.Status := lvRemovalLine.Status::Processed;
+                  lvRemovalLine.MODIFY;
+                UNTIL lvRemovalLine.NEXT = 0;
+              END;
+              //
+      //* Als voor alle vrijgegeven verkoop-afvoerregels de afvoerorder(s) zijn aangemaakt dan record 'lvCreatePORec' verwijderen
+              lvRemovalLine.SETRANGE(Type);  //* Reset filter op 'Type'
+              lvRemovalLine.SETRANGE("Removal Date");  //* Reset filter op 'Date'
+              IF NOT lvRemovalLine.FINDFIRST THEN
+                lvCreatePORec.DELETE
+              ELSE BEGIN  //*19105.sn
+                IF (lvCreatePORec."Plant Order Created" <> lvCreatePORec."Plant Order Created"::Partly) AND lvRemovalCreated THEN BEGIN
+                  lvCreatePORec."Plant Order Created" := lvCreatePORec."Plant Order Created"::Partly;
+                  lvCreatePORec.MODIFY;
+                END;
+              END;        //*19105.en
+            END;
+          UNTIL lvCreatePORec.NEXT = 0;
+        END;
+      END;
+
+      CASE lvNoOfPO OF
+        0: MESSAGE(lvText001, lvNoOfPO, '');
+        1: MESSAGE(lvText001, lvNoOfPO, '(' + lvFirstPO + ')');
+        ELSE
+          MESSAGE(lvText001, lvNoOfPO, '(' + lvFirstPO + '..' + lvLastPO + ')');
+      END;
+      IF IRemoval AND (lvExitOrderNo <> '') THEN
+        MESSAGE(lvText002, lvExitOrderNo);
+    END;
+
+    LOCAL PROCEDURE CreateArrivalPlantOrder@1100485019(ISalesHeadRec@1100485002 : Record 36;ISalesLine@1100485001 : Record 37;VAR OvarPlantOrderRec@1100485000 : Record 11012556;ICompany@1100485004 : Text[50]);
+    VAR
+      lvSalesRentalAppointmentRec@1100485003 : Record 11012991;
+    BEGIN
+      WITH OvarPlantOrderRec DO BEGIN
+        INIT;
+        "No." := '';
+        INSERT(TRUE);
+        TESTFIELD("No.");
+        VALIDATE(Type, Type::Arrival);
+        VALIDATE("Transfer Date", ISalesLine."Arrival Date");
+        IF ISalesHeadRec."Plant Depot Logistics" <> '' THEN
+          VALIDATE("From Location", ISalesHeadRec."Plant Depot Logistics");
+        VALIDATE("To Location", ISalesHeadRec."Plant Location Code");
+        VALIDATE("To Location Address Code", ISalesLine."Plant Location Address Code");
+        IF ISalesHeadRec."Ship-to Contact" <> '' THEN BEGIN
+          //* Als er op de verhuur order een contact is ingevoerd, zou die kunnen afwijken van de contact op
+          //* de locatie. De eerste heeft dan de voorkeur
+          VALIDATE("To Location Contact", ISalesHeadRec."Ship-to Contact");
+          "To Location Contact Phone No" := ISalesHeadRec."Ship-to Phone No.";
+        END;
+        "Sales Rental Order No." := ISalesHeadRec."No.";
+        "Shipment Method Code" := ISalesHeadRec."Shipment Method Code";
+        //* Add appointments
+        lvSalesRentalAppointmentRec.CHANGECOMPANY(ICompany);
+        IF lvSalesRentalAppointmentRec.GET(
+          ISalesHeadRec."Document Type", ISalesHeadRec."No.", ISalesLine."Arrival Date",
+          lvSalesRentalAppointmentRec.Type::Arrival,ISalesLine."Plant Location Address Code")
+        THEN BEGIN
+          "Appointment Fixed Date" := lvSalesRentalAppointmentRec."Fixed Date";
+          "Appointment Time" := lvSalesRentalAppointmentRec."Appointment Time";
+          "Appointment Code" := lvSalesRentalAppointmentRec."Appointment Code";
+          "Appointment Comment" := lvSalesRentalAppointmentRec.Comment;
+          IF lvSalesRentalAppointmentRec."Extra Comment ID" <> '' THEN
+            CreatePlantOrderAppCommLines(ICompany, lvSalesRentalAppointmentRec."Extra Comment ID", OvarPlantOrderRec);  //DP00183.c
+        END;
+        MODIFY(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE CreateRemovalPlantOrder@1100485025(ISalesHeadRec@1100485002 : Record 36;ISalesRemovalLine@1100485001 : Record 11012789;VAR OvarPlantOrderRec@1100485000 : Record 11012556;ICompany@1100485004 : Text[50]);
+    VAR
+      lvSalesRentalAppointmentRec@1100485003 : Record 11012991;
+    BEGIN
+      WITH OvarPlantOrderRec DO BEGIN
+        INIT;
+        "No." := '';
+        INSERT(TRUE);
+        TESTFIELD("No.");
+        VALIDATE(Type, Type::Removal);
+        VALIDATE("Transfer Date",  ISalesRemovalLine."Removal Date");
+        VALIDATE("From Location", ISalesHeadRec."Plant Location Code");
+        VALIDATE("From Location Address Code", ISalesRemovalLine."Plant Location Address Code");
+        IF ISalesHeadRec."Ship-to Contact" <> '' THEN BEGIN
+          VALIDATE("From Location Contact", ISalesHeadRec."Ship-to Contact");
+          "From Location Contact Phone No" := ISalesHeadRec."Ship-to Phone No.";
+        END;
+        IF ISalesHeadRec."Plant Depot Logistics" <> '' THEN
+          VALIDATE("To Location", ISalesHeadRec."Plant Depot Logistics");
+        "Sales Rental Order No." := ISalesHeadRec."No.";
+        //Add appointments
+        lvSalesRentalAppointmentRec.CHANGECOMPANY(ICompany);
+        IF lvSalesRentalAppointmentRec.GET(
+          ISalesHeadRec."Document Type", ISalesHeadRec."No.", ISalesRemovalLine."Removal Date",
+          lvSalesRentalAppointmentRec.Type::Removal, ISalesRemovalLine."Plant Location Address Code")
+        THEN BEGIN
+          "Appointment Fixed Date" := lvSalesRentalAppointmentRec."Fixed Date";
+          "Appointment Time" := lvSalesRentalAppointmentRec."Appointment Time";
+          "Appointment Code" := lvSalesRentalAppointmentRec."Appointment Code";
+          "Appointment Comment" := lvSalesRentalAppointmentRec.Comment;
+          IF lvSalesRentalAppointmentRec."Extra Comment ID" <> '' THEN
+            CreatePlantOrderAppCommLines(ICompany, lvSalesRentalAppointmentRec."Extra Comment ID", OvarPlantOrderRec);  //DP00183.c
+        END;
+        MODIFY(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE CreatePlantExitOrder@1100485012(ISalesHeadRec@1100485002 : Record 36;IExitDate@1100485001 : Date;VAR OvarExitOrderRec@1100485000 : Record 11012559);
+    BEGIN
+      WITH OvarExitOrderRec DO BEGIN
+        INIT;
+        "No." := '';
+        INSERT(TRUE);
+        TESTFIELD("No.");
+        VALIDATE(Type, Type::Sales);
+        VALIDATE("Exit-date", IExitDate);
+        VALIDATE(Location, ISalesHeadRec."Plant Location Code");
+        MODIFY(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE CreatePlantOrderLineArrival@1100485028(ISalesHeadRec@1100485002 : Record 36;ISalesLine@1100485001 : Record 37;IPlantOrderRec@1100485000 : Record 11012556);
+    VAR
+      lvPlantOrderLine@1100485003 : Record 11012557;
+      lvRoundPrecision@1100485004 : Decimal;
+    BEGIN
+      WITH lvPlantOrderLine DO BEGIN
+        INIT;
+        "Plant Order No." := IPlantOrderRec."No.";
+        "Line No." := ISalesLine."Line No."; //Important
+        InitRecord();
+        INSERT(TRUE);
+        Type :=Type::Plant;
+        "Plant Type" := ISalesLine."Plant Type";
+        "Rental Type" := "Rental Type"::Rental;
+        VALIDATE("Unit of Measure");  //Fill with Plant Unit
+        CALCFIELDS(Bulk);
+        IF Bulk AND (ISalesLine."Plant No." = '') THEN
+          "No." := '0'
+        ELSE
+          "No." := ISalesLine."Plant No.";
+        Description := ISalesLine.Description;
+        "Description 2" := ISalesLine."Description 2";
+        IF Bulk THEN
+          lvRoundPrecision := 0.00001
+        ELSE
+          lvRoundPrecision := 1;
+
+        Quantity := ROUND(
+          ISalesLine.Quantity * LogistPlantQtyPerUnitOfMeasure(ISalesLine."Plant Type",ISalesLine."Unit of Measure Code"),
+          lvRoundPrecision);
+        IF PlantSetupRec."Extended Picking Procedure" THEN
+          "Asked Quantity" := Quantity;
+
+        IF ISalesLine."Rental Starting Date" > "Transfer Date" THEN BEGIN
+          "Rental Shift" := TRUE;
+          lvPlantOrderLine."Rental Startdate (To Location)" := ISalesLine."Rental Starting Date";
+          lvPlantOrderLine."Rental Enddate (From Location)" := "Transfer Date";
+        END;
+        "Expected return on" := ISalesLine."Removal Date";
+        MODIFY(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE CreatePlantOrderLineRemoval@1100485021(ISalesHeadRec@1100485002 : Record 36;ISalesLine@1100485001 : Record 37;VAR VarSalesRemovalLine@1100485005 : Record 11012789;IPlantOrderRec@1100485000 : Record 11012556);
+    VAR
+      lvPlantOrderLine@1100485003 : Record 11012557;
+      lvRoundPrecision@1100485004 : Decimal;
+    BEGIN
+      WITH lvPlantOrderLine DO BEGIN
+        INIT;
+        "Plant Order No." := IPlantOrderRec."No.";
+        "Line No." := PlantNextOrderLineNo;
+        PlantNextOrderLineNo :=  PlantNextOrderLineNo + 10000;
+        InitRecord();
+        INSERT(TRUE);
+        Type :=Type::Plant;
+        "Plant Type" := ISalesLine."Plant Type";
+        "Rental Type" := "Rental Type"::Rental;
+        VALIDATE("Unit of Measure");  //Fill with Plant Unit
+        CALCFIELDS(Bulk);
+        IF Bulk AND (ISalesLine."Plant No." = '') THEN
+          "No." := '0'
+        ELSE
+          "No." := ISalesLine."Plant No.";
+        Description := ISalesLine.Description;
+        "Description 2" := ISalesLine."Description 2";
+        IF Bulk THEN
+          lvRoundPrecision := 0.00001
+        ELSE
+          lvRoundPrecision := 1;
+
+        Quantity := ROUND(
+          VarSalesRemovalLine.Quantity * LogistPlantQtyPerUnitOfMeasure(
+          ISalesLine."Plant Type",ISalesLine."Unit of Measure Code"),
+          lvRoundPrecision);
+        IF PlantSetupRec."Removal with Qty. to Receive" THEN
+          "Qty. to Receive" := Quantity;
+
+        IF VarSalesRemovalLine."Rental Ending Date" < "Transfer Date" THEN BEGIN
+          "Rental Shift" := TRUE;
+          lvPlantOrderLine."Rental Startdate (To Location)" := "Transfer Date";
+          lvPlantOrderLine."Rental Enddate (From Location)" := VarSalesRemovalLine."Rental Ending Date";
+        END;
+
+        "Original Arrival Order No." := ISalesLine."Arrival Order";
+        MODIFY(TRUE);
+
+        VarSalesRemovalLine."Removal Order Line No." := "Line No.";
+      END;
+    END;
+
+    LOCAL PROCEDURE CreatePlantOrderItemLineArriv@1100485029(ISalesHeadRec@1100485002 : Record 36;ISalesLine@1100485001 : Record 37;IPlantOrderRec@1100485000 : Record 11012556);
+    VAR
+      lvPlantOrderLine@1100485003 : Record 11012557;
+    BEGIN
+      WITH lvPlantOrderLine DO BEGIN
+        INIT;
+        "Plant Order No." := IPlantOrderRec."No.";
+        "Line No." := ISalesLine."Line No.";
+        INSERT(TRUE);
+        Type :=Type::Item;
+        SetNoInventoryWarning(TRUE);
+        VALIDATE("Item No.", ISalesLine."Item No.");
+        "Variant Code" := ISalesLine."Variant Code";
+        Description := ISalesLine.Description;
+        "Description 2" := ISalesLine."Description 2";
+        "Location Code" := ISalesHeadRec."Location Code Logistics";
+        Quantity := ROUND(
+          ISalesLine.Quantity * LogistItemQtyPerUnitOfMeasure(ISalesLine."Item No.",ISalesLine."Unit of Measure Code"),
+          0.00001);
+        IF PlantSetupRec."Extended Picking Procedure" THEN
+          "Asked Quantity" := Quantity;
+
+        GetItemUnitPrice(0);
+        VALIDATE("Sales Rate");
+        SetQtyForItemReservation();
+        MODIFY(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE CreatePlantOrderItemLineRemov@1100485017(ISalesHeadRec@1100485004 : Record 36;ISalesLine@1100485002 : Record 37;ISalesRemovalLine@1100485001 : Record 11012789;IPlantOrderRec@1100485000 : Record 11012556);
+    VAR
+      lvPlantOrderLine@1100485003 : Record 11012557;
+    BEGIN
+      WITH lvPlantOrderLine DO BEGIN
+        INIT;
+        "Plant Order No." := IPlantOrderRec."No.";
+        "Line No." := ISalesLine."Line No.";
+        INSERT(TRUE);
+        Type :=Type::Item;
+        VALIDATE("Item No.", ISalesLine."Item No.");
+        "Variant Code" := ISalesLine."Variant Code";
+        Description := ISalesLine.Description;
+        "Description 2" := ISalesLine."Description 2";
+        "Location Code" := ISalesHeadRec."Location Code Logistics";
+        Quantity := ROUND(
+          ISalesRemovalLine.Quantity * LogistItemQtyPerUnitOfMeasure(ISalesLine."Item No.",ISalesLine."Unit of Measure Code"),
+          0.00001);
+        IF PlantSetupRec."Removal with Qty. to Receive" THEN
+          "Qty. to Receive" := Quantity;
+
+        GetItemUnitPrice(0);
+        VALIDATE("Sales Rate", -"Sales Rate"); //call 19655: price must be negative
+        SetQtyForItemReservation();
+        MODIFY(TRUE);
+      END;
+    END;
+
+    PROCEDURE CreatePlantOrderAppCommLines@1100485018(ISalesCompanyName@1100485000 : Text[50];ISalesCommentID@1100485001 : Code[20];PlantOrder@1100485002 : Record 11012556);
+    VAR
+      lvAppointCommentLine@1100485003 : Record 97;
+      PlantCommentLine@1100485004 : Record 11072666;
+      lvNewLineNo@1100485005 : Integer;
+    BEGIN
+      lvAppointCommentLine.CHANGECOMPANY(ISalesCompanyName);
+      lvAppointCommentLine.SETRANGE("Table Name", lvAppointCommentLine."Table Name"::"Sales Appointment");
+      lvAppointCommentLine.SETRANGE("No.", ISalesCommentID);
+      IF lvAppointCommentLine.FINDSET THEN BEGIN
+        //DP00183.sc  Plant Order Comment (T11012669) now in Plant Comment Line (io Comment Line)
+        //C005461.c Now T11072666
+        PlantCommentLine.SETRANGE("Table No.", DATABASE::"Plant Order");
+        PlantCommentLine.SETRANGE("No.", PlantOrder."No.");
+        IF PlantCommentLine.FINDLAST THEN
+          lvNewLineNo := PlantCommentLine."Line No." + 10000
+        ELSE
+          lvNewLineNo := 10000;
+        REPEAT
+          PlantCommentLine.INIT;
+          PlantCommentLine."Table No." := DATABASE::"Plant Order";
+          PlantCommentLine."No." := PlantOrder."No.";
+          PlantCommentLine."No. 2" := '';
+          PlantCommentLine."Entry No." := 0;
+          PlantCommentLine."Line No." := lvNewLineNo;
+          PlantCommentLine.Date := lvAppointCommentLine.Date;
+          PlantCommentLine.Code := lvAppointCommentLine.Code;
+          PlantCommentLine.Comment := lvAppointCommentLine.Comment;
+          PlantCommentLine."Comment Code" := lvAppointCommentLine."Comment Code";
+          PlantCommentLine."Created by" := lvAppointCommentLine."Created by";
+          PlantCommentLine."Time Created" := lvAppointCommentLine."Time Created";
+          PlantCommentLine."Line Break" := lvAppointCommentLine."Line Break";
+          lvNewLineNo := lvNewLineNo + 10000;
+          PlantCommentLine.INSERT;
+        //DP00183.ec
+        UNTIL lvAppointCommentLine.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE CreateExitOrderLine@1100485013(ISalesHeadRec@1100485002 : Record 36;ISalesLine@1100485001 : Record 37;ISalesRemovalLine@1100485005 : Record 11012789;IExitOrderRec@1100485000 : Record 11012559);
+    VAR
+      lvExitOrderLine@1100485003 : Record 11012560;
+      lvRoundPrecision@1100485004 : Decimal;
+    BEGIN
+      WITH lvExitOrderLine DO BEGIN
+        INIT;
+        "Exit-order No." := IExitOrderRec."No.";
+        "Line No." := PlantNextOrderLineNo;
+        PlantNextOrderLineNo := PlantNextOrderLineNo + 10000;
+        "Exit-date" := ISalesRemovalLine."Removal Date";
+        "From Location" := ISalesHeadRec."Plant Location Code";
+        INSERT(TRUE);
+        Type := Type::Plant;
+        "Exit Type" := "Exit Type"::Sales;
+        CALCFIELDS(Bulk);
+        VALIDATE("Plant Type", ISalesLine."Plant Type");
+        IF Bulk THEN
+          lvRoundPrecision := 0.00001
+        ELSE
+          lvRoundPrecision := 1;
+
+        VALIDATE(Quantity, ROUND(
+          ISalesRemovalLine.Quantity * LogistPlantQtyPerUnitOfMeasure(
+          ISalesLine."Plant Type",ISalesLine."Unit of Measure Code"),
+          lvRoundPrecision));
+        Description := ISalesLine.Description;
+        "Original Arrival Order No." := ISalesLine."Arrival Order";
+        MODIFY(TRUE);
+      END;
+    END;
+
+    PROCEDURE ValidateNewProjectOnSalesLines@1100485015(ISalesHeadRec@1100485001 : Record 36);
+    VAR
+      lvSalesLine@1100485000 : Record 37;
+      lvSalesLine2@1100485002 : Record 37;
+    BEGIN
+      lvSalesLine.SETRANGE("Document Type", ISalesHeadRec."Document Type");
+      lvSalesLine.SETRANGE("Document No.", ISalesHeadRec."No.");
+      lvSalesLine.SETFILTER("Job No.", '<>%1', ISalesHeadRec."Job No.");
+      lvSalesLine.SETFILTER(Type,'<>%1', lvSalesLine.Type::" ");
+      IF lvSalesLine.FINDSET(TRUE,FALSE) THEN
+        REPEAT
+          lvSalesLine2 := lvSalesLine;
+          lvSalesLine2.SuspendUpdateVATAmounts(TRUE);
+          lvSalesLine2.VALIDATE("Job No.", ISalesHeadRec."Job No.");
+          lvSalesLine2.VALIDATE("Gen. Prod. Posting Group", lvSalesLine."Gen. Prod. Posting Group");
+          lvSalesLine2.VALIDATE("VAT Prod. Posting Group", lvSalesLine."VAT Prod. Posting Group");
+          lvSalesLine2.VALIDATE("Unit Price", lvSalesLine."Unit Price");
+          lvSalesLine2.VALIDATE("Line Discount %", lvSalesLine."Line Discount %");
+          IF (lvSalesLine."Line Amount" <> 0) OR (lvSalesLine."Line Amount" <> lvSalesLine2."Line Amount") THEN
+            lvSalesLine2.VALIDATE("Line Amount", lvSalesLine."Line Amount"); //IF prevents error when line amount = 0
+          lvSalesLine2.SuspendUpdateVATAmounts(FALSE);
+          lvSalesLine2.VALIDATE("Line Discount %", lvSalesLine."Line Discount %");
+          lvSalesLine2."Shortcut Dimension 1 Code" := lvSalesLine."Shortcut Dimension 1 Code";
+          lvSalesLine2."Shortcut Dimension 2 Code" := lvSalesLine."Shortcut Dimension 2 Code";
+          lvSalesLine2."Dimension Set ID" := lvSalesLine."Dimension Set ID";
+          lvSalesLine2.MODIFY;
+        UNTIL lvSalesLine.NEXT = 0;
+    END;
+
+    PROCEDURE LogistPlantQtyPerUnitOfMeasure@1100485016(IPlantType@1100485001 : Code[20];ISalesUnit@1100485000 : Code[10]) lvQtyPerUnit : Decimal;
+    VAR
+      lvPlantUnitRec@1100485002 : Record 11012599;
+      lvPlantTypeRec@1100485005 : Record 11012551;
+    BEGIN
+      //This function returns the ratio of sales unit code in sales company and unit code in logistics company
+      lvQtyPerUnit := 1;
+      IF (IPlantType = '') OR (ISalesUnit = '') THEN
+        EXIT;
+
+      lvPlantTypeRec.GET(IPlantType);
+      IF ISalesUnit = lvPlantTypeRec."Unit of Measure" THEN
+        EXIT;
+
+      lvPlantUnitRec.GET(IPlantType, ISalesUnit);
+      lvPlantUnitRec.TESTFIELD("Qty. per Unit of Measure");
+      lvQtyPerUnit := 1/lvPlantUnitRec."Qty. per Unit of Measure";
+    END;
+
+    PROCEDURE LogistItemQtyPerUnitOfMeasure@1100485020(IItemCode@1100485001 : Code[20];ISalesUnit@1100485000 : Code[10]) lvQtyPerUnit : Decimal;
+    VAR
+      lvItemUnitRec@1100485002 : Record 5404;
+      lvItemRec@1100485005 : Record 27;
+    BEGIN
+      //This function returns the ratio of sales unit code in sales company and sales unit code in logistics company
+      lvQtyPerUnit := 1;
+      IF (IItemCode = '') OR (ISalesUnit = '') THEN
+        EXIT;
+
+      lvItemRec.GET(IItemCode);
+      IF ISalesUnit = lvItemRec."Sales Unit of Measure" THEN
+        EXIT;
+
+      lvItemUnitRec.GET(IItemCode, ISalesUnit);
+      lvItemUnitRec.TESTFIELD("Qty. per Unit of Measure");
+      lvQtyPerUnit := 1/lvItemUnitRec."Qty. per Unit of Measure";
+    END;
+
+    PROCEDURE AdjustQuantRentalSide@1100485030(IPlantOrderRec@1100485000 : Record 11012556);
+    VAR
+      lvSalesOrderPlantOrderRelRec@1100485001 : Record 11012787;
+      lvPlantOrderLine@1100485002 : Record 11012557;
+    BEGIN
+      IF IPlantOrderRec."Sales Rental Order No." = '' THEN
+        EXIT;
+
+      IF NOT (IPlantOrderRec.Type IN [IPlantOrderRec.Type::Arrival, IPlantOrderRec.Type::Removal]) THEN
+        EXIT;
+
+      //Get Company and Sales Order
+      lvSalesOrderPlantOrderRelRec.SETCURRENTKEY(Level, "Plant Document No.");
+      lvSalesOrderPlantOrderRelRec.SETRANGE(Level, lvSalesOrderPlantOrderRelRec.Level::PlantOrder);
+      lvSalesOrderPlantOrderRelRec.SETRANGE("Plant Document No.", IPlantOrderRec."No.");
+      IF NOT lvSalesOrderPlantOrderRelRec.FINDFIRST THEN
+        EXIT;
+
+      lvPlantOrderLine.SETRANGE("Plant Order No.", IPlantOrderRec."No.");
+      IF IPlantOrderRec.Type = IPlantOrderRec.Type::Removal THEN
+        lvPlantOrderLine.SETRANGE(Type, lvPlantOrderLine.Type::Plant)
+      ELSE
+        lvPlantOrderLine.SETFILTER(Type, '<>%1', lvPlantOrderLine.Type::Text);
+      IF lvPlantOrderLine.FINDSET THEN BEGIN
+        REPEAT
+          CASE lvPlantOrderLine.Type OF
+            lvPlantOrderLine.Type::Plant:
+              BEGIN
+                CASE IPlantOrderRec.Type OF
+                  IPlantOrderRec.Type::Arrival:
+                    AdjustQuantPlantSalesLine(IPlantOrderRec, lvSalesOrderPlantOrderRelRec, lvPlantOrderLine);
+                  IPlantOrderRec.Type::Removal:
+                    AdjustQuantPlantRemovalLine(IPlantOrderRec, lvSalesOrderPlantOrderRelRec, lvPlantOrderLine);
+                END;
+              END;
+            lvPlantOrderLine.Type::Item:
+              BEGIN
+                IF IPlantOrderRec.Type = IPlantOrderRec.Type::Arrival THEN
+                  AdjustQuantItemSalesLine(IPlantOrderRec, lvSalesOrderPlantOrderRelRec, lvPlantOrderLine);
+              END;
+          END;
+        UNTIL lvPlantOrderLine.NEXT = 0;
+      END;
+
+      //IF IPlantOrderRec.Type = IPlantOrderRec.Type::Arrival THEN BEGIN
+      //  lvItemOrderLine.SETRANGE("Plant Order No.", IPlantOrderRec."No.");
+      //  IF lvItemOrderLine.FINDSET THEN
+      //    REPEAT
+      //      AdjustQuantItemSalesLine(IPlantOrderRec, lvSalesOrderPlantOrderRelRec, lvItemOrderLine);
+      //    UNTIL lvItemOrderLine.NEXT = 0;
+      //END;
+    END;
+
+    LOCAL PROCEDURE AdjustQuantPlantSalesLine@1100485031(IPlantOrderRec@1100485000 : Record 11012556;ISalesOrderPlantOrderRelRec@1100485002 : Record 11012787;IPlantOrderLine@1100485001 : Record 11012557);
+    VAR
+      lvSalesLine@1100485003 : Record 37;
+      lvPlantTypeRec@1100485004 : Record 11012551;
+      lvQuantLogist@1100485006 : Decimal;
+      lvRoundPrecision@1100485005 : Decimal;
+    BEGIN
+      lvSalesLine.CHANGECOMPANY(ISalesOrderPlantOrderRelRec."Sales Company Name");
+      lvSalesLine.SETRANGE("Document Type", lvSalesLine."Document Type"::Order);
+      lvSalesLine.SETRANGE("Document No.", IPlantOrderRec."Sales Rental Order No.");
+      lvSalesLine.SETRANGE("Line No.", IPlantOrderLine."Line No.");
+      lvSalesLine.SETRANGE("Plant Type", IPlantOrderLine."Plant Type");
+      IF lvSalesLine.FINDSET(TRUE, FALSE) THEN BEGIN
+        lvPlantTypeRec.CHANGECOMPANY(ISalesOrderPlantOrderRelRec."Sales Company Name");
+        IF lvPlantTypeRec.GET(IPlantOrderLine."Plant Type") THEN BEGIN
+          IF lvPlantTypeRec.Bulk THEN
+            lvRoundPrecision := 0.00001
+          ELSE
+            lvRoundPrecision := 1;
+
+          lvQuantLogist := ROUND(
+            (IPlantOrderLine.Quantity) * SalesPlantQtyPerUnitOfMeasure(
+              IPlantOrderLine."Plant Type",
+              IPlantOrderLine."Unit of Measure",
+              lvSalesLine."Unit of Measure Code",
+              ISalesOrderPlantOrderRelRec."Sales Company Name"),
+            lvRoundPrecision);
+          lvSalesLine."Quantity Shipped" := ROUND(lvSalesLine."Quantity Shipped" + lvQuantLogist);
+          lvSalesLine.MODIFY;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE AdjustQuantItemSalesLine@1100485032(IPlantOrderRec@1100485000 : Record 11012556;ISalesOrderPlantOrderRelRec@1100485002 : Record 11012787;IPLantOrderLine@1100485001 : Record 11012557);
+    VAR
+      lvSalesLine@1100485003 : Record 37;
+      lvQuantLogist@1100485006 : Decimal;
+    BEGIN
+      lvSalesLine.CHANGECOMPANY(ISalesOrderPlantOrderRelRec."Sales Company Name");
+      lvSalesLine.SETRANGE("Document Type", lvSalesLine."Document Type"::Order);
+      lvSalesLine.SETRANGE("Document No.", IPlantOrderRec."Sales Rental Order No.");
+      lvSalesLine.SETRANGE("Line No.", IPLantOrderLine."Line No.");
+      lvSalesLine.SETRANGE("Item No.", IPLantOrderLine."Item No.");
+      IF lvSalesLine.FINDSET(TRUE, FALSE) THEN BEGIN
+        lvQuantLogist :=
+          (IPLantOrderLine.Quantity) * SalesItemQtyPerUnitOfMeasure(
+            IPLantOrderLine."Item No.",
+            IPLantOrderLine."Unit of Measure",
+            lvSalesLine."Unit of Measure Code",
+            ISalesOrderPlantOrderRelRec."Sales Company Name");
+
+        lvSalesLine."Quantity Shipped" := ROUND(lvSalesLine."Quantity Shipped" + lvQuantLogist);
+        lvSalesLine.MODIFY;
+      END;
+    END;
+
+    LOCAL PROCEDURE AdjustQuantPlantRemovalLine@1100485022(IPlantOrderRec@1100485000 : Record 11012556;ISalesOrderPlantOrderRelRec@1100485003 : Record 11012787;IPlantOrderLine@1100485001 : Record 11012557);
+    VAR
+      lvSalesRentalRemovalLine@1100485002 : Record 11012789;
+      lvSalesRentalRemovalLine2@1100485007 : Record 11012789;
+      lvPlantTypeRec@1100485006 : Record 11012551;
+      lvQuantLogist@1100485004 : Decimal;
+      lvRoundPrecision@1100485005 : Decimal;
+      lvLineNo@1100485008 : Integer;
+    BEGIN
+      lvSalesRentalRemovalLine.CHANGECOMPANY(ISalesOrderPlantOrderRelRec."Sales Company Name");
+      lvSalesRentalRemovalLine.SETRANGE("Document No.", IPlantOrderRec."Sales Rental Order No.");
+      lvSalesRentalRemovalLine.SETRANGE("Removal Order Type",
+        lvSalesRentalRemovalLine."Removal Order Type"::"Plant Order");
+      lvSalesRentalRemovalLine.SETRANGE("Removal Order No.", IPlantOrderRec."No.");
+      lvSalesRentalRemovalLine.SETRANGE("Removal Order Line No.", IPlantOrderLine."Line No.");
+      lvSalesRentalRemovalLine.SETRANGE("Plant Type", IPlantOrderLine."Plant Type");
+      lvSalesRentalRemovalLine.SETRANGE(Type, lvSalesRentalRemovalLine.Type::Removal);
+      IF lvSalesRentalRemovalLine.FINDSET(TRUE, FALSE) THEN BEGIN
+        lvPlantTypeRec.CHANGECOMPANY(ISalesOrderPlantOrderRelRec."Sales Company Name");
+        IF lvPlantTypeRec.GET(IPlantOrderLine."Plant Type") THEN BEGIN
+           IF lvPlantTypeRec.Bulk THEN
+            lvRoundPrecision := 0.00001
+          ELSE
+            lvRoundPrecision := 1;
+
+          lvSalesRentalRemovalLine.CALCFIELDS("Unit of Measure Code");
+
+          lvQuantLogist := ROUND(
+            (IPlantOrderLine.Quantity - IPlantOrderLine."Quantity Exit") * SalesPlantQtyPerUnitOfMeasure(
+              IPlantOrderLine."Plant Type",
+              IPlantOrderLine."Unit of Measure",
+              lvSalesRentalRemovalLine."Unit of Measure Code",
+              ISalesOrderPlantOrderRelRec."Sales Company Name"),
+            lvRoundPrecision);
+
+          IF lvSalesRentalRemovalLine.Quantity <> lvQuantLogist THEN BEGIN
+            //Copy Quan
+            lvSalesRentalRemovalLine.Quantity := lvQuantLogist;
+            lvSalesRentalRemovalLine.MODIFY;
+            //Delete Other Removal Lines
+            lvSalesRentalRemovalLine.RESET;
+            lvSalesRentalRemovalLine.SETRANGE("Document No.", IPlantOrderRec."Sales Rental Order No.");
+            lvSalesRentalRemovalLine.SETRANGE("Document Line No.", lvSalesRentalRemovalLine."Document Line No.");
+            lvSalesRentalRemovalLine.SETFILTER("Line No.", '<>%1', lvSalesRentalRemovalLine."Line No.");
+            lvSalesRentalRemovalLine.SETRANGE("Plant Type", IPlantOrderLine."Plant Type");
+            lvSalesRentalRemovalLine.SETRANGE("Removal Order No.", '');
+            lvSalesRentalRemovalLine.DELETEALL;
+          END;
+          IF (IPlantOrderLine."Quantity Exit" <> 0) THEN BEGIN
+            //Add Removal Line Exit
+            lvSalesRentalRemovalLine2.CHANGECOMPANY(ISalesOrderPlantOrderRelRec."Sales Company Name");
+            lvSalesRentalRemovalLine2 := lvSalesRentalRemovalLine;
+            lvSalesRentalRemovalLine2.SETRANGE("Document No.", lvSalesRentalRemovalLine."Document No.");
+            lvSalesRentalRemovalLine2.SETRANGE("Document Line No.", lvSalesRentalRemovalLine."Document Line No.");
+            IF lvSalesRentalRemovalLine2.FINDLAST THEN
+              lvLineNo := lvSalesRentalRemovalLine2."Line No." + 10000
+            ELSE
+              lvLineNo := 10000;
+            lvSalesRentalRemovalLine2 := lvSalesRentalRemovalLine;
+            lvSalesRentalRemovalLine2."Line No." := lvLineNo;
+            lvSalesRentalRemovalLine2.Type := lvSalesRentalRemovalLine2.Type::Sale;
+            lvSalesRentalRemovalLine2."Reason Code" := IPlantOrderLine."Reason Code (Exit)";
+            lvSalesRentalRemovalLine2.Quantity := ROUND(
+              IPlantOrderLine."Quantity Exit" * SalesPlantQtyPerUnitOfMeasure(
+                IPlantOrderLine."Plant Type",
+                IPlantOrderLine."Unit of Measure",
+                lvSalesRentalRemovalLine."Unit of Measure Code",
+                ISalesOrderPlantOrderRelRec."Sales Company Name"),
+              lvRoundPrecision);
+            lvSalesRentalRemovalLine2.Status := lvSalesRentalRemovalLine2.Status::Open;
+            lvSalesRentalRemovalLine2.INSERT;
+          END;
+        END;
+      END;
+    END;
+
+    PROCEDURE SalesPlantQtyPerUnitOfMeasure@1100485027(IPlantType@1100485001 : Code[20];ILogistUnit@1100485000 : Code[10];ISalesUnit@1100485006 : Code[10];ISalesCompanyName@1100485004 : Text[50]) lvQtyPerUnit : Decimal;
+    VAR
+      lvPlantUnitRec@1100485002 : Record 11012599;
+    BEGIN
+      //This function returns the ratio of the unit code in logistics company and sales unit code in sales company
+      lvQtyPerUnit := 1;
+      IF (IPlantType = '') OR (ILogistUnit = '') OR (ISalesUnit = '') THEN
+        EXIT;
+
+      IF ILogistUnit = ISalesUnit THEN
+        EXIT;
+
+      lvPlantUnitRec.CHANGECOMPANY(ISalesCompanyName);
+      lvPlantUnitRec.GET(IPlantType, ILogistUnit);
+      lvPlantUnitRec.TESTFIELD("Qty. per Unit of Measure");
+      lvQtyPerUnit := 1/lvPlantUnitRec."Qty. per Unit of Measure";
+    END;
+
+    PROCEDURE SalesItemQtyPerUnitOfMeasure@1100485034(IItemNo@1100485001 : Code[20];ILogistUnit@1100485000 : Code[10];ISalesUnit@1100485006 : Code[10];ISalesCompanyName@1100485004 : Text[50]) lvQtyPerUnit : Decimal;
+    VAR
+      lvItemUnitRec@1100485002 : Record 5404;
+    BEGIN
+      //This function returns the ratio of the unit code in logistics company and sales unit code in sales company
+      lvQtyPerUnit := 1;
+      IF (IItemNo = '') OR (ILogistUnit = '') OR (ISalesUnit = '') THEN
+        EXIT;
+
+      IF ILogistUnit = ISalesUnit THEN
+        EXIT;
+
+      lvItemUnitRec.CHANGECOMPANY(ISalesCompanyName);
+      lvItemUnitRec.GET(IItemNo, ISalesUnit);
+      lvItemUnitRec.TESTFIELD("Qty. per Unit of Measure");
+      lvQtyPerUnit := 1/lvItemUnitRec."Qty. per Unit of Measure";
+    END;
+
+    PROCEDURE ReplaceSelectionCode@1100525000(IOldSelectionCode@1100485000 : Code[20];INewSelectionCode@1100485001 : Code[20]);
+    VAR
+      lvSalesHeadRec@1100485002 : Record 36;
+    BEGIN
+      WITH lvSalesHeadRec DO BEGIN
+        SETFILTER("Document Type", '%1|%2', "Document Type"::Quote, "Document Type"::Order);
+        SETRANGE("Sales Document Type", "Sales Document Type"::"Sales Logistics Separated");
+        SETRANGE("Selection Code", IOldSelectionCode);
+        IF FINDSET(TRUE,FALSE) THEN BEGIN
+          REPEAT
+            "Selection Code" := INewSelectionCode;
+            VALIDATE("Selection Code is Current Doc.");
+            MODIFY;
+          UNTIL NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE DeleteTodoByQuote@1100525001(QuoteNumber@1100525000 : Code[20]);
+    VAR
+      Todo@1100525001 : Record 5080;
+    BEGIN
+      IF QuoteNumber = '' THEN
+        EXIT;
+      Todo.SETCURRENTKEY("Quote Number");
+      Todo.SETRANGE("Quote Number",QuoteNumber);
+      Todo.DELETEALL(TRUE);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

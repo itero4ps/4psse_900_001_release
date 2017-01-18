@@ -1,0 +1,155 @@
+OBJECT Codeunit 11125711 Proj. Planning Activity Mgt.
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      ProjActCapComMgt@1100528400 : Codeunit 11125706;
+      Text000@1100528401 : TextConst 'ENU=%1 of %2  should not be longer than %3 characters.';
+
+    PROCEDURE GenProjPlanActivities@1100528400(Job@1100528400 : Record 11072003);
+    VAR
+      ProjectElement@1100528401 : Record 11012010;
+      ProjectPlanningActivity@1100528402 : Record 11012431;
+      ProjectPlanningBaseActivity@1100528403 : Record 11012434;
+      JobsSetup@1100528404 : Record 315;
+      ProjectTimeTable@1100528405 : Record 11020684;
+      MessageHasBeenGiven@1100528406 : Boolean;
+      ProjectPlanningActivityCode@1100528407 : Code[30];
+    BEGIN
+      JobsSetup.GET;
+      JobsSetup.TESTFIELD("Project Time Table");
+      IF (JobsSetup."Planning Activity Format" <> '') THEN
+        JobsSetup.TESTFIELD("Planning Activity Format", JobsSetup."Project Element Format");
+
+      ProjectTimeTable.GET(JobsSetup."Project Time Table");
+
+      ProjectElement.SETRANGE("Project No.", Job."No.");
+      IF ProjectElement.FINDSET THEN
+        REPEAT
+          IF PlanningActivityMustBeCreated(ProjectElement) THEN BEGIN
+            IF (STRLEN(ProjectElement.Element) > MAXSTRLEN(ProjectPlanningBaseActivity.Code)) AND
+               NOT MessageHasBeenGiven
+            THEN BEGIN
+              MESSAGE(
+                Text000,
+                ProjectElement.FIELDCAPTION(Element),
+                ProjectElement.TABLECAPTION,
+                MAXSTRLEN(ProjectPlanningBaseActivity.Code));
+              MessageHasBeenGiven := TRUE;
+            END;
+            ProjectPlanningActivityCode := COPYSTR(
+              ProjectElement.Element,
+              1,
+              MAXSTRLEN(ProjectPlanningActivity.Code));
+            ProjectPlanningActivity.SETCURRENTKEY("Project No.", Code);
+            ProjectPlanningActivity.SETRANGE("Project No.", Job."No.");
+            ProjectPlanningActivity.SETRANGE(Code, ProjectPlanningActivityCode);
+            IF NOT ProjectPlanningActivity.FINDFIRST THEN BEGIN
+              GenProjPlanActivity(
+                ProjectElement,
+                Job,
+                ProjectTimeTable,
+                ProjectPlanningActivityCode);
+              IF ProjectPlanningActivity.FINDFIRST THEN
+                LinkPrjPlActivityToBudgetLines(ProjectPlanningActivity, ProjectElement);
+            END;
+          END;
+        UNTIL ProjectElement.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE GenProjPlanActivity@1100528402(ProjectElement@1100528400 : Record 11012010;Job@1100528401 : Record 11072003;ProjectTimeTable@1100528403 : Record 11020684;ProjectPlanningActivityCode@1100528402 : Code[30]);
+    VAR
+      ProjectPlanningActivity@1100528405 : Record 11012431;
+    BEGIN
+      ProjectPlanningActivity.INIT;
+      ProjectPlanningActivity."Project No." := ProjectElement."Project No.";
+      ProjectPlanningActivity.VALIDATE(Code, ProjectPlanningActivityCode);
+      ProjectPlanningActivity.Type := ProjectElement."Planning Activity Type";
+      ProjectPlanningActivity.Description := ProjectElement.Description;
+      ProjectPlanningActivity."Constraint Type" :=
+        ProjectPlanningActivity."Constraint Type"::"Start No Earlier Than";
+      IF ProjectElement."Starting Date" > 0D THEN
+        ProjectPlanningActivity."Constraint Date" :=
+          CREATEDATETIME(
+            ProjectElement."Starting Date",
+            ProjectTimeTable.GetWorkFrom(ProjectElement."Starting Date"))
+      ELSE
+        ProjectPlanningActivity."Constraint Date" :=
+          CREATEDATETIME(Job."Starting Date", ProjectTimeTable.GetWorkFrom(Job."Starting Date"));
+      ProjectPlanningActivity."Starting Date" := ProjectPlanningActivity."Constraint Date";
+
+      ProjectPlanningActivity.INSERT(TRUE);
+    END;
+
+    LOCAL PROCEDURE LinkPrjPlActivityToBudgetLines@1100528404(ProjectPlanningActivity@1100528400 : Record 11012431;ProjectElement@1100528401 : Record 11012010);
+    VAR
+      BudgetLine@1100528402 : Record 11012001;
+    BEGIN
+      BudgetLine.SETCURRENTKEY("Project No.", Element, "Cost Type");
+      BudgetLine.SETRANGE("Project No.", ProjectElement."Project No.");
+      BudgetLine.SETRANGE(Element, ProjectElement.Element);
+      BudgetLine.SETRANGE("Cost Type", BudgetLine."Cost Type"::Labor);
+      IF BudgetLine.FINDSET THEN
+        REPEAT
+          BudgetLine."Project Planning Activity No." := ProjectPlanningActivity."No.";
+          BudgetLine."Proj. Plann. Parent Activ. No." := ProjectPlanningActivity."Parent Activity No.";
+          BudgetLine.MODIFY;
+        UNTIL BudgetLine.NEXT = 0;
+    END;
+
+    PROCEDURE CalcProjPlanActivityDuration@1100528401(StartingDateTime@1100528400 : DateTime;EndingDateTime@1100528401 : DateTime) Duration : Decimal;
+    BEGIN
+      Duration :=
+        ProjActCapComMgt.CalculateDuration(DT2DATE(StartingDateTime), DT2DATE(EndingDateTime), 0);
+    END;
+
+    PROCEDURE CalcProjPlanActEndingDateTime@1100528408(StartingDateTime@1100528400 : DateTime;PlannedHours@1100528401 : Decimal) EndingDateTime : DateTime;
+    VAR
+      JobsSetup@1100528402 : Record 315;
+      ProjectTimeTable@1100528404 : Record 11020684;
+      EndingDate@1100528403 : Date;
+    BEGIN
+      JobsSetup.GET;
+      JobsSetup.TESTFIELD("Project Time Table");
+      ProjectTimeTable.GET(JobsSetup."Project Time Table");
+
+      EndingDate :=
+        ProjActCapComMgt.CalculateEndingDate(DT2DATE(StartingDateTime), PlannedHours, 0);
+      EndingDateTime := CREATEDATETIME(EndingDate, ProjectTimeTable.GetWorkUntil(EndingDate));
+    END;
+
+    LOCAL PROCEDURE PlanningActivityMustBeCreated@1100528406(ProjectElement@1100528400 : Record 11012010) : Boolean;
+    VAR
+      ProjectPlanningActivity@1100528401 : Record 11012431;
+    BEGIN
+      IF ProjectPlanningActivity.ActivityCodeIsFormatted AND
+         (ProjectElement.Chapter = '') AND //Start element
+         (ProjectElement.Paragraph = '')
+      THEN
+        EXIT(FALSE);
+
+      ProjectElement.CALCFIELDS("Budget Hours");
+      IF NOT ((ProjectElement."Planning Activity Type" =
+               ProjectElement."Planning Activity Type"::Activity) AND
+              (ProjectElement."Budget Hours" = 0))
+      THEN
+        EXIT(TRUE);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

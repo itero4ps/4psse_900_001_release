@@ -1,0 +1,232 @@
+OBJECT Codeunit 5950 Service-Calc. Discount
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00;
+  }
+  PROPERTIES
+  {
+    TableNo=5902;
+    OnRun=VAR
+            ServiceLine@1000 : Record 5902;
+          BEGIN
+            ServiceLine.COPY(Rec);
+
+            TempServHeader.GET("Document Type","Document No.");
+            TemporaryHeader := FALSE;
+            CalculateInvoiceDiscount(TempServHeader,ServiceLine,TempServiceLine);
+
+            Rec := ServiceLine;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1000 : TextConst 'ENU=Service Charge';
+      TempServHeader@1001 : Record 5900;
+      TempServiceLine@1003 : Record 5902;
+      CustInvDisc@1004 : Record 19;
+      CustPostingGr@1005 : Record 92;
+      Currency@1006 : Record 4;
+      InvDiscBase@1008 : Decimal;
+      ChargeBase@1009 : Decimal;
+      CurrencyDate@1011 : Date;
+      TemporaryHeader@1012 : Boolean;
+
+    LOCAL PROCEDURE CalculateInvoiceDiscount@1(VAR ServHeader@1000 : Record 5900;VAR ServiceLine@1006 : Record 5902;VAR ServiceLine2@1001 : Record 5902);
+    VAR
+      TempVATAmountLine@1002 : TEMPORARY Record 290;
+      ServSetup@1003 : Record 5911;
+      SalesSetup@1005 : Record 311;
+      ServiceChargeLineNo@1004 : Integer;
+      ApplyServiceCharge@1101 : Boolean;
+    BEGIN
+      ServSetup.GET;
+      WITH ServiceLine DO BEGIN
+        LOCKTABLE;
+        ServHeader.TESTFIELD("Customer Posting Group");
+        CustPostingGr.GET(ServHeader."Customer Posting Group");
+
+        IF NOT IsServiceChargeUpdated(ServiceLine) THEN BEGIN
+          ServiceLine2.RESET;
+          ServiceLine2.SETRANGE("Document Type","Document Type");
+          ServiceLine2.SETRANGE("Document No.","Document No.");
+          ServiceLine2.SETRANGE("System-Created Entry",TRUE);
+          ServiceLine2.SETRANGE(Type,ServiceLine2.Type::"G/L Account");
+          ServiceLine2.SETRANGE("No.",CustPostingGr."Service Charge Acc.");
+          IF ServiceLine2.FIND('+') THEN BEGIN
+            ServiceChargeLineNo := ServiceLine2."Line No.";
+            ServiceLine2.VALIDATE("Unit Price",0);
+            ServiceLine2.MODIFY;
+          END;
+          ApplyServiceCharge := TRUE;
+        END;
+
+        ServiceLine2.RESET;
+        ServiceLine2.SETRANGE("Document Type","Document Type");
+        ServiceLine2.SETRANGE("Document No.","Document No.");
+        ServiceLine2.SETFILTER(Type,'<>0');
+        IF ServHeader."Document Type" = ServHeader."Document Type"::Order THEN
+          ServiceLine2.SETFILTER("Service Item No.",'<>%1','');
+        IF ServiceLine2.FIND('-') THEN;
+        ServiceLine2.CalcVATAmountLines(0,ServHeader,ServiceLine2,TempVATAmountLine,FALSE);
+        InvDiscBase :=
+          TempVATAmountLine.GetTotalInvDiscBaseAmount(
+            ServHeader."Prices Including VAT",ServHeader."Currency Code");
+        ChargeBase :=
+          TempVATAmountLine.GetTotalLineAmount(
+            ServHeader."Prices Including VAT",ServHeader."Currency Code");
+
+        IF NOT TemporaryHeader THEN
+          ServHeader.MODIFY;
+
+        IF ("Document Type" IN ["Document Type"::Quote]) AND
+           (ServHeader."Posting Date" = 0D)
+        THEN
+          CurrencyDate := WORKDATE
+        ELSE
+          CurrencyDate := ServHeader."Posting Date";
+
+        CustInvDisc.GetRec(
+          ServHeader."Invoice Disc. Code",ServHeader."Currency Code",CurrencyDate,ChargeBase);
+
+        IF ApplyServiceCharge THEN
+          IF CustInvDisc."Service Charge" <> 0 THEN BEGIN
+            CustPostingGr.TESTFIELD("Service Charge Acc.");
+            IF ServHeader."Currency Code" = '' THEN
+              Currency.InitRoundingPrecision
+            ELSE
+              Currency.GET(ServHeader."Currency Code");
+            IF TemporaryHeader THEN
+              ServiceLine2.SetServHeader(ServHeader);
+            IF ServiceChargeLineNo <> 0 THEN BEGIN
+              ServiceLine2.GET("Document Type","Document No.",ServiceChargeLineNo);
+              IF ServHeader."Prices Including VAT" THEN
+                ServiceLine2.VALIDATE(
+                  "Unit Price",
+                  ROUND(
+                    (1 + ServiceLine2."VAT %" / 100) * CustInvDisc."Service Charge",
+                    Currency."Unit-Amount Rounding Precision"))
+              ELSE
+                ServiceLine2.VALIDATE("Unit Price",CustInvDisc."Service Charge");
+              ServiceLine2.MODIFY;
+            END ELSE BEGIN
+              ServiceLine2.RESET;
+              ServiceLine2.SETRANGE("Document Type","Document Type");
+              ServiceLine2.SETRANGE("Document No.","Document No.");
+              ServiceLine2.FIND('+');
+              ServiceLine2.INIT;
+              IF TemporaryHeader THEN
+                ServiceLine2.SetServHeader(ServHeader);
+              ServiceLine2."Line No." := ServiceLine2."Line No." + GetNewServiceLineNoBias(ServiceLine2);
+              ServiceLine2.Type := ServiceLine2.Type::"G/L Account";
+              ServiceLine2.VALIDATE("No.",CustPostingGr."Service Charge Acc.");
+              ServiceLine2.Description := Text000;
+              ServiceLine2.VALIDATE(Quantity,1);
+              IF ServHeader."Prices Including VAT" THEN
+                ServiceLine2.VALIDATE(
+                  "Unit Price",
+                  ROUND(
+                    (1 + ServiceLine2."VAT %" / 100) * CustInvDisc."Service Charge",
+                    Currency."Unit-Amount Rounding Precision"))
+              ELSE
+                ServiceLine2.VALIDATE("Unit Price",CustInvDisc."Service Charge");
+              ServiceLine2."System-Created Entry" := TRUE;
+              ServiceLine2.INSERT;
+            END;
+            ServiceLine2.CalcVATAmountLines(0,ServHeader,ServiceLine2,TempVATAmountLine,FALSE);
+          END ELSE
+            IF ServiceChargeLineNo <> 0 THEN BEGIN
+              ServiceLine2.GET("Document Type","Document No.",ServiceChargeLineNo);
+              ServiceLine2.DELETE(TRUE);
+            END;
+
+        IF CustInvDiscRecExists(ServHeader."Invoice Disc. Code") THEN BEGIN
+          IF InvDiscBase <> ChargeBase THEN
+            CustInvDisc.GetRec(
+              ServHeader."Invoice Disc. Code",ServHeader."Currency Code",CurrencyDate,InvDiscBase);
+
+          ServHeader."Invoice Discount Calculation" := ServHeader."Invoice Discount Calculation"::"%";
+          ServHeader."Invoice Discount Value" := CustInvDisc."Discount %";
+          IF NOT TemporaryHeader THEN
+            ServHeader.MODIFY;
+
+          TempVATAmountLine.SetInvoiceDiscountPercent(
+            CustInvDisc."Discount %",ServHeader."Currency Code",
+            ServHeader."Prices Including VAT",SalesSetup."Calc. Inv. Disc. per VAT ID",
+            ServHeader."VAT Base Discount %");
+
+          ServiceLine2.SetServHeader(ServHeader);
+          ServiceLine2.UpdateVATOnLines(0,ServHeader,ServiceLine2,TempVATAmountLine);
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE CustInvDiscRecExists@2(InvDiscCode@1000 : Code[20]) : Boolean;
+    VAR
+      CustInvDisc@1001 : Record 19;
+    BEGIN
+      CustInvDisc.SETRANGE(Code,InvDiscCode);
+      EXIT(CustInvDisc.FINDFIRST);
+    END;
+
+    PROCEDURE CalculateWithServHeader@24(VAR TempServHeader@1000 : Record 5900;VAR ServiceLine@1003 : Record 5902;VAR TempServiceLine@1001 : Record 5902);
+    BEGIN
+      TemporaryHeader := TRUE;
+      IF ServiceLine.GET(TempServiceLine."Document Type",TempServiceLine."Document No.",TempServiceLine."Line No.") THEN
+        CalculateInvoiceDiscount(TempServHeader,ServiceLine,TempServiceLine);
+    END;
+
+    PROCEDURE CalculateIncDiscForHeader@3(VAR TempServiceHeader@1000 : Record 5900);
+    VAR
+      SalesSetup@1003 : Record 311;
+      ServiceLine@1002 : Record 5902;
+      ServiceLine2@1001 : Record 5902;
+    BEGIN
+      SalesSetup.GET;
+      IF NOT SalesSetup."Calc. Inv. Discount" THEN
+        EXIT;
+      WITH TempServiceHeader DO BEGIN
+        ServiceLine2."Document Type" := "Document Type";
+        ServiceLine2."Document No." := "No.";
+        ServiceLine.COPY(ServiceLine2);
+        CalculateInvoiceDiscount(TempServiceHeader,ServiceLine2,ServiceLine);
+      END;
+    END;
+
+    LOCAL PROCEDURE GetNewServiceLineNoBias@34(ServiceLineParam@1000 : Record 5902) : Integer;
+    VAR
+      LineAdd@1001 : Integer;
+      ServLin@1002 : Record 5902;
+    BEGIN
+      LineAdd := 10000;
+      WHILE ServLin.GET(ServiceLineParam."Document Type",ServiceLineParam."Document No.",ServiceLineParam."Line No." + LineAdd) AND
+            (LineAdd > 1)
+      DO
+        LineAdd := ROUND(LineAdd / 2,1,'<');
+      EXIT(LineAdd);
+    END;
+
+    LOCAL PROCEDURE IsServiceChargeUpdated@1102(ServiceLine@1103 : Record 5902) : Boolean;
+    VAR
+      ServiceLine1@1104 : Record 5902;
+    BEGIN
+      WITH ServiceLine DO BEGIN
+        ServiceLine1.RESET;
+        ServiceLine1.SETRANGE("Document Type","Document Type");
+        ServiceLine1.SETRANGE("Document No.","Document No.");
+        ServiceLine1.SETRANGE("System-Created Entry",TRUE);
+        ServiceLine1.SETRANGE(Type,ServiceLine1.Type::"G/L Account");
+        ServiceLine1.SETRANGE("No.",CustPostingGr."Service Charge Acc.");
+        EXIT(ServiceLine1.FINDLAST);
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

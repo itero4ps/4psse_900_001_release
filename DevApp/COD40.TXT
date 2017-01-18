@@ -1,0 +1,314 @@
+OBJECT Codeunit 40 LogInManagement
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 17=r,
+                TableData 18=r,
+                TableData 23=r,
+                TableData 27=r,
+                TableData 51=rimd,
+                TableData 9150=rimd,
+                TableData 9151=rimd,
+                TableData 9152=rimd;
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      CronusTxt@1002 : TextConst '@@@="{Locked} ";ENU=CRONUS';
+      PartnerAgreementNotAcceptedErr@1001 : TextConst 'ENU=Partner Agreement has not been accepted.';
+      Text022@1007 : TextConst 'ENU=You must change password before you can continue.';
+      GLSetup@1011 : Record 98;
+      User@1003 : Record 2000000120 SECURITYFILTERING(Filtered);
+      LogInWorkDate@1006 : Date;
+      LogInDate@1005 : Date;
+      LogInTime@1004 : Time;
+      GLSetupRead@1012 : Boolean;
+      Text11012001@1100409001 : TextConst 'ENU=The Automatic Data Conversion could not be finished. Before you contine please get in contact with your Microsoft Dynamics NAV vendor.\The Error message is:\%1';
+      Text11012002@1100409000 : TextConst 'ENU=Create Company Setup from XML File?';
+
+    PROCEDURE CompanyOpen@1();
+    VAR
+      CRMConnectionSetup@1000 : Record 5330;
+      Consenter@1100409004 : Record 11012229;
+      LicensePermission@1100409001 : Record 2000000043;
+      ConsentMgt@1100409002 : Codeunit 11012132;
+      HoursConsentMgt@1100409003 : Codeunit 11012206;
+    BEGIN
+      IF GUIALLOWED THEN
+        LogInStart;
+
+      // Register all Microsoft Dynamics CRM connection strings
+      IF CRMConnectionSetup.GET THEN
+        CRMConnectionSetup.UpdateAllConnectionRegistrations;
+    END;
+
+    PROCEDURE CompanyClose@2();
+    BEGIN
+      IF GUIALLOWED THEN
+        LogInEnd;
+    END;
+
+    LOCAL PROCEDURE LogInStart@3();
+    VAR
+      GLSetup@1000 : Record 98;
+      Profile@1006 : Record 2000000072;
+      Language@1005 : Record 2000000045;
+      LicenseAgreement@1008 : Record 140;
+      ApplicationManagement@1009 : Codeunit 1;
+      CompanyInitialize@1003 : Codeunit 2;
+      ConfPersonalizationMgt@1004 : Codeunit 9170;
+      IdentityManagement@1002 : Codeunit 9801;
+      JobQueueRestartUserSession@1001 : Codeunit 455;
+      WorkDatePage@1100409000 : Page 11020220;
+    BEGIN
+      IF (NOT IsDemoCompany) AND LicenseAgreement.GET THEN
+        IF LicenseAgreement.GetActive AND NOT LicenseAgreement.Accepted THEN BEGIN
+          PAGE.RUNMODAL(PAGE::"Additional Customer Terms");
+          LicenseAgreement.GET;
+          IF NOT LicenseAgreement.Accepted THEN
+            ERROR(PartnerAgreementNotAcceptedErr)
+        END;
+
+      Language.SETRANGE("Localization Exist",TRUE);
+      Language.SETRANGE("Globally Enabled",TRUE);
+      Language."Language ID" := GLOBALLANGUAGE;
+      IF NOT Language.FIND THEN BEGIN
+        Language."Language ID" := WINDOWSLANGUAGE;
+        IF NOT Language.FIND THEN
+          Language."Language ID" := ApplicationManagement.ApplicationLanguage;
+      END;
+      GLOBALLANGUAGE := Language."Language ID";
+
+      // Check for and fix orphaned job queue jobs (e.g. due to server restart)
+      JobQueueRestartUserSession.CheckAndRestartUserSessions;
+
+      // Check if the logged in user must change login before allowing access.
+      IF 0 <> User.COUNT THEN BEGIN
+        IF IdentityManagement.IsUserNamePasswordAuthentication THEN BEGIN
+          User.SETRANGE("User Security ID",USERSECURITYID);
+          User.FINDFIRST;
+          IF User."Change Password" THEN
+            PAGE.RUNMODAL(PAGE::"Change Password");
+
+          SELECTLATESTVERSION;
+          User.FINDFIRST;
+          IF User."Change Password" THEN
+            ERROR(Text022);
+        END;
+        User.SETRANGE("User Security ID");
+      END;
+
+      IF NOT GLSetup.GET THEN BEGIN
+        //**4PS.sn
+        IF CONFIRM(Text11012002) THEN
+          REPORT.RUNMODAL(REPORT::"Import Data From XML File");
+        //**4PS.en
+        CompanyInitialize.RUN;
+        COMMIT;
+        CLEAR(CompanyInitialize);
+      END;
+
+      IF Profile.ISEMPTY THEN BEGIN
+        ConfPersonalizationMgt.RUN;
+        COMMIT;
+        CLEAR(ConfPersonalizationMgt);
+      END;
+
+      LogInDate := TODAY;
+      LogInTime := TIME;
+      LogInWorkDate := 0D;
+
+      WORKDATE := GetDefaultWorkDate;
+
+      //**4PS.sn
+      IF GLSetup."Force Setting Work Date" THEN BEGIN
+        WorkDatePage.LOOKUPMODE(TRUE);
+        WorkDatePage.RUNMODAL;
+      END;
+      //**4PS.en
+
+      SetupMyCustomer;
+      SetupMyItem;
+      SetupMyVendor;
+    END;
+
+    LOCAL PROCEDURE LogInEnd@4();
+    VAR
+      UserSetup@1000 : Record 91;
+      UserTimeRegister@1001 : Record 51;
+      LogOutDate@1002 : Date;
+      LogOutTime@1003 : Time;
+      Minutes@1004 : Integer;
+      UserSetupFound@1005 : Boolean;
+      RegisterTime@1006 : Boolean;
+      RepUsageMgt@1100529900 : Codeunit 11012362;
+    BEGIN
+      IF LogInWorkDate <> 0D THEN
+        IF LogInWorkDate = LogInDate THEN
+          WORKDATE := TODAY
+        ELSE
+          WORKDATE := LogInWorkDate;
+
+      IF LogInDate <> 0D THEN BEGIN //**4PS.n call 17229; remove check as soon as platform fix is released f.e. NAV2009SP2
+        IF USERID <> '' THEN BEGIN
+          IF UserSetup.GET(USERID) THEN BEGIN
+            UserSetupFound := TRUE;
+            RegisterTime := UserSetup."Register Time";
+          END;
+          IF NOT UserSetupFound THEN
+            IF GetGLSetup THEN
+              RegisterTime := GLSetup."Register Time";
+          IF RegisterTime THEN BEGIN
+            LogOutDate := TODAY;
+            LogOutTime := TIME;
+            IF (LogOutDate > LogInDate) OR (LogOutDate = LogInDate) AND (LogOutTime > LogInTime) THEN
+              Minutes := ROUND((1440 * (LogOutDate - LogInDate)) + ((LogOutTime - LogInTime) / 60000),1);
+            IF Minutes = 0 THEN
+              Minutes := 1;
+            UserTimeRegister.INIT;
+            UserTimeRegister."User ID" := USERID;
+            UserTimeRegister.Date := LogInDate;
+            IF UserTimeRegister.FIND THEN BEGIN
+              UserTimeRegister.Minutes := UserTimeRegister.Minutes + Minutes;
+              UserTimeRegister.MODIFY;
+            END ELSE BEGIN
+              UserTimeRegister.Minutes := Minutes;
+              UserTimeRegister.INSERT;
+            END;
+          END;
+        END;
+      END; //**4PS.n
+
+
+      //**4PS.sn DJN DP00309
+      RepUsageMgt.SaveUsage;
+      CLEAR(RepUsageMgt);
+      //**4PS.en DJN
+    END;
+
+    LOCAL PROCEDURE IsDemoCompany@11() : Boolean;
+    BEGIN
+      EXIT(STRPOS(COMPANYNAME,CronusTxt) = 1)
+    END;
+
+    LOCAL PROCEDURE GetGLSetup@5() : Boolean;
+    BEGIN
+      IF NOT GLSetupRead THEN
+        GLSetupRead := GLSetup.GET;
+      EXIT(GLSetupRead);
+    END;
+
+    PROCEDURE GetDefaultWorkDate@6() : Date;
+    VAR
+      GLEntry@1000 : Record 17;
+      OK@1001 : Boolean;
+    BEGIN
+      IF IsDemoCompany THEN
+        IF GLEntry.READPERMISSION THEN BEGIN
+          GLEntry.SETCURRENTKEY("G/L Account No.","Posting Date");
+          OK := TRUE;
+          REPEAT
+            GLEntry.SETFILTER("G/L Account No.",'>%1',GLEntry."G/L Account No.");
+            GLEntry.SETFILTER("Posting Date",'>%1',GLEntry."Posting Date");
+            IF GLEntry.FINDFIRST THEN BEGIN
+              GLEntry.SETRANGE("G/L Account No.",GLEntry."G/L Account No.");
+              GLEntry.SETRANGE("Posting Date");
+              GLEntry.FINDLAST;
+            END ELSE
+              OK := FALSE
+          UNTIL NOT OK;
+          IF NOT (GLEntry."Posting Date" IN [0D,WORKDATE]) THEN BEGIN
+            LogInWorkDate := WORKDATE;
+            EXIT(NORMALDATE(GLEntry."Posting Date"));
+          END;
+        END;
+      EXIT(WORKDATE);
+    END;
+
+    LOCAL PROCEDURE SetupMyCustomer@7();
+    VAR
+      Customer@1000 : Record 18;
+      MyCustomer@1001 : Record 9150;
+      MaxCustomersToAdd@1002 : Integer;
+      I@1003 : Integer;
+    BEGIN
+      IF NOT IsDemoCompany THEN
+        EXIT;
+      MyCustomer.SETRANGE("User ID",USERID);
+      IF NOT MyCustomer.ISEMPTY THEN
+        EXIT;
+      I := 0;
+      MaxCustomersToAdd := 5;
+      Customer.SETFILTER(Balance,'<>0');
+      IF Customer.FINDSET THEN
+        REPEAT
+          I += 1;
+          MyCustomer."User ID" := USERID;
+          MyCustomer."Customer No." := Customer."No.";
+          IF MyCustomer.INSERT THEN;
+        UNTIL (Customer.NEXT = 0) OR (I >= MaxCustomersToAdd);
+    END;
+
+    LOCAL PROCEDURE SetupMyItem@8();
+    VAR
+      Item@1000 : Record 27;
+      MyItem@1001 : Record 9152;
+      MaxItemsToAdd@1002 : Integer;
+      I@1003 : Integer;
+    BEGIN
+      IF NOT IsDemoCompany THEN
+        EXIT;
+      MyItem.SETRANGE("User ID",USERID);
+      IF NOT MyItem.ISEMPTY THEN
+        EXIT;
+      I := 0;
+      MaxItemsToAdd := 5;
+
+      Item.SETFILTER("Unit Price",'<>0');
+      IF Item.FINDSET THEN
+        REPEAT
+          I += 1;
+          MyItem."User ID" := USERID;
+          MyItem."Item No." := Item."No.";
+          IF MyItem.INSERT THEN;
+        UNTIL (Item.NEXT = 0) OR (I >= MaxItemsToAdd);
+    END;
+
+    LOCAL PROCEDURE SetupMyVendor@9();
+    VAR
+      Vendor@1000 : Record 23;
+      MyVendor@1001 : Record 9151;
+      MaxVendorsToAdd@1002 : Integer;
+      I@1003 : Integer;
+    BEGIN
+      IF NOT IsDemoCompany THEN
+        EXIT;
+      MyVendor.SETRANGE("User ID",USERID);
+      IF NOT MyVendor.ISEMPTY THEN
+        EXIT;
+      I := 0;
+      MaxVendorsToAdd := 5;
+      Vendor.SETFILTER(Balance,'<>0');
+      IF Vendor.FINDSET THEN
+        REPEAT
+          I += 1;
+          MyVendor."User ID" := USERID;
+          MyVendor."Vendor No." := Vendor."No.";
+          IF MyVendor.INSERT THEN;
+        UNTIL (Vendor.NEXT = 0) OR (I >= MaxVendorsToAdd);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

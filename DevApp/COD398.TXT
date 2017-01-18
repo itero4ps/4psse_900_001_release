@@ -1,0 +1,484 @@
+OBJECT Codeunit 398 Sales Tax Calculate
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW17.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1000 : TextConst 'ENU=%1 in %2 %3 must be filled in with unique values when %4 is %5.';
+      Text001@1001 : TextConst 'ENU="The sales tax amount for the %1 %2 and the %3 %4 is incorrect. "';
+      Text003@1002 : TextConst 'ENU=Lines is not initialized';
+      Text004@1003 : TextConst 'ENU=The calculated sales tax amount is %5, but was supposed to be %6.';
+      TaxArea@1004 : Record 318;
+      TaxAreaLine@1005 : Record 319;
+      TaxDetail@1006 : Record 322;
+      TMPTaxDetail@1007 : TEMPORARY Record 322;
+      ExchangeFactor@1008 : Decimal;
+      TotalTaxAmountRounding@1009 : Decimal;
+      TotalForAllocation@1010 : Decimal;
+      RemainingTaxDetails@1011 : Integer;
+      LastCalculationOrder@1012 : Integer;
+      Initialised@1013 : Boolean;
+      FirstLine@1014 : Boolean;
+      TaxOnTaxCalculated@1015 : Boolean;
+      CalculationOrderViolation@1016 : Boolean;
+
+    PROCEDURE CalculateTax@3(TaxAreaCode@1001 : Code[20];TaxGroupCode@1002 : Code[10];TaxLiable@1003 : Boolean;Date@1004 : Date;Amount@1005 : Decimal;Quantity@1006 : Decimal;ExchangeRate@1007 : Decimal) TaxAmount@1000 : Decimal;
+    VAR
+      MaxAmount@1008 : Decimal;
+      TaxBaseAmount@1009 : Decimal;
+    BEGIN
+      TaxAmount := 0;
+
+      IF NOT TaxLiable OR (TaxAreaCode = '') OR (TaxGroupCode = '') OR
+         ((Amount = 0) AND (Quantity = 0))
+      THEN
+        EXIT;
+
+      IF ExchangeRate = 0 THEN
+        ExchangeFactor := 1
+      ELSE
+        ExchangeFactor := ExchangeRate;
+
+      Amount := Amount / ExchangeFactor;
+
+      TaxAreaLine.SETCURRENTKEY("Tax Area","Calculation Order");
+      TaxAreaLine.SETRANGE("Tax Area",TaxAreaCode);
+      IF TaxAreaLine.FIND('+') THEN BEGIN
+        LastCalculationOrder := TaxAreaLine."Calculation Order" + 1;
+        TaxOnTaxCalculated := FALSE;
+        CalculationOrderViolation := FALSE;
+        REPEAT
+          IF TaxAreaLine."Calculation Order" >= LastCalculationOrder THEN
+            CalculationOrderViolation := TRUE
+          ELSE
+            LastCalculationOrder := TaxAreaLine."Calculation Order";
+          TaxDetail.RESET;
+          TaxDetail.SETRANGE("Tax Jurisdiction Code",TaxAreaLine."Tax Jurisdiction Code");
+          IF TaxGroupCode = '' THEN
+            TaxDetail.SETFILTER("Tax Group Code",'%1',TaxGroupCode)
+          ELSE
+            TaxDetail.SETFILTER("Tax Group Code",'%1|%2','',TaxGroupCode);
+          IF Date = 0D THEN
+            TaxDetail.SETFILTER("Effective Date",'<=%1',WORKDATE)
+          ELSE
+            TaxDetail.SETFILTER("Effective Date",'<=%1',Date);
+          TaxDetail.SETRANGE("Tax Type",TaxDetail."Tax Type"::"Sales Tax");
+          IF TaxDetail.FINDLAST THEN BEGIN
+            TaxOnTaxCalculated := TaxOnTaxCalculated OR TaxDetail."Calculate Tax on Tax";
+            IF TaxDetail."Calculate Tax on Tax" THEN
+              TaxBaseAmount := Amount + TaxAmount
+            ELSE
+              TaxBaseAmount := Amount;
+            IF (ABS(TaxBaseAmount) <= TaxDetail."Maximum Amount/Qty.") OR
+               (TaxDetail."Maximum Amount/Qty." = 0)
+            THEN
+              TaxAmount := TaxAmount + TaxBaseAmount * TaxDetail."Tax Below Maximum" / 100
+            ELSE BEGIN
+              MaxAmount := TaxBaseAmount / ABS(TaxBaseAmount) * TaxDetail."Maximum Amount/Qty.";
+              TaxAmount :=
+                TaxAmount + ((MaxAmount * TaxDetail."Tax Below Maximum") +
+                             ((TaxBaseAmount - MaxAmount) * TaxDetail."Tax Above Maximum")) / 100;
+            END;
+          END;
+          TaxDetail.SETRANGE("Tax Type",TaxDetail."Tax Type"::"Excise Tax");
+          IF TaxDetail.FINDLAST THEN BEGIN
+            IF (ABS(Quantity) <= TaxDetail."Maximum Amount/Qty.") OR
+               (TaxDetail."Maximum Amount/Qty." = 0)
+            THEN
+              TaxAmount := TaxAmount + Quantity * TaxDetail."Tax Below Maximum"
+            ELSE BEGIN
+              MaxAmount := Quantity / ABS(Quantity) * TaxDetail."Maximum Amount/Qty.";
+              TaxAmount :=
+                TaxAmount + (MaxAmount * TaxDetail."Tax Below Maximum") +
+                ((Quantity - MaxAmount) * TaxDetail."Tax Above Maximum");
+            END;
+          END;
+        UNTIL TaxAreaLine.NEXT(-1) = 0;
+        TaxAmount := TaxAmount * ExchangeFactor;
+
+        IF TaxOnTaxCalculated AND CalculationOrderViolation THEN
+          ERROR(
+            Text000,
+            TaxAreaLine.FIELDCAPTION("Calculation Order"),TaxArea.TABLECAPTION,TaxAreaLine."Tax Area",
+            TaxDetail.FIELDCAPTION("Calculate Tax on Tax"),CalculationOrderViolation);
+      END;
+    END;
+
+    PROCEDURE ReverseCalculateTax@4(TaxAreaCode@1001 : Code[20];TaxGroupCode@1002 : Code[10];TaxLiable@1003 : Boolean;Date@1004 : Date;TotalAmount@1005 : Decimal;Quantity@1006 : Decimal;ExchangeRate@1007 : Decimal) Amount@1000 : Decimal;
+    VAR
+      Inclination@1008 : ARRAY [10] OF Decimal;
+      Constant@1009 : ARRAY [10] OF Decimal;
+      MaxRangeAmount@1010 : ARRAY [10] OF Decimal;
+      MaxTaxAmount@1011 : Decimal;
+      i@1012 : Integer;
+      j@1013 : Integer;
+      Steps@1014 : Integer;
+      InclinationLess@1015 : Decimal;
+      InclinationHigher@1016 : Decimal;
+      ConstantHigher@1017 : Decimal;
+      SplitAmount@1018 : Decimal;
+      MaxAmount@1019 : Decimal;
+      Inserted@1020 : Boolean;
+      Found@1021 : Boolean;
+    BEGIN
+      Amount := TotalAmount;
+
+      IF NOT TaxLiable OR (TaxAreaCode = '') OR (TaxGroupCode = '') OR
+         ((Amount = 0) AND (Quantity = 0))
+      THEN
+        EXIT;
+
+      IF ExchangeRate = 0 THEN
+        ExchangeFactor := 1
+      ELSE
+        ExchangeFactor := ExchangeRate;
+
+      TotalAmount := TotalAmount / ExchangeFactor;
+
+      TaxAreaLine.SETCURRENTKEY("Tax Area","Calculation Order");
+      TaxAreaLine.SETRANGE("Tax Area",TaxAreaCode);
+      Steps := 1;
+      CLEAR(Inclination);
+      CLEAR(Constant);
+      CLEAR(MaxRangeAmount);
+      IF TaxAreaLine.FIND('+') THEN BEGIN
+        LastCalculationOrder := TaxAreaLine."Calculation Order" + 1;
+        TaxOnTaxCalculated := FALSE;
+        CalculationOrderViolation := FALSE;
+        REPEAT
+          IF TaxAreaLine."Calculation Order" >= LastCalculationOrder THEN
+            CalculationOrderViolation := TRUE
+          ELSE
+            LastCalculationOrder := TaxAreaLine."Calculation Order";
+          TaxDetail.RESET;
+          TaxDetail.SETRANGE("Tax Jurisdiction Code",TaxAreaLine."Tax Jurisdiction Code");
+          IF TaxGroupCode = '' THEN
+            TaxDetail.SETFILTER("Tax Group Code",'%1',TaxGroupCode)
+          ELSE
+            TaxDetail.SETFILTER("Tax Group Code",'%1|%2','',TaxGroupCode);
+          IF Date = 0D THEN
+            TaxDetail.SETFILTER("Effective Date",'<=%1',WORKDATE)
+          ELSE
+            TaxDetail.SETFILTER("Effective Date",'<=%1',Date);
+          TaxDetail.SETRANGE("Tax Type",TaxDetail."Tax Type"::"Sales Tax");
+          IF TaxDetail.FINDLAST THEN BEGIN
+            TaxOnTaxCalculated := TaxOnTaxCalculated OR TaxDetail."Calculate Tax on Tax";
+            InclinationLess := TaxDetail."Tax Below Maximum" / 100;
+            InclinationHigher := TaxDetail."Tax Above Maximum" / 100;
+
+            IF TaxDetail."Maximum Amount/Qty." = 0 THEN BEGIN
+              FOR i := 1 TO Steps DO
+                IF TaxDetail."Calculate Tax on Tax" THEN BEGIN
+                  Inclination[i] := Inclination[i] + (1 + Inclination[i]) * InclinationLess;
+                  Constant[i] := (1 + InclinationLess) * Constant[i];
+                END ELSE
+                  Inclination[i] := Inclination[i] + InclinationLess;
+            END ELSE BEGIN
+              IF TaxDetail."Calculate Tax on Tax" THEN BEGIN
+                ConstantHigher :=
+                  (TaxDetail."Tax Below Maximum" - TaxDetail."Tax Above Maximum") / 100 *
+                  TaxDetail."Maximum Amount/Qty.";
+                i := 1;
+                Found := FALSE;
+                WHILE i < Steps DO BEGIN
+                  MaxTaxAmount := (1 + Inclination[i]) * MaxRangeAmount[i] + Constant[i];
+                  IF ABS(TaxDetail."Maximum Amount/Qty.") < MaxTaxAmount THEN BEGIN
+                    SplitAmount :=
+                      (ABS(TaxDetail."Maximum Amount/Qty.") / TaxDetail."Maximum Amount/Qty.") *
+                      ((ABS(TaxDetail."Maximum Amount/Qty.") - Constant[i]) / (1 + Inclination[i]));
+                    i := Steps;
+                    Found := TRUE;
+                  END;
+                  i := i + 1;
+                END;
+                IF NOT Found THEN
+                  SplitAmount :=
+                    (ABS(TaxDetail."Maximum Amount/Qty.") / TaxDetail."Maximum Amount/Qty.") *
+                    (ABS(TaxDetail."Maximum Amount/Qty.") - Constant[Steps]) / (1 + Inclination[Steps]);
+              END ELSE BEGIN
+                ConstantHigher :=
+                  (TaxDetail."Tax Below Maximum" - TaxDetail."Tax Above Maximum") / 100 *
+                  TaxDetail."Maximum Amount/Qty.";
+                SplitAmount := TaxDetail."Maximum Amount/Qty.";
+              END;
+              i := 1;
+              Inserted := FALSE;
+              WHILE i <= Steps DO BEGIN
+                CASE TRUE OF
+                  (MaxRangeAmount[i] < SplitAmount) AND (MaxRangeAmount[i] > 0):
+                    BEGIN
+                      IF TaxDetail."Calculate Tax on Tax" THEN BEGIN
+                        Inclination[i] := Inclination[i] + (1 + Inclination[i]) * InclinationLess;
+                        Constant[i] := (1 + InclinationLess) * Constant[i];
+                      END ELSE
+                        Inclination[i] := Inclination[i] + InclinationLess;
+                    END;
+                  MaxRangeAmount[i] = SplitAmount:
+                    BEGIN
+                      IF TaxDetail."Calculate Tax on Tax" THEN BEGIN
+                        Inclination[i] := Inclination[i] + (1 + Inclination[i]) * InclinationLess;
+                        Constant[i] := (1 + InclinationLess) * Constant[i];
+                      END ELSE
+                        Inclination[i] := Inclination[i] + InclinationLess;
+                      Inserted := TRUE;
+                    END;
+                  (MaxRangeAmount[i] > SplitAmount) OR (MaxRangeAmount[i] = 0):
+                    BEGIN
+                      IF Inserted THEN BEGIN
+                        IF TaxDetail."Calculate Tax on Tax" THEN BEGIN
+                          Inclination[i] := Inclination[i] + (1 + Inclination[i]) * InclinationHigher;
+                          Constant[i] := (1 + InclinationHigher) * Constant[i];
+                        END ELSE
+                          Inclination[i] := Inclination[i] + InclinationHigher;
+                        Constant[i] := Constant[i] + ConstantHigher;
+                      END ELSE BEGIN
+                        Steps := Steps + 1;
+                        FOR j := Steps DOWNTO i + 1 DO BEGIN
+                          Inclination[j] := Inclination[j - 1];
+                          Constant[j] := Constant[j - 1];
+                          MaxRangeAmount[j] := MaxRangeAmount[j - 1];
+                        END;
+                        IF TaxDetail."Calculate Tax on Tax" THEN BEGIN
+                          Inclination[i] := Inclination[i] + (1 + Inclination[i]) * InclinationLess;
+                          Constant[i] := (1 + InclinationLess) * Constant[i];
+                        END ELSE
+                          Inclination[i] := Inclination[i] + InclinationLess;
+                        MaxRangeAmount[i] := SplitAmount;
+                        Inserted := TRUE;
+                      END;
+                    END;
+                END;
+                i := i + 1;
+              END;
+            END;
+          END;
+          TaxDetail.SETRANGE("Tax Type",TaxDetail."Tax Type"::"Excise Tax");
+          IF TaxDetail.FINDLAST THEN BEGIN
+            IF (ABS(Quantity) <= TaxDetail."Maximum Amount/Qty.") OR
+               (TaxDetail."Maximum Amount/Qty." = 0)
+            THEN
+              ConstantHigher := Quantity * TaxDetail."Tax Below Maximum"
+            ELSE BEGIN
+              MaxAmount := Quantity / ABS(Quantity) * TaxDetail."Maximum Amount/Qty.";
+              ConstantHigher :=
+                (MaxAmount * TaxDetail."Tax Below Maximum") +
+                ((Quantity - MaxAmount) * TaxDetail."Tax Above Maximum");
+            END;
+            ConstantHigher := ABS(ConstantHigher);
+
+            FOR i := 1 TO Steps DO
+              Constant[i] := Constant[i] + ConstantHigher;
+          END;
+        UNTIL TaxAreaLine.NEXT(-1) = 0;
+
+        IF TaxOnTaxCalculated AND CalculationOrderViolation THEN
+          ERROR(
+            Text000,
+            TaxAreaLine.FIELDCAPTION("Calculation Order"),TaxArea.TABLECAPTION,TaxAreaLine."Tax Area",
+            TaxDetail.FIELDCAPTION("Calculate Tax on Tax"),CalculationOrderViolation);
+      END;
+
+      i := 1;
+      Found := FALSE;
+      WHILE i < Steps DO BEGIN
+        MaxTaxAmount := (1 + Inclination[i]) * MaxRangeAmount[i] + Constant[i];
+        IF ABS(TotalAmount) < MaxTaxAmount THEN BEGIN
+          IF TotalAmount = 0 THEN
+            Amount := 0
+          ELSE
+            Amount :=
+              (ABS(TotalAmount) / TotalAmount) *
+              ((ABS(TotalAmount) - Constant[i]) / (1 + Inclination[i]));
+          i := Steps;
+          Found := TRUE;
+        END;
+        i := i + 1;
+      END;
+
+      IF NOT Found THEN
+        IF TotalAmount = 0 THEN
+          Amount := 0
+        ELSE
+          Amount :=
+            (ABS(TotalAmount) / TotalAmount) *
+            (ABS(TotalAmount) - Constant[Steps]) / (1 + Inclination[Steps]);
+
+      Amount := Amount * ExchangeFactor;
+    END;
+
+    PROCEDURE InitSalesTaxLines@6(TaxAreaCode@1000 : Code[20];TaxGroupCode@1001 : Code[10];TaxLiable@1002 : Boolean;Amount@1003 : Decimal;Quantity@1004 : Decimal;Date@1005 : Date;DesiredTaxAmount@1006 : Decimal);
+    VAR
+      GenJnlLine@1007 : Record 81;
+      MaxAmount@1009 : Decimal;
+      TaxAmount@1010 : Decimal;
+      AddedTaxAmount@1011 : Decimal;
+      TaxBaseAmount@1012 : Decimal;
+    BEGIN
+      TaxAmount := 0;
+
+      Initialised := TRUE;
+      FirstLine := TRUE;
+      TMPTaxDetail.DELETEALL;
+
+      RemainingTaxDetails := 0;
+
+      IF (TaxAreaCode = '') OR (TaxGroupCode = '') THEN
+        EXIT;
+
+      TaxAreaLine.SETCURRENTKEY("Tax Area","Calculation Order");
+      TaxAreaLine.SETRANGE("Tax Area",TaxAreaCode);
+      IF TaxAreaLine.FIND('+') THEN BEGIN
+        LastCalculationOrder := TaxAreaLine."Calculation Order" + 1;
+        TaxOnTaxCalculated := FALSE;
+        CalculationOrderViolation := FALSE;
+        REPEAT
+          IF TaxAreaLine."Calculation Order" >= LastCalculationOrder THEN
+            CalculationOrderViolation := TRUE
+          ELSE
+            LastCalculationOrder := TaxAreaLine."Calculation Order";
+          TaxDetail.RESET;
+          TaxDetail.SETRANGE("Tax Jurisdiction Code",TaxAreaLine."Tax Jurisdiction Code");
+          IF TaxGroupCode = '' THEN
+            TaxDetail.SETFILTER("Tax Group Code",'%1',TaxGroupCode)
+          ELSE
+            TaxDetail.SETFILTER("Tax Group Code",'%1|%2','',TaxGroupCode);
+          IF Date = 0D THEN
+            TaxDetail.SETFILTER("Effective Date",'<=%1',WORKDATE)
+          ELSE
+            TaxDetail.SETFILTER("Effective Date",'<=%1',Date);
+          TaxDetail.SETRANGE("Tax Type",TaxDetail."Tax Type"::"Sales Tax");
+          IF TaxDetail.FINDLAST AND ((TaxDetail."Tax Below Maximum" <> 0) OR (TaxDetail."Tax Above Maximum" <> 0)) THEN BEGIN
+            TaxOnTaxCalculated := TaxOnTaxCalculated OR TaxDetail."Calculate Tax on Tax";
+            IF TaxDetail."Calculate Tax on Tax" THEN
+              TaxBaseAmount := Amount + TaxAmount
+            ELSE
+              TaxBaseAmount := Amount;
+            IF TaxLiable THEN BEGIN
+              IF (ABS(TaxBaseAmount) <= TaxDetail."Maximum Amount/Qty.") OR
+                 (TaxDetail."Maximum Amount/Qty." = 0)
+              THEN
+                AddedTaxAmount := TaxBaseAmount * TaxDetail."Tax Below Maximum" / 100
+              ELSE BEGIN
+                MaxAmount := TaxBaseAmount / ABS(TaxBaseAmount) * TaxDetail."Maximum Amount/Qty.";
+                AddedTaxAmount :=
+                  ((MaxAmount * TaxDetail."Tax Below Maximum") +
+                   ((TaxBaseAmount - MaxAmount) * TaxDetail."Tax Above Maximum")) / 100;
+              END;
+            END ELSE
+              AddedTaxAmount := 0;
+            TaxAmount := TaxAmount + AddedTaxAmount;
+            TMPTaxDetail := TaxDetail;
+            TMPTaxDetail."Tax Below Maximum" := AddedTaxAmount;
+            TMPTaxDetail."Tax Above Maximum" := TaxBaseAmount;
+            TMPTaxDetail.INSERT;
+            RemainingTaxDetails := RemainingTaxDetails + 1;
+          END;
+          TaxDetail.SETRANGE("Tax Type",TaxDetail."Tax Type"::"Excise Tax");
+          IF TaxDetail.FINDLAST AND ((TaxDetail."Tax Below Maximum" <> 0) OR (TaxDetail."Tax Above Maximum" <> 0)) THEN BEGIN
+            IF TaxLiable THEN BEGIN
+              IF (ABS(Quantity) <= TaxDetail."Maximum Amount/Qty.") OR
+                 (TaxDetail."Maximum Amount/Qty." = 0)
+              THEN
+                AddedTaxAmount := Quantity * TaxDetail."Tax Below Maximum"
+              ELSE BEGIN
+                MaxAmount := Quantity / ABS(Quantity) * TaxDetail."Maximum Amount/Qty.";
+                AddedTaxAmount :=
+                  (MaxAmount * TaxDetail."Tax Below Maximum") +
+                  ((Quantity - MaxAmount) * TaxDetail."Tax Above Maximum");
+              END;
+            END ELSE
+              AddedTaxAmount := 0;
+            TaxAmount := TaxAmount + AddedTaxAmount;
+            TMPTaxDetail := TaxDetail;
+            TMPTaxDetail."Tax Below Maximum" := AddedTaxAmount;
+            TMPTaxDetail."Tax Above Maximum" := TaxBaseAmount;
+            TMPTaxDetail.INSERT;
+            RemainingTaxDetails := RemainingTaxDetails + 1;
+          END;
+        UNTIL TaxAreaLine.NEXT(-1) = 0;
+
+        TaxAmount := ROUND(TaxAmount);
+
+        IF (TaxAmount <> DesiredTaxAmount) AND (ABS(TaxAmount - DesiredTaxAmount) <= 0.01) THEN
+          IF TMPTaxDetail.FIND('-') THEN BEGIN
+            TMPTaxDetail."Tax Below Maximum" :=
+              TMPTaxDetail."Tax Below Maximum" - TaxAmount + DesiredTaxAmount;
+            TMPTaxDetail.MODIFY;
+            TaxAmount := DesiredTaxAmount;
+          END;
+
+        IF TaxOnTaxCalculated AND CalculationOrderViolation THEN
+          ERROR(
+            Text000,
+            TaxAreaLine.FIELDCAPTION("Calculation Order"),TaxArea.TABLECAPTION,TaxAreaLine."Tax Area",
+            TaxDetail.FIELDCAPTION("Calculate Tax on Tax"),CalculationOrderViolation);
+      END;
+
+      IF TaxAmount <> DesiredTaxAmount THEN
+        ERROR(
+          Text001 +
+          Text004,
+          TaxAreaCode,GenJnlLine.FIELDCAPTION("Tax Area Code"),
+          TaxGroupCode,GenJnlLine.FIELDCAPTION("Tax Group Code"),
+          TaxAmount,DesiredTaxAmount);
+
+      TotalForAllocation := DesiredTaxAmount;
+    END;
+
+    PROCEDURE GetSalesTaxLine@5(VAR TaxDetail2@1000 : Record 322;VAR ReturnTaxAmount@1001 : Decimal;VAR ReturnTaxBaseAmount@1002 : Decimal) : Boolean;
+    VAR
+      TaxAmount@1003 : Decimal;
+    BEGIN
+      ReturnTaxAmount := 0;
+
+      IF NOT Initialised THEN
+        ERROR(Text003);
+
+      IF FirstLine THEN BEGIN
+        IF NOT TMPTaxDetail.FIND('-') THEN BEGIN
+          Initialised := FALSE;
+          EXIT(FALSE);
+        END;
+        TotalTaxAmountRounding := 0;
+        FirstLine := FALSE;
+      END ELSE
+        IF TMPTaxDetail.NEXT = 0 THEN BEGIN
+          Initialised := FALSE;
+          EXIT(FALSE);
+        END;
+
+      ReturnTaxBaseAmount := ROUND(TMPTaxDetail."Tax Above Maximum");
+
+      TaxAmount := TMPTaxDetail."Tax Below Maximum";
+      ReturnTaxAmount := ROUND(TaxAmount + TotalTaxAmountRounding);
+      TotalTaxAmountRounding := TaxAmount + TotalTaxAmountRounding - ReturnTaxAmount;
+
+      IF RemainingTaxDetails = 0 THEN
+        TaxAmount := TotalForAllocation
+      ELSE
+        IF ABS(TaxAmount) > ABS(TotalForAllocation) THEN
+          TaxAmount := TotalForAllocation;
+
+      TotalForAllocation := TotalForAllocation - TaxAmount;
+
+      TaxDetail2 := TMPTaxDetail;
+
+      EXIT(TRUE);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

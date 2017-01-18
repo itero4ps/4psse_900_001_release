@@ -1,0 +1,898 @@
+OBJECT Codeunit 11020501 Post Plant Transport Order
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=11020505;
+    Permissions=TableData 11020507=ri,
+                TableData 11020508=ri;
+    OnRun=VAR
+            lvTransOrderRec2@1100485000 : Record 11020505;
+          BEGIN
+            lvTransOrderRec2.COPY(Rec);
+            RunPostTransportOrder(lvTransOrderRec2, FALSE);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@11012007 : TextConst 'ENU=Posting not allowed. There are no Transport Costs and no Plant Orders present on %1 ''%2''.';
+      TransOrderRec@11012001 : Record 11020505;
+      TransCostLineRec@11012002 : Record 11020506;
+      TransPlantOrderRec@1100485005 : Record 11020509;
+      LinkedTransOrdersRec@1100485011 : Record 11020514;
+      PostedTransOrderRec@1100485002 : Record 11020507;
+      PostedTransCostLineRec@1100485003 : Record 11020508;
+      PostedLinkedTransOrdersRec@1100485012 : Record 11020515;
+      PlantOrderRec@1100485004 : Record 11012556;
+      Text001@1100485001 : TextConst 'ENU=Total Percentage is not 100, in %1 ''%2''';
+      Text002@1100485006 : TextConst 'ENU=''%1'' not present on the %2';
+      TransRideRec@1100485000 : Record 11020517;
+      TransRideLineRec@1100485013 : Record 11020518;
+      ExtraTransCostSalesOrderActive@1100485018 : Boolean;
+      MainTOStatusInvoiced@1100485010 : Option;
+      DummyMaxDateDiff@1100485007 : Integer;
+      Text003@1100485008 : TextConst 'ENU=No plant order(s) present on the transport order. Continue?';
+      Text004@1100485009 : TextConst 'ENU=Transport order ''%1'' is a linked transport order, Transport costs must be posted with transport order ''%2''.';
+      Text005@1100485014 : TextConst 'ENU=%1 not equal to total of the Transport Orders, first distribute cost.';
+      Text006@1100485015 : TextConst 'ENU=Transport Order %1 is linked to Transport Order %2, Ttransport Order %3 is not present on thie Ride Number.\ \Note: All linked Transport Orders must be present on the same Ride.';
+      Text007@1100485016 : TextConst 'ENU=No Transportorders present on Ride No. %1.';
+      Text008@1100485017 : TextConst 'ENU=Transport Order ''%1'' is linked to Ride ''%2'', Ride is not yet released .';
+      PlantOrderNoSRO@1100485019 : Code[20];
+      Text009@1100525000 : TextConst 'ENU=Plant Orders on Transport Orders of Ride ''%1'' not present on Ride.';
+      Text010@1100525001 : TextConst 'ENU=Plant Orders of Ride ''%1'' not present on Transport Orders of Ride.';
+      Text011@1100525002 : TextConst 'ENU=Plant Order(s):';
+      Text012@1210190000 : TextConst 'ENU=Nothing to post, no released transport order present.';
+      Text013@1210190001 : TextConst 'ENU=Plant Orders of %1 (of %2) released transport orders posted.';
+      Text014@1210190002 : TextConst 'ENU=So not all plant orders are posted yet.';
+
+    PROCEDURE RunReleaseTransportRide@1100485005(VAR Rec@1100485000 : Record 11020517);
+    VAR
+      lvTransOrderRec@1100485003 : Record 11020505;
+      lvPostedTransOrderRec@1100525000 : Record 11020507;
+      lvDummyDiff@1100485001 : Integer;
+    BEGIN
+      TransRideRec.COPY(Rec);
+
+      WITH TransRideRec DO BEGIN
+        //* Moet meerdere keren kunnen, dus ok als de status van de rit al op vrijgegeven staat. Het kan namelijk zo zijn dat
+        //* nog niet alle bijbehorende TO's in 1 keer alle vrijgegeven kunnen worden. Want vrijgeven van de TO is afhanklijk
+        //* van de status van de MO, bij afvoerorders zal dit in veel gevallen niet gelijk kunnen.
+        //* NB: Wel alleen de open TO's behandelen, dus niet TO vrijgeven als deze al vrijgegeven is.
+        IF Status > Status::Released THEN
+          FIELDERROR(Status);
+        CheckTransRideCommon();
+        CheckRidePOsMatchRideTOrderPOs("No.");
+
+        TransRideLineRec.RESET;
+        TransRideLineRec.SETRANGE("Ride No.", "No.");
+        IF TransRideLineRec.FINDSET(FALSE,FALSE) THEN BEGIN
+          REPEAT
+            IF NOT lvTransOrderRec.GET(TransRideLineRec."Transport Order No.") THEN BEGIN
+              IF NOT lvPostedTransOrderRec.GET(TransRideLineRec."Transport Order No.") THEN //* TO can already been posted (then OK)
+                lvTransOrderRec.GET(TransRideLineRec."Transport Order No.");  //* Error if TO not present
+            END ELSE BEGIN
+              IF lvTransOrderRec.Status < lvTransOrderRec.Status::Released THEN BEGIN
+                IF NOT CheckPlantOrdersStatusLessOnTO(lvTransOrderRec."No.", PlantOrderRec.Status::Released) THEN
+                  RunReleaseTransportOrder(lvTransOrderRec, lvDummyDiff);
+              END;
+            END;
+          UNTIL TransRideLineRec.NEXT = 0;
+        END;
+
+        Status:= Status::Released;
+        MODIFY;
+      END;
+
+      Rec := TransRideRec;
+    END;
+
+    PROCEDURE RunReleaseTransportOrder@1100485006(VAR Rec@1100485000 : Record 11020505;VAR OMaxDateDifferenceTOPO@1100485001 : Integer);
+    BEGIN
+      TransOrderRec.COPY(Rec);
+      OMaxDateDifferenceTOPO := 0;
+
+      WITH TransOrderRec DO BEGIN
+        IF Status >= Status::Released THEN
+          FIELDERROR(Status);
+        CheckTransOrderCommon(TransOrderRec, TRUE);
+
+        TransPlantOrderRec.RESET;
+        TransPlantOrderRec.SETRANGE("Transport Order No.", "No.");
+        IF TransPlantOrderRec.FIND('-') THEN BEGIN
+          REPEAT
+            CheckTransPlantorderLine(OMaxDateDifferenceTOPO);
+          UNTIL TransPlantOrderRec.NEXT = 0;
+        END;
+
+        Status:= Status::Released;
+        //
+        TransPlantOrderRec.RESET;
+        TransPlantOrderRec.SETRANGE("Transport Order No.", "No.");
+        IF TransPlantOrderRec.FIND('-') THEN BEGIN  //* If PO('s) on the TO
+          TransPlantOrderRec.SETFILTER("Status (PO)", '<>%1', TransPlantOrderRec."Status (PO)"::Posted);
+          IF NOT TransPlantOrderRec.FIND('-') THEN  //* If all PO's of the TO are posted
+            Status:= Status::"PO Posted";
+        END;
+        MODIFY;
+      END;
+
+      Rec := TransOrderRec;
+    END;
+
+    PROCEDURE RunResetReleaseTransportRide@1100485010(VAR Rec@1100485000 : Record 11020517);
+    BEGIN
+      TransRideRec.COPY(Rec);
+
+      WITH TransRideRec DO BEGIN
+        TESTFIELD(Status, Status::Released);
+
+        //* Niet de bijbehorende (vrijgegeven) TO's openen. Dit zal een vaak niet gewenste situatie zijn.
+        //* Indien gewenst kan men een afzonderlijke TO vrijgeven.
+
+        Status := Status::Open;
+        MODIFY;
+      END;
+
+      Rec := TransRideRec;
+    END;
+
+    PROCEDURE RunResetReleaseTransportOrder@1100485008(VAR Rec@1100485000 : Record 11020505);
+    BEGIN
+      TransOrderRec.COPY(Rec);
+
+      WITH TransOrderRec DO BEGIN
+        IF (Status <> Status::Released) THEN BEGIN
+          IF (Status <> Status::"PO Posted") THEN
+            TESTFIELD(Status, Status::Released);
+        END;
+
+        IF ("Transport Order Printed" = 0) THEN
+          Status := Status::Open
+        ELSE
+          Status := Status::Printed;
+
+        MODIFY;
+      END;
+
+      Rec := TransOrderRec;
+    END;
+
+    PROCEDURE RunPostTransRidePlantOrders@1100485017(VAR Rec@1100485000 : Record 11020518;MessMode@1210190000 : Boolean);
+    VAR
+      lvTransOrderRec@1100485001 : Record 11020505;
+      CounterTO@1210190001 : Integer;
+      CounterTO_PostedPO@1210190002 : Integer;
+    BEGIN
+      //* Vanuit rit alleen mogelijk voor vrijgegeven TO's en vrijgegeven MO's, rest wordt overgeslagen. Ook is het
+      //* mogelijk om MO's van specifieke TO's te boeken, dan moet dit voor aanroep geregeld worden (bv MarkedOnly).
+      //* Als men MO's gaat boeken vanuit de rit dan moet men wel goed weten wat men doet. Als bv een aanvoerorder of
+      //* een afvoerorder al worden geboekt voordat resp. de spullen gereed zijn gezet en wijzigingen picklijst zijn verwerkt
+      //* of spullen retour en gecontroleerd zijn, dan heeft men een probleem (dus MO zolang op 'Open' laten staan).
+      //* Er is bewust voor gekozen om op de rit bij de status niet de optie 'Verzonden' toe te voegen. Want niet alle
+      //* MO's hoeven al geboekt te zijn, aan de status van de ritregels (TO's) is te zien of alle MO's van al geboekt
+      //* zijn, de status van de TO staat dan op verzonden.
+      //* Het is mogelijk om alleen de aanvoerorder (ook overige verpl.) of alleen de afvoerorder (deze meestal later) te boeken,
+      //* voor aanroep moet dan een filter op veld 'Type (TO)' gezet zijn.
+
+      TransRideLineRec.COPY(Rec);
+
+      WITH TransRideLineRec DO BEGIN
+        TransRideRec.GET("Ride No.");
+        TransRideRec.TESTFIELD(Status, TransRideRec.Status::Released);
+        CheckRidePOsMatchRideTOrderPOs("Ride No.");
+
+        SETRANGE("Ride No.", TransRideRec."No."); //* Waarschijnlijk al voor aanroep gezet maar zeker zijn dat maar van 1 rit
+        SETRANGE("Status (TO)", "Status (TO)"::Released);
+        //*22597.sn
+        IF MessMode THEN BEGIN
+          IF TransRideLineRec.ISEMPTY THEN BEGIN
+            MESSAGE(Text012);
+            EXIT;
+          END;
+        END;
+        //*22597.en
+        IF TransRideLineRec.FINDSET(FALSE,FALSE) THEN BEGIN
+          REPEAT
+            CounterTO := CounterTO + 1;  //*22597.n
+            IF lvTransOrderRec.GET(TransRideLineRec."Transport Order No.") THEN BEGIN  //* 'IF', TO can already been posted
+              IF lvTransOrderRec.Status = lvTransOrderRec.Status::Released THEN BEGIN  //* Only for released (not posted) TO's
+                RunPostTransportPlantOrders(lvTransOrderRec, TRUE);
+                IF lvTransOrderRec.Status = lvTransOrderRec.Status::"PO Posted" THEN  //*22597.n
+                  CounterTO_PostedPO := CounterTO_PostedPO + 1;  //*22597.n
+              END;
+            END;
+          UNTIL TransRideLineRec.NEXT = 0;
+          //*22597.sn
+          IF MessMode THEN BEGIN
+            IF CounterTO_PostedPO <  CounterTO THEN
+              MESSAGE(Text013 + ' ' + Text014, CounterTO_PostedPO, CounterTO)
+            ELSE
+              MESSAGE(Text013, CounterTO_PostedPO, CounterTO);
+          END;
+          //*22597.en
+        END;
+      END;
+
+      Rec := TransRideLineRec;
+    END;
+
+    PROCEDURE RunPostTransportPlantOrders@1100485007(VAR Rec@1100485000 : Record 11020505;IRideProcessMode@1100485001 : Boolean);
+    BEGIN
+      TransOrderRec.COPY(Rec);
+
+      WITH TransOrderRec DO BEGIN
+        TESTFIELD(Status, Status::Released);
+        CheckTransOrderCommon(TransOrderRec, TRUE);
+
+        TransPlantOrderRec.RESET;
+        TransPlantOrderRec.SETRANGE("Transport Order No.", "No.");
+        IF NOT TransPlantOrderRec.FIND('-') THEN BEGIN
+          IF NOT IRideProcessMode THEN BEGIN
+            IF NOT CONFIRM(Text003, FALSE) THEN
+              ERROR('');
+          END;
+        END ELSE BEGIN
+          REPEAT
+            CheckTransPlantorderLine(DummyMaxDateDiff);  //* First check all.
+          UNTIL TransPlantOrderRec.NEXT = 0;
+        END;
+
+        TransPlantOrderRec.RESET;
+        TransPlantOrderRec.SETRANGE("Transport Order No.", "No.");
+        IF IRideProcessMode THEN
+          TransPlantOrderRec.SETRANGE("Status (PO)", TransPlantOrderRec."Status (PO)"::Released);
+        IF TransPlantOrderRec.FIND('-') THEN BEGIN
+          REPEAT
+            ProcessTransPlantorderLine();
+          UNTIL TransPlantOrderRec.NEXT = 0;
+        END;
+
+        TransPlantOrderRec.RESET;
+        TransPlantOrderRec.SETRANGE("Transport Order No.", "No.");
+        TransPlantOrderRec.SETFILTER("Status (PO)", '<>%1', TransPlantOrderRec."Status (PO)"::Posted);
+        IF NOT TransPlantOrderRec.FIND('-') THEN BEGIN  //* If all PO's of the TO are posted
+          Status:= Status::"PO Posted";
+          MODIFY;
+        END
+      END;
+
+      Rec := TransOrderRec;
+    END;
+
+    PROCEDURE RunPostTransportRide@1100485012(VAR Rec@1100485000 : Record 11020517);
+    VAR
+      lvTransOrderRec@1100485003 : Record 11020505;
+      lvPostedTransOrderRec@1100525000 : Record 11020507;
+    BEGIN
+      TransRideRec.COPY(Rec);
+
+      WITH TransRideRec DO BEGIN
+        TESTFIELD(Status, Status::Released);
+        CheckTransRideCommon();
+        CheckRidePOsMatchRideTOrderPOs("No.");
+
+        TransRideLineRec.RESET;
+        TransRideLineRec.SETRANGE("Ride No.", "No.");
+        IF TransRideLineRec.FINDSET(FALSE,FALSE) THEN BEGIN
+          REPEAT
+            IF NOT lvTransOrderRec.GET(TransRideLineRec."Transport Order No.") THEN BEGIN
+              IF NOT lvPostedTransOrderRec.GET(TransRideLineRec."Transport Order No.") THEN //* TO can already been posted (then OK)
+                lvTransOrderRec.GET(TransRideLineRec."Transport Order No.");  //* Error if TO not present
+            END ELSE BEGIN
+              lvTransOrderRec.CALCFIELDS("Invoice with Transport Order");
+              IF (lvTransOrderRec."Invoice with Transport Order" = '') THEN
+                RunPostTransportOrder(lvTransOrderRec, TRUE);
+
+              //TransRideLineRec."Posted (TO)" := TRUE;  //* Field must be set when the TO is posted
+              //TransRideLineRec.MODIFY;                 //* (now it is possible to posted one TO of a Ride)
+            END;
+          UNTIL TransRideLineRec.NEXT = 0;
+        END;
+
+        Posted := TRUE;
+        Status:= Status::Posted;
+        "Transport Cost" := TransRideLineRec.GetTotalRideOrderCost("No.",1);
+        "Load/Unload Cost" := TransRideLineRec.GetTotalRideOrderCost("No.",2);
+        MODIFY;
+      END;
+
+      Rec := TransRideRec;
+    END;
+
+    PROCEDURE RunPostTransportOrder@1100485011(VAR Rec@1100485001 : Record 11020505;IFromRideMode@1100485002 : Boolean);
+    VAR
+      lvTransOrderRec2@1100485000 : Record 11020505;
+      lvTransRideRec@1100525000 : Record 11020517;
+    BEGIN
+      TransOrderRec.COPY(Rec);
+      lvTransOrderRec2.COPY(TransOrderRec);
+
+      WITH TransOrderRec DO BEGIN
+        LOCKTABLE;
+        CheckStatusOnPostTransOrder();
+        CALCFIELDS("Invoice with Transport Order");
+        IF ("Invoice with Transport Order" <> '') THEN
+          ERROR(Text004, "No.", "Invoice with Transport Order");
+        IF (NOT IFromRideMode) AND ("Ride No." <> '') THEN BEGIN
+          IF lvTransRideRec.GET("Ride No.") THEN BEGIN
+            IF (NOT lvTransRideRec.Posted) AND (lvTransRideRec.Status <> lvTransRideRec.Status::Released) THEN
+              ERROR(Text008, "No.", "Ride No.");
+          END;
+        END;
+
+        LinkedTransOrdersRec.RESET;
+        LinkedTransOrdersRec.SETRANGE("Transport Order No.", "No.");
+        IF LinkedTransOrdersRec.FIND('-') THEN BEGIN
+          REPEAT
+            TransOrderRec.GET(LinkedTransOrdersRec."Linked Transport Order No.");
+            CheckStatusOnPostTransOrder();
+            CheckTransOrderCommon(TransOrderRec, TRUE);
+            LinkedTransOrdersRec.ValidateLinkedTransOrder(FALSE);
+          UNTIL LinkedTransOrdersRec.NEXT = 0;
+        END;
+        TransOrderRec.GET(lvTransOrderRec2."No.");
+
+        PostTransportOrder();
+
+        //* Gekoppelde TO's pas boeken nadat 'Hoofd-TO' is geboekt
+        LinkedTransOrdersRec.RESET;
+        LinkedTransOrdersRec.SETRANGE("Transport Order No.", "No.");
+        IF LinkedTransOrdersRec.FIND('-') THEN BEGIN
+          REPEAT
+            TransOrderRec.GET(LinkedTransOrdersRec."Linked Transport Order No.");
+            PostTransportOrder();
+            //
+            PostedLinkedTransOrdersRec.INIT;
+            PostedLinkedTransOrdersRec.TRANSFERFIELDS(LinkedTransOrdersRec);
+            PostedLinkedTransOrdersRec.INSERT;
+            //
+            LinkedTransOrdersRec.DELETE;
+          UNTIL LinkedTransOrdersRec.NEXT = 0;
+        END;
+        TransOrderRec.COPY(lvTransOrderRec2);
+
+      END;
+    END;
+
+    LOCAL PROCEDURE PostTransportOrder@1();
+    VAR
+      lvTransRideLineRec@1100525000 : Record 11020518;
+    BEGIN
+      WITH TransOrderRec DO BEGIN
+        PlantOrderNoSRO := '';
+        CALCFIELDS("From Depot", "To Depot", "Invoice with Transport Order");
+        CheckStatusOnPostTransOrder();
+        CheckTransOrderCommon(TransOrderRec, TRUE);
+
+        IF ("Invoice with Transport Order" = '') THEN BEGIN
+          CheckTransOrderCostRelated();
+
+          TransCostLineRec.RESET;
+          TransCostLineRec.SETRANGE("Transport Order No.", "No.");
+          TransCostLineRec.SETFILTER(Type, '<>%1', TransCostLineRec.Type::Text);
+          IF NOT TransCostLineRec.FIND('-') THEN BEGIN
+            IF NOT TransOrderRec.PlantOrdersPresent() THEN
+              ERROR(Text000, TABLECAPTION, "No.");
+          END ELSE BEGIN
+            REPEAT
+              CheckTransCostLine();
+            UNTIL TransCostLineRec.NEXT = 0
+          END;
+        END;
+
+        TransPlantOrderRec.RESET;
+        TransPlantOrderRec.SETRANGE("Transport Order No.", "No.");
+        IF TransPlantOrderRec.FIND('-') THEN BEGIN
+          PlantOrderNoSRO := TransPlantOrderRec."Plant Order No.";  //* Fill with first
+          REPEAT
+            TransPlantOrderRec.Posted := TRUE;
+            TransPlantOrderRec.MODIFY;
+            //
+            { //Merge MBS40->MBS2009  Commerce Portal (CP) is deleted since MBS2009
+            IF PlantOrderRec.GET(TransPlantOrderRec."Plant Order No.") THEN BEGIN
+              //WebSite materieelorder moet worden bijgewerkt ivm TO Order
+              IF PlantOrderRec.Posted THEN
+                PlantOrderRec.SynchWebsite(PlantOrderRec,PlantOrderRec);
+            END;
+            }
+          UNTIL TransPlantOrderRec.NEXT = 0;
+        END;
+
+        PostedTransOrderRec.INIT;
+        PostedTransOrderRec.TRANSFERFIELDS(TransOrderRec);
+        PostedTransOrderRec."Posting Date" := TODAY;
+        PostedTransOrderRec.Status := PostedTransOrderRec.Status::"TO Posted";
+        PostedTransOrderRec."Posted by" := USERID;  //DP00241.n (16484)
+        FillInvoicedFields();
+        IF PostedTransOrderRec."Purchase Order" = '' THEN BEGIN
+          PostedTransOrderRec.CALCFIELDS("External Transport");
+          IF NOT PostedTransOrderRec."External Transport" THEN
+            PostedTransOrderRec."Purchase Order" := '-';  //* I.v.m. performance coll. inkooporders genereren
+        END;
+        PostedTransOrderRec.INSERT;
+
+        TransCostLineRec.RESET;
+        TransCostLineRec.SETRANGE("Transport Order No.", "No.");
+        IF TransCostLineRec.FIND('-') THEN BEGIN
+          ExtraTransportCostSalesActive();
+          REPEAT
+            IF ("Invoice with Transport Order" = '') THEN
+              ProcessTransCostLine()
+            ELSE
+              TransCostLineRec.DELETE;
+          UNTIL TransCostLineRec.NEXT = 0;
+        END;
+
+        IF "Ride No." <> '' THEN BEGIN
+          IF lvTransRideLineRec.GET("Ride No.", "No.") THEN BEGIN
+            IF NOT lvTransRideLineRec."Posted (TO)" THEN BEGIN
+              lvTransRideLineRec."Posted (TO)" := TRUE;
+              lvTransRideLineRec.MODIFY(FALSE);
+            END
+          END;
+        END;
+        MoveDocumentLinksToPosted(TransOrderRec,PostedTransOrderRec); //DP00183
+        MoveCommentLinesToPosted(TransOrderRec,PostedTransOrderRec);  //DP00183
+
+        DELETE(FALSE);  //* 'FALSE'
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckStatusOnPostTransOrder@1100485015();
+    BEGIN
+      WITH TransOrderRec DO BEGIN
+        IF (Status <> Status::"PO Posted") THEN BEGIN
+          IF (Status <> Status::Released) THEN
+            TESTFIELD(Status, Status::"PO Posted")
+          ELSE BEGIN
+            IF TransOrderRec.PlantOrdersPresent() THEN BEGIN  //* Als geen materieelorder aanwezig op TO, dan voldoet vrijgegeven
+              //* Transport order met status 'Released' (vrijgegeven) waarop geen niet-geboekte materieelorders aanwezig zijn als
+              //* status 'PO Posted' (verzonden) beschouwen. Dus TO-status vrijgegeven voldoet dan.
+              IF CheckPlantOrdersStatusLessOnTO(TransOrderRec."No.", PlantOrderRec.Status::Posted) THEN
+                TESTFIELD(Status, Status::"PO Posted");
+            END;
+          END;
+        END;
+      END;
+    END;
+
+    PROCEDURE CheckPlantOrdersStatusLessOnTO@1100485013(ITransOrderNo@1100485001 : Code[20];IStatusLessThan@1100485002 : Option) : Boolean;
+    VAR
+      lvTransPlantOrderRec@1100485000 : Record 11020509;
+    BEGIN
+      //* Check Plant Order(s) with status less than a certain status present on Transport Order
+      lvTransPlantOrderRec.SETRANGE("Transport Order No.", ITransOrderNo);
+      lvTransPlantOrderRec.SETFILTER("Status (PO)", '<%1', IStatusLessThan);
+      IF lvTransPlantOrderRec.FINDFIRST THEN
+        EXIT(TRUE);
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE CheckTransRideCommon@1100485019();
+    VAR
+      lvTransOrderRec@1100485001 : Record 11020505;
+      lvTransRideLineRec2@1100485002 : Record 11020518;
+      lvPostedTransOrderRec@1100525000 : Record 11020507;
+      lvAmount@1100485000 : Decimal;
+    BEGIN
+      WITH TransRideRec DO BEGIN
+        TESTFIELD("No.");
+        TESTFIELD(Date);
+        TESTFIELD("Shipping Agent");
+        TESTFIELD("Means of Transport");
+        IF Status >= Status::Released THEN BEGIN  //* Only on post, not when the ride is released
+          IF "Transport Cost" <> 0 THEN BEGIN
+            lvAmount := TransRideLineRec.GetTotalRideOrderCost("No.",1);
+            IF "Transport Cost" <> lvAmount THEN
+              ERROR(Text005, FIELDCAPTION("Transport Cost"));
+          END;
+          IF "Load/Unload Cost" <> 0 THEN BEGIN
+            lvAmount := TransRideLineRec.GetTotalRideOrderCost("No.",2);
+            IF "Load/Unload Cost" <> lvAmount THEN
+              ERROR(Text005, FIELDCAPTION("Load/Unload Cost"));
+          END;
+        END;
+
+        //* Check Lines
+        //* Alle TO's moeten aanwezig zijn bij de niet-geboekte TO's.
+        //* Alle gekoppelde TO's moeten op een (1) rit aanwezig zijn want als hoofd-TO wordt
+        //* geboekt dan worden gelijk alle gekoppelde TO's ook geboekt.
+        TransRideLineRec.RESET;
+        TransRideLineRec.SETRANGE("Ride No.", "No.");
+        IF NOT TransRideLineRec.FINDSET(FALSE,FALSE) THEN
+          ERROR(Text007, "No.")
+        ELSE BEGIN
+          REPEAT
+            IF NOT lvTransOrderRec.GET(TransRideLineRec."Transport Order No.") THEN BEGIN
+              IF NOT lvPostedTransOrderRec.GET(TransRideLineRec."Transport Order No.") THEN //* TO can already been posted (then OK)
+                lvTransOrderRec.GET(TransRideLineRec."Transport Order No.");  //* Error if TO not present
+            END ELSE BEGIN
+              lvTransOrderRec.TESTFIELD("Ride No.", "No."); //* Zou normaal gesproken altijd zo moeten zijn.
+              lvTransOrderRec.TESTFIELD("Shipping Agent", "Shipping Agent");
+              lvTransOrderRec.TESTFIELD("Means of Transport", "Means of Transport");
+
+              lvTransOrderRec.CALCFIELDS("Invoice with Transport Order");
+              IF (lvTransOrderRec."Invoice with Transport Order" <> '') THEN BEGIN
+                IF NOT lvTransRideLineRec2.GET("No.", lvTransOrderRec."Invoice with Transport Order") THEN BEGIN
+                  ERROR(Text006, lvTransOrderRec."No.",
+                    lvTransOrderRec."Invoice with Transport Order", lvTransOrderRec."Invoice with Transport Order");
+                END;
+              END ELSE BEGIN
+                LinkedTransOrdersRec.RESET;
+                LinkedTransOrdersRec.SETRANGE("Transport Order No.", lvTransOrderRec."No.");
+                IF LinkedTransOrdersRec.FIND('-') THEN BEGIN
+                  REPEAT
+                    IF NOT lvTransRideLineRec2.GET("No.", LinkedTransOrdersRec."Linked Transport Order No.") THEN BEGIN
+                      ERROR(Text006, LinkedTransOrdersRec."Linked Transport Order No.",
+                        lvTransOrderRec."No.", LinkedTransOrdersRec."Linked Transport Order No.");
+                    END;
+                  UNTIL LinkedTransOrdersRec.NEXT = 0;
+                END;
+              END;
+            END;
+          UNTIL TransRideLineRec.NEXT = 0;
+        END;
+
+      END;
+    END;
+
+    PROCEDURE CheckTransOrderCommon@1100485003(ITransOrderRec@1100525000 : Record 11020505;IErrorMode@1100525001 : Boolean) : Boolean;
+    BEGIN
+      WITH ITransOrderRec DO BEGIN
+        IF IErrorMode THEN BEGIN
+          TESTFIELD("No.");
+          TESTFIELD("Transport Date");
+          TESTFIELD("From Location");
+          TESTFIELD("To Location");
+          TESTFIELD("Shipping Agent");
+          TESTFIELD("Means of Transport");
+        END ELSE BEGIN
+          IF ("No." = '') OR
+             ("Transport Date" = 0D) OR
+             ("From Location" = '') OR
+             ("To Location" = '') OR
+             ("Shipping Agent" = '') OR
+             ("Means of Transport" = '')
+          THEN
+            EXIT(FALSE);
+        END;
+      END;
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE CheckRidePOsMatchRideTOrderPOs@1100525000(RideNo@1100525000 : Code[20]);
+    VAR
+      lvRidePORec@1100525001 : Record 11020550;
+      lvRideTORec@1100525002 : Record 11020518;
+      lvTransOrderPORec@1100525003 : Record 11020509;
+      lvTmpPlantOrderOfTOsRec@1100525004 : TEMPORARY Record 11012556;
+      lvMissingPOs@1100525005 : Text[1024];
+    BEGIN
+      lvRideTORec.SETRANGE("Ride No.", RideNo);
+      IF lvRideTORec.FINDSET THEN BEGIN
+        lvMissingPOs := '';
+        REPEAT
+          lvRideTORec.TESTFIELD("Transport Order No.");
+          lvTransOrderPORec.SETRANGE("Transport Order No.", lvRideTORec."Transport Order No.");
+          IF lvTransOrderPORec.FINDSET THEN BEGIN
+            REPEAT
+              lvTransOrderPORec.TESTFIELD("Plant Order No.");
+              IF NOT lvRidePORec.GET(RideNo, lvTransOrderPORec."Plant Order No.") THEN
+                lvMissingPOs := lvMissingPOs + lvTransOrderPORec."Plant Order No." + ', ';
+              IF NOT lvTmpPlantOrderOfTOsRec.GET(lvTransOrderPORec."Plant Order No.") THEN BEGIN
+                lvTmpPlantOrderOfTOsRec."No." := lvTransOrderPORec."Plant Order No.";
+                lvTmpPlantOrderOfTOsRec.INSERT;
+              END;
+            UNTIL lvTransOrderPORec.NEXT = 0;
+          END;
+        UNTIL lvRideTORec.NEXT = 0;
+        IF lvMissingPOs <> '' THEN
+          ERROR(STRSUBSTNO(Text009, RideNo) + '\ \' + Text011 + ' ' + COPYSTR(lvMissingPOs,1,STRLEN(lvMissingPOs)-2));
+      END;
+
+      lvRidePORec.SETRANGE("Ride No.", RideNo);
+      IF lvRidePORec.FINDSET THEN BEGIN
+        lvMissingPOs := '';
+        REPEAT
+          lvRidePORec.TESTFIELD("Plant Order No.");
+          IF NOT lvTmpPlantOrderOfTOsRec.GET(lvRidePORec."Plant Order No.") THEN
+            lvMissingPOs := lvMissingPOs + lvRidePORec."Plant Order No." + ', ';
+        UNTIL lvRidePORec.NEXT = 0;
+        IF lvMissingPOs <> '' THEN
+          ERROR(STRSUBSTNO(Text010, RideNo) + '\ \' + Text011 + ' ' + COPYSTR(lvMissingPOs,1,STRLEN(lvMissingPOs)-2));
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckTransOrderCostRelated@1100485009();
+    BEGIN
+      WITH TransOrderRec DO BEGIN
+        IF "From Depot" AND ("Perc. From Location" <> 0) THEN
+          FIELDERROR("Perc. From Location");
+        IF "To Depot" AND ("Perc. To Location" <> 0) THEN
+          FIELDERROR("Perc. To Location");
+        IF "Perc. Internal" <> 0 THEN
+          TESTFIELD("Internal Customer No.");
+        IF "Perc. Project" <> 0 THEN
+          TESTFIELD("Project No.");
+        IF ("Perc. From Location" < 0) OR ("Perc. From Location" > 100) THEN
+          FIELDERROR("Perc. From Location");
+        IF ("Perc. To Location" < 0) OR ("Perc. To Location" > 100) THEN
+          FIELDERROR("Perc. To Location");
+        IF ("Perc. Internal" < 0) OR ("Perc. Internal" > 100) THEN
+          FIELDERROR("Perc. Internal");
+        IF ("Perc. Project" < 0) OR ("Perc. Project" > 100) THEN
+          FIELDERROR("Perc. Project");
+        IF GetTotalPercentage() <> 100 THEN BEGIN
+          IF NOT ("From Depot" AND "To Depot" AND (GetTotalPercentage() = 0)) THEN
+            ERROR(Text001, TABLECAPTION, "No.");
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckTransCostLine@1100485002();
+    BEGIN
+      WITH TransCostLineRec DO BEGIN
+        IF Type <> Type::Text THEN BEGIN
+          TESTFIELD("No.");
+          TESTFIELD(Description);
+          TESTFIELD(Quantity);
+          TESTFIELD(Amount);
+          TESTFIELD(Description);  //*33268
+          IF "Plant Order No." <> '' THEN BEGIN
+            IF NOT TransPlantOrderRec.GET("Transport Order No.", "Plant Order No.") THEN
+              FIELDERROR("Plant Order No.", STRSUBSTNO(Text002, "Plant Order No.", TransOrderRec.TABLECAPTION));
+          END;
+        END;
+        TransCostLineRec.CheckInvoiceTo(TransOrderRec,TransCostLineRec);
+      END;
+    END;
+
+    LOCAL PROCEDURE ProcessTransCostLine@3();
+    BEGIN
+      WITH TransCostLineRec DO BEGIN
+        CheckTransCostLine();
+
+        PostedTransCostLineRec.INIT;
+        PostedTransCostLineRec.TRANSFERFIELDS(TransCostLineRec);
+        IF PostedTransCostLineRec.Type = PostedTransCostLineRec.Type::Text THEN BEGIN
+          PostedTransCostLineRec.Quantity := 0;
+          PostedTransCostLineRec."Unit of Measure" := '';
+          PostedTransCostLineRec.Price := 0;
+          PostedTransCostLineRec.Amount := 0;
+        END;
+        PostedTransCostLineRec.INSERT;
+
+        IF ExtraTransCostSalesOrderActive AND (PostedTransCostLineRec.Type <> PostedTransCostLineRec.Type::Text) THEN
+          CheckExtraTransportCostSales();
+
+        DELETE;
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckTransPlantorderLine@1100485000(VAR IOMaxDateDifferenceTOPO@1100485000 : Integer);
+    BEGIN
+      WITH TransPlantOrderRec DO BEGIN
+        CALCFIELDS("Transfer Date", "From Location", "To Location");
+        TESTFIELD("Plant Order No.");
+        TESTFIELD("From Location", TransOrderRec."From Location");
+        TESTFIELD("To Location", TransOrderRec."To Location");
+        PlantOrderRec.GET("Plant Order No.");
+        IF NOT PlantOrderRec.Posted THEN
+          PlantOrderRec.TESTFIELD(Status, PlantOrderRec.Status::Released);
+        IF PlantOrderRec.Type = PlantOrderRec.Type::"Negative Inventory Correction" THEN
+          PlantOrderRec.FIELDERROR(Type);
+
+        IF (NOT PlantOrderRec.Posted) AND (ABS("Transfer Date" - TransOrderRec."Transport Date") > IOMaxDateDifferenceTOPO) THEN
+          IOMaxDateDifferenceTOPO := ABS("Transfer Date" - TransOrderRec."Transport Date");
+      END;
+    END;
+
+    LOCAL PROCEDURE ProcessTransPlantorderLine@1100485004();
+    VAR
+      lvPostPlantOrderCU@1100485000 : Codeunit 11012553;
+    BEGIN
+      WITH TransPlantOrderRec DO BEGIN
+        CheckTransPlantorderLine(DummyMaxDateDiff);
+
+        PlantOrderRec.GET("Plant Order No.");
+        IF NOT PlantOrderRec.Posted THEN BEGIN
+          IF PlantOrderRec."Transfer Date" <> TransOrderRec."Transport Date" THEN
+            AdjustPlantOrderTransferDate();
+          lvPostPlantOrderCU.RunPostPlantOrderFromTransport(PlantOrderRec);
+          PlantOrderRec.GET("Plant Order No.");
+          PlantOrderRec.TESTFIELD(Posted, TRUE);
+        END ELSE BEGIN
+          { //Merge MBS40->MBS2009
+          //WebSite materieelorder moet worden bijgewerkt ivm TO Order
+          PlantOrderRec.SynchWebsite(PlantOrderRec,PlantOrderRec);
+          }
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE AdjustPlantOrderTransferDate@1100485001();
+    VAR
+      lvPlantOrderLineRec@1100485000 : Record 11012557;
+      lvPlantOrderCostRec@1100485001 : Record 11012558;
+    BEGIN
+      WITH PlantOrderRec DO BEGIN
+        "Transfer Date" := TransOrderRec."Transport Date";
+        IF NOT "Rental Shift" THEN BEGIN
+          "Rental Startdate (To Location)" := "Transfer Date";
+          "Rental Enddate (From Location)" := "Transfer Date";
+        END ELSE BEGIN
+          IF "Rental Startdate (To Location)" < "Transfer Date" THEN
+            "Rental Startdate (To Location)" := "Transfer Date";
+          IF "Rental Enddate (From Location)" > "Transfer Date" THEN
+            "Rental Enddate (From Location)" := "Transfer Date";
+        END;
+        MODIFY;
+      END;
+
+      WITH lvPlantOrderLineRec DO BEGIN
+        SETRANGE("Plant Order No.", PlantOrderRec."No.");
+        MODIFYALL("Transfer Date", PlantOrderRec."Transfer Date");
+
+        SETRANGE("Rental Type", "Rental Type"::Rental);
+        SETRANGE("Rental Shift", TRUE);
+        IF FIND('-') THEN BEGIN
+          REPEAT
+            IF "Rental Startdate (To Location)" < "Transfer Date" THEN
+              "Rental Startdate (To Location)" := "Transfer Date";
+            IF "Rental Enddate (From Location)" > "Transfer Date" THEN
+              "Rental Enddate (From Location)" := "Transfer Date";
+            MODIFY;
+          UNTIL NEXT = 0;
+        END;
+      END;
+
+      WITH lvPlantOrderCostRec DO BEGIN
+        SETRANGE("Plant Order No.", PlantOrderRec."No.");
+        MODIFYALL(Date, PlantOrderRec."Transfer Date");
+      END;
+    END;
+
+    LOCAL PROCEDURE FillInvoicedFields@1100485014();
+    VAR
+      lvTransCostLineRec@1100485000 : Record 11020506;
+    BEGIN
+      //* Concerning the permance in create Invoice Proposal set 'Invoced' if there is nothing to invoice.
+      //* Also important for the field 'Status Invoiced'.
+
+      IF (TransOrderRec."Invoice with Transport Order" <> '') THEN BEGIN
+        PostedTransOrderRec."From Location Invoiced" := TRUE;
+        PostedTransOrderRec."To Location Invoiced" := TRUE;
+        PostedTransOrderRec."Internal Invoiced" := TRUE;
+        PostedTransOrderRec."Project Invoiced" := TRUE;
+        PostedTransOrderRec."Status Invoiced" := MainTOStatusInvoiced;
+        EXIT;
+      END;
+
+      WITH lvTransCostLineRec DO BEGIN
+        SETRANGE("Transport Order No.", TransOrderRec."No.");
+        IF NOT FIND('-') THEN BEGIN
+          PostedTransOrderRec."From Location Invoiced" := TRUE;
+          PostedTransOrderRec."To Location Invoiced" := TRUE;
+          PostedTransOrderRec."Internal Invoiced" := TRUE;
+          PostedTransOrderRec."Project Invoiced" := TRUE;
+        END ELSE BEGIN
+          IF TransOrderRec."From Depot" THEN
+            PostedTransOrderRec."From Location Invoiced" := TRUE
+          ELSE BEGIN
+            IF TransOrderRec."Perc. From Location" = 0 THEN BEGIN
+              SETFILTER("Invoice-to",'%1|%2', "Invoice-to"::Location, "Invoice-to"::"From Location");
+              IF NOT FIND('-') THEN
+                PostedTransOrderRec."From Location Invoiced" := TRUE;
+            END;
+          END;
+          IF TransOrderRec."To Depot" THEN
+            PostedTransOrderRec."To Location Invoiced" := TRUE
+          ELSE BEGIN
+            IF TransOrderRec."Perc. To Location" = 0 THEN BEGIN
+              SETFILTER("Invoice-to", '%1|%2', "Invoice-to"::Location, "Invoice-to"::"To Location");
+              IF NOT FIND('-') THEN
+                PostedTransOrderRec."To Location Invoiced" := TRUE;
+            END;
+          END;
+          IF TransOrderRec."Perc. Internal" = 0 THEN BEGIN
+            SETRANGE("Invoice-to", "Invoice-to"::Internal);
+            IF NOT FIND('-') THEN
+              PostedTransOrderRec."Internal Invoiced" := TRUE;
+          END;
+          IF TransOrderRec."Perc. Project" = 0 THEN BEGIN
+            SETRANGE("Invoice-to", "Invoice-to"::Project);
+            IF NOT FIND('-') THEN
+              PostedTransOrderRec."Project Invoiced" := TRUE;
+          END;
+        END;
+      END;
+
+      PostedTransOrderRec.FillStatusInvoiced(FALSE);
+      MainTOStatusInvoiced := PostedTransOrderRec."Status Invoiced";
+    END;
+
+    PROCEDURE ExtraTransportCostSalesActive@1100485018();
+    VAR
+      lvCostObjectExtraTransRec@1100485000 : Record 11012992;
+    BEGIN
+      //* Extra Transport Cost on Sales Rental Order tbv granule 'Sales Logistics Separated'.
+      //* Als men deze granule niet heeft dan zullen er geen records in deze tabel staan en geeft de leesactie dus
+      //* geen foutmelding.
+      //* NB: Kan bij 4PS op systeem probleem geven omdat hier met verschillende licenties wordt gewerkt.
+      //*     Dan moet deze tabel maar leeg gemaakt worden.
+
+      ExtraTransCostSalesOrderActive := NOT lvCostObjectExtraTransRec.ISEMPTY;
+    END;
+
+    PROCEDURE CheckExtraTransportCostSales@1100485020();
+    VAR
+      lvCostObjectExtraTransRec@1100485002 : Record 11012992;
+      lvSalesOrderPlantOrderRelRec@1100485001 : Record 11012787;
+      lvPlantOrderRec@1100485004 : Record 11012556;
+      lvSalesOrderRec@1100485000 : Record 36;
+      lvExtraTransCostRec@1100485005 : Record 11012993;
+      lvPlantOrderNo@1100485003 : Code[20];
+    BEGIN
+      WITH PostedTransCostLineRec DO BEGIN
+        IF NOT lvCostObjectExtraTransRec.GET("No.") THEN
+          EXIT;
+
+        IF PostedTransCostLineRec."Plant Order No." <> '' THEN
+          lvPlantOrderNo := PostedTransCostLineRec."Plant Order No."
+        ELSE
+          lvPlantOrderNo := PlantOrderNoSRO;  //* Dan maar van eerste (bij Heras is het er toch altijd maar 1)
+        IF (lvPlantOrderNo = '') THEN
+          EXIT;
+        IF NOT lvPlantOrderRec.GET(lvPlantOrderNo) THEN
+          EXIT;
+        IF lvPlantOrderRec."Sales Rental Order No." = '' THEN
+          EXIT;
+
+        lvSalesOrderPlantOrderRelRec.SETCURRENTKEY(Level, "Plant Document No.");
+        lvSalesOrderPlantOrderRelRec.SETRANGE(Level, lvSalesOrderPlantOrderRelRec.Level::PlantOrder);
+        lvSalesOrderPlantOrderRelRec.SETRANGE("Plant Document No.", lvPlantOrderNo);
+        lvSalesOrderPlantOrderRelRec.SETFILTER("Sales Order No.", '<>%1', '');
+        IF NOT lvSalesOrderPlantOrderRelRec.FINDFIRST THEN
+          EXIT;
+
+        IF lvSalesOrderPlantOrderRelRec."Sales Company Name" <> COMPANYNAME THEN
+          lvSalesOrderRec.CHANGECOMPANY(lvSalesOrderPlantOrderRelRec."Sales Company Name");
+        IF NOT lvSalesOrderRec.GET(lvSalesOrderRec."Document Type"::Order, lvSalesOrderPlantOrderRelRec."Sales Order No.") THEN
+          EXIT;
+        IF lvSalesOrderRec."Sales Document Type" <> lvSalesOrderRec."Sales Document Type"::"Sales Logistics Separated" THEN
+          EXIT;
+
+        IF lvSalesOrderPlantOrderRelRec."Sales Company Name" <> COMPANYNAME THEN
+          lvExtraTransCostRec.CHANGECOMPANY(lvSalesOrderPlantOrderRelRec."Sales Company Name");
+        lvExtraTransCostRec.INIT;
+        lvExtraTransCostRec."Sales Order No." := lvSalesOrderPlantOrderRelRec."Sales Order No.";
+        lvExtraTransCostRec."Transport Order No." := "Transport Order No.";
+        lvExtraTransCostRec."Line No." := "Line No.";
+        lvExtraTransCostRec."Plant Order No." := lvPlantOrderNo;
+        lvExtraTransCostRec."Transfer Date" := TransOrderRec."Transport Date";
+        IF TransOrderRec.Type <> TransOrderRec.Type::Removal THEN
+          lvExtraTransCostRec.Arrival := TRUE;
+        lvExtraTransCostRec."Cost Object" := "No.";
+        lvExtraTransCostRec.Description := Description;
+        lvExtraTransCostRec.Quantity := Quantity;
+        lvExtraTransCostRec."Unit of Measure" := "Unit of Measure";
+        lvExtraTransCostRec.Price := Price;
+        lvExtraTransCostRec.Amount := Amount;
+        lvExtraTransCostRec."Created on" := CURRENTDATETIME;
+        lvExtraTransCostRec.INSERT;
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

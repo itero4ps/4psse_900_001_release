@@ -1,0 +1,668 @@
+OBJECT Codeunit 6086330 Expense-Post
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=EMW16.00.10.1.02.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=6086320;
+    Permissions=TableData 38=rimd,
+                TableData 39=rimd,
+                TableData 81=rimd,
+                TableData 11072008=rimd;
+    OnRun=BEGIN
+            RunWithCheck(Rec);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      ContiniaUserSetup@1160040007 : Record 6086002;
+      EMSetup@1160040002 : Record 6086300;
+      PurchHeader@1160040009 : Record 38;
+      PostingDate@1160040004 : Date;
+      PostingDateExists@1160040006 : Boolean;
+      ReplacePostingDate@1160040005 : Boolean;
+      WrongMatchAmtErr@1160040000 : TextConst 'ENU=Amount and Matched Amount does not match.';
+      WrongAllocAmtErr@1160040008 : TextConst 'ENU=%1 on %2 %3 does not match the total allocated amount.';
+      TextRejected@1160040001 : TextConst 'ENU=Rejected';
+      WrongStatusErr@1160040003 : TextConst 'ENU=%1 must be either %2 or %3';
+      NoOfGenJnlLines@1160040011 : Integer;
+      NoOfPurchLines@1160040010 : Integer;
+      HasCommentErrors@1160040012 : TextConst 'ENU=There is one or more errors on this Expense.\\Please correct these before the posting the Expense.';
+      CreateGenJnlBalanceEntry@1160040013 : Boolean;
+      PurchInvApprovalForced@1160040014 : TextConst 'ENU=Expense Management invoice. Approval forced.';
+      AppForcedBy@1160040015 : TextConst 'ENU=Approval forced by %1';
+
+    PROCEDURE RunWithCheck@1160040011(VAR Expense@1160040000 : Record 6086320);
+    VAR
+      CheckLine@1160040001 : Codeunit 6086333;
+    BEGIN
+      CheckLine.RUN(Expense);
+      Code(Expense);
+    END;
+
+    PROCEDURE RunWithoutCheck@1160040010(VAR Expense@1160040000 : Record 6086320);
+    BEGIN
+      Code(Expense);
+    END;
+
+    PROCEDURE Code@1160040009(VAR Expense@1160040014 : Record 6086320);
+    VAR
+      PurchLine@1160040019 : Record 39;
+      GenJnlLine@1160040018 : Record 81;
+      GenJnlBatch@1160040017 : Record 232;
+      ExpenseType@1160040016 : Record 6086307;
+      CreditCard@1160040015 : Record 6086311;
+      Expense2@1160040013 : Record 6086320;
+      ExpenseAllocation@1160040012 : Record 6086321;
+      BankTransaction@1160040011 : Record 6086330;
+      ExpenseMatch@1160040010 : Record 6086349;
+      ExpenseDimMgt@1160040009 : Codeunit 6086318;
+      BalanceAccountNo@1160040008 : Code[20];
+      BalanceAccountType@1160040007 : 'G/L Account,,,Bank Account';
+      ExpensePosting@1160040006 : 'Use General Journal,Use Purchase Invoice';
+      UseExpenseAllocation@1160040005 : Boolean;
+      DocumentNo@1160040004 : Code[20];
+      BankTransAccountType@1160040003 : Integer;
+      BankTransAccountNo@1160040002 : Code[20];
+      DocType@1160040001 : Integer;
+      BalancingAmount@1160040000 : Decimal;
+    BEGIN
+      EMSetup.GET;
+
+      CLEAR(NoOfGenJnlLines);
+      CLEAR(NoOfPurchLines);
+
+      WITH Expense DO BEGIN
+        ContiniaUserSetup.GET("Employee No.");
+        // *****************************************************************************************************************************
+        // DETERMINE IF WE SHOULD POST USING A GEN. JOURNAL OR PURCHASE INVOICE. ALSO DETERMINE WHICH BALANCING ACCOUNT TYPE AND NUMBER
+        // *****************************************************************************************************************************
+        CASE TRUE OF
+          NOT "Matched to Bank Transaction":
+            BEGIN
+              ExpensePosting := EMSetup."Expense Posting";
+              BalanceAccountType := GenJnlLine."Bal. Account Type"::Vendor;
+              BalanceAccountNo := ContiniaUserSetup."Vendor No.";
+            END;
+
+          "Matched to Bank Transaction":
+            BEGIN
+              ExpensePosting := ExpensePosting::"Use General Journal";
+              IF CalcMatchedAmount <> Amount THEN
+                ERROR(WrongMatchAmtErr);
+
+              ExpenseMatch.SETRANGE("Expense Entry No.","Entry No.");
+              ExpenseMatch.FINDFIRST;
+
+              BankTransaction.GET(ExpenseMatch."Transaction Entry No.");
+
+              CreditCard.SETRANGE("Card No.",BankTransaction."Card Id");
+              CreditCard.FINDFIRST;
+
+              IF CreditCard."Account No." <> '' THEN BEGIN
+                BalanceAccountType := CreditCard."Account Type";
+                BalanceAccountNo := CreditCard."Account No.";
+              END ELSE BEGIN
+                EMSetup.TESTFIELD("Card Transaction Bal. No.");
+                BalanceAccountType := EMSetup."Card Transaction Bal. Type";
+                BalanceAccountNo := EMSetup."Card Transaction Bal. No.";
+              END;
+            END;
+        END;
+
+        // *****************************************************************************************************************************
+        // AN EXPENSE CAN HAVE ONE OR MORE ALLOCATIONS. IF NO ALLOCATION EXISTS THEN VALUES FROM THE EXPENSE IS USED. IF ALLOCATED THE
+        // LOOP BELOW WILL RUN FOR EACH ALLOCATION LINE AND USE THE VALUES FROM THAT WHEN POSTING.
+        // *****************************************************************************************************************************
+        UseExpenseAllocation := FALSE;
+        CreateGenJnlBalanceEntry := FALSE;
+        ExpenseAllocation.SETCURRENTKEY("Expense Entry No.");
+        ExpenseAllocation.SETRANGE("Expense Entry No.","Entry No.");
+        IF ExpenseAllocation.FINDFIRST THEN BEGIN
+          CALCFIELDS("Allocated Amount (LCY)");
+          IF "Allocated Amount (LCY)" <> "Amount (LCY)" THEN
+            ERROR(WrongAllocAmtErr,FIELDCAPTION("Amount (LCY)"),TABLECAPTION,"Entry No.");
+          UseExpenseAllocation := TRUE;
+        END ELSE
+          Expense2.COPY(Expense,FALSE);
+
+        REPEAT
+          IF UseExpenseAllocation THEN BEGIN
+            ExpenseAllocation.TESTFIELD("Employee No.","Employee No.");
+            Expense2.TRANSFERFIELDS(ExpenseAllocation);
+            Expense2."Entry No." := "Entry No.";
+          END;
+
+          IF ExpensePosting = ExpensePosting::"Use General Journal" THEN BEGIN
+            CleanUpGenJnl(GenJnlLine."Journal Template Name",GenJnlLine."Journal Batch Name");
+
+            EMSetup.TESTFIELD("Expense Template Name");
+            EMSetup.TESTFIELD("Expense Batch Name");
+            GenJnlBatch.GET(EMSetup."Expense Template Name",EMSetup."Expense Batch Name");
+
+            IF DocumentNo = '' THEN
+              DocumentNo := GetNextGenJnlDocNo(GenJnlBatch,"Document Date");
+
+            GenJnlLine.INIT;
+            GenJnlLine."Journal Template Name" := EMSetup."Expense Template Name";
+            GenJnlLine."Journal Batch Name" := EMSetup."Expense Batch Name";
+            GenJnlLine."Line No." := GetNextGenJnlLineNo(GenJnlLine."Journal Template Name",GenJnlLine."Journal Batch Name");
+            GenJnlLine.INSERT(TRUE);
+
+            GenJnlLine."Document No." := DocumentNo;
+            IF ReplacePostingDate THEN BEGIN
+              GenJnlLine.VALIDATE("Posting Date",PostingDate);
+              GenJnlLine.VALIDATE("Document Date","Document Date");
+            END ELSE
+              GenJnlLine.VALIDATE("Posting Date","Document Date");
+
+            IF "No Refund" AND "Matched to Bank Transaction" THEN BEGIN
+              //PERSONAL PURCHASE WITH COMPANY CARD
+              GenJnlLine.VALIDATE("Account Type",GenJnlLine."Account Type"::Vendor);
+              GenJnlLine.VALIDATE("Account No.",ContiniaUserSetup."Vendor No.");
+              GenJnlLine.VALIDATE("Bal. Account Type",BalanceAccountType);
+              GenJnlLine.VALIDATE("Bal. Account No.",BalanceAccountNo);
+              GenJnlLine."External Document No." := STRSUBSTNO('%1 %2',TABLECAPTION,"Entry No.");
+              UseExpenseAllocation := TRUE;
+            END ELSE
+              IF (Status = Status::Rejected) AND "Matched to Bank Transaction" AND (NOT "No Refund") AND
+                 (Expense2."Amount (LCY)" > 0)
+              THEN BEGIN
+                GenJnlLine.VALIDATE("Account Type",GenJnlLine."Account Type"::Vendor);
+                GenJnlLine.VALIDATE("Account No.",ContiniaUserSetup."Vendor No.");
+                GenJnlLine.VALIDATE("Bal. Account Type",BalanceAccountType);
+                GenJnlLine.VALIDATE("Bal. Account No.",BalanceAccountNo);
+                GenJnlLine."External Document No." := STRSUBSTNO('%1 %2',TABLECAPTION,"Entry No.");
+                UseExpenseAllocation := FALSE;
+              END ELSE BEGIN
+                GenJnlLine.VALIDATE("Account Type",GenJnlLine."Account Type"::"G/L Account");
+                GenJnlLine.VALIDATE("Account No.",Expense2."Expense Account");
+                IF NOT UseExpenseAllocation THEN BEGIN
+                  GenJnlLine.VALIDATE("Bal. Account Type",BalanceAccountType);
+                  GenJnlLine.VALIDATE("Bal. Account No.",BalanceAccountNo);
+                END ELSE BEGIN
+                  CreateGenJnlBalanceEntry := TRUE;
+                  BalancingAmount := -ABS("Amount (LCY)");
+                END;
+                IF BalanceAccountType = GenJnlLine."Bal. Account Type"::Vendor THEN
+                  GenJnlLine."External Document No." := STRSUBSTNO('%1 %2',TABLECAPTION,"Entry No.");
+              END;
+
+            IF (Status = Status::Rejected) AND (NOT "Matched to Bank Transaction") THEN BEGIN
+              GenJnlLine.VALIDATE(Amount,0);
+              BalancingAmount := 0;
+              GenJnlLine."Document Type" := GenJnlLine."Document Type"::Invoice;
+            END ELSE
+              IF Expense2."Amount (LCY)" > 0 THEN BEGIN
+                GenJnlLine."Document Type" := GenJnlLine."Document Type"::"Credit Memo";
+                IF BalanceAccountType = GenJnlLine."Bal. Account Type"::Vendor THEN
+                  GenJnlLine."Document Type" := GenJnlLine."Document Type"::Invoice;
+                GenJnlLine.VALIDATE(Amount,ABS(Expense2."Amount (LCY)"));
+                BalancingAmount := -ABS("Amount (LCY)");
+              END ELSE BEGIN
+                GenJnlLine."Document Type" := GenJnlLine."Document Type"::Invoice;
+                IF BalanceAccountType = GenJnlLine."Bal. Account Type"::Vendor THEN
+                  GenJnlLine."Document Type" := GenJnlLine."Document Type"::"Credit Memo";
+                GenJnlLine.VALIDATE(Amount,-ABS(Expense2."Amount (LCY)"));
+                BalancingAmount := ABS("Amount (LCY)");
+              END;
+
+            IF NOT(
+               (GenJnlLine."Account Type" = GenJnlLine."Account Type"::Vendor) OR
+               (BalanceAccountType = GenJnlLine."Bal. Account Type"::Vendor))
+            THEN
+              GenJnlLine."Document Type" := GenJnlLine."Document Type"::" ";
+
+            DocType := GenJnlLine."Document Type";
+
+            GenJnlLine.Description := COPYSTR(GetExpPostingDesc(Expense2),1,MAXSTRLEN(GenJnlLine.Description));
+
+            IF (NOT (GenJnlLine."Account Type" IN
+               [GenJnlLine."Account Type"::Customer,GenJnlLine."Account Type"::Vendor,GenJnlLine."Account Type"::"Bank Account"]))
+            THEN BEGIN
+              IF Expense2."Gen. Prod. Posting Group" <> '' THEN BEGIN
+                GenJnlLine."Gen. Posting Type" := GenJnlLine."Gen. Posting Type"::Purchase;
+                GenJnlLine.VALIDATE("Gen. Prod. Posting Group",Expense2."Gen. Prod. Posting Group");
+              END;
+              IF Expense2."VAT Prod. Posting Group" <> '' THEN
+                GenJnlLine.VALIDATE("VAT Prod. Posting Group",Expense2."VAT Prod. Posting Group");
+            END;
+
+            GenJnlLine.VALIDATE("Currency Code",'');
+
+            GenJnlLine.VALIDATE("Shortcut Dimension 1 Code",Expense2."Global Dimension 1 Code");
+            GenJnlLine.VALIDATE("Shortcut Dimension 2 Code",Expense2."Global Dimension 2 Code");
+            IF NOT UseExpenseAllocation THEN
+              ExpenseDimMgt.CopyExpDimToJnlLine(Expense,GenJnlLine)
+            ELSE
+              ExpenseDimMgt.CopyExpAllocDimToJnlLine(ExpenseAllocation,GenJnlLine);
+
+            GenJnlLine.MODIFY(TRUE);
+
+            CreateJobJnlLine(Expense2,GenJnlLine,UseExpenseAllocation,ExpenseAllocation);
+
+            IF "Matched to Bank Transaction" THEN BEGIN
+              BankTransaction.Posted := TRUE;
+              BankTransaction.MODIFY;
+            END;
+
+            NoOfGenJnlLines := NoOfGenJnlLines + 1;
+
+            "Created Doc. Type" := DATABASE::"Gen. Journal Line";
+            "Created Doc. Subtype" := GenJnlLine."Document Type"::" ";
+            "Created Doc. ID" := GenJnlLine."Document No.";
+          END ELSE BEGIN
+            IF PostingDateExists AND ReplacePostingDate THEN
+              "Document Date" := PostingDate;
+
+            IF PurchHeader."Buy-from Vendor No." <> ContiniaUserSetup."Vendor No." THEN BEGIN
+              ForcePIApproval; // this will force the approval of the previous invoice
+              CreatePurchInvHeader(Expense,PurchHeader);
+            END;
+
+            PurchLine.INIT;
+            PurchLine."Document Type" := PurchHeader."Document Type";
+            PurchLine."Document No." := PurchHeader."No.";
+            PurchLine."Line No." := GetNextPurchLineNo(PurchHeader);
+            PurchLine.INSERT(TRUE);
+
+            PurchLine.VALIDATE(Type,PurchLine.Type::"G/L Account");
+            PurchLine.VALIDATE("No.",Expense2."Expense Account");
+            IF Expense2."Gen. Prod. Posting Group" <> '' THEN
+              PurchLine.VALIDATE("Gen. Prod. Posting Group",Expense2."Gen. Prod. Posting Group");
+            IF Expense2."VAT Prod. Posting Group" <> '' THEN
+              PurchLine.VALIDATE("VAT Prod. Posting Group",Expense2."VAT Prod. Posting Group");
+            PurchLine.VALIDATE(Quantity,1);
+
+            IF Status = Status::Approved THEN BEGIN
+              PurchLine.VALIDATE("Direct Unit Cost",ABS(Expense2."Amount (LCY)"));
+              PurchLine.VALIDATE(Description,COPYSTR(GetExpPostingDesc(Expense2),1,MAXSTRLEN(PurchLine.Description)));
+            END ELSE BEGIN
+              IF "Cash/Private Card" THEN
+                PurchLine.VALIDATE("Direct Unit Cost",0)
+              ELSE
+                PurchLine.VALIDATE("Direct Unit Cost",ABS(Expense2."Amount (LCY)"));
+              PurchLine.VALIDATE(Description,
+                COPYSTR(TextRejected + ': ' + GetExpPostingDesc(Expense2),1,MAXSTRLEN(PurchLine.Description)));
+            END;
+            PurchLine.VALIDATE("Description 2",Expense2."Description 2");
+
+            IF Expense2."Job No." <> '' THEN BEGIN
+              PurchLine.VALIDATE("Job No.",Expense2."Job No.");
+              PurchLine.VALIDATE("Job Task No.",Expense2."Job Task No.");
+              PurchLine.VALIDATE("Job Line Type",PurchLine."Job Line Type"::Contract);
+              PurchLine.VALIDATE("Job Unit Price",PurchLine."Unit Cost (LCY)");
+            END;
+
+            PurchLine.VALIDATE("Shortcut Dimension 1 Code",Expense2."Global Dimension 1 Code");
+            PurchLine.VALIDATE("Shortcut Dimension 2 Code",Expense2."Global Dimension 2 Code");
+            IF NOT UseExpenseAllocation THEN
+              ExpenseDimMgt.CopyExpDimToPurchLine(Expense,PurchLine)
+            ELSE
+              ExpenseDimMgt.CopyExpAllocDimToPurchLine(ExpenseAllocation,PurchLine);
+
+            PurchLine.MODIFY(TRUE);
+
+            NoOfPurchLines := NoOfPurchLines + 1;
+
+            "Created Doc. Type" := DATABASE::"Purchase Line";
+            "Created Doc. Subtype" := PurchLine."Document Type";
+            "Created Doc. ID" := PurchLine."Document No.";
+            "Created Doc. Ref. No." := PurchLine."Line No.";
+          END;
+
+        UNTIL (NOT UseExpenseAllocation) OR (ExpenseAllocation.NEXT = 0);
+
+        IF NOT PostingDateExists THEN
+          ForcePIApproval;
+
+      // IF THE EXPENSE HAS BEEN MATCHED TO A BANK TRANSACTION, AND THE EXPENSE HAS BEEN ADDED TO A PURCHASE INVOICES WE NEED TO MAKE A
+        // BALANCE ENTRY IN THE CONFIGURED GENERAL JOURNAL. IF THE EXPENSE WAS CREATED IN A JOURNAL THE BALANCING HAS ALREADY BEEN DONE
+        IF CreateGenJnlBalanceEntry THEN BEGIN
+          CleanUpGenJnl(GenJnlLine."Journal Template Name",GenJnlLine."Journal Batch Name");
+
+          EMSetup.TESTFIELD("Expense Template Name");
+          EMSetup.TESTFIELD("Expense Batch Name");
+          GenJnlBatch.GET(EMSetup."Expense Template Name",EMSetup."Expense Batch Name");
+
+          IF DocumentNo = '' THEN
+            DocumentNo := GetNextGenJnlDocNo(GenJnlBatch,"Document Date");
+
+          GenJnlLine.INIT;
+          GenJnlLine."Journal Template Name" := EMSetup."Expense Template Name";
+          GenJnlLine."Journal Batch Name" := EMSetup."Expense Batch Name";
+          GenJnlLine."Line No." := GetNextGenJnlLineNo(GenJnlLine."Journal Template Name",GenJnlLine."Journal Batch Name");
+          GenJnlLine.INSERT(TRUE);
+
+          GenJnlLine."Document No." := DocumentNo;
+          GenJnlLine.VALIDATE("Posting Date","Document Date");
+          GenJnlLine.VALIDATE("Account Type",BalanceAccountType);
+          GenJnlLine.VALIDATE("Account No.",BalanceAccountNo);
+          GenJnlLine."Document Type" := DocType;
+
+          IF GenJnlLine."Account Type" = GenJnlLine."Account Type"::Vendor THEN BEGIN
+            GenJnlLine.VALIDATE(Amount,-ABS(BalancingAmount));
+            GenJnlLine."External Document No." := STRSUBSTNO('%1 %2',TABLECAPTION,"Entry No.");
+          END ELSE
+            GenJnlLine.VALIDATE(Amount,BalancingAmount);
+
+          GenJnlLine.Description := COPYSTR(GetExpPostingDesc(Expense),1,MAXSTRLEN(GenJnlLine.Description));
+          GenJnlLine.VALIDATE("Currency Code",'');
+
+          GenJnlLine.VALIDATE("Shortcut Dimension 1 Code","Global Dimension 1 Code");
+          GenJnlLine.VALIDATE("Shortcut Dimension 2 Code","Global Dimension 2 Code");
+          ExpenseDimMgt.CopyExpDimToJnlLine(Expense,GenJnlLine);
+
+          GenJnlLine.MODIFY(TRUE);
+
+          NoOfGenJnlLines := NoOfGenJnlLines + 1;
+        END;
+
+        VALIDATE(Posted,TRUE);
+        MODIFY;
+      END;
+
+      //Rec := Expense;
+    END;
+
+    PROCEDURE SetPostingDate@1(NewReplacePostingDate@1000 : Boolean;NewPostingDate@1002 : Date);
+    BEGIN
+      PostingDateExists := TRUE;
+      ReplacePostingDate := NewReplacePostingDate;
+      PostingDate := NewPostingDate;
+    END;
+
+    LOCAL PROCEDURE CreatePurchInvHeader@1160040005(VAR Expense@1160040005 : Record 6086320;VAR PurchHeader@1160040000 : Record 38);
+    VAR
+      NoSeriesMgt@1160040002 : Codeunit 396;
+    BEGIN
+      WITH Expense DO BEGIN
+        CLEAR(PurchHeader);
+        PurchHeader."Document Type" := PurchHeader."Document Type"::Invoice;
+
+        EMSetup.GET;
+        IF EMSetup."Invoice Nos." <> '' THEN
+          NoSeriesMgt.InitSeries(EMSetup."Invoice Nos.",PurchHeader."No. Series",TODAY,PurchHeader."No.",PurchHeader."No. Series")
+        ELSE
+          PurchHeader."No." := '';
+        PurchHeader.INSERT(TRUE);
+
+        PurchHeader.VALIDATE("Buy-from Vendor No.",ContiniaUserSetup."Vendor No.");
+        PurchHeader.VALIDATE("Currency Code",'');
+        PurchHeader.VALIDATE("Posting Date","Document Date");
+        PurchHeader.VALIDATE("Shortcut Dimension 1 Code","Global Dimension 1 Code");
+        PurchHeader.VALIDATE("Shortcut Dimension 2 Code","Global Dimension 2 Code");
+        PurchHeader.VALIDATE("Vendor Invoice No.",STRSUBSTNO('%1 %2',TABLECAPTION,"Entry No."));
+        PurchHeader.VALIDATE("Prices Including VAT",TRUE);
+        PurchHeader.MODIFY(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE GetExpPostingDesc@1160040003(Expense@1160040000 : Record 6086320) PostingDesc : Text[1024];
+    VAR
+      ExpPostingDescFields@1160040002 : Record 6086333;
+    BEGIN
+      PostingDesc := EMSetup."Posting Description";
+      ExpPostingDescFields.ASCENDING(FALSE);
+      IF ExpPostingDescFields.FINDFIRST THEN
+        REPEAT
+          PostingDesc :=
+            Replace(PostingDesc,'%' + FORMAT(ExpPostingDescFields."Parameter No."),
+              ExtractText(Expense,ExpPostingDescFields."Field Type Code"),FALSE);
+        UNTIL ExpPostingDescFields.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE Replace@1000000003(Text@1000000000 : Text[1024];ReplaceTxt@1000000001 : Text[1024];ReplaceWithTxt@1000000002 : Text[1024];CaseSensitive@1160040000 : Boolean) : Text[1024];
+    VAR
+      i@1000000005 : Integer;
+      ReplaceTxtLen@1000000003 : Integer;
+      ReplaceWithTxtLen@1000000004 : Integer;
+    BEGIN
+      ReplaceTxtLen := STRLEN(ReplaceTxt);
+      ReplaceWithTxtLen := STRLEN(ReplaceWithTxt);
+
+      IF CaseSensitive THEN
+        i := STRPOS(Text,ReplaceTxt)
+      ELSE
+        i := STRPOS(UPPERCASE(Text),UPPERCASE(ReplaceTxt));
+
+      IF i <> 0 THEN BEGIN
+        Text := COPYSTR(Text,1,i-1) + ReplaceWithTxt + COPYSTR(Text,i + ReplaceTxtLen);
+        Text :=
+          COPYSTR(Text,1,i-1 + ReplaceWithTxtLen) + Replace(COPYSTR(Text,i + ReplaceWithTxtLen),ReplaceTxt,ReplaceWithTxt,CaseSensitive)
+      ;
+      END;
+      EXIT(Text);
+    END;
+
+    PROCEDURE ExtractText@1160040040(Expense@1160040000 : Record 6086320;FieldTypeCode@1160040001 : Code[20]) : Text[1024];
+    VAR
+      FieldType@1160040002 : Record 6086345;
+      ExpenseDim@1160040006 : Record 6086353;
+      Field@1160040007 : Record 2000000041;
+      DimCode@1160040008 : Code[20];
+      RecRef@1160040003 : RecordRef;
+      FldRef@1160040004 : FieldRef;
+      i@1160040005 : Integer;
+    BEGIN
+      IF FieldType.GET(FieldTypeCode) THEN
+        IF FieldType.IsSystemField THEN BEGIN
+          RecRef.GETTABLE(Expense);
+          FOR i := 1 TO RecRef.FIELDCOUNT DO BEGIN
+            FldRef := RecRef.FIELDINDEX(i);
+            IF FldRef.NUMBER = FieldType.GetSystemFieldExpTableNo THEN
+              EXIT(FORMAT(FldRef.VALUE));
+          END;
+        END ELSE BEGIN
+          DimCode := FieldType.GetDimCode;
+          IF DimCode <> '' THEN BEGIN
+            ExpenseDim.SETRANGE("Expense Entry No.",Expense."Entry No.");
+            ExpenseDim.SETRANGE("Dimension Code",DimCode);
+            IF ExpenseDim.FINDFIRST THEN
+              EXIT(ExpenseDim."Dimension Value Code");
+          END ELSE BEGIN
+            ExpenseDim.SETRANGE("Expense Entry No.",Expense."Entry No.");
+            ExpenseDim.SETRANGE("Field Code",FieldTypeCode);
+            IF ExpenseDim.FINDFIRST THEN
+              EXIT(ExpenseDim."Field Value");
+          END;
+        END;
+    END;
+
+    PROCEDURE GetNextGenJnlLineNo@1160040000(JnlTemplName@1160040000 : Code[10];JnlBatchName@1160040001 : Code[10]) : Integer;
+    VAR
+      GenJnlLine@1160040002 : Record 81;
+    BEGIN
+      GenJnlLine.SETRANGE("Journal Template Name",JnlTemplName);
+      GenJnlLine.SETRANGE("Journal Batch Name",JnlBatchName);
+      IF GenJnlLine.FINDLAST THEN
+        EXIT(GenJnlLine."Line No." + 10000)
+      ELSE
+        EXIT(10000);
+    END;
+
+    PROCEDURE GetNextGenJnlDocNo@1160040002(GenJnlBatch@1160040000 : Record 232;DocDate@1160040003 : Date) : Code[20];
+    VAR
+      GenJnlLine@1160040001 : Record 81;
+      NoSeriesMgt@1160040002 : Codeunit 396;
+    BEGIN
+      GenJnlLine.SETRANGE("Journal Template Name",GenJnlBatch."Journal Template Name");
+      GenJnlLine.SETRANGE("Journal Batch Name",GenJnlBatch.Name);
+      IF GenJnlLine.FINDLAST THEN
+        EXIT(INCSTR(GenJnlLine."Document No."))
+      ELSE
+        EXIT(NoSeriesMgt.GetNextNo(GenJnlBatch."No. Series",DocDate,FALSE));
+    END;
+
+    PROCEDURE GetNextPurchLineNo@1160040001(PurchHeader@1160040000 : Record 38) : Integer;
+    VAR
+      PurchLine@1160040001 : Record 39;
+    BEGIN
+      PurchLine.SETRANGE("Document Type",PurchHeader."Document Type");
+      PurchLine.SETRANGE("Document No.",PurchHeader."No.");
+      IF PurchLine.FINDLAST THEN
+        EXIT(PurchLine."Line No." + 10000)
+      ELSE
+        EXIT(10000);
+    END;
+
+    PROCEDURE GetDocCreated@1160040004(VAR NewNoOfGenJnlLines@1160040000 : Integer;VAR NewNoOfPurchLines@1160040001 : Integer);
+    BEGIN
+      NewNoOfGenJnlLines += NoOfGenJnlLines;
+      NewNoOfPurchLines += NoOfPurchLines;
+    END;
+
+    PROCEDURE CleanUpGenJnl@1160040006(JnlTemplName@1160040001 : Code[10];JnlBatchName@1160040000 : Code[10]);
+    VAR
+      GenJnlLine@1160040002 : Record 81;
+    BEGIN
+      GenJnlLine.SETRANGE("Journal Template Name",JnlTemplName);
+      GenJnlLine.SETRANGE("Journal Batch Name",JnlBatchName);
+      GenJnlLine.SETFILTER("Account No.",'%1','');
+      GenJnlLine.DELETEALL(TRUE);
+    END;
+
+    PROCEDURE ForcePIApproval@161024026();
+    VAR
+      ApprovalCmtLine@1160040005 : Record 455;
+      ApprovalEntry@1160040004 : Record 454;
+      UserSetup@1160040003 : Record 91;
+      DCApprovalsBridge@1160040002 : Codeunit 6085790;
+      EMApprovalMgt@1160040000 : Codeunit 6086312;
+      DCApprovalMgt@1160040006 : Codeunit 6085722;
+      PurchRecRef@1160040001 : RecordRef;
+    BEGIN
+      IF PurchHeader.Status <> PurchHeader.Status::Open THEN
+        EXIT;
+
+      IF PurchHeader."No." = '' THEN
+        EXIT;
+
+      CODEUNIT.RUN(CODEUNIT::"Release Purchase Document",PurchHeader);
+
+      UserSetup.GET(EMApprovalMgt.GetCurrUserID);
+
+      PurchRecRef.GETTABLE(PurchHeader);
+      DCApprovalsBridge.InitializeApprovalEntry(PurchRecRef,ApprovalEntry);
+      DCApprovalMgt.MakeApprovalEntry(ApprovalEntry,0,EMApprovalMgt.GetCurrUserID);
+
+      ApprovalEntry.SETRANGE("Table ID",DATABASE::"Purchase Header");
+      ApprovalEntry.SETRANGE("Document Type",PurchHeader."Document Type");
+      ApprovalEntry.SETRANGE("Document No.",PurchHeader."No.");
+      ApprovalEntry.FINDLAST;
+      ApprovalEntry.Status := ApprovalEntry.Status::Approved;
+      ApprovalEntry.MODIFY;
+
+      EMApprovalMgt.CreateAppvlCmtLine(
+        DATABASE::"Purchase Header",PurchHeader."Document Type",PurchHeader."No.",STRSUBSTNO(AppForcedBy,EMApprovalMgt.GetCurrUserID));
+    END;
+
+    PROCEDURE CreateJobJnlLine@1160040007(Expense@1160040000 : Record 6086320;GenJnlLine@1160040007 : Record 81;UseExpenseAllocation@1160040008 : Boolean;ExpenseAllocation@1160040009 : Record 6086321);
+    VAR
+      ExpMgtSetup@1160040001 : Record 6086300;
+      JobJnlLine@1160040004 : Record 11072008;
+      JobJnlTemplate@1160040002 : Record 11072007;
+      JobJnlBatch@1160040003 : Record 11072011;
+      Job@1160040010 : Record 11072003;
+      Currency@1160040013 : Record 4;
+      CurrExchRate@1160040012 : Record 330;
+      GLSetup@1160040015 : Record 98;
+      ExpenseDimMgt@1160040006 : Codeunit 6086318;
+      NextLineNo@1160040005 : Integer;
+      CurrencyFactor@1160040011 : Decimal;
+      UnitAmountRoundingPrecision@1160040014 : Decimal;
+      Amount@1160040016 : Decimal;
+    BEGIN
+      IF (Expense."Job No." = '') OR (Expense."Job Task No." = '') OR
+         (GenJnlLine."Account Type" <> GenJnlLine."Account Type"::"G/L Account")
+      THEN
+        EXIT;
+
+      ExpMgtSetup.GET;
+      IF (ExpMgtSetup."Job Template Name" = '') OR (ExpMgtSetup."Job Batch Name" = '') THEN
+        EXIT;
+
+      Job.GET(Expense."Job No.");
+      JobJnlBatch.GET(ExpMgtSetup."Job Template Name",ExpMgtSetup."Job Batch Name");
+      JobJnlBatch.TESTFIELD("No. Series",'');
+
+      NextLineNo := GetNextJobJnlLineNo(ExpMgtSetup."Job Template Name",ExpMgtSetup."Job Batch Name");
+
+      CleanUpJobJnl(ExpMgtSetup."Job Template Name",ExpMgtSetup."Job Batch Name");
+
+      CLEAR(JobJnlLine);
+      JobJnlLine.VALIDATE("Journal Template Name",ExpMgtSetup."Job Template Name");
+      JobJnlLine.VALIDATE("Journal Batch Name",ExpMgtSetup."Job Batch Name");
+      JobJnlLine.VALIDATE("Line No.",NextLineNo + 10000);
+      JobJnlLine.VALIDATE("Source Code",JobJnlTemplate."Source Code");
+      JobJnlLine.VALIDATE("Reason Code",JobJnlBatch."Reason Code");
+      JobJnlLine.VALIDATE("Job No.",Expense."Job No.");
+      JobJnlLine.VALIDATE("Job Task No.",Expense."Job Task No.");
+      JobJnlLine.VALIDATE("Posting Date",GenJnlLine."Posting Date");
+      JobJnlLine.VALIDATE(Type,JobJnlLine.Type::"G/L Account");
+      JobJnlLine.VALIDATE("Line Type",JobJnlLine."Line Type"::Contract);
+      JobJnlLine.VALIDATE("No.",GenJnlLine."Account No.");
+      JobJnlLine.VALIDATE(Description,Expense.Description);
+      JobJnlLine.VALIDATE("Document No.",GenJnlLine."Document No.");
+      IF Job."Currency Code" <> '' THEN BEGIN
+        GLSetup.GET;
+      //CurrencyFactor := CurrExchRate.ExchangeRate(GenJnlLine."Posting Date",Job."Currency Code"); //**4PS.o
+        CurrencyFactor := CurrExchRate.ExchangeRate(0,'',GenJnlLine."Posting Date",Job."Currency Code",FALSE); //**4PS.n
+        UnitAmountRoundingPrecision := GLSetup."Unit-Amount Rounding Precision";
+        Amount :=
+      //  ROUND(CurrExchRate.ExchangeAmtLCYToFCY(GenJnlLine."Posting Date", //**4PS.o
+      //    Job."Currency Code",GenJnlLine."VAT Base Amount",CurrencyFactor),UnitAmountRoundingPrecision); //**4PS.o
+          ROUND(CurrExchRate.ExchangeAmtLCYToFCY(0,'',GenJnlLine."Posting Date", //**4PS.n
+            Job."Currency Code",GenJnlLine."VAT Base Amount",CurrencyFactor,FALSE),UnitAmountRoundingPrecision); //**4PS.n
+        JobJnlLine.VALIDATE("Unit Cost",Amount);
+        JobJnlLine.VALIDATE("Unit Price",Amount);
+      END ELSE BEGIN
+        JobJnlLine.VALIDATE("Unit Cost",GenJnlLine."VAT Base Amount");
+        JobJnlLine.VALIDATE("Unit Price",GenJnlLine."VAT Base Amount");
+      END;
+      JobJnlLine.VALIDATE(Quantity,1);
+      JobJnlLine.VALIDATE("Shortcut Dimension 1 Code",Expense."Global Dimension 1 Code");
+      JobJnlLine.VALIDATE("Shortcut Dimension 2 Code",Expense."Global Dimension 2 Code");
+      IF NOT UseExpenseAllocation THEN
+        ExpenseDimMgt.CopyExpDimToJobJnlLine(Expense,JobJnlLine)
+      ELSE
+        ExpenseDimMgt.CopyExpAllocDimToJobJnlLine(ExpenseAllocation,JobJnlLine);
+      JobJnlLine.INSERT(TRUE);
+    END;
+
+    PROCEDURE GetNextJobJnlLineNo@1160040018(JnlTemplName@1160040000 : Code[10];JnlBatchName@1160040001 : Code[10]) : Integer;
+    VAR
+      JobJnlLine@1160040003 : Record 11072008;
+    BEGIN
+      JobJnlLine.SETRANGE("Journal Template Name",JnlTemplName);
+      JobJnlLine.SETRANGE("Journal Batch Name",JnlBatchName);
+      IF JobJnlLine.FINDLAST THEN
+        EXIT(JobJnlLine."Line No." + 10000)
+      ELSE
+        EXIT(10000);
+    END;
+
+    PROCEDURE CleanUpJobJnl@1160040008(JnlTemplName@1160040001 : Code[10];JnlBatchName@1160040000 : Code[10]);
+    VAR
+      JobJnlLine@1160040002 : Record 11072008;
+    BEGIN
+      JobJnlLine.SETRANGE("Journal Template Name",JnlTemplName);
+      JobJnlLine.SETRANGE("Journal Batch Name",JnlBatchName);
+      JobJnlLine.SETFILTER("No.",'%1','');
+      JobJnlLine.DELETEALL(TRUE);
+    END;
+
+    BEGIN
+    {
+      4PS, Objects renumbered
+    }
+    END.
+  }
+}
+

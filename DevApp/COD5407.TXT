@@ -1,0 +1,832 @@
+OBJECT Codeunit 5407 Prod. Order Status Management
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00.00.45243,4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=5405;
+    Permissions=TableData 242=r,
+                TableData 5405=rimd,
+                TableData 5410=rid,
+                TableData 5896=rim;
+    OnRun=VAR
+            ChangeStatusForm@1005 : Page 99000882;
+          BEGIN
+            ChangeStatusForm.Set(Rec);
+            IF ChangeStatusForm.RUNMODAL = ACTION::Yes THEN BEGIN
+              ChangeStatusForm.ReturnPostingInfo(NewStatus,NewPostingDate,NewUpdateUnitCost);
+              ChangeStatusOnProdOrder(Rec,NewStatus,NewPostingDate,NewUpdateUnitCost);
+              COMMIT;
+              MESSAGE(Text000,Status,TABLECAPTION,"No.",ToProdOrder.Status,ToProdOrder.TABLECAPTION,ToProdOrder."No.")
+            END;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1000 : TextConst 'ENU=%2 %3  with status %1 has been changed to %5 %6 with status %4.';
+      Text002@1002 : TextConst 'ENU=Posting Automatic consumption...\\';
+      Text003@1003 : TextConst 'ENU=Posting lines         #1###### @2@@@@@@@@@@@@@';
+      Text004@1004 : TextConst 'ENU=%1 %2 has not been finished. Some output is still missing. Do you still want to finish the order?';
+      Text005@1005 : TextConst 'ENU=The update has been interrupted to respect the warning.';
+      Text006@1006 : TextConst 'ENU=%1 %2 has not been finished. Some consumption is still missing. Do you still want to finish the order?';
+      Text007@1007 : TextConst 'ENU=The status of order %1 cannot be changed as it is related to planning line %2 in worksheet %3 %4.';
+      ToProdOrder@1018 : Record 5405;
+      SourceCodeSetup@1009 : Record 242;
+      Item@1030 : Record 27;
+      InvtSetup@1022 : Record 313;
+      DimMgt@1029 : Codeunit 408;
+      ReserveProdOrderLine@1011 : Codeunit 99000837;
+      ReserveProdOrderComp@1012 : Codeunit 99000838;
+      ReservMgt@1017 : Codeunit 99000845;
+      CalendarMgt@1013 : Codeunit 99000755;
+      UpdateProdOrderCost@1014 : Codeunit 99000757;
+      ACYMgt@1015 : Codeunit 5837;
+      WhseProdRelease@1016 : Codeunit 5774;
+      WhseOutputProdRelease@1008 : Codeunit 7325;
+      InvtAdjmt@1020 : Codeunit 5895;
+      NewStatus@1028 : 'Quote,Planned,Firm Planned,Released,Finished';
+      NewPostingDate@1027 : Date;
+      NewUpdateUnitCost@1026 : Boolean;
+      SourceCodeSetupRead@1021 : Boolean;
+      Text008@1001 : TextConst 'ENU=%1 %2 cannot be finished as the associated subcontract order %3 has not been fully delivered.';
+      Text009@1010 : TextConst 'ENU=You cannot finish line %1 on %2 %3. It has consumption or capacity posted with no output.';
+      Text010@1019 : TextConst 'ENU=You must specify a %1 in %2 %3 %4.';
+
+    PROCEDURE ChangeStatusOnProdOrder@10(ProdOrder@1000 : Record 5405;NewStatus@1003 : 'Quote,Planned,Firm Planned,Released,Finished';NewPostingDate@1004 : Date;NewUpdateUnitCost@1005 : Boolean);
+    BEGIN
+      SetPostingInfo(NewStatus,NewPostingDate,NewUpdateUnitCost);
+      ErrorIfInPlanningWksh(ProdOrder);
+      IF NewStatus = NewStatus::Finished THEN BEGIN
+        CheckBeforeFinishProdOrder(ProdOrder);
+        FlushProdOrder(ProdOrder,NewStatus,NewPostingDate);
+        ProdOrder.HandleItemTrackingDeletion;
+        ErrorIfUnableToClearWIP(ProdOrder);
+        TransProdOrder(ProdOrder);
+
+        InvtSetup.GET;
+        IF InvtSetup."Automatic Cost Adjustment" <>
+           InvtSetup."Automatic Cost Adjustment"::Never
+        THEN BEGIN
+          InvtAdjmt.SetProperties(TRUE,InvtSetup."Automatic Cost Posting");
+          InvtAdjmt.MakeMultiLevelAdjmt;
+        END;
+
+        WhseProdRelease.FinishedDelete(ProdOrder);
+        WhseOutputProdRelease.FinishedDelete(ProdOrder);
+      END ELSE BEGIN
+        TransProdOrder(ProdOrder);
+        FlushProdOrder(ProdOrder,NewStatus,NewPostingDate);
+        WhseProdRelease.Release(ProdOrder);
+      END;
+      ResetStatusItemJournal(ProdOrder,ToProdOrder,NewStatus);  //**4PS.n
+      COMMIT;
+
+      CLEAR(InvtAdjmt);
+    END;
+
+    LOCAL PROCEDURE TransProdOrder@1(VAR FromProdOrder@1000 : Record 5405);
+    VAR
+      ToProdOrderLine@1001 : Record 5406;
+    BEGIN
+      WITH FromProdOrder DO BEGIN
+        ToProdOrderLine.LOCKTABLE;
+
+        ToProdOrder := FromProdOrder;
+        ToProdOrder.Status := NewStatus;
+
+        CASE Status OF
+          Status::Simulated:
+            ToProdOrder."Simulated Order No." := "No.";
+          Status::Planned:
+            ToProdOrder."Planned Order No." := "No.";
+          Status::"Firm Planned":
+            ToProdOrder."Firm Planned Order No." := "No.";
+          Status::Released:
+            ToProdOrder."Finished Date" := NewPostingDate;
+        END;
+
+        ToProdOrder.TestNoSeries;
+        IF (ToProdOrder.GetNoSeriesCode <> GetNoSeriesCode) AND
+           (ToProdOrder.Status <> ToProdOrder.Status::Finished)
+        THEN BEGIN
+          ToProdOrder."No." := '';
+          ToProdOrder."Due Date" := 0D;
+        END;
+
+        ToProdOrder.INSERT(TRUE);
+        ToProdOrder."Starting Time" := "Starting Time";
+        ToProdOrder."Starting Date" := "Starting Date";
+        ToProdOrder."Ending Time" := "Ending Time";
+        ToProdOrder."Ending Date" := "Ending Date";
+        ToProdOrder."Due Date" := "Due Date";
+        ToProdOrder."Shortcut Dimension 1 Code" := "Shortcut Dimension 1 Code";
+        ToProdOrder."Shortcut Dimension 2 Code" := "Shortcut Dimension 2 Code";
+        ToProdOrder."Dimension Set ID" := "Dimension Set ID";
+        ToProdOrder.MODIFY;
+
+        TransProdOrderLine(FromProdOrder);
+        TransProdOrderRtngLine(FromProdOrder);
+        TransProdOrderComp(FromProdOrder);
+        TransProdOrderRtngTool(FromProdOrder);
+        TransProdOrderRtngPersnl(FromProdOrder);
+        TransProdOrdRtngQltyMeas(FromProdOrder);
+        TransProdOrderCmtLine(FromProdOrder);
+        TransProdOrderRtngCmtLn(FromProdOrder);
+        TransProdOrderBOMCmtLine(FromProdOrder);
+        TransProdOrderCapNeed(FromProdOrder);
+        DELETE;
+        FromProdOrder := ToProdOrder;
+      END;
+    END;
+
+    LOCAL PROCEDURE TransProdOrderLine@21(FromProdOrder@1003 : Record 5405);
+    VAR
+      FromProdOrderLine@1021 : Record 5406;
+      ToProdOrderLine@1020 : Record 5406;
+      InvtAdjmtEntryOrder@1000 : Record 5896;
+    BEGIN
+      WITH FromProdOrderLine DO BEGIN
+        SETRANGE(Status,FromProdOrder.Status);
+        SETRANGE("Prod. Order No.",FromProdOrder."No.");
+        LOCKTABLE;
+        IF FINDSET THEN BEGIN
+          REPEAT
+            ToProdOrderLine := FromProdOrderLine;
+            ToProdOrderLine.Status := ToProdOrder.Status;
+            ToProdOrderLine."Prod. Order No." := ToProdOrder."No.";
+            ToProdOrderLine.INSERT;
+            IF NewStatus = NewStatus::Finished THEN BEGIN
+              IF InvtAdjmtEntryOrder.GET(InvtAdjmtEntryOrder."Order Type"::Production,"Prod. Order No.","Line No.") THEN BEGIN
+                InvtAdjmtEntryOrder."Routing No." := ToProdOrderLine."Routing No.";
+                InvtAdjmtEntryOrder.MODIFY;
+              END ELSE
+                InvtAdjmtEntryOrder.SetProdOrderLine(FromProdOrderLine);
+              InvtAdjmtEntryOrder."Cost is Adjusted" := FALSE;
+              InvtAdjmtEntryOrder."Is Finished" := TRUE;
+              InvtAdjmtEntryOrder.MODIFY;
+
+              IF NewUpdateUnitCost THEN
+                UpdateProdOrderCost.UpdateUnitCostOnProdOrder(FromProdOrderLine,TRUE,TRUE);
+              ToProdOrderLine."Unit Cost (ACY)" :=
+                ACYMgt.CalcACYAmt(ToProdOrderLine."Unit Cost",NewPostingDate,TRUE);
+              ToProdOrderLine."Cost Amount (ACY)" :=
+                ACYMgt.CalcACYAmt(ToProdOrderLine."Cost Amount",NewPostingDate,FALSE);
+              ReservMgt.SetProdOrderLine(FromProdOrderLine);
+              ReservMgt.DeleteReservEntries(TRUE,0);
+            END ELSE BEGIN
+              IF Item.GET("Item No.") THEN BEGIN
+                IF (Item."Costing Method" <> Item."Costing Method"::Standard) AND NewUpdateUnitCost THEN
+                  UpdateProdOrderCost.UpdateUnitCostOnProdOrder(FromProdOrderLine,FALSE,TRUE);
+              END;
+              ToProdOrderLine.BlockDynamicTracking(TRUE);
+              ToProdOrderLine.VALIDATE(Quantity);
+              ReserveProdOrderLine.TransferPOLineToPOLine(FromProdOrderLine,ToProdOrderLine,0,TRUE);
+            END;
+            ToProdOrderLine.VALIDATE("Unit Cost","Unit Cost");
+            ToProdOrderLine.MODIFY;
+          UNTIL NEXT = 0;
+          DELETEALL;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE TransProdOrderRtngLine@20(FromProdOrder@1002 : Record 5405);
+    VAR
+      FromProdOrderRtngLine@1016 : Record 5409;
+      ToProdOrderRtngLine@1015 : Record 5409;
+      ProdOrderCapNeed@1000 : Record 5410;
+    BEGIN
+      WITH FromProdOrderRtngLine DO BEGIN
+        SETRANGE(Status,FromProdOrder.Status);
+        SETRANGE("Prod. Order No.",FromProdOrder."No.");
+        LOCKTABLE;
+        IF FINDSET THEN BEGIN
+          REPEAT
+            ToProdOrderRtngLine := FromProdOrderRtngLine;
+            ToProdOrderRtngLine.Status := ToProdOrder.Status;
+            ToProdOrderRtngLine."Prod. Order No." := ToProdOrder."No.";
+            IF ToProdOrder.Status = ToProdOrder.Status::Released THEN
+              ToProdOrderRtngLine."Routing Status" := "Routing Status"::Planned;
+
+            IF ToProdOrder.Status IN [ToProdOrder.Status::"Firm Planned",ToProdOrder.Status::Released] THEN BEGIN
+              ProdOrderCapNeed.SETRANGE("Prod. Order No.",FromProdOrder."No.");
+              ProdOrderCapNeed.SETRANGE(Status,FromProdOrder.Status);
+              ProdOrderCapNeed.SETRANGE("Routing Reference No.","Routing Reference No.");
+              ProdOrderCapNeed.SETRANGE("Operation No.","Operation No.");
+              ProdOrderCapNeed.SETRANGE("Requested Only",FALSE);
+              ProdOrderCapNeed.CALCSUMS("Needed Time (ms)");
+              ToProdOrderRtngLine."Expected Capacity Need" := ProdOrderCapNeed."Needed Time (ms)";
+            END;
+            ToProdOrderRtngLine.INSERT;
+          UNTIL NEXT = 0;
+          DELETEALL;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE TransProdOrderComp@17(FromProdOrder@1002 : Record 5405);
+    VAR
+      FromProdOrderComp@1014 : Record 5407;
+      ToProdOrderComp@1013 : Record 5407;
+      Location@1000 : Record 14;
+    BEGIN
+      WITH FromProdOrderComp DO BEGIN
+        SETRANGE(Status,FromProdOrder.Status);
+        SETRANGE("Prod. Order No.",FromProdOrder."No.");
+        LOCKTABLE;
+        IF FINDSET THEN BEGIN
+          REPEAT
+            IF Location.GET("Location Code") AND
+               Location."Bin Mandatory" AND
+               NOT Location."Directed Put-away and Pick" AND
+               (Status = Status::"Firm Planned") AND
+               (ToProdOrder.Status = ToProdOrder.Status::Released) AND
+               ("Flushing Method" IN ["Flushing Method"::Forward,"Flushing Method"::"Pick + Forward"]) AND
+               ("Routing Link Code" = '') AND
+               ("Bin Code" = '')
+            THEN
+              ERROR(
+                Text010,
+                FIELDCAPTION("Bin Code"),
+                TABLECAPTION,
+                FIELDCAPTION("Line No."),
+                "Line No.");
+            ToProdOrderComp := FromProdOrderComp;
+            ToProdOrderComp.Status := ToProdOrder.Status;
+            ToProdOrderComp."Prod. Order No." := ToProdOrder."No.";
+            ToProdOrderComp.INSERT;
+            IF NewStatus = NewStatus::Finished THEN BEGIN
+              ReservMgt.SetProdOrderComponent(FromProdOrderComp);
+              ReservMgt.DeleteReservEntries(TRUE,0);
+            END ELSE BEGIN
+              ToProdOrderComp.BlockDynamicTracking(TRUE);
+              ToProdOrderComp.VALIDATE("Expected Quantity");
+              ReserveProdOrderComp.TransferPOCompToPOComp(FromProdOrderComp,ToProdOrderComp,0,TRUE);
+              IF ToProdOrderComp.Status IN [ToProdOrderComp.Status::"Firm Planned",ToProdOrderComp.Status::Released] THEN
+                ToProdOrderComp.AutoReserve;
+            END;
+            ToProdOrderComp.MODIFY;
+          UNTIL NEXT = 0;
+          DELETEALL;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE TransProdOrderRtngTool@14(FromProdOrder@1002 : Record 5405);
+    VAR
+      FromProdOrderRtngTool@1010 : Record 5411;
+      ToProdOrderRoutTool@1009 : Record 5411;
+    BEGIN
+      WITH FromProdOrderRtngTool DO BEGIN
+        SETRANGE(Status,FromProdOrder.Status);
+        SETRANGE("Prod. Order No.",FromProdOrder."No.");
+        LOCKTABLE;
+        IF FINDSET THEN BEGIN
+          REPEAT
+            ToProdOrderRoutTool := FromProdOrderRtngTool;
+            ToProdOrderRoutTool.Status := ToProdOrder.Status;
+            ToProdOrderRoutTool."Prod. Order No." := ToProdOrder."No.";
+            ToProdOrderRoutTool.INSERT;
+          UNTIL NEXT = 0;
+          DELETEALL;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE TransProdOrderRtngPersnl@11(FromProdOrder@1002 : Record 5405);
+    VAR
+      FromProdOrderRtngPersonnel@1008 : Record 5412;
+      ToProdOrderRtngPersonnel@1007 : Record 5412;
+    BEGIN
+      WITH FromProdOrderRtngPersonnel DO BEGIN
+        SETRANGE(Status,FromProdOrder.Status);
+        SETRANGE("Prod. Order No.",FromProdOrder."No.");
+        LOCKTABLE;
+        IF FINDSET THEN BEGIN
+          REPEAT
+            ToProdOrderRtngPersonnel := FromProdOrderRtngPersonnel;
+            ToProdOrderRtngPersonnel.Status := ToProdOrder.Status;
+            ToProdOrderRtngPersonnel."Prod. Order No." := ToProdOrder."No.";
+            ToProdOrderRtngPersonnel.INSERT;
+          UNTIL NEXT = 0;
+          DELETEALL;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE TransProdOrdRtngQltyMeas@12(FromProdOrder@1002 : Record 5405);
+    VAR
+      FromProdOrderRtngQltyMeas@1010 : Record 5413;
+      ToProdOrderRtngQltyMeas@1009 : Record 5413;
+    BEGIN
+      WITH FromProdOrderRtngQltyMeas DO BEGIN
+        SETRANGE(Status,FromProdOrder.Status);
+        SETRANGE("Prod. Order No.",FromProdOrder."No.");
+        LOCKTABLE;
+        IF FINDSET THEN BEGIN
+          REPEAT
+            ToProdOrderRtngQltyMeas := FromProdOrderRtngQltyMeas;
+            ToProdOrderRtngQltyMeas.Status := ToProdOrder.Status;
+            ToProdOrderRtngQltyMeas."Prod. Order No." := ToProdOrder."No.";
+            ToProdOrderRtngQltyMeas.INSERT;
+          UNTIL NEXT = 0;
+          DELETEALL;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE TransProdOrderCmtLine@13(FromProdOrder@1002 : Record 5405);
+    VAR
+      FromProdOrderCommentLine@1001 : Record 5414;
+      ToProdOrderCommentLine@1000 : Record 5414;
+      RecordLinkManagement@1003 : Codeunit 447;
+    BEGIN
+      WITH FromProdOrderCommentLine DO BEGIN
+        SETRANGE(Status,FromProdOrder.Status);
+        SETRANGE("Prod. Order No.",FromProdOrder."No.");
+        LOCKTABLE;
+        IF FINDSET THEN BEGIN
+          REPEAT
+            ToProdOrderCommentLine := FromProdOrderCommentLine;
+            ToProdOrderCommentLine.Status := ToProdOrder.Status;
+            ToProdOrderCommentLine."Prod. Order No." := ToProdOrder."No.";
+            ToProdOrderCommentLine.INSERT;
+          UNTIL NEXT = 0;
+          DELETEALL;
+        END;
+      END;
+      RecordLinkManagement.CopyLinks(FromProdOrder,ToProdOrder);
+    END;
+
+    LOCAL PROCEDURE TransProdOrderRtngCmtLn@16(FromProdOrder@1002 : Record 5405);
+    VAR
+      FromProdOrderRtngComment@1006 : Record 5415;
+      ToProdOrderRtngComment@1005 : Record 5415;
+    BEGIN
+      WITH FromProdOrderRtngComment DO BEGIN
+        SETRANGE(Status,FromProdOrder.Status);
+        SETRANGE("Prod. Order No.",FromProdOrder."No.");
+        LOCKTABLE;
+        IF FINDSET THEN BEGIN
+          REPEAT
+            ToProdOrderRtngComment := FromProdOrderRtngComment;
+            ToProdOrderRtngComment.Status := ToProdOrder.Status;
+            ToProdOrderRtngComment."Prod. Order No." := ToProdOrder."No.";
+            ToProdOrderRtngComment.INSERT;
+          UNTIL NEXT = 0;
+          DELETEALL;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE TransProdOrderBOMCmtLine@18(FromProdOrder@1002 : Record 5405);
+    VAR
+      FromProdOrderBOMComment@1004 : Record 5416;
+      ToProdOrderBOMComment@1003 : Record 5416;
+    BEGIN
+      WITH FromProdOrderBOMComment DO BEGIN
+        SETRANGE(Status,FromProdOrder.Status);
+        SETRANGE("Prod. Order No.",FromProdOrder."No.");
+        LOCKTABLE;
+        IF FINDSET THEN BEGIN
+          REPEAT
+            ToProdOrderBOMComment := FromProdOrderBOMComment;
+            ToProdOrderBOMComment.Status := ToProdOrder.Status;
+            ToProdOrderBOMComment."Prod. Order No." := ToProdOrder."No.";
+            ToProdOrderBOMComment.INSERT;
+          UNTIL NEXT = 0;
+          DELETEALL;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE TransProdOrderCapNeed@23(FromProdOrder@1000 : Record 5405);
+    VAR
+      FromProdOrderCapNeed@1002 : Record 5410;
+      ToProdOrderCapNeed@1001 : Record 5410;
+    BEGIN
+      WITH FromProdOrderCapNeed DO BEGIN
+        SETRANGE(Status,FromProdOrder.Status);
+        SETRANGE("Prod. Order No.",FromProdOrder."No.");
+        SETRANGE("Requested Only",FALSE);
+        IF NewStatus = NewStatus::Finished THEN
+          DELETEALL
+        ELSE BEGIN
+          LOCKTABLE;
+          IF FINDSET THEN BEGIN
+            REPEAT
+              ToProdOrderCapNeed := FromProdOrderCapNeed;
+              ToProdOrderCapNeed.Status := ToProdOrder.Status;
+              ToProdOrderCapNeed."Prod. Order No." := ToProdOrder."No.";
+              ToProdOrderCapNeed."Allocated Time" := ToProdOrderCapNeed."Needed Time";
+              ToProdOrderCapNeed.INSERT;
+            UNTIL NEXT = 0;
+            DELETEALL;
+          END;
+        END;
+      END;
+    END;
+
+    PROCEDURE FlushProdOrder@4(ProdOrder@1000 : Record 5405;NewStatus@1001 : 'Simulated,Planned,Firm Planned,Released,Finished';PostingDate@1002 : Date);
+    VAR
+      Item@1003 : Record 27;
+      ItemJnlLine@1020 : Record 83;
+      ProdOrderLine@1006 : Record 5406;
+      ProdOrderRtngLine@1008 : Record 5409;
+      ProdOrderComp@1009 : Record 5407;
+      ItemJnlPostLine@1004 : Codeunit 22;
+      CostCalcMgt@1015 : Codeunit 5836;
+      ItemTrackingMgt@1007 : Codeunit 6500;
+      Window@1016 : Dialog;
+      QtyToPost@1017 : Decimal;
+      NoOfRecords@1018 : Integer;
+      LineCount@1019 : Integer;
+      OutputQty@1010 : Decimal;
+      OutputQtyBase@1013 : Decimal;
+      ActualOutputAndScrapQty@1012 : Decimal;
+      ActualOutputAndScrapQtyBase@1011 : Decimal;
+    BEGIN
+      IF NewStatus < NewStatus::Released THEN
+        EXIT;
+
+      GetSourceCodeSetup;
+
+      ProdOrderLine.LOCKTABLE;
+      ProdOrderLine.RESET;
+      ProdOrderLine.SETRANGE(Status,ProdOrder.Status);
+      ProdOrderLine.SETRANGE("Prod. Order No.",ProdOrder."No.");
+      IF ProdOrderLine.FINDSET THEN
+        REPEAT
+          ProdOrderRtngLine.SETCURRENTKEY("Prod. Order No.",Status,"Flushing Method");
+          IF NewStatus = NewStatus::Released THEN
+            ProdOrderRtngLine.SETRANGE("Flushing Method",ProdOrderRtngLine."Flushing Method"::Forward)
+          ELSE BEGIN
+            ProdOrderRtngLine.ASCENDING(FALSE); // In case of backward flushing on the last operation
+            ProdOrderRtngLine.SETRANGE("Flushing Method",ProdOrderRtngLine."Flushing Method"::Backward);
+          END;
+          ProdOrderRtngLine.SETRANGE(Status,ProdOrderLine.Status);
+          ProdOrderRtngLine.SETRANGE("Prod. Order No.",ProdOrder."No.");
+          ProdOrderRtngLine.SETRANGE("Routing No.",ProdOrderLine."Routing No.");
+          ProdOrderRtngLine.SETRANGE("Routing Reference No.",ProdOrderLine."Routing Reference No.");
+          ProdOrderRtngLine.LOCKTABLE;
+          IF ProdOrderRtngLine.FIND('-') THEN BEGIN
+            // First found operation
+            IF ProdOrderRtngLine."Flushing Method" = ProdOrderRtngLine."Flushing Method"::Backward THEN BEGIN
+              ActualOutputAndScrapQtyBase :=
+                CostCalcMgt.CalcActOperOutputAndScrap(ProdOrderLine,ProdOrderRtngLine);
+              ActualOutputAndScrapQty := ActualOutputAndScrapQtyBase / ProdOrderLine."Qty. per Unit of Measure";
+            END;
+
+            IF (ProdOrderRtngLine."Flushing Method" = ProdOrderRtngLine."Flushing Method"::Forward) OR
+               (ProdOrderRtngLine."Next Operation No." = '')
+            THEN BEGIN
+              OutputQty := ProdOrderLine."Remaining Quantity";
+              OutputQtyBase := ProdOrderLine."Remaining Qty. (Base)";
+            END ELSE
+              IF ProdOrderRtngLine."Next Operation No." <> '' THEN BEGIN // Not Last Operation
+                OutputQty := ActualOutputAndScrapQty;
+                OutputQtyBase := ActualOutputAndScrapQtyBase;
+              END;
+
+            REPEAT
+              ItemJnlLine.INIT;
+              ItemJnlLine.VALIDATE("Entry Type",ItemJnlLine."Entry Type"::Output);
+              ItemJnlLine.VALIDATE("Posting Date",PostingDate);
+              ItemJnlLine."Document No." := ProdOrder."No.";
+              ItemJnlLine.VALIDATE("Order Type",ItemJnlLine."Order Type"::Production);
+              ItemJnlLine.VALIDATE("Order No.",ProdOrder."No.");
+              ItemJnlLine.VALIDATE("Order Line No.",ProdOrderLine."Line No.");
+              ItemJnlLine.VALIDATE("Item No.",ProdOrderLine."Item No.");
+              ItemJnlLine.VALIDATE("Routing Reference No.",ProdOrderRtngLine."Routing Reference No.");
+              ItemJnlLine.VALIDATE("Routing No.",ProdOrderRtngLine."Routing No.");
+              ItemJnlLine.VALIDATE("Variant Code",ProdOrderLine."Variant Code");
+              ItemJnlLine."Location Code" := ProdOrderLine."Location Code";
+              IF ItemJnlLine."Unit of Measure Code" <> ProdOrderLine."Unit of Measure Code" THEN
+                ItemJnlLine.VALIDATE("Unit of Measure Code",ProdOrderLine."Unit of Measure Code");
+              ItemJnlLine.VALIDATE("Operation No.",ProdOrderRtngLine."Operation No.");
+              IF ProdOrderRtngLine."Concurrent Capacities" = 0 THEN
+                ProdOrderRtngLine."Concurrent Capacities" := 1;
+              SetTimeAndQuantityOmItemJnlLine(ItemJnlLine,ProdOrderRtngLine,OutputQtyBase,OutputQty);
+              ItemJnlLine."Source Code" := SourceCodeSetup.Flushing;
+              IF NOT (ItemJnlLine.TimeIsEmpty AND (ItemJnlLine."Output Quantity" = 0)) THEN BEGIN
+                DimMgt.UpdateGlobalDimFromDimSetID(ItemJnlLine."Dimension Set ID",ItemJnlLine."Shortcut Dimension 1 Code",
+                  ItemJnlLine."Shortcut Dimension 2 Code");
+                IF ProdOrderRtngLine."Next Operation No." = '' THEN
+                  ReserveProdOrderLine.TransferPOLineToItemJnlLine(ProdOrderLine,ItemJnlLine,ItemJnlLine."Output Quantity (Base)");
+                ItemJnlPostLine.RunWithCheck(ItemJnlLine);
+              END;
+
+              IF (ProdOrderRtngLine."Flushing Method" = ProdOrderRtngLine."Flushing Method"::Backward) AND
+                 (ProdOrderRtngLine."Next Operation No." = '')
+              THEN BEGIN
+                OutputQty += ActualOutputAndScrapQty;
+                OutputQtyBase += ActualOutputAndScrapQtyBase;
+              END;
+            UNTIL ProdOrderRtngLine.NEXT = 0;
+          END;
+        UNTIL ProdOrderLine.NEXT = 0;
+
+      WITH ProdOrderComp DO BEGIN
+        SETCURRENTKEY(Status,"Prod. Order No.","Routing Link Code","Flushing Method");
+        IF NewStatus = NewStatus::Released THEN
+          SETFILTER(
+            "Flushing Method",
+            '%1|%2',
+            "Flushing Method"::Forward,
+            "Flushing Method"::"Pick + Forward")
+        ELSE
+          SETFILTER(
+            "Flushing Method",
+            '%1|%2',
+            "Flushing Method"::Backward,
+            "Flushing Method"::"Pick + Backward");
+        SETRANGE("Routing Link Code",'');
+        SETRANGE(Status,Status::Released);
+        SETRANGE("Prod. Order No.",ProdOrder."No.");
+        SETFILTER("Item No.",'<>%1','');
+        LOCKTABLE;
+        IF FINDSET THEN BEGIN
+          NoOfRecords := COUNT;
+          Window.OPEN(
+            Text002 +
+            Text003);
+          LineCount := 0;
+
+          REPEAT
+            LineCount := LineCount + 1;
+            Item.GET("Item No.");
+            Item.TESTFIELD("Rounding Precision");
+            Window.UPDATE(1,LineCount);
+            Window.UPDATE(2,ROUND(LineCount / NoOfRecords * 10000,1));
+            ProdOrderLine.GET(Status,ProdOrder."No.","Prod. Order Line No.");
+            IF NewStatus = NewStatus::Released THEN
+              QtyToPost := GetNeededQty(1,FALSE)
+            ELSE
+              QtyToPost := GetNeededQty(0,FALSE);
+            QtyToPost := ROUND(QtyToPost,Item."Rounding Precision",'>');
+
+            IF QtyToPost <> 0 THEN BEGIN
+              ItemJnlLine.INIT;
+              ItemJnlLine.VALIDATE("Entry Type",ItemJnlLine."Entry Type"::Consumption);
+              ItemJnlLine.VALIDATE("Posting Date",PostingDate);
+              ItemJnlLine."Order Type" := ItemJnlLine."Order Type"::Production;
+              ItemJnlLine."Order No." := ProdOrder."No.";
+              ItemJnlLine."Source No." := ProdOrderLine."Item No.";
+              ItemJnlLine."Source Type" := ItemJnlLine."Source Type"::Item;
+              ItemJnlLine."Order Line No." := ProdOrderLine."Line No.";
+              ItemJnlLine."Document No." := ProdOrder."No.";
+              ItemJnlLine.VALIDATE("Item No.","Item No.");
+              ItemJnlLine.VALIDATE("Prod. Order Comp. Line No.","Line No.");
+              IF ItemJnlLine."Unit of Measure Code" <> "Unit of Measure Code" THEN
+                ItemJnlLine.VALIDATE("Unit of Measure Code","Unit of Measure Code");
+              ItemJnlLine."Qty. per Unit of Measure" := "Qty. per Unit of Measure";
+              ItemJnlLine.Description := Description;
+              ItemJnlLine.VALIDATE(Quantity,QtyToPost);
+              ItemJnlLine.VALIDATE("Unit Cost","Unit Cost");
+              ItemJnlLine."Location Code" := "Location Code";
+              ItemJnlLine."Bin Code" := "Bin Code";
+              ItemJnlLine."Variant Code" := "Variant Code";
+              ItemJnlLine."Source Code" := SourceCodeSetup.Flushing;
+              ItemJnlLine."Gen. Bus. Posting Group" := ProdOrder."Gen. Bus. Posting Group";
+              ItemJnlLine."Gen. Prod. Posting Group" := Item."Gen. Prod. Posting Group";
+              IF Item."Item Tracking Code" <> '' THEN
+                ItemTrackingMgt.CopyItemTracking(RowID1,ItemJnlLine.RowID1,FALSE);
+              ItemJnlPostLine.RUN(ItemJnlLine);
+            END;
+          UNTIL NEXT = 0;
+          Window.CLOSE;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckBeforeFinishProdOrder@3(ProdOrder@1000 : Record 5405);
+    VAR
+      ProdOrderLine@1001 : Record 5406;
+      ProdOrderComp@1002 : Record 5407;
+      ProdOrderRtngLine@1003 : Record 5409;
+      PurchLine@1004 : Record 39;
+      ShowWarning@1005 : Boolean;
+    BEGIN
+      WITH PurchLine DO BEGIN
+        SETCURRENTKEY("Document Type",Type,"Prod. Order No.","Prod. Order Line No.","Routing No.","Operation No.");
+        SETRANGE("Document Type","Document Type"::Order);
+        SETRANGE(Type,Type::Item);
+        SETRANGE("Prod. Order No.",ProdOrder."No.");
+        SETFILTER("Outstanding Quantity",'<>%1',0);
+        IF FINDFIRST THEN
+          ERROR(Text008,ProdOrder.TABLECAPTION,ProdOrder."No.","Document No.");
+      END;
+
+      WITH ProdOrderLine DO BEGIN
+        SETRANGE(Status,ProdOrder.Status);
+        SETRANGE("Prod. Order No.",ProdOrder."No.");
+        SETFILTER("Remaining Quantity",'<>0');
+        IF NOT ISEMPTY THEN BEGIN
+          ProdOrderRtngLine.SETRANGE(Status,ProdOrder.Status);
+          ProdOrderRtngLine.SETRANGE("Prod. Order No.",ProdOrder."No.");
+          ProdOrderRtngLine.SETRANGE("Next Operation No.",'');
+          IF NOT ProdOrderRtngLine.ISEMPTY THEN BEGIN
+            ProdOrderRtngLine.SETFILTER("Flushing Method",'<>%1',ProdOrderRtngLine."Flushing Method"::Backward);
+            ShowWarning := NOT ProdOrderRtngLine.ISEMPTY;
+          END ELSE
+            ShowWarning := TRUE;
+
+          IF ShowWarning THEN BEGIN;
+            IF CONFIRM(STRSUBSTNO(Text004,ProdOrder.TABLECAPTION,ProdOrder."No.")) THEN
+              EXIT;
+            ERROR(Text005);
+          END;
+        END;
+      END;
+
+      WITH ProdOrderComp DO BEGIN
+        SETAUTOCALCFIELDS("Pick Qty. (Base)");
+        SETRANGE(Status,ProdOrder.Status);
+        SETRANGE("Prod. Order No.",ProdOrder."No.");
+        SETFILTER("Remaining Quantity",'<>0');
+        IF FINDSET THEN
+          REPEAT
+            TESTFIELD("Pick Qty. (Base)",0);
+            IF (("Flushing Method" <> "Flushing Method"::Backward) AND
+                ("Flushing Method" <> "Flushing Method"::"Pick + Backward") AND
+                ("Routing Link Code" = '')) OR
+               (("Routing Link Code" <> '') AND NOT RtngWillFlushComp(ProdOrderComp))
+            THEN BEGIN
+              IF CONFIRM(STRSUBSTNO(Text006,ProdOrder.TABLECAPTION,ProdOrder."No.")) THEN
+                EXIT;
+              ERROR(Text005);
+            END;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE RtngWillFlushComp@6(ProdOrderComp@1000 : Record 5407) : Boolean;
+    VAR
+      ProdOrderRtngLine@1001 : Record 5409;
+      ProdOrderLine@1002 : Record 5406;
+    BEGIN
+      IF ProdOrderComp."Routing Link Code" = '' THEN
+        EXIT;
+
+      WITH ProdOrderComp DO
+        ProdOrderLine.GET(Status,"Prod. Order No.","Prod. Order Line No.");
+
+      WITH ProdOrderRtngLine DO BEGIN
+        SETCURRENTKEY("Prod. Order No.",Status,"Flushing Method");
+        SETRANGE("Flushing Method","Flushing Method"::Backward);
+        SETRANGE(Status,Status::Released);
+        SETRANGE("Prod. Order No.",ProdOrderComp."Prod. Order No.");
+        SETRANGE("Routing Link Code",ProdOrderComp."Routing Link Code");
+        SETRANGE("Routing No.",ProdOrderLine."Routing No.");
+        SETRANGE("Routing Reference No.",ProdOrderLine."Routing Reference No.");
+        EXIT(FINDFIRST);
+      END;
+    END;
+
+    LOCAL PROCEDURE GetSourceCodeSetup@15();
+    BEGIN
+      IF NOT SourceCodeSetupRead THEN
+        SourceCodeSetup.GET;
+      SourceCodeSetupRead := TRUE;
+    END;
+
+    LOCAL PROCEDURE ErrorIfInPlanningWksh@5(VAR ProdOrder@1000 : Record 5405);
+    VAR
+      ReqLine@1001 : Record 246;
+    BEGIN
+      EXIT; //**4PS.n
+      //db, 10-06-02: check on (planning)status=new is useless and status=cancel not required; check also skipped for collective update...
+
+      ReqLine.SETCURRENTKEY("Ref. Order Type","Ref. Order Status","Ref. Order No.","Ref. Line No.");
+      ReqLine.SETRANGE("Ref. Order Type",ReqLine."Ref. Order Type"::"Prod. Order");
+      ReqLine.SETRANGE("Ref. Order Status",ProdOrder.Status);
+      ReqLine.SETRANGE("Ref. Order No.",ProdOrder."No.");
+      IF ReqLine.FINDFIRST THEN
+        ERROR(Text007,
+          ProdOrder."No.",ReqLine."Line No.",ReqLine."Worksheet Template Name",ReqLine."Journal Batch Name");
+    END;
+
+    PROCEDURE SetPostingInfo@2(Status@1002 : 'Quote,Planned,Firm Planned,Released,Finished';PostingDate@1001 : Date;UpdateUnitCost@1000 : Boolean);
+    BEGIN
+      NewStatus := Status;
+      NewPostingDate := PostingDate;
+      NewUpdateUnitCost := UpdateUnitCost;
+    END;
+
+    LOCAL PROCEDURE ErrorIfUnableToClearWIP@7(ProdOrder@1001 : Record 5405);
+    VAR
+      ProdOrderLine@1000 : Record 5406;
+    BEGIN
+      ProdOrderLine.SETRANGE(Status,ProdOrder.Status);
+      ProdOrderLine.SETRANGE("Prod. Order No.",ProdOrder."No.");
+      IF ProdOrderLine.FINDSET THEN
+        REPEAT
+          IF NOT OutputExists(ProdOrderLine) THEN
+            IF MatrOrCapConsumpExists(ProdOrderLine) THEN
+              ERROR(Text009,ProdOrderLine."Line No.",ToProdOrder.TABLECAPTION,ProdOrderLine."Prod. Order No.");
+        UNTIL ProdOrderLine.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE OutputExists@9(ProdOrderLine@1001 : Record 5406) : Boolean;
+    VAR
+      ItemLedgEntry@1000 : Record 32;
+    BEGIN
+      ItemLedgEntry.SETCURRENTKEY("Order Type","Order No.","Order Line No.");
+      ItemLedgEntry.SETRANGE("Order Type",ItemLedgEntry."Order Type"::Production);
+      ItemLedgEntry.SETRANGE("Order No.",ProdOrderLine."Prod. Order No.");
+      ItemLedgEntry.SETRANGE("Order Line No.",ProdOrderLine."Line No.");
+      ItemLedgEntry.SETRANGE("Entry Type",ItemLedgEntry."Entry Type"::Output);
+      IF ItemLedgEntry.FINDFIRST THEN BEGIN
+        ItemLedgEntry.CALCSUMS(Quantity);
+        IF ItemLedgEntry.Quantity <> 0 THEN
+          EXIT(TRUE)
+      END;
+      EXIT(FALSE);
+    END;
+
+    LOCAL PROCEDURE MatrOrCapConsumpExists@22(ProdOrderLine@1002 : Record 5406) : Boolean;
+    VAR
+      ItemLedgEntry@1000 : Record 32;
+      CapLedgEntry@1001 : Record 5832;
+    BEGIN
+      ItemLedgEntry.SETCURRENTKEY("Order Type","Order No.","Order Line No.");
+      ItemLedgEntry.SETRANGE("Order Type",ItemLedgEntry."Order Type"::Production);
+      ItemLedgEntry.SETRANGE("Order No.",ProdOrderLine."Prod. Order No.");
+      ItemLedgEntry.SETRANGE("Order Line No.",ProdOrderLine."Line No.");
+      ItemLedgEntry.SETRANGE("Entry Type",ItemLedgEntry."Entry Type"::Consumption);
+      IF ItemLedgEntry.FINDFIRST THEN
+        EXIT(TRUE);
+
+      CapLedgEntry.SETCURRENTKEY("Order Type","Order No.","Order Line No.","Routing No.","Routing Reference No.");
+      CapLedgEntry.SETRANGE("Order Type",CapLedgEntry."Order Type"::Production);
+      CapLedgEntry.SETRANGE("Order No.",ProdOrderLine."Prod. Order No.");
+      CapLedgEntry.SETRANGE("Routing No.",ProdOrderLine."Routing No.");
+      CapLedgEntry.SETRANGE("Routing Reference No.",ProdOrderLine."Routing Reference No.");
+      EXIT(CapLedgEntry.FINDFIRST);
+    END;
+
+    LOCAL PROCEDURE SetTimeAndQuantityOmItemJnlLine@8(VAR ItemJnlLine@1000 : Record 83;ProdOrderRtngLine@1001 : Record 5409;OutputQtyBase@1003 : Decimal;OutputQty@1004 : Decimal);
+    VAR
+      CostCalculationManagement@1002 : Codeunit 5836;
+    BEGIN
+      IF ItemJnlLine.SubcontractingWorkCenterUsed THEN BEGIN
+        ItemJnlLine.VALIDATE("Output Quantity",0);
+        ItemJnlLine.VALIDATE("Run Time",0);
+        ItemJnlLine.VALIDATE("Setup Time",0)
+      END ELSE BEGIN
+        ItemJnlLine.VALIDATE(
+          "Setup Time",
+          ROUND(
+            ProdOrderRtngLine."Setup Time" *
+            ProdOrderRtngLine."Concurrent Capacities" *
+            CalendarMgt.QtyperTimeUnitofMeasure(
+              ProdOrderRtngLine."Work Center No.",
+              ProdOrderRtngLine."Setup Time Unit of Meas. Code"),
+            0.00001));
+        ItemJnlLine.VALIDATE(
+          "Run Time",
+          CostCalculationManagement.CalcCostTime(
+            OutputQtyBase,
+            ProdOrderRtngLine."Setup Time",ProdOrderRtngLine."Setup Time Unit of Meas. Code",
+            ProdOrderRtngLine."Run Time",ProdOrderRtngLine."Run Time Unit of Meas. Code",
+            ProdOrderRtngLine."Lot Size",
+            ProdOrderRtngLine."Scrap Factor % (Accumulated)",ProdOrderRtngLine."Fixed Scrap Qty. (Accum.)",
+            ProdOrderRtngLine."Work Center No.",0,FALSE,0));
+        ItemJnlLine.VALIDATE("Output Quantity",OutputQty);
+      END;
+    END;
+
+    PROCEDURE ResetStatusItemJournal@1210190000(FromProdOrder@1210190006 : Record 5405;ToProdOrder@1210190002 : Record 5405;NewStatus@1210190000 : 'Quote,Planned,Firm Planned,Released,Finished');
+    VAR
+      ItemJnlLine@1210190001 : Record 83;
+    BEGIN
+      //**4PS
+      ItemJnlLine.SETCURRENTKEY("Production Order");
+      IF FromProdOrder."Firm Planned Order No." = '' THEN
+        ItemJnlLine.SETRANGE("Production Order", FromProdOrder."No.")
+      ELSE
+        ItemJnlLine.SETRANGE("Production Order", FromProdOrder."Firm Planned Order No.");
+
+      IF ItemJnlLine.FIND('-') THEN BEGIN
+        REPEAT
+          IF NewStatus = NewStatus::Finished THEN BEGIN
+            ItemJnlLine."Inventory Status" := ItemJnlLine."Inventory Status"::produced;
+            ItemJnlLine.Blocked := FALSE;
+          END;
+          ItemJnlLine."Production Status" := NewStatus;
+          ItemJnlLine.MODIFY;
+        UNTIL ItemJnlLine.NEXT = 0;
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

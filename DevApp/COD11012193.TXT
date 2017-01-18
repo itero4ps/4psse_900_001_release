@@ -1,0 +1,508 @@
+OBJECT Codeunit 11012193 Request Handler (4PS-Mobile)
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    SingleInstance=Yes;
+    OnRun=VAR
+            lvMobileSetupRec@1100525000 : Record 11012676;
+          BEGIN
+            lvMobileSetupRec.GET;
+            lvMobileSetupRec.TESTFIELD("Receive Message Queue");
+            lvMobileSetupRec.TESTFIELD("Reply Message Queue");
+
+            IF ISNULL(ReceiveMessageQueue) THEN
+              ReceiveMessageQueue := ReceiveMessageQueue.MessageQueue(lvMobileSetupRec."Receive Message Queue");
+            ReceiveMessageQueue.Formatter := XMLMessageFormatter.XmlMessageFormatter;
+            ReceiveMessageQueue.UseJournalQueue(FALSE);
+            ReceiveMessageQueue.BeginReceive;
+
+            IF ISNULL(ReplyMessageQueue) THEN
+              ReplyMessageQueue := ReplyMessageQueue.MessageQueue(lvMobileSetupRec."Reply Message Queue");
+            ReplyMessageQueue.UseJournalQueue(FALSE);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      XMLDOMMgt@1100485001 : Codeunit 11020220;
+      Text002@1100485000 : TextConst 'ENU=Missing tag ''%1'' in ''%2'' message';
+      Text003@1100485002 : TextConst 'ENU=Unknown message type ''%1'' in ''%2'' message';
+      Text004@1100485003 : TextConst 'ENU=Request ''%1'' by unknown employee (resource) ''%2''';
+      ReceiveMessageQueue@1100525000 : DotNet "'System.Messaging, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'.System.Messaging.MessageQueue" WITHEVENTS;
+      ReplyMessageQueue@1100525001 : DotNet "'System.Messaging, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'.System.Messaging.MessageQueue";
+      XMLMessageFormatter@1100525003 : DotNet "'System.Messaging, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'.System.Messaging.XmlMessageFormatter";
+      Text005@1100525002 : TextConst 'ENU=Request ''%1'' for employee (resource) ''%2'', resource is no employee';
+
+    PROCEDURE ParsMessage@1100485000(XMLDocIn@1100485001 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";InMsg@1100485000 : DotNet "'System.Messaging, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'.System.Messaging.Message") ResultBln : Boolean;
+    VAR
+      ErrorRec@1100409003 : Record 11012051;
+      Resource@1100525002 : Record 11229278;
+      WorkOrder@1100525003 : Record 11229279;
+      HistoryWorkOrder@1100525000 : Record 11229279;
+      BaseServiceInspectionList@1100525004 : Record 11071930;
+      ServiceAnalysis@1100409002 : Record 11012842;
+      SUPRoom@1100525006 : Record 11071950;
+      SUPPart@1100525007 : Record 11071951;
+      SUPRoomPart@1100525008 : Record 11072282;
+      SUPPartServiceAnalysis@1100525009 : Record 11072283;
+      lvExchangetMgtCU@1100485004 : Codeunit 11012194;
+      XMLFormat@1100528701 : Codeunit 11020221;
+      lvXMLNodeReturn@1100485008 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      lvXMLCurrNode@1100485007 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      MobileWorkOrderNo@1100527000 : Code[20];
+      MobileObjectNo@1100525005 : Code[20];
+      LocationCode@1100409004 : Code[20];
+      lvMessTypeTag@1100485010 : Text[30];
+      lvRequestType@1100485002 : Text[100];
+      lvReplyType@1100485003 : Text[100];
+      lvApplicationVersion@1100525001 : Text[30];
+      ComputerName@1100409000 : Text;
+      WindowsUserName@1100409001 : Text;
+      LastUpdateDate@1100528700 : Date;
+      LastUpdateTime@1100525010 : Time;
+    BEGIN
+      XMLDOMMgt.RemoveNamespaces(XMLDocIn,XMLDocIn);
+      ResultBln := FALSE;
+      lvMessTypeTag := '';
+
+      lvXMLCurrNode := XMLDocIn.DocumentElement;
+      IF XMLDOMMgt.FindNode(lvXMLCurrNode,'RequestType',lvXMLNodeReturn) THEN BEGIN
+        lvRequestType := lvXMLNodeReturn.InnerText;
+        lvMessTypeTag := 'REQUEST';
+      END ELSE BEGIN
+        IF XMLDOMMgt.FindNode(lvXMLCurrNode,'ReplyType',lvXMLNodeReturn) THEN BEGIN
+          lvReplyType := lvXMLNodeReturn.InnerText;
+          lvMessTypeTag := 'REPLY';
+        END;
+      END;
+
+      IF lvMessTypeTag = '' THEN
+        EXIT  //* Ignore unknown message types (no error)
+      ELSE BEGIN
+        IF XMLDOMMgt.FindNode(lvXMLCurrNode,'ParameterList',lvXMLNodeReturn) THEN
+          lvXMLCurrNode := lvXMLNodeReturn
+        ELSE BEGIN
+          ErrorRec.InsertError(ErrorRec."Source Type"::Mobile, STRSUBSTNO(Text002, 'ParameterList', lvMessTypeTag));//* All messages should start with this tag (after the message type tag)
+          EXIT(FALSE);
+        END;
+      END;
+
+      CASE lvMessTypeTag OF
+        'REQUEST':
+          BEGIN
+            //outgoing data
+            IF COPYSTR(lvRequestType, 1, 4) = 'Send' THEN BEGIN
+              IF (lvRequestType <> 'SendMobileUserSettings') THEN BEGIN
+                IF XMLDOMMgt.FindNode(lvXMLCurrNode,'ResourceNo',lvXMLNodeReturn) THEN
+                  Resource."No." := lvXMLNodeReturn.InnerText;
+                IF (NOT Resource.GET(Resource."No.")) OR (Resource."No." = '') THEN BEGIN
+                  ErrorRec.InsertError(ErrorRec."Source Type"::Mobile, STRSUBSTNO(Text004, lvRequestType, Resource."No."));
+                  EXIT(FALSE);
+                END;
+                IF (Resource.Type <> Resource.Type::Employee) OR (Resource."Source No." = '') THEN BEGIN
+                  ErrorRec.InsertError(ErrorRec."Source Type"::Mobile, STRSUBSTNO(Text005, lvRequestType, Resource."No."));
+                  EXIT(FALSE);
+                END;
+              END;
+              IF XMLDOMMgt.FindNode(lvXMLCurrNode, 'ApplicationVersion', lvXMLNodeReturn) THEN
+                lvApplicationVersion := lvXMLNodeReturn.InnerText;
+              LastUpdateDate := 0D;
+              IF XMLDOMMgt.FindNode(lvXMLCurrNode, 'LastUpdateDate', lvXMLNodeReturn) THEN
+                XMLFormat.EvaluateDateAndTime(lvXMLNodeReturn.InnerText, LastUpdateDate, LastUpdateTime);
+              CASE lvRequestType OF
+                'SendBudgetLine',
+                'SendContractAgreement',
+                'SendReportProcedure',
+                'SendRelatedWorkOrder',
+                'SendExtraCost',
+                'SendRelatedUsedItems',
+                'SendRelatedItemsToOrder',
+                'SendRelatedWorkingTimes',
+                'SendRelatedExtraCosts',
+                'SendCentralServiceOrderFields',
+                'SendHistoryWorkOrder',
+                'SendHistoryUsedItem', // dp00563
+                'SendHistoryInspectionLine', // dp00563
+                'SendServiceLocStructureLines',
+                'SendServiceOrderObjects',
+                'SendServiceOrderInspectionLines',
+                'SendServiceOrderObjSpecLines',
+                'SendBaseObjectSpecificationOpts',
+                'SendMobileItemUsage',
+                'SendWorkOrderTexts',
+                'SendUnitPriceWorkOrder',
+                'SendServiceSourceEMail', // dp00563
+                'SendObjectNoByDecentralObject', // dp00276
+                'SendWorkOrderByOrderNo': // dp00276
+                  BEGIN
+                    IF XMLDOMMgt.FindNode(lvXMLCurrNode,'WorkOrderNo',lvXMLNodeReturn) THEN BEGIN
+                      WorkOrder."No." := lvXMLNodeReturn.InnerText;
+                      IF NOT WorkOrder.GET(WorkOrder."No.") THEN
+                        WorkOrder.INIT;
+                    END;
+                  END;
+              END;
+            END;
+            CASE lvRequestType OF // dp00563.sn
+              'SendHistoryUsedItem',
+              'SendHistoryInspectionLine':
+                 BEGIN
+                   IF XMLDOMMgt.FindNode(lvXMLCurrNode,'HistoryWorkOrderNo',lvXMLNodeReturn) THEN BEGIN
+                     HistoryWorkOrder."No." := lvXMLNodeReturn.InnerText;
+                     IF NOT HistoryWorkOrder.GET(HistoryWorkOrder."No.") THEN
+                       HistoryWorkOrder.INIT;
+                   END;
+                 END;
+            END; // dp00563.en
+            CASE lvRequestType OF
+              'SendMobileSetup':
+                ResultBln := lvExchangetMgtCU.SendMobileSetup(InMsg, Resource."No.");
+              'SendMobileUserSettings':
+                BEGIN
+                  IF XMLDOMMgt.FindNode(lvXMLCurrNode, 'ComputerName', lvXMLNodeReturn) THEN
+                    ComputerName := lvXMLNodeReturn.InnerText;
+                  IF XMLDOMMgt.FindNode(lvXMLCurrNode, 'WindowsUserName', lvXMLNodeReturn) THEN
+                    WindowsUserName := lvXMLNodeReturn.InnerText;
+                  ResultBln := lvExchangetMgtCU.SendMobileUserSettings(InMsg, ComputerName, WindowsUserName);
+                END;
+              'SendOrderKind':
+                ResultBln := lvExchangetMgtCU.SendOrderKind(InMsg, LastUpdateDate);
+              'SendOrderType':
+                ResultBln := lvExchangetMgtCU.SendOrderType(InMsg, LastUpdateDate);
+              'SendProblem':
+                ResultBln := lvExchangetMgtCU.SendProblem(InMsg, LastUpdateDate);
+              'SendCause':
+                ResultBln := lvExchangetMgtCU.SendCause(InMsg, LastUpdateDate);
+              'SendSolution':
+                ResultBln := lvExchangetMgtCU.SendSolution(InMsg, LastUpdateDate);
+              'SendProblemDiscipline':
+                BEGIN
+                  IF XMLDOMMgt.FindNode(lvXMLCurrNode, 'WorkOrderNo', lvXMLNodeReturn) THEN
+                    ServiceAnalysis.Code := lvXMLNodeReturn.InnerText;
+                  IF NOT ServiceAnalysis.GET(ServiceAnalysis."Analysis Type"::Problem, ServiceAnalysis.Code) THEN
+                    ServiceAnalysis.INIT;
+                  ResultBln := lvExchangetMgtCU.SendProblemDiscipline(InMsg, ServiceAnalysis);
+                END;
+              'SendProblemDiscipline2':
+                ResultBln := lvExchangetMgtCU.SendProblemDiscipline2(InMsg, LastUpdateDate); // DP00981
+              'SendProblemCause':
+                BEGIN
+                  // obsolete from version 210
+                  IF XMLDOMMgt.FindNode(lvXMLCurrNode, 'WorkOrderNo', lvXMLNodeReturn) THEN
+                    ServiceAnalysis.Code := lvXMLNodeReturn.InnerText;
+                  IF NOT ServiceAnalysis.GET(ServiceAnalysis."Analysis Type"::Problem, ServiceAnalysis.Code) THEN
+                    ServiceAnalysis.INIT;
+                  ResultBln := lvExchangetMgtCU.SendProblemCause(InMsg, ServiceAnalysis);
+                END;
+              'SendProblemSolution':
+                BEGIN
+                  // obsolete from version 210
+                  IF XMLDOMMgt.FindNode(lvXMLCurrNode, 'WorkOrderNo', lvXMLNodeReturn) THEN
+                    ServiceAnalysis.Code := lvXMLNodeReturn.InnerText;
+                  IF NOT ServiceAnalysis.GET(ServiceAnalysis."Analysis Type"::Problem, ServiceAnalysis.Code) THEN
+                    ServiceAnalysis.INIT;
+                  ResultBln := lvExchangetMgtCU.SendProblemSolution(InMsg, ServiceAnalysis);
+                END;
+              'SendServiceAnalysisRelation':
+                ResultBln := lvExchangetMgtCU.SendServiceAnalysisRelation(InMsg, LastUpdateDate);
+              'SendServiceAnalysisSetup':
+                ResultBln := lvExchangetMgtCU.SendServiceAnalysisSetup(InMsg);
+      // DP00981.sn
+              'SendServiceLocationType':
+                ResultBln := lvExchangetMgtCU.SendServiceLocationType(InMsg, LastUpdateDate);
+              'SendServiceLocationTypeRoom':
+                ResultBln := lvExchangetMgtCU.SendServiceLocationTypeRoom(InMsg, LastUpdateDate);
+              'SendSupRoom':
+                ResultBln := lvExchangetMgtCU.SendSUPRoom(InMsg, LastUpdateDate);
+              'SendSupPart':
+                ResultBln := lvExchangetMgtCU.SendSUPPart(InMsg, LastUpdateDate);
+              'SendSupRoomPart':
+                ResultBln := lvExchangetMgtCU.SendSUPRoomPart(InMsg, LastUpdateDate);
+              'SendSupPartProblem':
+                ResultBln := lvExchangetMgtCU.SendSUPPartProblem(InMsg, LastUpdateDate);
+      // DP00981.en
+              'SendPriority':
+                ResultBln := lvExchangetMgtCU.SendServicePriority(InMsg, LastUpdateDate);
+              'SendUnitOfMeasure':
+                ResultBln := lvExchangetMgtCU.SendUnitOfMeasure(InMsg, Resource."Filter Set (Mobile)", Resource.Company, LastUpdateDate);
+              'SendTerritory':
+                ResultBln := lvExchangetMgtCU.SendTerritory(InMsg);
+              'SendCostComponent':
+                ResultBln := lvExchangetMgtCU.SendCostComponent(InMsg);
+              'SendCostCenter':
+                ResultBln := lvExchangetMgtCU.SendCostCenter(InMsg);
+              'SendCostObject':
+                ResultBln := lvExchangetMgtCU.SendCostObject(InMsg, Resource."Filter Set (Mobile)", Resource.Company);
+              'SendWageComponent':
+                ResultBln := lvExchangetMgtCU.SendWageComponent(InMsg, Resource."Filter Set (Mobile)", Resource.Company, Resource."Source No.", LastUpdateDate);
+              'SendCostCode':
+                ResultBln := lvExchangetMgtCU.SendCostCode(InMsg, Resource."Filter Set (Mobile)", Resource.Company, LastUpdateDate);
+              'SendDebriefTextRubric':
+                ResultBln := lvExchangetMgtCU.SendDebriefTextRubric(InMsg, LastUpdateDate);
+              'SendItem':
+                BEGIN
+                  LocationCode := '';
+                  IF XMLDOMMgt.FindNode(lvXMLCurrNode, 'WorkOrderNo', lvXMLNodeReturn) THEN
+                    LocationCode := lvXMLNodeReturn.InnerText;
+                  ResultBln := lvExchangetMgtCU.SendItem(InMsg, Resource."Filter Set (Mobile)", LocationCode, Resource.Company, LastUpdateDate);
+                END;
+              'SendResource':
+                ResultBln := lvExchangetMgtCU.SendResource(InMsg, Resource."Filter Set (Mobile)", Resource.Company);
+              'SendServiceLocation':
+                BEGIN
+                  ResultBln := lvExchangetMgtCU.SendServiceLocation(InMsg, Resource."Filter Set (Mobile)", Resource.Company, LastUpdateDate);
+                  Resource."Mobile Last Time Synchonized" := CURRENTDATETIME;
+                  Resource.MODIFY;
+                END;
+              'SendWorkOrder':
+                ResultBln := lvExchangetMgtCU.SendWorkOrder(InMsg, Resource."No.");
+              'SendBudgetLine':
+                ResultBln := lvExchangetMgtCU.SendBudgetLine(InMsg, WorkOrder);
+              'SendContractAgreement':
+                ResultBln := lvExchangetMgtCU.SendContractAgreement(InMsg, WorkOrder);
+              'SendReportProcedure':
+                ResultBln := lvExchangetMgtCU.SendReportProcedureLocWO(InMsg, WorkOrder);
+              'SendReportProcedureLocs':
+                ResultBln := lvExchangetMgtCU.SendReportProcedureLocs(InMsg, Resource."Filter Set (Mobile)", Resource.Company);
+              'SendRelatedWorkOrder':
+                ResultBln := lvExchangetMgtCU.SendRelatedWorkOrders(InMsg, WorkOrder);
+              'SendApplicationVersion':
+                ResultBln := lvExchangetMgtCU.SendApplicationVersion(InMsg);
+              'SendWorkOrderNoOfDecentralOrder':
+                BEGIN
+                  MobileWorkOrderNo := '';
+                  IF XMLDOMMgt.FindNode(lvXMLCurrNode,'WorkOrderNo',lvXMLNodeReturn) THEN
+                    MobileWorkOrderNo := lvXMLNodeReturn.InnerText;
+                  ResultBln := lvExchangetMgtCU.SendWorkOrderNoOfDecentralOrder(InMsg, MobileWorkOrderNo, Resource."No.");
+                END;
+              'SendObjectNoByDecentralObject': // dp00276
+                ResultBln := lvExchangetMgtCU.SendObjectNoByDecentralObject(InMsg, WorkOrder);
+              'SendExtraCost':
+                ResultBln := lvExchangetMgtCU.SendExtraCost(InMsg, WorkOrder);
+              'SendRelatedUsedItems':
+                ResultBln := lvExchangetMgtCU.SendRelatedUsedItems(InMsg, WorkOrder);
+              'SendRelatedExtraCosts':
+                ResultBln := lvExchangetMgtCU.SendRelatedExtraCosts(InMsg, WorkOrder);
+              'SendRelatedWorkingTimes':
+                ResultBln := lvExchangetMgtCU.SendRelatedWorkingTimes(InMsg, WorkOrder);
+              'SendRelatedItemsToOrder':
+                ResultBln := lvExchangetMgtCU.SendRelatedItemsToOrder(InMsg, WorkOrder);
+              'SendDeletedWorkOrder':
+                ResultBln := lvExchangetMgtCU.SendDeletedWorkOrder(InMsg, Resource."No.");
+              'SendCentralServiceOrderFields':
+                ResultBln := lvExchangetMgtCU.SendCentralServiceOrderFields(InMsg, WorkOrder);
+              'SendHistoryWorkOrder':
+                ResultBln := lvExchangetMgtCU.SendHistoricWorkOrders(InMsg, WorkOrder);
+              'SendHistoryUsedItem': // dp00563
+                ResultBln := lvExchangetMgtCU.SendHistoryUsedItems(InMsg, WorkOrder, HistoryWorkOrder);
+              'SendHistoryInspectionLine': // dp00563
+                ResultBln := lvExchangetMgtCU.SendHistoryInspectionLines(InMsg, WorkOrder, HistoryWorkOrder);
+              'SendConsignments':
+                ResultBln := lvExchangetMgtCU.SendConsignments(InMsg, Resource);
+              'SendEmployeeAbsences':
+                ResultBln := lvExchangetMgtCU.SendEmployeeAbsences(InMsg, Resource);
+              'SendServiceLocStructureLines':
+                ResultBln := lvExchangetMgtCU.SendServLocStructureLines(InMsg, WorkOrder);
+              'SendServiceOrderObjects':
+                ResultBln := lvExchangetMgtCU.SendServiceOrderObjects(InMsg, WorkOrder);
+              'SendServiceOrderInspectionLines':
+                ResultBln := lvExchangetMgtCU.SendServOrderInspectionLines(InMsg, WorkOrder);
+              'SendServiceInspectionOptions':
+                ResultBln := lvExchangetMgtCU.SendServiceInspectionOptions(InMsg, LastUpdateDate);
+              'SendServiceOrderObjSpecLines':
+                ResultBln := lvExchangetMgtCU.SendServiceOrderObjSpecLines(InMsg, WorkOrder);
+              'SendBaseObjectSpecificationOpts':
+                ResultBln := lvExchangetMgtCU.SendBaseObjectSpecOptions(InMsg, WorkOrder);
+              'SendWorkOrderTexts':
+                ResultBln := lvExchangetMgtCU.SendServiceTexts(InMsg, WorkOrder);
+              'SendMobileItemUsage':
+                ResultBln := lvExchangetMgtCU.SendMobileItemUsage(InMsg, WorkOrder);
+              'SendVendor':
+                ResultBln := lvExchangetMgtCU.SendVendor(InMsg, Resource."Filter Set (Mobile)", Resource.Company, LastUpdateDate);
+              'SendUnitPriceWorkOrder':
+                ResultBln := lvExchangetMgtCU.SendUnitPriceWorkOrder(InMsg, WorkOrder);
+              'SendServiceSourceEMail': // dp00563
+                ResultBln := lvExchangetMgtCU.SendServiceSourceEMail(InMsg, WorkOrder);
+              'SendServiceInspectionLists': // dp00626
+                ResultBln := lvExchangetMgtCU.SendServiceInspectionLists(InMsg);
+              'SendServiceInspectionLines': // dp00626
+                BEGIN
+                  IF XMLDOMMgt.FindNode(lvXMLCurrNode, 'WorkOrderNo', lvXMLNodeReturn) THEN
+                    BaseServiceInspectionList.Code := lvXMLNodeReturn.InnerText;
+                  IF NOT BaseServiceInspectionList.GET(BaseServiceInspectionList.Code) THEN
+                    BaseServiceInspectionList.INIT;
+                  ResultBln := lvExchangetMgtCU.SendServiceInspectionLines(InMsg, BaseServiceInspectionList);
+                END;
+              'SendWorkOrderByOrderNo': // dp00276
+                ResultBln := lvExchangetMgtCU.SendWorkOrderByOrderNo(InMsg, WorkOrder);
+              'SendFieldServiceStatusReason':
+                ResultBln := lvExchangetMgtCU.SendFieldServiceStatusReason(InMsg);
+              'SendDispatchAttachmentType':
+                ResultBln := lvExchangetMgtCU.SendDispatchAttachmentType(InMsg, LastUpdateDate);
+              ELSE BEGIN
+                ErrorRec.InsertError(ErrorRec."Source Type"::Mobile, STRSUBSTNO(Text003, lvRequestType, lvMessTypeTag));
+                EXIT(FALSE);
+              END;
+            END;
+          END;
+        'REPLY':
+          BEGIN
+            //Incoming data
+            CASE lvReplyType OF
+              'WorkOrder':
+                ResultBln := lvExchangetMgtCU.ReceiveWorkOrder(lvXMLCurrNode);
+              'Budget':
+                ResultBln := lvExchangetMgtCU.ReceiveBudgetLine(lvXMLCurrNode);
+              'CostPlus':
+                ResultBln := lvExchangetMgtCU.ReceiveCostPlusEntry(lvXMLCurrNode);
+              'AdviceOrder':
+                ResultBln := lvExchangetMgtCU.ReceiveAdviceOrderLine(lvXMLCurrNode);
+              'AdviceOrderText':
+                ResultBln := lvExchangetMgtCU.ReceiveAdviceOrderLineText(lvXMLCurrNode);
+              'StatusFS':
+                ResultBln := lvExchangetMgtCU.ReceiveStatusFS(lvXMLCurrNode);
+              'DebriefText':
+                ResultBln := lvExchangetMgtCU.ReceiveDebriefText(lvXMLCurrNode);
+              'DaySheet':
+                ResultBln := lvExchangetMgtCU.ReceiveHourAccountingLine(lvXMLCurrNode);
+              'DecentralWorkOrder':
+                ResultBln := lvExchangetMgtCU.ReceiveDecentralWorkOrder(lvXMLCurrNode);
+              'Acknowledge':  //Note: Is processed immediately, not in/via logbook
+                ResultBln := lvExchangetMgtCU.ProcessAcknowledge(lvXMLCurrNode);
+              'Coordinates':  //Note: Is processed immediately, not in/via logbook
+                ResultBln := lvExchangetMgtCU.ProcessPositionLogEntry(lvXMLCurrNode);
+              'ServiceOrderInspectionLines':
+                ResultBln := lvExchangetMgtCU.ReceiveOrderInspectionLine(lvXMLCurrNode);
+              'ServiceOrderObjectSpecificationLines':
+                ResultBln := lvExchangetMgtCU.ReceiveOrderObjectSpecLine(lvXMLCurrNode);
+              'WorkOrderTexts':
+                ResultBln := lvExchangetMgtCU.ReceiveWorkOrderText(lvXMLCurrNode);
+              'RestockItem':
+                ResultBln := lvExchangetMgtCU.ReceiveRestockItem(lvXMLCurrNode);
+              'CreateRestockPurchOrder':                                                     // C024394.n
+                ResultBln := lvExchangetMgtCU.ReceiveCreateRestockPurchOrder(lvXMLCurrNode); // C024394.n
+              'Planning':
+                ResultBln := lvExchangetMgtCU.ReceivePlanning(lvXMLCurrNode);
+              'PurchaseAdviceOrder':
+                ResultBln := lvExchangetMgtCU.ReceivePurchaseAdviceOrder(lvXMLCurrNode);
+              'WUPProduction':
+                ResultBln := lvExchangetMgtCU.ReceiveWUPProduction(lvXMLCurrNode);
+              'ServiceOrderObject': // dp00276
+                ResultBln := lvExchangetMgtCU.ReceiveServiceOrderObject(lvXMLCurrNode);
+              ELSE BEGIN
+                ErrorRec.InsertError(ErrorRec."Source Type"::Mobile, STRSUBSTNO(Text003, lvReplyType, lvMessTypeTag));
+                EXIT(FALSE);
+              END;
+            END;
+          END;
+      END;
+
+      CLEAR(lvXMLCurrNode);
+      CLEAR(lvXMLNodeReturn);
+    END;
+
+    PROCEDURE WriteToQueue@1240002(InMsg@1450002 : DotNet "'System.Messaging, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'.System.Messaging.Message";XMLDoc@1450000 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument");
+    VAR
+      OutMsg@1100525000 : DotNet "'System.Messaging, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'.System.Messaging.Message";
+      TimeSpan@1100409000 : DotNet "'mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.TimeSpan";
+    BEGIN
+      OutMsg := OutMsg.Message;
+      OutMsg.TimeToBeReceived(TimeSpan.TimeSpan(0, 2, 0)); //give webservice 2 minutes to read message
+      //Do not make this time shorter, it includes a (small) risk that the webservice read the EOT while the some of the earlier messages are expired.
+      OutMsg.CorrelationId(InMsg.Id);
+      OutMsg.Label(InMsg.Label + '-Reply');
+      OutMsg.Body(XMLDoc);
+      ReplyMessageQueue.Send(OutMsg);
+      CLEAR(TimeSpan);
+      CLEAR(OutMsg);
+    END;
+
+    PROCEDURE EndTransaction@1100485002(InMsg@1100485000 : DotNet "'System.Messaging, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'.System.Messaging.Message");
+    VAR
+      XMLDocOut@1100485001 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+    BEGIN
+      XMLDocOut := XMLDocOut.XmlDocument;
+      XMLDocOut.LoadXml('<EndOfTransaction/>');
+      WriteToQueue(InMsg, XMLDocOut);
+      CLEAR(XMLDocOut);
+    END;
+
+    PROCEDURE ProcessFileForTesting@1100485001(IFileName@1100485002 : Text[100]);
+    VAR
+      InMsg@1100485001 : DotNet "'System.Messaging, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'.System.Messaging.Message";
+      XMLDoc@1100485000 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      FPSMobileSetup@1100525000 : Record 11012676;
+    BEGIN
+      //* This function is only used for testing debrief messages
+      FPSMobileSetup.GET;
+      FPSMobileSetup.TESTFIELD("Reply Message Queue");
+
+      IF ISNULL(ReplyMessageQueue) THEN
+        ReplyMessageQueue := ReplyMessageQueue.MessageQueue(FPSMobileSetup."Reply Message Queue");
+
+      XMLDoc := XMLDoc.XmlDocument;
+      XMLDOMMgt.LoadXMLFromClientFile(XMLDoc, IFileName, TRUE);
+
+      InMsg := InMsg.Message;
+      InMsg.Label('Test 4PS Mobile');
+      IF ParsMessage(XMLDoc, InMsg) THEN;
+    END;
+
+    EVENT ReceiveMessageQueue@1100525000::PeekCompleted@125(sender@1100525001 : Variant;e@1100525000 : DotNet "'System.Messaging, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'.System.Messaging.PeekCompletedEventArgs");
+    BEGIN
+    END;
+
+    EVENT ReceiveMessageQueue@1100525000::ReceiveCompleted@126(sender@1100525001 : Variant;e@1100525000 : DotNet "'System.Messaging, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'.System.Messaging.ReceiveCompletedEventArgs");
+    VAR
+      InMsg@1100525002 : DotNet "'System.Messaging, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'.System.Messaging.Message" WITHEVENTS;
+      XMLDoc@1100525003 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      StreamReader@1100525004 : DotNet "'mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.IO.StreamReader";
+      MsgBody@1100525005 : Text;
+    BEGIN
+      InMsg := ReceiveMessageQueue.EndReceive(e.AsyncResult);
+      ReceiveMessageQueue.BeginReceive;
+
+      XMLDoc := XMLDoc.XmlDocument;
+      StreamReader := StreamReader.StreamReader(InMsg.BodyStream);
+      MsgBody := StreamReader.ReadToEnd;
+      XMLDoc.LoadXml(MsgBody);
+      ParsMessage(XMLDoc, InMsg);
+      CLEAR(StreamReader);
+      CLEAR(InMsg);
+      CLEAR(XMLDoc);
+    END;
+
+    EVENT ReceiveMessageQueue@1100525000::Disposed@127(sender@1100525001 : Variant;e@1100525000 : DotNet "'mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.EventArgs");
+    BEGIN
+    END;
+
+    EVENT ReplyMessageQueue@1100525001::PeekCompleted@125(sender@1100525001 : Variant;e@1100525000 : DotNet "'System.Messaging, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'.System.Messaging.PeekCompletedEventArgs");
+    BEGIN
+    END;
+
+    EVENT ReplyMessageQueue@1100525001::ReceiveCompleted@126(sender@1100525001 : Variant;e@1100525000 : DotNet "'System.Messaging, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'.System.Messaging.ReceiveCompletedEventArgs");
+    BEGIN
+    END;
+
+    EVENT ReplyMessageQueue@1100525001::Disposed@127(sender@1100525001 : Variant;e@1100525000 : DotNet "'mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.EventArgs");
+    BEGIN
+    END;
+
+    BEGIN
+    {
+      //* This (SingleInstance) codeunit is started by codeunit 1 (NAS Handler).
+      //* Errors will be send to the 'Error log server'.
+      4PS02 JD 07-05-2009 Adjusted ReportProcedure to make is possible to return the report procedures of all servicelocation in one
+                          message
+    }
+    END.
+  }
+}
+

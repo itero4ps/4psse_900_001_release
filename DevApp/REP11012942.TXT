@@ -1,0 +1,583 @@
+OBJECT Report 11012942 Create Rental Unit Invoice
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    CaptionML=ENU=Create Rental Unit Invoices;
+    ProcessingOnly=Yes;
+    OnInitReport=BEGIN
+                   ProjSetup.GET;
+                   ProjSetup.TESTFIELD("Rental Units active", TRUE);
+                   ProjSetup.TESTFIELD("Invoice Period Rental Units");
+                 END;
+
+    OnPreReport=BEGIN
+                  IF PostingDate = 0D THEN
+                    ERROR(Text002, SalesHeadTmp.FIELDCAPTION("Posting Date"));
+                  IF DocumentDate = 0D THEN
+                    ERROR(Text002, SalesHeadTmp.FIELDCAPTION("Document Date"));
+
+                  IF (YearNoForewards <> 0) AND ((PeriodNoForewards = 0) OR (PeriodDateForewards = 0D)) THEN
+                    ERROR(Text000, Text004);
+                  IF (YearNoAfterwards <> 0) AND ((PeriodNoAfterwards = 0) OR (PeriodDateAfterwards = 0D)) THEN
+                    ERROR(Text000, Text005);
+                  IF (YearNoForewards = 0) AND (YearNoAfterwards = 0) THEN
+                    ERROR(Text001, Text004, Text005);
+                  CheckRentalPeriodAttention(TRUE);
+                  CheckRentalPeriodAttention(FALSE);
+
+                  SalesHeadNo := 0;
+                  LastProject := '';
+                  LastCustomer := '';
+                  TmpError.RESET;
+                  TmpError.DELETEALL;
+                END;
+
+    OnPostReport=BEGIN
+                   IF TmpError.FINDFIRST THEN BEGIN
+                     COMMIT;
+                     PAGE.RUN(PAGE::Errors, TmpError);
+                   END;
+                 END;
+
+  }
+  DATASET
+  {
+    { 6200;    ;DataItem;                    ;
+               DataItemTable=Table11012941;
+               DataItemTableView=SORTING(Completely Invoiced,Project No.,Customer No.,Rental Unit)
+                                 WHERE(Completely Invoiced=CONST(No),
+                                       Customer No.=FILTER(<>''),
+                                       Status=FILTER(>Preparation));
+               OnPreDataItem=BEGIN
+                               FILTERGROUP(9);
+                               IF (YearNoForewards <> 0) AND (YearNoAfterwards = 0) THEN
+                                 SETRANGE("Invoice Moment", "Invoice Moment"::Forewards);
+                               IF (YearNoForewards = 0) AND (YearNoAfterwards <> 0) THEN
+                                 SETRANGE("Invoice Moment", "Invoice Moment"::Afterwards);
+                               FILTERGROUP(0);
+
+                               Window.OPEN(FIELDCAPTION("Project No.") + '/' + FIELDCAPTION("Rental Unit") + '#1############################');
+                             END;
+
+               OnAfterGetRecord=VAR
+                                  RentalUnit@1100529004 : Record 11012940;
+                                  RentalPackageLineRate@1100529008 : Record 11229856;
+                                  RentalPeriodEnd@1100529003 : Date;
+                                  RentalStartDate@1100528403 : Date;
+                                  RentalEndDate@1100528404 : Date;
+                                  StartDateSplit@1100529006 : Date;
+                                  EndDateSplit@1100529007 : Date;
+                                  NextRateDate@1100529009 : Date;
+                                  InvoiceRunNo@1100529001 : Integer;
+                                  SplitNo@1100529005 : Integer;
+                                  LineQuantity@1100528407 : Decimal;
+                                  LineAmount@1100528402 : Decimal;
+                                  IsCredit@1100528405 : Boolean;
+                                  SalesHeadTmpInserted@1100529000 : Boolean;
+                                  UnitOfMeasure@1100528406 : Code[10];
+                                BEGIN
+                                  Window.UPDATE(1, "Project No." + '/' + "Rental Unit");
+                                  IF ProjSetup."Invoice Period Rental Units" = ProjSetup."Invoice Period Rental Units" THEN
+                                    RentalUnitInvoicingCU.BuildPackageInvoicePeriods("Rental Package");
+                                  IF "Invoice Moment" <> "Invoice Moment"::Afterwards THEN BEGIN
+                                    IF "Rental Package"."Starting Date" > PeriodDateForewards THEN
+                                      CurrReport.SKIP;
+                                    RentalPeriodEnd := RentalUnitInvoicingCU.GetPeriodEndForInvoiceFreq(
+                                      TRUE, "Invoice Frequency", YearNoForewards, PeriodNoForewards, PeriodDateForewards);
+                                  END ELSE BEGIN
+                                    RentalPeriodEnd := RentalUnitInvoicingCU.GetPeriodEndForInvoiceFreq(
+                                      FALSE, "Invoice Frequency", YearNoAfterwards, PeriodNoAfterwards, PeriodDateAfterwards);
+                                    IF "Rental Package"."Starting Date" > RentalPeriodEnd THEN
+                                      CurrReport.SKIP;
+                                  END;
+                                  IF NOT RentalUnitInvoicingCU.CheckPackageAndReadRelatedData(
+                                    "Rental Package", RentalPeriodEnd, FALSE, Proj, ProjType, ProjPrin, DefaultProjElement, RentalUnit, TmpError)
+                                  THEN
+                                    CurrReport.SKIP;
+                                  RentalRateLine.SETRANGE("Project No.", "Project No.");
+                                  RentalRateLine.SETRANGE("Rental Unit", "Rental Unit");
+                                  RentalRateLine.SETRANGE("Starting Date Package", "Starting Date");
+                                  IF RentalRateLine.FINDSET(TRUE, FALSE) THEN BEGIN
+                                    UnitOfMeasure := RentalUnitInvoicingCU.DetermineUnitOfMeasure("Rental Package");
+                                    SalesHeadTmpInserted := FALSE;
+                                    REPEAT
+                                      RentalRateLine.CALCFIELDS(Type);
+                                      RentalUnitInvoicingCU.CalcRentalRateLineData(
+                                        "Rental Package",
+                                        RentalRateLine,
+                                        RentalPeriodEnd,
+                                        RentalStartDate,
+                                        RentalEndDate,
+                                        LineQuantity,
+                                        IsCredit);
+                                      IF LineQuantity <> 0 THEN BEGIN
+                                        SplitNo := 0;
+                                        StartDateSplit := RentalStartDate;
+                                        EndDateSplit :=  0D;
+                                        REPEAT
+                                          SplitNo := SplitNo + 1;
+                                          IF SplitNo > 1 THEN
+                                            StartDateSplit := EndDateSplit + 1;
+                                          RentalRateLine.GetLineRateOnRefDate(RentalRateLine, StartDateSplit, RentalPackageLineRate);
+                                          NextRateDate := RentalUnitInvoicingCU.NextRateDateInInvoicePeriod(RentalPackageLineRate, RentalEndDate);
+                                          IF NextRateDate <> 0D THEN BEGIN
+                                            EndDateSplit :=  NextRateDate - 1;
+                                            LineQuantity := RentalUnitInvoicingCU.CalculateNoOfPeriods("Invoice Frequency", StartDateSplit, EndDateSplit);
+                                          END ELSE BEGIN
+                                            EndDateSplit :=  RentalEndDate;
+                                            IF SplitNo > 1 THEN
+                                              LineQuantity := RentalUnitInvoicingCU.CalculateNoOfPeriods("Invoice Frequency", StartDateSplit, EndDateSplit);
+                                          END;
+                                          LineAmount := LineQuantity * RentalPackageLineRate."Period Amount";
+                                          IF SplitNo = 1 THEN BEGIN
+                                            IF NOT SalesHeadTmpInserted THEN BEGIN
+                                              InsertSalesHeadTmp("Rental Package");
+                                              InvoiceRunNo := RentalUnitInvoicingCU.WriteHistoryHead("Project No.", "Rental Unit", "Starting Date", FALSE);
+                                              SalesHeadTmpInserted := TRUE;
+                                            END;
+                                            RentalRateLine."Previous Invoice No." := RentalRateLine."Last Invoice No.";
+                                            RentalRateLine."Previous Invoiced Until" := RentalRateLine."Invoiced Until";
+                                            RentalRateLine."Previous Invoice Type" :=  RentalRateLine."Invoice Type";
+                                            IF NOT IsCredit THEN
+                                              RentalRateLine."Invoiced Until" := RentalEndDate
+                                            ELSE
+                                              RentalRateLine."Invoiced Until" := RentalStartDate - 1;
+                                            RentalRateLine."Last Invoice No." := SalesHeadTmp."No.";
+                                            RentalRateLine."Invoice Status" :=  RentalRateLine."Invoice Status"::"Temporary";
+                                            RentalRateLine."Invoice Type" :=  RentalRateLine."Invoice Type"::Invoice;
+                                            RentalRateLine.MODIFY;
+                                          END;
+                                          InsertSalesLineTmp(InvoiceRunNo, StartDateSplit, EndDateSplit, LineQuantity, UnitOfMeasure, RentalPackageLineRate."Period Amount");
+                                          RentalUnitInvoicingCU.WriteHistoryLine(
+                                            RentalRateLine, InvoiceRunNo, LineQuantity, UnitOfMeasure, LineAmount,
+                                            StartDateSplit, EndDateSplit, SplitNo,
+                                            RentalPackageLineRate."Period Amount", RentalPackageLineRate."Year Amount");
+                                        UNTIL EndDateSplit >= RentalEndDate;
+                                      END;
+                                    UNTIL RentalRateLine.NEXT = 0;
+                                    IF SalesHeadTmpInserted THEN
+                                      UpdateRentalPackageInvoiced("Rental Package",
+                                        RentalUnitInvoicingCU.GetPeriodStartForInvoiceFreqFromPeriodEnd("Invoice Frequency", RentalPeriodEnd),
+                                        RentalPeriodEnd)  //HK: Dates of selected period    //2016: Now also very important for Invoice Periods based on Date.
+                                    ELSE
+                                      UpdateCompletelyInvoiced("Rental Package");
+                                  END;
+                                END;
+
+               OnPostDataItem=BEGIN
+                                Window.CLOSE;
+                                RentalUnitInvoicingCU.CreateRentalInvoices(SalesHeadTmp, SalesLineTmp, FALSE);
+                              END;
+
+               ReqFilterFields=Project No.,Customer No.,Rental Unit }
+
+  }
+  REQUESTPAGE
+  {
+    PROPERTIES
+    {
+      SaveValues=Yes;
+      OnOpenPage=BEGIN
+                   PostingDate := 0D;
+                   DocumentDate := TODAY;
+                   PrevYearNoForewards := YearNoForewards;
+                   PrevYearNoAfterwards := YearNoAfterwards;
+                   FillRentalPeriodAttention(TRUE);
+                   FillRentalPeriodAttention(FALSE);
+                 END;
+
+    }
+    CONTROLS
+    {
+      { 1100409001;0;Container;
+                  ContainerType=ContentArea }
+
+      { 1100409000;1;Group  ;
+                  CaptionML=ENU=Options }
+
+      { 1100409004;2;Field  ;
+                  CaptionML=ENU=Posting Date;
+                  NotBlank=Yes;
+                  SourceExpr=PostingDate }
+
+      { 1100409005;2;Field  ;
+                  CaptionML=ENU=Document Date;
+                  NotBlank=Yes;
+                  SourceExpr=DocumentDate }
+
+      { 1100529004;2;Group  ;
+                  CaptionML=ENU=Invoice forewards;
+                  GroupType=Group }
+
+      { 1100529001;3;Field  ;
+                  CaptionML=ENU=Year;
+                  BlankZero=Yes;
+                  SourceExpr=YearNoForewards;
+                  MaxValue=2099;
+                  OnValidate=BEGIN
+                               IF YearNoForewards <> PrevYearNoForewards THEN BEGIN
+                                  PeriodNoForewards := 0;
+                                  PeriodDateForewards := 0D;
+                                  PrevYearNoForewards := YearNoForewards;
+                               END;
+                             END;
+                              }
+
+      { 1100529002;3;Field  ;
+                  CaptionML=ENU=Period No. (Month);
+                  BlankZero=Yes;
+                  SourceExpr=PeriodNoForewards;
+                  MinValue=0;
+                  MaxValue=12;
+                  OnValidate=BEGIN
+                               OnValidatePeriodNo(TRUE);
+                             END;
+
+                  OnAssistEdit=BEGIN
+                                 IF RentalUnitInvoicingCU.PeriodSelectionShift('PERIODNO', YearNoForewards, PeriodNoForewards, PeriodDateForewards) THEN
+                                   OnValidatePeriodNo(TRUE);
+                               END;
+                                }
+
+      { 1100529000;3;Field  ;
+                  CaptionML=ENU=Period Date (to);
+                  SourceExpr=PeriodDateForewards;
+                  OnValidate=BEGIN
+                               OnValidatePeriodDate(TRUE);
+                             END;
+
+                  OnAssistEdit=BEGIN
+                                 IF RentalUnitInvoicingCU.PeriodSelectionShift('PERIODDATE', YearNoForewards, PeriodNoForewards, PeriodDateForewards) THEN
+                                   OnValidatePeriodDate(TRUE);
+                               END;
+                                }
+
+      { 1100529007;3;Field  ;
+                  CaptionML=ENU=Rent to (per Freq.);
+                  SourceExpr=GetRentalPeriodToInfo(TRUE);
+                  Style=Attention;
+                  StyleExpr=PeriodForewardsAttention;
+                  QuickEntry=FALSE }
+
+      { 1100529003;2;Group  ;
+                  CaptionML=ENU=Invoice afterwards;
+                  GroupType=Group }
+
+      { 1100529005;3;Field  ;
+                  CaptionML=ENU=Year;
+                  BlankZero=Yes;
+                  SourceExpr=YearNoAfterwards;
+                  MaxValue=2099;
+                  OnValidate=BEGIN
+                               IF YearNoAfterwards <> PrevYearNoAfterwards THEN BEGIN
+                                  PeriodNoAfterwards := 0;
+                                  PeriodDateAfterwards := 0D;
+                                  PrevYearNoAfterwards := YearNoAfterwards;
+                               END;
+                             END;
+                              }
+
+      { 1100529006;3;Field  ;
+                  CaptionML=ENU=Period No. (Month);
+                  BlankZero=Yes;
+                  SourceExpr=PeriodNoAfterwards;
+                  MinValue=0;
+                  MaxValue=12;
+                  OnValidate=BEGIN
+                               OnValidatePeriodNo(FALSE);
+                             END;
+
+                  OnAssistEdit=BEGIN
+                                 IF RentalUnitInvoicingCU.PeriodSelectionShift('PERIODNO', YearNoAfterwards, PeriodNoAfterwards, PeriodDateAfterwards) THEN
+                                   OnValidatePeriodNo(FALSE);
+                               END;
+                                }
+
+      { 1100529009;3;Field  ;
+                  CaptionML=ENU=Period Date (to);
+                  SourceExpr=PeriodDateAfterwards;
+                  OnValidate=BEGIN
+                               OnValidatePeriodDate(FALSE);
+                             END;
+
+                  OnAssistEdit=BEGIN
+                                 IF RentalUnitInvoicingCU.PeriodSelectionShift('PERIODDATE', YearNoAfterwards, PeriodNoAfterwards, PeriodDateAfterwards) THEN
+                                   OnValidatePeriodNo(FALSE);
+                               END;
+                                }
+
+      { 1100529008;3;Field  ;
+                  CaptionML=ENU=Rent to (per Freq.);
+                  SourceExpr=GetRentalPeriodToInfo(FALSE);
+                  Style=Attention;
+                  StyleExpr=PeriodAfterwardsAttention;
+                  QuickEntry=FALSE }
+
+    }
+  }
+  LABELS
+  {
+  }
+  CODE
+  {
+    VAR
+      RentalRateLine@1210190021 : Record 11012942;
+      SalesHeadTmp@1210190008 : TEMPORARY Record 36;
+      SalesLineTmp@1210190009 : TEMPORARY Record 37;
+      ProjSetup@1210190023 : Record 315;
+      Proj@1210190014 : Record 11072003;
+      ProjType@1210190015 : Record 11012009;
+      ProjPrin@1100485000 : Record 11012005;
+      TmpError@1100529011 : TEMPORARY Record 11012051;
+      RentalUnitInvoicingCU@1210190019 : Codeunit 11012940;
+      Window@1210190038 : Dialog;
+      PeriodForewardsAttention@1100529014 : Boolean INDATASET;
+      PeriodAfterwardsAttention@1100529015 : Boolean INDATASET;
+      PostingDate@1210190002 : Date;
+      DocumentDate@1100485001 : Date;
+      PeriodDateForewards@1100529000 : Date;
+      PeriodDateAfterwards@1100529005 : Date;
+      YearNoForewards@1100529001 : Integer;
+      PrevYearNoForewards@1100525000 : Integer;
+      PeriodNoForewards@1100529002 : Integer;
+      YearNoAfterwards@1100529004 : Integer;
+      PrevYearNoAfterwards@1100525001 : Integer;
+      PeriodNoAfterwards@1100529003 : Integer;
+      SalesHeadNo@1210190013 : Integer;
+      SalesLineNo@1210190012 : Integer;
+      DefaultProjElement@1210190022 : Code[20];
+      LastProject@1210190010 : Code[20];
+      LastCustomer@1210190011 : Code[20];
+      Text000@1100529007 : TextConst 'ENU=All period %1 selections must be filled';
+      Text001@1210190024 : TextConst 'ENU=Period %1 and/or %2 must be filled';
+      Text002@1210190028 : TextConst 'ENU=%1 must be filled';
+      Text003@1210190044 : TextConst 'ENU=%1 period %2 (%3) more than a month in the future.\ \Continue with create invoices?';
+      Text004@1210190043 : TextConst 'ENU=forewards';
+      Text005@1210190045 : TextConst 'ENU=afterwards';
+      Text006@1100529006 : TextConst 'ENU=Year';
+
+    LOCAL PROCEDURE OnValidatePeriodNo@1100529002(Forewards@1100529000 : Boolean);
+    BEGIN
+      IF Forewards THEN BEGIN
+        IF (PeriodNoForewards <> 0) AND (YearNoForewards = 0) THEN
+          ERROR(Text002, Text006 + ' ' + Text004);
+        RentalUnitInvoicingCU.DeterminePeriodDateFromPeriodNo(YearNoForewards, PeriodNoForewards, PeriodDateForewards)
+      END ELSE BEGIN
+        IF (PeriodNoAfterwards <> 0) AND (YearNoAfterwards = 0) THEN
+          ERROR(Text002, Text006 + ' ' + Text005);
+        RentalUnitInvoicingCU.DeterminePeriodDateFromPeriodNo(YearNoAfterwards, PeriodNoAfterwards, PeriodDateAfterwards);
+      END;
+      FillRentalPeriodAttention(Forewards);
+    END;
+
+    LOCAL PROCEDURE OnValidatePeriodDate@1100529000(Forewards@1100529000 : Boolean);
+    BEGIN
+      IF Forewards THEN
+        RentalUnitInvoicingCU.DeterminePeriodNoFromPeriodDate(PeriodDateForewards, YearNoForewards, PeriodNoForewards)
+      ELSE
+        RentalUnitInvoicingCU.DeterminePeriodNoFromPeriodDate(PeriodDateAfterwards, YearNoAfterwards, PeriodNoAfterwards);
+      FillRentalPeriodAttention(Forewards);
+    END;
+
+    LOCAL PROCEDURE GetRentalPeriodToInfo@1100529016(Forewards@1100529004 : Boolean) PeriodToInfo : Text;
+    VAR
+      RefDate@1100525000 : Date;
+      Attention@1100525001 : Boolean;
+    BEGIN
+      IF Forewards THEN
+        RentalUnitInvoicingCU.DetermineRentalPeriodInfo(
+          Forewards, YearNoForewards, PeriodNoForewards, PeriodDateForewards, PeriodToInfo, Attention, RefDate)
+      ELSE
+        RentalUnitInvoicingCU.DetermineRentalPeriodInfo(
+          Forewards, YearNoAfterwards, PeriodNoAfterwards, PeriodDateAfterwards, PeriodToInfo, Attention, RefDate);
+    END;
+
+    LOCAL PROCEDURE FillRentalPeriodAttention@1100525001(Forewards@1100529004 : Boolean);
+    VAR
+      RefDate@1100525000 : Date;
+      Attention@1100525001 : Boolean;
+      PeriodToInfo@1100525002 : Text;
+    BEGIN
+      IF Forewards THEN BEGIN
+        RentalUnitInvoicingCU.DetermineRentalPeriodInfo(
+          Forewards, YearNoForewards, PeriodNoForewards, PeriodDateForewards, PeriodToInfo, Attention, RefDate);
+        PeriodForewardsAttention := Attention;
+      END ELSE BEGIN
+        RentalUnitInvoicingCU.DetermineRentalPeriodInfo(
+          Forewards, YearNoAfterwards, PeriodNoAfterwards, PeriodDateAfterwards, PeriodToInfo, Attention, RefDate);
+        PeriodAfterwardsAttention := Attention;
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckRentalPeriodAttention@1100525004(Forewards@1100529004 : Boolean);
+    VAR
+      RefDate@1100525000 : Date;
+      Attention@1100525002 : Boolean;
+      PeriodToInfo@1100525001 : Text;
+    BEGIN
+      IF Forewards THEN BEGIN
+        RentalUnitInvoicingCU.DetermineRentalPeriodInfo(
+          Forewards, YearNoForewards, PeriodNoForewards, PeriodDateForewards, PeriodToInfo, Attention, RefDate);
+        IF Attention THEN BEGIN
+          IF NOT CONFIRM(Text003, FALSE, "Rental Package".FIELDCAPTION("Starting Date"), Text004, RefDate) THEN
+            ERROR('');
+        END;
+      END ELSE BEGIN
+        RentalUnitInvoicingCU.DetermineRentalPeriodInfo(
+          Forewards, YearNoAfterwards, PeriodNoAfterwards, PeriodDateAfterwards, PeriodToInfo, Attention, RefDate);
+        IF Attention THEN BEGIN
+          IF NOT CONFIRM(Text003, FALSE, "Rental Package".FIELDCAPTION("Ending Date"), Text005, RefDate) THEN
+            ERROR('');
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertSalesHeadTmp@1210190000(RentalPackage@1210190000 : Record 11012941);
+    BEGIN
+      WITH RentalPackage DO BEGIN
+        IF ("Project No." = LastProject) AND ("Customer No." = LastCustomer) AND
+           (Proj."Rental Unit Invoice by" = Proj."Rental Unit Invoice by"::Customer)
+        THEN
+          EXIT;
+
+        LastProject := "Project No.";
+        LastCustomer := "Customer No.";
+        SalesHeadNo := SalesHeadNo + 1;
+        SalesLineNo := 10000;
+
+        SalesHeadTmp.INIT;
+        SalesHeadTmp."Document Type" := SalesHeadTmp."Document Type"::Invoice;
+        SalesHeadTmp."No." := STRSUBSTNO('T-M-P-%1', SalesHeadNo);
+        SalesHeadTmp."No. Series" := ProjType."Sales Invoice Nos.";
+        SalesHeadTmp."Posting No. Series" := ProjType."Posted Sales Invoice Nos.";
+        SalesHeadTmp."Last Shipping No." := ProjType."Credit Memo Nos.";        // Fields used (only) in tmp record
+        SalesHeadTmp."Last Posting No." := ProjType."Posted Credit Memo Nos.";  // for No. Series of a Credit Memo
+        SalesHeadTmp."Job No." := "Project No.";
+        SalesHeadTmp."Sell-to Customer No." := "Customer No.";
+        SalesHeadTmp."Posting Date" := PostingDate;
+        SalesHeadTmp."Document Date" := DocumentDate;
+        SalesHeadTmp."Your Reference" := "Customer Reference";
+        SalesHeadTmp."Principal Reference" := ProjPrin."Principal Reference";
+        SalesHeadTmp.INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertSalesLineTmp@1210190001(InvoiceRunNo@1100529000 : Integer;RentalStartDate@1100528400 : Date;RentalEndDate@1100528401 : Date;LineQuantity@1100528403 : Decimal;UnitOfMeasure@1100528402 : Code[10];PeriodAmount@1100529001 : Decimal);
+    BEGIN
+      SalesLineTmp.INIT;
+      SalesLineTmp."Document Type" := SalesHeadTmp."Document Type";
+      SalesLineTmp."Document No." := SalesHeadTmp."No.";
+      SalesLineTmp."Line No." := SalesLineNo;
+      SalesLineTmp."System-Created Entry" := TRUE;
+      SalesLineTmp."Sell-to Customer No." := SalesHeadTmp."Sell-to Customer No.";
+      SalesLineTmp."Job No." := SalesHeadTmp."Job No.";
+      IF RentalRateLine.Element <> '' THEN
+        SalesLineTmp.Element := RentalRateLine.Element
+      ELSE
+        SalesLineTmp.Element := DefaultProjElement;
+      SalesLineTmp.Type := SalesLineTmp.Type::"G/L Account";
+      SalesLineTmp."Shortcut Dimension 2 Code" := RentalRateLine."Cost Object";
+      IF (ProjSetup."Provisions at Closure") AND
+         (Proj."Project Status" >= Proj."Project Status"::Finished) THEN
+        SalesLineTmp."No." := ProjType."Provision Account Rental UR"
+      ELSE BEGIN
+        CASE RentalRateLine.Type OF
+          RentalRateLine.Type::ServiceCost:
+            SalesLineTmp."No." := ProjType."Rental Unit Service Cost Rev.";
+          RentalRateLine.Type::Utilities:
+            SalesLineTmp."No." := ProjType."Rental Unit Acc Utilities Rev.";
+          ELSE
+            SalesLineTmp."No." := ProjType."Rental Unit Account Revenue";
+        END;
+      END;
+      SalesLineTmp.Quantity := LineQuantity;
+      SalesLineTmp."Unit Price" := PeriodAmount;
+      SalesLineTmp.Amount := ROUND((SalesLineTmp.Quantity * SalesLineTmp."Unit Price"));
+      SalesLineTmp."Line Discount %" := 0;
+      SalesLineTmp."Amount (LCY)" := SalesLineTmp.Amount;
+      SalesLineTmp.Description := RentalRateLine.Description;
+      SalesLineTmp."Unit of Measure Code" := UnitOfMeasure;
+      SalesLineTmp."VAT Prod. Posting Group" := RentalRateLine."VAT Prod. Posting Group";
+      IF (ProjPrin."VAT Bus. Posting Group" <> '') THEN
+        SalesLineTmp."VAT Bus. Posting Group" := ProjPrin."VAT Bus. Posting Group"
+      ELSE
+        SalesLineTmp."VAT Bus. Posting Group" := Proj."VAT Bus. Posting Group";
+      SalesLineTmp."Relate to" := SalesLineTmp."Relate to"::Rental;
+      SalesLineTmp."Rental Period" := STRSUBSTNO('%1..%2', RentalStartDate, RentalEndDate);
+      SalesLineTmp."Rental Unit" := RentalRateLine."Rental Unit";
+      SalesLineTmp."Rental Package Date" := RentalRateLine."Starting Date Package";
+      CASE RentalRateLine.Type OF
+        RentalRateLine.Type::ServiceCost:
+          SalesLineTmp."Rental Unit Line Type" := SalesLineTmp."Rental Unit Line Type"::ServiceCost;
+        RentalRateLine.Type::Utilities:
+          SalesLineTmp."Rental Unit Line Type" := SalesLineTmp."Rental Unit Line Type"::Utilities;
+        ELSE
+          SalesLineTmp."Rental Unit Line Type" := SalesLineTmp."Rental Unit Line Type"::Rent;
+      END;
+      SalesLineTmp."Plant Rental Split No." := RentalRateLine."Line No.";
+      SalesLineTmp."Alternative No." := InvoiceRunNo;  //Only fill this field in tmp-rec!
+      SalesLineTmp.INSERT;
+      SalesLineNo := SalesLineNo + 10000;
+    END;
+
+    LOCAL PROCEDURE UpdateRentalPackageInvoiced@1210190005(RentalPackage@1210190000 : Record 11012941;RentalPeriodStartDate@1100528400 : Date;RentalPeriodEndDate@1100528401 : Date);
+    VAR
+      RentalRateLine@1100529000 : Record 11012942;
+    BEGIN
+      WITH RentalPackage DO BEGIN
+        FIND;
+        "Previous Invoice No." := "Last Invoice No.";
+        "Previous Invoiced Until" := "Invoiced Until";
+        "Previous Invoice Type" :=  "Invoice Type";
+        "Last Invoice No." := SalesHeadTmp."No.";
+        "Invoice Status" :=  "Invoice Status"::"Temporary";
+        "Invoice Type" :=  "Invoice Type"::Invoice;
+        //
+        RentalRateLine.SETRANGE("Project No.", "Project No.");
+        RentalRateLine.SETRANGE("Rental Unit", "Rental Unit");
+        RentalRateLine.SETRANGE("Starting Date Package", "Starting Date");
+        RentalRateLine.SETFILTER("Invoiced Until", '>%1', RentalPeriodEndDate);
+        IF RentalRateLine.ISEMPTY THEN BEGIN
+          RentalRateLine.SETFILTER("Invoiced Until", '>=%1', RentalPeriodStartDate);
+          IF NOT RentalRateLine.ISEMPTY THEN
+            "Invoiced Until" := RentalPeriodEndDate
+          ELSE
+            "Invoiced Until" := RentalPeriodStartDate -1;
+        END;
+        //VALIDATE("Completely Invoiced");
+        "Completely Invoiced" := RentalRateLine.CompletelyInvoiced(0, 'M', RentalPackage, RentalRateLine);
+        MODIFY;
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdateCompletelyInvoiced@1210190003(RentalPackage@1210190000 : Record 11012941);
+    VAR
+      RentalRateLine@1100529000 : Record 11012942;
+    BEGIN
+      WITH RentalPackage DO BEGIN
+        FIND;
+        //VALIDATE("Completely Invoiced");
+        "Completely Invoiced" := RentalRateLine.CompletelyInvoiced(0, 'M', RentalPackage, RentalRateLine);
+        IF "Completely Invoiced" THEN
+          MODIFY;
+      END;
+    END;
+
+    BEGIN
+    {
+      DP00617: Several modifications
+      C024144: Period selection modified
+    }
+    END.
+  }
+  RDLDATA
+  {
+  }
+}
+

@@ -1,0 +1,166 @@
+OBJECT Codeunit 6086308 Expense Inbox-Check
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=EMW16.00.10.1.02.00;
+  }
+  PROPERTIES
+  {
+    TableNo=6086323;
+    OnRun=VAR
+            FileManagement@1160040005 : Codeunit 6085584;
+            Reminder@1160040007 : Record 6086319;
+            ExpenseAttachment@1160040008 : Record 6086326;
+            ExpenseInboxAttachment@1160040004 : Record 6086328;
+            Log@1160040000 : Record 6086329;
+            ExpenseDim@1160040009 : Record 6086353;
+            EmptyGuid@1160040001 : GUID;
+            IsNew@1160040002 : Boolean;
+          BEGIN
+            IsNew := "Expense GUID" = EmptyGuid;
+            IF NOT IsNew THEN BEGIN
+              Expense.SETRANGE("Expense GUID","Expense GUID");
+              IsNew := NOT Expense.FINDFIRST;
+            END;
+
+            Expense.SetSuspendInboxCheck(TRUE);
+            IF IsNew THEN BEGIN
+              Expense.INIT;
+              Expense."Entry No." := GetLastLineNo + 1;
+              Expense.INSERT(TRUE);
+              Expense.VALIDATE("Employee No.",Rec."Employee No.");
+            END ELSE
+              Reminder.ResetReminder(Expense);
+
+            Expense.VALIDATE(Description,Rec.Description);
+            Expense.VALIDATE("Description 2",Rec."Description 2");
+            Expense.VALIDATE("Expense Type",Rec."Expense Type");
+            Expense.VALIDATE("Document Date",Rec."Document Date");
+            Expense.VALIDATE("Country/Region Code",Rec."Country/Region Code");
+
+            IF NOT Expense."Matched to Bank Transaction" THEN BEGIN
+              IF Expense."Currency Code" <> Rec."Currency Code" THEN
+                Expense.VALIDATE("Currency Code",Rec."Currency Code");
+              IF Expense.Amount <> Rec.Amount THEN
+                Expense.VALIDATE(Amount,Rec.Amount);
+            END ELSE BEGIN
+              TESTFIELD("Currency Code",Expense."Currency Code");
+              TESTFIELD(Amount,Expense.Amount);
+            END;
+
+            Expense.VALIDATE("Job No.",Rec."Job No.");
+            Expense.VALIDATE("Job Task No.",Rec."Job Task No.");
+            Expense.VALIDATE("Expense GUID",Rec."Expense GUID");
+            IF NOT Expense."Matched to Bank Transaction" THEN
+              Expense.VALIDATE("Cash/Private Card",Rec."Cash/Private Card");
+
+            Expense.SetSuspendInboxCheck(TRUE);
+            Expense.SetSkipSendToExpUser(TRUE);
+            Expense.MODIFY;
+
+            ExpenseDim.SETRANGE("Expense Entry No.",Expense."Entry No.");
+            ExpenseDim.DELETEALL;
+
+            ExpInboxDim.SETRANGE("Inbox Entry No.","Entry No.");
+            IF ExpInboxDim.FINDSET THEN BEGIN
+              GLSetup.GET;
+              REPEAT
+                ExpenseDim."Expense Entry No." := Expense."Entry No.";
+                ExpenseDim."Dimension Code" := ExpInboxDim."Dimension Code";
+                ExpenseDim."Field Code" := ExpInboxDim."Field Code";
+                ExpenseDim.VALIDATE("Dimension Value Code",ExpInboxDim."Dimension Value Code");
+                ExpenseDim.VALIDATE("Field Value",ExpInboxDim."Field Value");
+                ExpenseDim.INSERT;
+              UNTIL ExpInboxDim.NEXT = 0;
+            END;
+
+            IF "Expense Entry No." <> 0 THEN BEGIN
+              ExpenseAttachment.SETCURRENTKEY("Expense Entry No.");
+              ExpenseAttachment.SETRANGE("Expense Entry No.",Rec."Expense Entry No.");
+              IF ExpenseAttachment.FINDFIRST THEN
+                REPEAT
+                  GlobalExpenseAttachmentTemp.COPY(ExpenseAttachment);
+                  GlobalExpenseAttachmentTemp.INSERT;
+                UNTIL ExpenseAttachment.NEXT = 0;
+
+              IF ExpenseAttachment.FINDFIRST THEN
+                REPEAT
+                  ExpenseAttachment.DELETE(FALSE); // don't delete the file
+                UNTIL ExpenseAttachment.NEXT = 0;
+            END;
+
+            IF "Expense Entry No." <> Expense."Entry No." THEN BEGIN
+              "Expense Entry No." := Expense."Entry No.";
+              MODIFY;
+            END;
+
+            ExpenseInboxAttachment.RESET;
+            ExpenseInboxAttachment.SETCURRENTKEY("Expense Inbox Entry No.");
+            ExpenseInboxAttachment.SETRANGE("Expense Inbox Entry No.","Entry No.");
+            IF ExpenseInboxAttachment.FINDFIRST THEN
+              REPEAT
+                ExpenseAttachment."Entry No." := 0;
+                ExpenseAttachment."Expense Entry No." := Rec."Expense Entry No.";
+                ExpenseAttachment.Filename := ExpenseInboxAttachment.Filename;
+                ExpenseAttachment.INSERT(TRUE);
+
+                FileManagement.CopyFile(ExpenseInboxAttachment.GetServerFilenameAndPath,ExpenseAttachment.GetServerFilenameAndPath);
+              UNTIL ExpenseInboxAttachment.NEXT = 0;
+
+            Log.LogRreceivedFromCO(Expense);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      GLSetup@1160040003 : Record 98;
+      Expense@1160040001 : Record 6086320;
+      ExpInboxDim@1160040002 : Record 6086324;
+      GlobalExpenseAttachmentTemp@1160040005 : TEMPORARY Record 6086326;
+
+    LOCAL PROCEDURE GetLastLineNo@1160040002() : Integer;
+    VAR
+      Expense2@1160040000 : Record 6086320;
+    BEGIN
+      IF Expense2.FINDLAST THEN
+        EXIT(Expense2."Entry No.")
+      ELSE
+        EXIT(0);
+    END;
+
+    PROCEDURE GetExpenseEntryNo@1160040000() : Integer;
+    BEGIN
+      EXIT(Expense."Entry No.");
+    END;
+
+    PROCEDURE DeleteFiles@1160040004(VAR InboxExpense@1160040002 : Record 6086323);
+    VAR
+      FileManagement@1160040003 : Codeunit 6085584;
+      ExpenseInboxAttachment@1160040001 : Record 6086328;
+    BEGIN
+      ExpenseInboxAttachment.RESET;
+      ExpenseInboxAttachment.SETCURRENTKEY("Expense Inbox Entry No.");
+      ExpenseInboxAttachment.SETRANGE("Expense Inbox Entry No.",InboxExpense."Entry No.");
+      IF ExpenseInboxAttachment.FINDFIRST THEN
+        REPEAT
+          FileManagement.DeleteFile(ExpenseInboxAttachment.GetServerFilenameAndPath,FALSE); // No errors
+        UNTIL ExpenseInboxAttachment.NEXT = 0;
+
+      // It is assumed that the global TempExpenseAttachment has been filled in OnRun
+      GlobalExpenseAttachmentTemp.RESET;
+      GlobalExpenseAttachmentTemp.SETCURRENTKEY("Expense Entry No.");
+      GlobalExpenseAttachmentTemp.SETRANGE("Expense Entry No.",InboxExpense."Expense Entry No.");
+      IF GlobalExpenseAttachmentTemp.FINDFIRST THEN
+        REPEAT
+          FileManagement.DeleteFile(GlobalExpenseAttachmentTemp.GetServerFilenameAndPath,FALSE); // No errors
+        UNTIL GlobalExpenseAttachmentTemp.NEXT = 0;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

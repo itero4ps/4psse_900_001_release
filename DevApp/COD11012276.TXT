@@ -1,0 +1,427 @@
+OBJECT Codeunit 11012276 Phone Number Formatting
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=VAR
+            PhoneNo@1100528700 : Text[20];
+          BEGIN
+            PhoneNo := '172612159';
+            //PhoneNo := '+441675432400';
+            ValidatePhoneNumber('', PhoneNo);
+            MESSAGE('%1', PhoneNo);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      DOMDocument@1100525001 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      MinLengthForNSN@1100528700 : Integer;
+      MaxLengthForNSN@1100528701 : Integer;
+      MaxLengthCountryCode@1100528702 : Integer;
+      FirstGroupPattern@1100528704 : Text[30];
+      StringFunctions@1100528703 : Codeunit 11012273;
+      Text001@1100528705 : TextConst 'ENU=Phone Number cannot be formatted automatically.';
+      Text002@1100528707 : TextConst 'ENU=The file %1 does not exist.';
+      FileMgt@1100525000 : Codeunit 419;
+
+    LOCAL PROCEDURE SetConsts@1210190002();
+    BEGIN
+      // The minimum length of the national significant number.
+      MinLengthForNSN := 3;
+
+      // The ITU says the maximum length should be 15, but we have found longer numbers in Germany.
+      MaxLengthForNSN := 16;
+
+      MaxLengthCountryCode := 3;
+
+      FirstGroupPattern := '(\$\d)';
+    END;
+
+    PROCEDURE ValidatePhoneNumber@1100528708(DefaultCountryRegionCode@1100528701 : Code[10];VAR PhoneNo@1100528700 : Text[30]);
+    BEGIN
+      IF NOT DoValidatePhoneNumber(DefaultCountryRegionCode, PhoneNo) THEN
+        MESSAGE(Text001);
+    END;
+
+    PROCEDURE DoValidatePhoneNumber@1100528700(DefaultCountryRegionCode@1100528701 : Code[10];VAR PhoneNo@1100528700 : Text[30]) : Boolean;
+    VAR
+      MarketingSetup@1100528714 : Record 5079;
+      CompanyInformation@1100528710 : Record 79;
+      CountryRegion@1100528711 : Record 9;
+      RootElement@1100528707 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlElement";
+      NumberFormats@1100528703 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+      XMLDOMManagement4PS@1100525000 : Codeunit 11020220;
+      Number@1100528712 : Text[30];
+      CountryCode@1100528708 : Text[30];
+      CountryCode2@1100528709 : Text[30];
+      InternationalPrefix@1100528706 : Text[30];
+      NationalPrefix@1100528705 : Text[30];
+      NationalPrefixFormattingRule@1100528704 : Text[30];
+      CountryRegionCode@1100528713 : Text[30];
+    BEGIN
+      MarketingSetup.GET;
+      IF MarketingSetup."Phone Number Meta Data XML" = '' THEN
+        EXIT(TRUE); // Not active
+
+      IF NOT FileMgt.ClientFileExists(MarketingSetup."Phone Number Meta Data XML") THEN
+        ERROR(Text002, MarketingSetup."Phone Number Meta Data XML");
+
+      IF PhoneNo = '' THEN
+        EXIT(TRUE);
+
+      // Set global consts
+      SetConsts;
+
+      IF STRLEN(PhoneNo) < MinLengthForNSN THEN
+        EXIT(FALSE);
+
+      IF DefaultCountryRegionCode = '' THEN BEGIN
+        CompanyInformation.GET;
+        CompanyInformation.TESTFIELD("Country/Region Code");
+        CountryRegion.GET(CompanyInformation."Country/Region Code");
+      END ELSE
+        CountryRegion.GET(DefaultCountryRegionCode);
+
+      CountryRegion.TESTFIELD("EU Country/Region Code");
+      DefaultCountryRegionCode := CountryRegion."EU Country/Region Code";
+
+      // Delete except the following characters
+      Number := DELCHR(PhoneNo, '=', DELCHR(PhoneNo, '=', '+0123456789'));
+
+      // Load XML
+      IF ISNULL(DOMDocument) THEN BEGIN
+        DOMDocument := DOMDocument.XmlDocument;
+        XMLDOMManagement4PS.LoadXMLFromClientFile(
+          DOMDocument, MarketingSetup."Phone Number Meta Data XML", TRUE);
+      END;
+      RootElement := DOMDocument.DocumentElement;
+
+      // Load metadata for default country/region
+      IF NOT LoadCountryRegionData(
+        DefaultCountryRegionCode, RootElement,
+        CountryCode, InternationalPrefix, NationalPrefix, NationalPrefixFormattingRule, NumberFormats) THEN
+        EXIT(FALSE);
+
+      // Try to extract a country code from number
+      TryToExtractCountryCode(Number, RootElement, InternationalPrefix, CountryCode2);
+      IF STRLEN(Number) < MinLengthForNSN THEN
+        EXIT(FALSE);
+
+      IF (CountryCode2 <> '') AND (CountryCode2 <> CountryCode) THEN BEGIN
+        IF GetCountryRegionByCountryCode(CountryCode2, RootElement, CountryRegionCode) THEN BEGIN
+          // Load metadata for country code extracted from number
+          IF NOT LoadCountryRegionData(
+            CountryRegionCode, RootElement,
+            CountryCode, InternationalPrefix, NationalPrefix, NationalPrefixFormattingRule, NumberFormats) THEN
+            EXIT(FALSE);
+        END ELSE
+          CountryRegionCode := DefaultCountryRegionCode;
+      END ELSE
+        CountryRegionCode := DefaultCountryRegionCode;
+
+      // Strip national prefix from number
+      StripNationalPrefix(Number, NationalPrefix);
+      IF (STRLEN(Number) < MinLengthForNSN) OR (STRLEN(Number) > MaxLengthForNSN) THEN
+        EXIT(FALSE);
+
+      IF FormatAccordingFormat(
+        CountryRegionCode, PhoneNo, Number,
+        CountryCode, InternationalPrefix, NationalPrefix, NationalPrefixFormattingRule, NumberFormats) THEN BEGIN
+        PhoneNo := Number;
+        EXIT(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE LoadCountryRegionData@1100528724(CountryRegionCode@1100528700 : Code[10];RootElement@1100528709 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlElement";VAR CountryCode@1100528708 : Text[30];VAR InternationalPrefix@1100528707 : Text[30];VAR NationalPrefix@1100528706 : Text[30];VAR NationalPrefixFormattingRule@1100528701 : Text[30];VAR NumberFormats@1100528705 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList") : Boolean;
+    VAR
+      Territory@1100528704 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      Element@1100528703 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlElement";
+      Attribute@1100528702 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlAttribute";
+    BEGIN
+      CountryCode := '';
+      InternationalPrefix := '';
+      NationalPrefix := '';
+      NationalPrefixFormattingRule := '';
+      CLEAR(NumberFormats);
+
+      Territory := RootElement.SelectSingleNode(STRSUBSTNO('.//territory[@id=''%1'']', CountryRegionCode));
+      IF ISNULL(Territory) THEN
+        EXIT(FALSE);
+      NumberFormats := Territory.SelectNodes('.//numberFormat');
+      Element := Territory;
+      Attribute := Element.GetAttributeNode('countryCode');
+      IF NOT ISNULL(Attribute) THEN
+        CountryCode := FORMAT(Attribute.Value);
+      Attribute := Element.GetAttributeNode('internationalPrefix');
+      IF NOT ISNULL(Attribute) THEN
+        InternationalPrefix := FORMAT(Attribute.Value);
+      Attribute := Element.GetAttributeNode('nationalPrefix');
+      IF NOT ISNULL(Attribute) THEN
+        NationalPrefix := FORMAT(Attribute.Value);
+      Attribute := Element.GetAttributeNode('nationalPrefixFormattingRule');
+      IF NOT ISNULL(Attribute) THEN
+        NationalPrefixFormattingRule := FORMAT(Attribute.Value);
+
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE TryToExtractCountryCode@1100528703(VAR Number@1100528700 : Text[30];RootElement@1100528703 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlElement";InternationalPrefix@1100528701 : Text[30];VAR CountryCode@1100528702 : Text[30]) : Boolean;
+    BEGIN
+      IF Number = '' THEN
+        EXIT(FALSE);
+
+      WHILE StripInternationalPrefix(Number, InternationalPrefix) DO BEGIN
+        IF STRLEN(Number) < MinLengthForNSN THEN
+          EXIT(FALSE);
+        IF ExtractCountryCode(Number, RootElement, CountryCode) THEN
+          EXIT(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE StripInternationalPrefix@1100528702(VAR Number@1100528701 : Text[30];InternationalPrefix@1100528700 : Text[30]) : Boolean;
+    BEGIN
+      IF Number = '' THEN
+        EXIT(FALSE);
+
+      IF COPYSTR(Number, 1, 1) = '+' THEN BEGIN
+        Number := COPYSTR(Number, 2);
+        EXIT(TRUE);
+      END;
+
+      IF COPYSTR(Number, 1, STRLEN(InternationalPrefix)) = InternationalPrefix THEN BEGIN
+        Number := COPYSTR(Number, STRLEN(InternationalPrefix) + 1);
+        EXIT(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE StripNationalPrefix@1100528705(VAR Number@1100528701 : Text[30];NationalPrefix@1100528700 : Text[30]) : Boolean;
+    BEGIN
+      IF (Number = '') OR (NationalPrefix = '') THEN
+        EXIT(FALSE);
+
+      IF COPYSTR(Number, 1, STRLEN(NationalPrefix)) = NationalPrefix THEN BEGIN
+        Number := COPYSTR(Number, STRLEN(NationalPrefix) + 1);
+        EXIT(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE ExtractCountryCode@1100528704(VAR Number@1100528700 : Text[30];RootElement@1100528703 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlElement";VAR CountryCode@1100528704 : Text[30]) : Boolean;
+    VAR
+      Territory@1100528702 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      I@1100528701 : Integer;
+    BEGIN
+      CountryCode := '';
+
+      IF COPYSTR(Number, 1, 1) = '0' THEN // Country codes do not begin with a '0'.
+        EXIT(FALSE);
+
+      FOR I := 1 TO MaxLengthCountryCode DO BEGIN
+        CountryCode := COPYSTR(Number, 1, I);
+        Territory := RootElement.SelectSingleNode(STRSUBSTNO('.//territory[@countryCode=''%1'']', CountryCode));
+        IF NOT ISNULL(Territory) THEN BEGIN
+          Number := COPYSTR(Number, I + 1);
+          EXIT(TRUE);
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE GetCountryRegionByCountryCode@1100528709(CountryCode@1100528701 : Text[30];RootElement@1100528702 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlElement";VAR CountryRegionCode@1100528700 : Text[10]) : Boolean;
+    VAR
+      Territory@1100528705 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      Element@1100528704 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlElement";
+      Attribute@1100528703 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlAttribute";
+    BEGIN
+      CountryRegionCode := '';
+
+      Territory := RootElement.SelectSingleNode(STRSUBSTNO('.//territory[@countryCode=''%1'']', CountryCode));
+      Element := Territory;
+      Attribute := Element.GetAttributeNode('id');
+      IF NOT ISNULL(Attribute) THEN BEGIN
+        CountryRegionCode := FORMAT(Attribute.Value);
+        EXIT(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE FormatAccordingFormat@1100528707(CountryRegionCode@1100528713 : Code[10];PhoneNo@1100528711 : Text[30];VAR Number@1100528701 : Text[30];CountryCode@1100528710 : Text[30];InternationalPrefix@1100528706 : Text[30];NationalPrefix@1100528705 : Text[30];NationalPrefixFormattingRule@1100528704 : Text[30];NumberFormats@1100528700 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList") : Boolean;
+    VAR
+      CountryRegion@1100528714 : Record 9;
+      NumberFormat@1100528702 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlElement";
+      PatternNode@1100528703 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      FormatNode@1100528707 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      PatternText@1100528708 : Text[1024];
+      FormatText@1100528709 : Text[1024];
+    BEGIN
+      IF NOT ChooseNumberFormat(Number, NumberFormats, NumberFormat) THEN
+        EXIT(FALSE);
+
+      CountryRegion.SETRANGE("EU Country/Region Code", CountryRegionCode);
+      //kkleermaker.sn, 130909, C006155
+      IF NOT CountryRegion.FINDFIRST THEN
+        EXIT(FALSE);
+      //kkleermaker.en
+
+      PatternNode := NumberFormat.GetAttributeNode('pattern');
+      PatternText := FORMAT(PatternNode.Value);
+      FormatNode := NumberFormat.SelectSingleNode('.//format');
+      FormatText := FORMAT(FormatNode.InnerText);
+
+      IF CountryRegion."Phone Number Formatting" = CountryRegion."Phone Number Formatting"::National THEN BEGIN
+        IF NationalPrefixFormattingRule <> '' THEN BEGIN
+          IF NationalPrefix <> '' THEN BEGIN
+            NationalPrefixFormattingRule :=
+              StringFunctions.ReplaceString(NationalPrefixFormattingRule, '$NP', NationalPrefix); // result 0$FG (for region NL)
+            NationalPrefixFormattingRule :=
+              StringFunctions.ReplaceString(NationalPrefixFormattingRule, '$FG', '$1');           // result 0$1  (for region NL)
+          END ELSE
+            NationalPrefixFormattingRule := '';
+        END;
+
+        IF NationalPrefixFormattingRule <> '' THEN
+          // result 0$1 $2 $3 (for region NL)
+          FormatText := StringFunctions.ReplaceString(FormatText, '$1', NationalPrefixFormattingRule);
+
+        Number := RegExpReplaceNth(Number, PatternText, FormatText);
+        EXIT(TRUE);
+      END ELSE IF CountryRegion."Phone Number Formatting" = CountryRegion."Phone Number Formatting"::International THEN BEGIN
+        Number := RegExpReplaceNth(Number, PatternText, FormatText);
+        Number := '+' + CountryCode + ' ' + Number;
+        EXIT(TRUE);
+      END ELSE BEGIN
+        Number := PhoneNo;
+        EXIT(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE ChooseNumberFormat@1100528712(Number@1100528700 : Text[30];NumberFormats@1100528701 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";VAR NumberFormat@1100528703 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlElement") : Boolean;
+    VAR
+      LeadingDigits@1100528704 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+      LeadingDigit@1100528705 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      Pattern@1100528707 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      LeadingDigitText@1100528712 : Text;
+      I@1100528706 : Integer;
+    BEGIN
+      CLEAR(NumberFormat);
+
+      FOR I := 0 TO NumberFormats.Count - 1 DO BEGIN
+        NumberFormat := NumberFormats.Item(I);
+        LeadingDigits := NumberFormat.SelectNodes('.//leadingDigits');
+        IF LeadingDigits.Count > 0 THEN BEGIN
+          LeadingDigit := LeadingDigits.Item(LeadingDigits.Count - 1); // The last one is the most detailed
+          LeadingDigitText := CleanUpRegExp(LeadingDigit.InnerText);
+          IF RegExpSearch(Number, '(' + LeadingDigitText + ')') = 1 THEN BEGIN
+            Pattern := NumberFormat.GetAttributeNode('pattern');
+            IF MatchesEntirely(Number, '(' + FORMAT(Pattern.Value) + ')') THEN
+              EXIT(TRUE);
+          END;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE MatchesEntirely@1100528710(String@1100528701 : Text[1024];RegExpPattern@1100528700 : Text[1024]) : Boolean;
+    VAR
+      RegExpManagement@1100528704 : Codeunit 11012262;
+      Match@1100528702 : Text[1024];
+    BEGIN
+      RegExpPattern := CleanUpRegExp(RegExpPattern);
+      IF RegExpManagement.RegExpFindMatches(String, RegExpPattern) THEN BEGIN
+        Match := RegExpManagement.GetSubMatchFirstMatch(0);
+        EXIT(STRLEN(Match) = STRLEN(String));
+      END;
+    END;
+
+    LOCAL PROCEDURE RegExpReplace@1210190008(String@1210190004 : Text[1024];RegExpPattern@1210190000 : Text[1024];NewString@1210190001 : Text[1024]) : Text[100];
+    VAR
+      RegExpManagement@1100528701 : Codeunit 11012262;
+      Match@1210190002 : Text[1024];
+      P@1210190003 : Integer;
+    BEGIN
+      RegExpPattern := CleanUpRegExp(RegExpPattern);
+      IF RegExpManagement.RegExpFindMatches(String, RegExpPattern) THEN BEGIN
+        Match := RegExpManagement.GetSubMatchFirstMatch(0);
+        P := STRPOS(String, Match);
+        IF P > 1 THEN
+          String := COPYSTR(String, 1, (P - 1)) + NewString + COPYSTR(String, P + STRLEN(Match))
+        ELSE
+          String := NewString + COPYSTR(String, P + STRLEN(Match));
+      END;
+
+      EXIT(String);
+    END;
+
+    LOCAL PROCEDURE RegExpReplaceNth@1100528706(String@1210190004 : Text[1024];RegExpPattern@1210190000 : Text[1024];NewString@1210190001 : Text[1024]) : Text[100];
+    VAR
+      RegExpManagement@1100528701 : Codeunit 11012262;
+      Match@1210190002 : Text[1024];
+      I@1100528700 : Integer;
+    BEGIN
+      RegExpPattern := CleanUpRegExp(RegExpPattern);
+      IF RegExpManagement.RegExpFindMatches(String, RegExpPattern) THEN BEGIN
+        FOR I := 0 TO RegExpManagement.GetSubMatchCountFirstMatch - 1 DO BEGIN
+          Match := RegExpManagement.GetSubMatchFirstMatch(I);
+          NewString := StringFunctions.ReplaceString(NewString, STRSUBSTNO('$%1', I + 1), Match);
+        END;
+      END;
+
+      EXIT(NewString);
+    END;
+
+    LOCAL PROCEDURE RegExpSearch@1100528701(String@1100528701 : Text[1024];RegExpPattern@1100528700 : Text[1024]) : Integer;
+    VAR
+      RegExpManagement@1100528703 : Codeunit 11012262;
+      Match@1100528702 : Text[1024];
+    BEGIN
+      RegExpPattern := CleanUpRegExp(RegExpPattern);
+      IF RegExpManagement.RegExpFindMatches(String, RegExpPattern) THEN BEGIN
+        Match := RegExpManagement.GetSubMatchFirstMatch(0);
+        EXIT(STRPOS(String, Match));
+      END;
+    END;
+
+    PROCEDURE CleanUpRegExp@1210190000(RegExp@1210190000 : Text) : Text[1024];
+    VAR
+      StringFunctions@1210190001 : Codeunit 11012273;
+    BEGIN
+      EXIT(DELCHR(
+             RegExp, '=',
+             FORMAT(StringFunctions.Space) +
+             FORMAT(StringFunctions.CarriageReturn) +
+             FORMAT(StringFunctions.LineFeed) +
+             FORMAT(StringFunctions.Tab)));
+    END;
+
+    EVENT DOMDocument@1100525001::NodeInserting@93(sender@1100525001 : Variant;e@1100525000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeChangedEventArgs");
+    BEGIN
+    END;
+
+    EVENT DOMDocument@1100525001::NodeInserted@94(sender@1100525001 : Variant;e@1100525000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeChangedEventArgs");
+    BEGIN
+    END;
+
+    EVENT DOMDocument@1100525001::NodeRemoving@95(sender@1100525001 : Variant;e@1100525000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeChangedEventArgs");
+    BEGIN
+    END;
+
+    EVENT DOMDocument@1100525001::NodeRemoved@96(sender@1100525001 : Variant;e@1100525000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeChangedEventArgs");
+    BEGIN
+    END;
+
+    EVENT DOMDocument@1100525001::NodeChanging@97(sender@1100525001 : Variant;e@1100525000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeChangedEventArgs");
+    BEGIN
+    END;
+
+    EVENT DOMDocument@1100525001::NodeChanged@98(sender@1100525001 : Variant;e@1100525000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeChangedEventArgs");
+    BEGIN
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

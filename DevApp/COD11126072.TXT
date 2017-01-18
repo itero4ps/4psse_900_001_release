@@ -1,0 +1,203 @@
+OBJECT Codeunit 11126072 FSW Create Cost Plus Entries
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+
+    PROCEDURE CreateServOrderCPE@1100528000(FieldServiceWorksheetLine@1100528000 : Record 11125879;VAR NumberOfCreatedLines@1100528005 : Integer);
+    VAR
+      ServiceOrderExtension@1100528009 : Record 11071727;
+      FieldServiceWorksheet@1100528003 : Record 11125878;
+    BEGIN
+      NumberOfCreatedLines := 0;
+      FieldServiceWorksheet.GET(FieldServiceWorksheetLine."Worksheet No.");
+      ServiceOrderExtension.GET(FieldServiceWorksheet."Service Order No.");
+
+      IF (ServiceOrderExtension."Surcharge % Labor" <> 0) OR
+          (ServiceOrderExtension."Surcharge % Material" <> 0) OR
+          (ServiceOrderExtension."Surcharge % Subcontr." <> 0) OR
+          (ServiceOrderExtension."Surcharge % Plant" <> 0) OR
+          (ServiceOrderExtension."Surcharge % Sundry" <> 0) THEN
+        CreateServOrderCPECostPlusSurch(FieldServiceWorksheetLine, NumberOfCreatedLines)
+      ELSE
+        CreateServOrderCPEForUP(FieldServiceWorksheetLine, NumberOfCreatedLines)
+    END;
+
+    PROCEDURE CreateServOrderCPECostPlusSurch@1100528005(FieldServiceWorksheetLine@1100528000 : Record 11125879;VAR NumberOfCreatedLines@1100528005 : Integer);
+    VAR
+      ServiceSetup@1100528001 : Record 11012800;
+      ServiceOrder@1100528002 : Record 11012823;
+      ServiceOrderExtension@1100528009 : Record 11071727;
+      FieldServiceWorksheet@1100528003 : Record 11125878;
+      TransitLine@1100528006 : Record 11125880;
+      VATProductPostingGroup@1100528007 : Record 324;
+      ServiceUnitPrice@1100528004 : Record 11071769;
+    BEGIN
+      NumberOfCreatedLines := 0;
+      ServiceSetup.GET();
+      FieldServiceWorksheet.GET(FieldServiceWorksheetLine."Worksheet No.");
+      TransitLine.GET(FieldServiceWorksheetLine."Worksheet No.", FieldServiceWorksheetLine."Transit Code");
+      ServiceOrder.GET(FieldServiceWorksheet."Service Order No.");
+      ServiceOrderExtension.GET(FieldServiceWorksheet."Service Order No.");
+      ServiceUnitPrice.GET(FieldServiceWorksheetLine."Price Book Code", FieldServiceWorksheetLine."Index Date", FieldServiceWorksheetLine."Unit Price Code");
+
+      IF TryCreateServOrderCPEForVATCode(ServiceSetup, FieldServiceWorksheetLine, ServiceUnitPrice, ServiceOrderExtension, TransitLine, ServiceOrder, '') THEN
+        NumberOfCreatedLines += 1;
+
+      GetApplicableVATProdPostingGroups(ServiceUnitPrice, VATProductPostingGroup);
+      VATProductPostingGroup.MARKEDONLY(TRUE);
+      IF VATProductPostingGroup.FINDSET THEN
+        REPEAT
+          IF TryCreateServOrderCPEForVATCode(ServiceSetup, FieldServiceWorksheetLine, ServiceUnitPrice, ServiceOrderExtension, TransitLine, ServiceOrder, VATProductPostingGroup.Code) THEN
+            NumberOfCreatedLines += 1;
+        UNTIL VATProductPostingGroup.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE TryCreateServOrderCPEForVATCode@1100528003(ServiceSetup@1100528002 : Record 11012800;FieldServiceWorksheetLine@1100528000 : Record 11125879;ServiceUnitPrice@1100528008 : Record 11071769;ServiceOrderExtension@1100528013 : Record 11071727;TransitLine@1100528010 : Record 11125880;ServiceOrder@1100528006 : Record 11012823;VATProductPostingGroupCode@1100528001 : Code[10]) : Boolean;
+    VAR
+      ServiceOrderCostPlusEntry@1100528004 : Record 11012825;
+      LastEntryNo@1100528005 : Integer;
+      SalesPriceLCY@1100528003 : Decimal;
+    BEGIN
+      WITH FieldServiceWorksheetLine DO BEGIN
+        SalesPriceLCY := GetTotalUnitPriceByVATCode(ServiceUnitPrice, ServiceOrderExtension, VATProductPostingGroupCode)  * FieldServiceWorksheetLine.Quantity;
+        IF SalesPriceLCY = 0 THEN EXIT(FALSE);
+
+        IF (VATProductPostingGroupCode = '') THEN //Give unit price budgetlines without VAT Prod. Posting Group, the code of the serviceorder
+          VATProductPostingGroupCode := ServiceOrder."VAT Prod. Posting Group";
+        DoCreateServOrderCPE(FieldServiceWorksheetLine, ServiceOrderExtension, TransitLine, ServiceSetup, SalesPriceLCY, VATProductPostingGroupCode);
+      END;
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE GetApplicableVATProdPostingGroups@1100528001(ServiceUnitPrice@1100528001 : Record 11071769;VAR VATProductPostingGroup@1100528000 : Record 324);
+    VAR
+      SUPInternalBudgetLine@1100528002 : Record 11071770;
+    BEGIN
+      SUPInternalBudgetLine.SETRANGE("Price Book Code", ServiceUnitPrice."Price Book Code");
+      SUPInternalBudgetLine.SETRANGE("Index Date", ServiceUnitPrice."Index Date");
+      SUPInternalBudgetLine.SETRANGE("Price Book Type", ServiceUnitPrice."Price Book Type");
+      SUPInternalBudgetLine.SETRANGE("Unit Price Code", ServiceUnitPrice.Code);
+      IF SUPInternalBudgetLine.FINDSET() THEN
+        REPEAT
+          IF SUPInternalBudgetLine."VAT Prod. Posting Group" <> '' THEN BEGIN
+            VATProductPostingGroup.GET(SUPInternalBudgetLine."VAT Prod. Posting Group");
+            VATProductPostingGroup.MARK(TRUE);
+          END;
+        UNTIL SUPInternalBudgetLine.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE GetTotalUnitPriceByVATCode@1100528002(ServiceUnitPrice@1100528000 : Record 11071769;ServiceOrderExtension@1100528004 : Record 11071727;VATProdcutPostingGroup@1100528002 : Code[10]) : Decimal;
+    VAR
+      SUPInternalBudgetLine@1100528001 : Record 11071770;
+      SalesPriceLCY@1100528003 : Decimal;
+      CostType@1100528005 : 'Labor,Material,Subcontracting,Plant,Sundry,Revenue';
+    BEGIN
+      SalesPriceLCY += (GetUnitPriceByVATCodeCostType(ServiceUnitPrice, VATProdcutPostingGroup, CostType::Labor) * (ServiceOrderExtension."Surcharge % Labor"/100 + 1));
+      SalesPriceLCY += (GetUnitPriceByVATCodeCostType(ServiceUnitPrice, VATProdcutPostingGroup, CostType::Material) * (ServiceOrderExtension."Surcharge % Material"/100 + 1));
+      SalesPriceLCY += (GetUnitPriceByVATCodeCostType(ServiceUnitPrice, VATProdcutPostingGroup, CostType::Subcontracting) * (ServiceOrderExtension."Surcharge % Subcontr."/100 + 1));
+      SalesPriceLCY += (GetUnitPriceByVATCodeCostType(ServiceUnitPrice, VATProdcutPostingGroup, CostType::Plant) * (ServiceOrderExtension."Surcharge % Plant"/100 + 1));
+      SalesPriceLCY += (GetUnitPriceByVATCodeCostType(ServiceUnitPrice, VATProdcutPostingGroup, CostType::Sundry) * (ServiceOrderExtension."Surcharge % Sundry"/100 + 1));
+      EXIT(SalesPriceLCY);
+    END;
+
+    LOCAL PROCEDURE GetUnitPriceByVATCodeCostType@1100528004(ServiceUnitPrice@1100528000 : Record 11071769;VATProdcutPostingGroup@1100528002 : Code[10];CostType@1100528005 : 'Labor,Material,Subcontracting,Plant,Sundry,Revenue') : Decimal;
+    VAR
+      SUPInternalBudgetLine@1100528001 : Record 11071770;
+      SalesPriceLCY@1100528003 : Decimal;
+    BEGIN
+      SUPInternalBudgetLine.SETRANGE("Price Book Code", ServiceUnitPrice."Price Book Code");
+      SUPInternalBudgetLine.SETRANGE("Index Date", ServiceUnitPrice."Index Date");
+      SUPInternalBudgetLine.SETRANGE("Price Book Type", ServiceUnitPrice."Price Book Type");
+      SUPInternalBudgetLine.SETRANGE("Unit Price Code", ServiceUnitPrice.Code);
+      SUPInternalBudgetLine.SETRANGE("VAT Prod. Posting Group", VATProdcutPostingGroup);
+      SUPInternalBudgetLine.SETRANGE("Cost Type", CostType);
+      IF SUPInternalBudgetLine.FINDSET() THEN
+        REPEAT
+          SalesPriceLCY += SUPInternalBudgetLine.Amount;
+        UNTIL SUPInternalBudgetLine.NEXT = 0;
+
+      EXIT(SalesPriceLCY);
+    END;
+
+    LOCAL PROCEDURE CreateServOrderCPEForUP@1100528006(FieldServiceWorksheetLine@1100528001 : Record 11125879;VAR NumberOfCreatedLines@1100528000 : Integer);
+    VAR
+      ServiceUnitPrice@1100528002 : Record 11071769;
+      ServiceOrderExtension@1100528004 : Record 11071727;
+      ServiceOrder@1100528005 : Record 11012823;
+      TransitLine@1100528006 : Record 11125880;
+      FieldServiceWorksheet@1100528007 : Record 11125878;
+      ServiceSetup@1100528008 : Record 11012800;
+      SalesPriceLCY@1100528003 : Decimal;
+    BEGIN
+      ServiceSetup.GET();
+      FieldServiceWorksheet.GET(FieldServiceWorksheetLine."Worksheet No.");
+      TransitLine.GET(FieldServiceWorksheetLine."Worksheet No.", FieldServiceWorksheetLine."Transit Code");
+      ServiceOrder.GET(FieldServiceWorksheet."Service Order No.");
+      ServiceOrderExtension.GET(FieldServiceWorksheet."Service Order No.");
+      ServiceUnitPrice.GET(FieldServiceWorksheetLine."Price Book Code", FieldServiceWorksheetLine."Index Date", FieldServiceWorksheetLine."Unit Price Code");
+
+      WITH FieldServiceWorksheetLine DO BEGIN
+        ServiceUnitPrice.GET("Price Book Code", "Index Date", "Unit Price Code");
+        SalesPriceLCY :=  ServiceUnitPrice."Unit Price" * FieldServiceWorksheetLine.Quantity;
+        IF SalesPriceLCY = 0 THEN BEGIN
+          NumberOfCreatedLines := 0;
+          EXIT;
+        END;
+
+        DoCreateServOrderCPE(FieldServiceWorksheetLine, ServiceOrderExtension, TransitLine, ServiceSetup, SalesPriceLCY, ServiceOrder."VAT Prod. Posting Group");
+        NumberOfCreatedLines := 1;
+      END;
+
+      EXIT;
+    END;
+
+    LOCAL PROCEDURE DoCreateServOrderCPE@1100528007(FieldServiceWorksheetLine@1100528001 : Record 11125879;ServiceOrderExtension@1100528006 : Record 11071727;TransitLine@1100528008 : Record 11125880;ServiceSetup@1100528009 : Record 11012800;SalesPriceLCY@1100528000 : Decimal;VATProductPostingGroupCode@1100528002 : Code[10]) : Boolean;
+    VAR
+      ServiceOrderCostPlusEntry@1100528004 : Record 11012825;
+      LastEntryNo@1100528005 : Integer;
+    BEGIN
+        ServiceOrderCostPlusEntry.SETRANGE("Service Order No.", ServiceOrderExtension."Service Order No.");
+        ServiceOrderCostPlusEntry.SETRANGE("Line No.");
+        IF ServiceOrderCostPlusEntry.FINDLAST THEN
+          LastEntryNo := ServiceOrderCostPlusEntry."Line No."
+        ELSE
+          LastEntryNo := 0;
+
+        ServiceOrderCostPlusEntry.INIT;
+        ServiceOrderCostPlusEntry.VALIDATE("Service Order No.", ServiceOrderExtension."Service Order No.");
+        ServiceOrderCostPlusEntry."Line No." := LastEntryNo + 10000;
+        ServiceOrderCostPlusEntry.INSERT(TRUE);
+
+        //ServiceOrderCostPlusEntry."Cost Object" := ServiceSetup."Cost Object Revenues";
+        ServiceOrderCostPlusEntry."VAT Prod. Posting Group" := VATProductPostingGroupCode;
+
+        ServiceOrderCostPlusEntry.Description := TransitLine.Reference;
+        ServiceOrderCostPlusEntry."Compression Id" := FieldServiceWorksheetLine."Transit Code";
+        ServiceOrderCostPlusEntry."Unit Price Line Code" := FieldServiceWorksheetLine."Unit Price Code";
+
+        //ServiceOrderCostPlusEntry."Cost Type" := ServiceOrderCostPlusEntry."Cost Type"::Revenue;
+        ServiceOrderCostPlusEntry.Chargeable := TRUE;
+
+        ServiceOrderCostPlusEntry.VALIDATE(Quantity, 1);
+        ServiceOrderCostPlusEntry.VALIDATE("Sales Price (LCY)", SalesPriceLCY);
+        ServiceOrderCostPlusEntry.MODIFY(TRUE);
+      EXIT;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

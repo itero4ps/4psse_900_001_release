@@ -1,0 +1,266 @@
+OBJECT Report 92 Import Consolidation from File
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW18.00;
+  }
+  PROPERTIES
+  {
+    CaptionML=ENU=Import Consolidation from File;
+    ProcessingOnly=Yes;
+    OnPreReport=VAR
+                  BusUnit2@1006 : Record 220;
+                  GLSetup@1007 : Record 98;
+                  FileManagement@1000 : Codeunit 419;
+                BEGIN
+                  IF FileName = '' THEN
+                    ERROR(Text000);
+                  ServerFileName := FileManagement.UploadFileSilent(FileName);
+
+                  IF GLDocNo = '' THEN
+                    ERROR(Text015);
+
+                  IF FileFormat = FileFormat::"Version 4.00 or Later (.xml)" THEN BEGIN
+                    Consolidate.ImportFromXML(ServerFileName);
+                    Consolidate.GetGlobals(
+                      ProductVersion,FormatVersion,BusUnit."Company Name",
+                      SubsidCurrencyCode,AdditionalCurrencyCode,ParentCurrencyCode,
+                      CheckSum,ConsolidStartDate,ConsolidEndDate);
+                    CalculatedCheckSum := Consolidate.CalcCheckSum;
+                    IF CheckSum <> CalculatedCheckSum THEN
+                      ERROR(Text036,CheckSum,CalculatedCheckSum);
+                    TransferPerDay := TRUE;
+                  END ELSE BEGIN
+                    CLEAR(GLEntryFile);
+                    GLEntryFile.TEXTMODE := TRUE;
+                    GLEntryFile.OPEN(ServerFileName);
+                    GLEntryFile.READ(TextLine);
+                    IF COPYSTR(TextLine,1,4) = '<01>' THEN BEGIN
+                      BusUnit."Company Name" := DELCHR(COPYSTR(TextLine,5,30),'>');
+                      EVALUATE(ConsolidStartDate,COPYSTR(TextLine,36,9));
+                      EVALUATE(ConsolidEndDate,COPYSTR(TextLine,46,9));
+                      EVALUATE(TransferPerDay,COPYSTR(TextLine,56,3));
+                    END;
+                  END;
+
+                  IF (BusUnit."Company Name" = '') OR (ConsolidStartDate = 0D) OR (ConsolidEndDate = 0D) THEN
+                    ERROR(Text001);
+
+                  IF NOT
+                     CONFIRM(
+                       Text023,
+                       FALSE,ConsolidStartDate,ConsolidEndDate)
+                  THEN
+                    CurrReport.QUIT;
+
+                  BusUnit.SETCURRENTKEY("Company Name");
+                  BusUnit.SETRANGE("Company Name",BusUnit."Company Name");
+                  BusUnit.FIND('-');
+                  IF BusUnit.NEXT <> 0 THEN
+                    ERROR(
+                      Text005 +
+                      Text006,
+                      BusUnit.FIELDCAPTION("Company Name"),BusUnit."Company Name");
+                  BusUnit.TESTFIELD(Consolidate,TRUE);
+
+                  BusUnit2."File Format" := FileFormat;
+                  IF BusUnit."File Format" <> FileFormat THEN
+                    IF NOT CONFIRM(
+                         Text037 + Text038,FALSE,
+                         BusUnit.FIELDCAPTION("File Format"),BusUnit2."File Format",BusUnit.TABLECAPTION,BusUnit."File Format")
+                    THEN
+                      CurrReport.QUIT;
+
+                  IF FileFormat = FileFormat::"Version 4.00 or Later (.xml)" THEN BEGIN
+                    IF SubsidCurrencyCode = '' THEN
+                      SubsidCurrencyCode := BusUnit."Currency Code";
+                    GLSetup.GET;
+                    IF (SubsidCurrencyCode <> BusUnit."Currency Code") AND
+                       (SubsidCurrencyCode <> GLSetup."LCY Code") AND
+                       NOT ((BusUnit."Currency Code" = '') AND (GLSetup."LCY Code" = ''))
+                    THEN
+                      ERROR(
+                        Text002,
+                        BusUnit.FIELDCAPTION("Currency Code"),SubsidCurrencyCode,
+                        BusUnit.TABLECAPTION,BusUnit."Currency Code");
+                  END ELSE BEGIN
+                    SubsidCurrencyCode := BusUnit."Currency Code";
+                    Window.OPEN(
+                      '#1###############################\\' +
+                      Text024 +
+                      Text025 +
+                      Text026);
+                    Window.UPDATE(1,Text027);
+                    Window.UPDATE(2,BusUnit.Code);
+                    Window.UPDATE(3,'');
+                  END;
+                END;
+
+    OnPostReport=BEGIN
+                   IF FileFormat = FileFormat::"Version 3.70 or Earlier (.txt)" THEN
+                     Consolidate.SetGlobals(
+                       '','',BusUnit."Company Name",
+                       SubsidCurrencyCode,AdditionalCurrencyCode,ParentCurrencyCode,
+                       0,ConsolidStartDate,ConsolidEndDate);
+                   Consolidate.UpdateGLEntryDimSetID;
+                   Consolidate.SetDocNo(GLDocNo);
+                   Consolidate.RUN(BusUnit);
+                 END;
+
+  }
+  DATASET
+  {
+    { 6710;    ;DataItem;                    ;
+               DataItemTable=Table15;
+               DataItemTableView=SORTING(No.)
+                                 WHERE(Account Type=CONST(Posting));
+               OnPreDataItem=BEGIN
+                               IF FileFormat = FileFormat::"Version 4.00 or Later (.xml)" THEN
+                                 CurrReport.BREAK;
+                             END;
+
+               OnAfterGetRecord=BEGIN
+                                  "Consol. Debit Acc." := "No.";
+                                  "Consol. Credit Acc." := "No.";
+                                  "Consol. Translation Method" := "Consol. Translation Method"::"Average Rate (Manual)";
+                                  Consolidate.InsertGLAccount("G/L Account");
+                                END;
+
+               OnPostDataItem=VAR
+                                TempGLEntry@1001 : TEMPORARY Record 17;
+                                TempDimBuf@1000 : TEMPORARY Record 360;
+                              BEGIN
+                                IF FileFormat = FileFormat::"Version 4.00 or Later (.xml)" THEN
+                                  CurrReport.BREAK;
+
+                                // Import G/L entries
+                                WHILE GLEntryFile.POS <> GLEntryFile.LEN DO BEGIN
+                                  GLEntryFile.READ(TextLine);
+                                  CASE COPYSTR(TextLine,1,4) OF
+                                    '<02>':
+                                      BEGIN
+                                        TempGLEntry.INIT;
+                                        EVALUATE(TempGLEntry."G/L Account No.",COPYSTR(TextLine,5,20));
+                                        EVALUATE(TempGLEntry."Posting Date",COPYSTR(TextLine,26,9));
+                                        EVALUATE(TempGLEntry.Amount,COPYSTR(TextLine,36,22));
+                                        IF TempGLEntry.Amount > 0 THEN
+                                          TempGLEntry."Debit Amount" := TempGLEntry.Amount
+                                        ELSE
+                                          TempGLEntry."Credit Amount" := -TempGLEntry.Amount;
+                                        TempGLEntry."Entry No." := Consolidate.InsertGLEntry(TempGLEntry);
+                                      END;
+                                    '<03>':
+                                      BEGIN
+                                        TempDimBuf.INIT;
+                                        TempDimBuf."Table ID" := DATABASE::"G/L Entry";
+                                        TempDimBuf."Entry No." := TempGLEntry."Entry No.";
+                                        TempDimBuf."Dimension Code" := COPYSTR(TextLine,5,20);
+                                        TempDimBuf."Dimension Value Code" := COPYSTR(TextLine,26,20);
+                                        Consolidate.InsertEntryDim(TempDimBuf,TempDimBuf."Entry No.");
+                                      END;
+                                  END;
+                                END;
+
+                                Consolidate.SelectAllImportedDimensions;
+                              END;
+                               }
+
+  }
+  REQUESTPAGE
+  {
+    PROPERTIES
+    {
+      SaveValues=Yes;
+    }
+    CONTROLS
+    {
+      { 1900000001;0;Container;
+                  ContainerType=ContentArea }
+
+      { 1900000002;1;Group  ;
+                  CaptionML=ENU=Options }
+
+      { 3   ;2   ;Field     ;
+                  CaptionML=ENU=File Format;
+                  OptionCaptionML=ENU=Version 4.00 or Later (.xml),Version 3.70 or Earlier (.txt);
+                  SourceExpr=FileFormat }
+
+      { 2   ;2   ;Field     ;
+                  Name=FileNameControl;
+                  CaptionML=ENU=File Name;
+                  SourceExpr=FileName;
+                  OnAssistEdit=VAR
+                                 FileManagement@1000 : Codeunit 419;
+                               BEGIN
+                                 IF FileFormat = FileFormat::"Version 4.00 or Later (.xml)" THEN
+                                   FileName := FileManagement.OpenFileDialog(Text034,FileName,FileManagement.GetToFilterText('','.xml'))
+                                 ELSE
+                                   FileName := FileManagement.OpenFileDialog(Text031,FileName,FileManagement.GetToFilterText('','.txt'));
+                               END;
+                                }
+
+      { 1   ;2   ;Field     ;
+                  CaptionML=ENU=Document No.;
+                  SourceExpr=GLDocNo }
+
+    }
+  }
+  LABELS
+  {
+  }
+  CODE
+  {
+    VAR
+      Text000@1000 : TextConst 'ENU=Enter the file name.';
+      Text001@1001 : TextConst 'ENU=The file to be imported has an unknown format.';
+      Text002@1067 : TextConst 'ENU=The %1 in the file to be imported (%2) does not match the %1 in the %3 (%4).';
+      Text005@1003 : TextConst 'ENU=The business unit %1 %2 is not unique.\\';
+      Text006@1004 : TextConst 'ENU=Delete %1 in the extra records.';
+      Text015@1007 : TextConst 'ENU=Enter a document number.';
+      Text023@1014 : TextConst 'ENU=Do you want to consolidate in the period from %1 to %2?';
+      Text024@1015 : TextConst 'ENU=Business Unit Code   #2##########\';
+      Text025@1016 : TextConst 'ENU=G/L Account No.      #3##########\';
+      Text026@1017 : TextConst 'ENU=Date                 #4######';
+      Text027@1018 : TextConst 'ENU=Reading File...';
+      Text031@1022 : TextConst 'ENU=Import from Text File';
+      BusUnit@1025 : Record 220;
+      Consolidate@1064 : Codeunit 432;
+      Window@1036 : Dialog;
+      GLEntryFile@1037 : File;
+      FileName@1038 : Text;
+      FileFormat@1060 : 'Version 4.00 or Later (.xml),Version 3.70 or Earlier (.txt)';
+      TextLine@1039 : Text[250];
+      GLDocNo@1040 : Code[20];
+      ConsolidStartDate@1041 : Date;
+      ConsolidEndDate@1042 : Date;
+      TransferPerDay@1043 : Boolean;
+      CheckSum@1065 : Decimal;
+      CalculatedCheckSum@1073 : Decimal;
+      Text034@1061 : TextConst 'ENU=Import from XML File';
+      ParentCurrencyCode@1072 : Code[10];
+      SubsidCurrencyCode@1071 : Code[10];
+      AdditionalCurrencyCode@1070 : Code[10];
+      ProductVersion@1068 : Code[10];
+      FormatVersion@1069 : Code[10];
+      Text036@1074 : TextConst 'ENU=Imported checksum (%1) does not equal the calculated checksum (%2). The file may be corrupt.';
+      Text037@1005 : TextConst 'ENU=The entered %1, %2, does not equal the %1 on this %3, %4.';
+      Text038@1002 : TextConst 'ENU=\Do you want to continue?';
+      ServerFileName@1006 : Text;
+
+    PROCEDURE InitializeRequest@3(NewFileFormat@1002 : Option;NewFileName@1000 : Text;NewGLDocNo@1001 : Code[20]);
+    BEGIN
+      FileFormat := NewFileFormat;
+      FileName := NewFileName;
+      GLDocNo := NewGLDocNo;
+    END;
+
+    BEGIN
+    END.
+  }
+  RDLDATA
+  {
+  }
+}
+

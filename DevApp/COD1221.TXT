@@ -1,0 +1,164 @@
+OBJECT Codeunit 1221 SEPA CT-Fill Export Buffer
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00;
+  }
+  PROPERTIES
+  {
+    TableNo=1226;
+    Permissions=TableData 1226=rimd;
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      HasErrorsErr@1007 : TextConst 'ENU=The file export has one or more errors. For each of the lines to be exported, resolve any errors that are displayed in the File Export Errors FactBox.';
+      FieldIsBlankErr@1006 : TextConst '@@@="%1=field name, e.g. Post Code.";ENU=Field %1 must be specified.';
+      SameBankErr@1000 : TextConst 'ENU=All lines must have the same bank account as the balancing account.';
+      RemitMsg@1001 : TextConst '@@@="%1=Document type, %2=Document no., e.g. Invoice A123";ENU=%1 %2';
+
+    PROCEDURE FillExportBuffer@3(VAR GenJnlLine@1000 : Record 81;VAR PaymentExportData@1001 : Record 1226);
+    VAR
+      TempGenJnlLine@1011 : TEMPORARY Record 81;
+      GeneralLedgerSetup@1012 : Record 98;
+      BankAccount@1010 : Record 270;
+      Customer@1009 : Record 18;
+      Vendor@1008 : Record 23;
+      VendorBankAccount@1007 : Record 288;
+      CustomerBankAccount@1006 : Record 287;
+      CreditTransferRegister@1005 : Record 1205;
+      CreditTransferEntry@1004 : Record 1206;
+      BankExportImportSetup@1003 : Record 1200;
+      MessageID@1002 : Code[20];
+    BEGIN
+      TempGenJnlLine.COPYFILTERS(GenJnlLine);
+      CODEUNIT.RUN(CODEUNIT::"SEPA CT-Prepare Source",TempGenJnlLine);
+
+      TempGenJnlLine.RESET;
+      TempGenJnlLine.FINDSET;
+      BankAccount.GET(TempGenJnlLine."Bal. Account No.");
+      BankAccount.TESTFIELD(IBAN);
+      BankAccount.GetBankExportImportSetup(BankExportImportSetup);
+      BankExportImportSetup.TESTFIELD("Check Export Codeunit");
+      TempGenJnlLine.DeletePaymentFileBatchErrors;
+      REPEAT
+        CODEUNIT.RUN(BankExportImportSetup."Check Export Codeunit",TempGenJnlLine);
+        IF TempGenJnlLine."Bal. Account No." <> BankAccount."No." THEN
+          TempGenJnlLine.InsertPaymentFileError(SameBankErr);
+      UNTIL TempGenJnlLine.NEXT = 0;
+
+      IF TempGenJnlLine.HasPaymentFileErrorsInBatch THEN BEGIN
+        COMMIT;
+        ERROR(HasErrorsErr);
+      END;
+
+      GeneralLedgerSetup.GET;
+      GeneralLedgerSetup.TESTFIELD("LCY Code");
+
+      MessageID := BankAccount.GetCreditTransferMessageNo;
+      CreditTransferRegister.CreateNew(MessageID,BankAccount."No.");
+
+      WITH PaymentExportData DO BEGIN
+        RESET;
+        IF FINDLAST THEN;
+
+        TempGenJnlLine.FINDSET;
+        REPEAT
+          INIT;
+          "Entry No." += 1;
+          SetPreserveNonLatinCharacters(BankExportImportSetup."Preserve Non-Latin Characters");
+          SetBankAsSenderBank(BankAccount);
+          "Transfer Date" := TempGenJnlLine."Posting Date";
+          "Document No." := TempGenJnlLine."Document No.";
+          "Applies-to Ext. Doc. No." := TempGenJnlLine."Applies-to Ext. Doc. No.";
+          Amount := TempGenJnlLine.Amount;
+          IF TempGenJnlLine."Currency Code" = '' THEN
+            "Currency Code" := GeneralLedgerSetup."LCY Code"
+          ELSE
+            "Currency Code" := TempGenJnlLine."Currency Code";
+
+          CASE TempGenJnlLine."Account Type" OF
+            TempGenJnlLine."Account Type"::Customer:
+              BEGIN
+                Customer.GET(TempGenJnlLine."Account No.");
+                CustomerBankAccount.GET(Customer."No.",TempGenJnlLine."Recipient Bank Account");
+                SetCustomerAsRecipient(Customer,CustomerBankAccount);
+              END;
+            TempGenJnlLine."Account Type"::Vendor:
+              BEGIN
+                Vendor.GET(TempGenJnlLine."Account No.");
+                VendorBankAccount.GET(Vendor."No.",TempGenJnlLine."Recipient Bank Account");
+                SetVendorAsRecipient(Vendor,VendorBankAccount);
+              END;
+          END;
+
+          VALIDATE("SEPA Instruction Priority","SEPA Instruction Priority"::NORMAL);
+          VALIDATE("SEPA Payment Method","SEPA Payment Method"::TRF);
+          VALIDATE("SEPA Charge Bearer","SEPA Charge Bearer"::SLEV);
+          "SEPA Batch Booking" := FALSE;
+          SetCreditTransferIDs(MessageID);
+
+          IF "Applies-to Ext. Doc. No." <> '' THEN
+            AddRemittanceText(STRSUBSTNO(RemitMsg,TempGenJnlLine."Applies-to Doc. Type","Applies-to Ext. Doc. No."))
+          ELSE
+            AddRemittanceText(TempGenJnlLine.Description);
+          IF TempGenJnlLine."Message to Recipient" <> '' THEN
+            AddRemittanceText(TempGenJnlLine."Message to Recipient");
+
+          ValidatePaymentExportData(PaymentExportData,TempGenJnlLine);
+          INSERT(TRUE);
+          CreditTransferEntry.CreateNew(
+            CreditTransferRegister."No.","Entry No.",
+            TempGenJnlLine."Account Type",TempGenJnlLine."Account No.",
+            TempGenJnlLine.GetAppliesToDocEntryNo,
+            "Transfer Date","Currency Code",Amount,COPYSTR("End-to-End ID",1,MAXSTRLEN("End-to-End ID")),
+            TempGenJnlLine."Recipient Bank Account",TempGenJnlLine."Message to Recipient");
+        UNTIL TempGenJnlLine.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE ValidatePaymentExportData@2(VAR PaymentExportData@1000 : Record 1226;VAR GenJnlLine@1001 : Record 81);
+    BEGIN
+      ValidatePaymentExportDataField(PaymentExportData,GenJnlLine,PaymentExportData.FIELDNAME("Sender Bank Account No."));
+      ValidatePaymentExportDataField(PaymentExportData,GenJnlLine,PaymentExportData.FIELDNAME("Recipient Name"));
+      ValidatePaymentExportDataField(PaymentExportData,GenJnlLine,PaymentExportData.FIELDNAME("Recipient Bank Acc. No."));
+      ValidatePaymentExportDataField(PaymentExportData,GenJnlLine,PaymentExportData.FIELDNAME("Transfer Date"));
+      ValidatePaymentExportDataField(PaymentExportData,GenJnlLine,PaymentExportData.FIELDNAME("Payment Information ID"));
+      ValidatePaymentExportDataField(PaymentExportData,GenJnlLine,PaymentExportData.FIELDNAME("End-to-End ID"));
+    END;
+
+    LOCAL PROCEDURE ValidatePaymentExportDataField@5(VAR PaymentExportData@1000 : Record 1226;VAR GenJnlLine@1001 : Record 81;FieldName@1003 : Text);
+    VAR
+      Field@1004 : Record 2000000041;
+      RecRef@1005 : RecordRef;
+      FieldRef@1002 : FieldRef;
+    BEGIN
+      RecRef.GETTABLE(PaymentExportData);
+      Field.SETRANGE(TableNo,RecRef.NUMBER);
+      Field.SETRANGE(FieldName,FieldName);
+      Field.FINDFIRST;
+      FieldRef := RecRef.FIELD(Field."No.");
+      IF (Field.Type = Field.Type::Text) AND (FORMAT(FieldRef.VALUE) <> '') THEN
+        EXIT;
+      IF (Field.Type = Field.Type::Code) AND (FORMAT(FieldRef.VALUE) <> '') THEN
+        EXIT;
+      IF (Field.Type = Field.Type::Decimal) AND (FORMAT(FieldRef.VALUE) <> '0') THEN
+        EXIT;
+      IF (Field.Type = Field.Type::Integer) AND (FORMAT(FieldRef.VALUE) <> '0') THEN
+        EXIT;
+      IF (Field.Type = Field.Type::Date) AND (FORMAT(FieldRef.VALUE) <> '0D') THEN
+        EXIT;
+
+      PaymentExportData.AddGenJnlLineErrorText(GenJnlLine,STRSUBSTNO(FieldIsBlankErr,Field."Field Caption"));
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

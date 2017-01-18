@@ -1,0 +1,252 @@
+OBJECT Codeunit 11020222 Distr. SalesLines Over SubProj
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      PlantSetupRec@1100525000 : Record 11012550;
+
+    PROCEDURE DistrSalesLinesOverSubProjects@1100525001(SalesHeadRec@1100485000 : Record 36);
+    VAR
+      SalesLineRec@1100485001 : Record 37;
+      ProjRec@1100485003 : Record 11072003;
+      NextLineNo@1100525000 : Integer;
+    BEGIN
+      IF NOT SalesHeadRec."Plant Invoice" THEN
+        SalesHeadRec.TESTFIELD(Status, SalesHeadRec.Status::Open)
+      ELSE BEGIN
+        PlantSetupRec.GET;
+        IF PlantSetupRec."Distr. Inv. over Sub Projects" = PlantSetupRec."Distr. Inv. over Sub Projects"::No THEN
+          PlantSetupRec.FIELDERROR("Distr. Inv. over Sub Projects");
+      END;
+
+      SalesLineRec.SETRANGE("Document Type", SalesHeadRec."Document Type");
+      SalesLineRec.SETRANGE("Document No.", SalesHeadRec."No.");
+      IF NOT SalesLineRec.FINDLAST THEN
+        EXIT;
+      NextLineNo := SalesLineRec."Line No." + 10000;  //* Determine next line number before other filters are set
+
+      SalesLineRec.SETFILTER("Job No.", '<>%1', '');
+      SalesLineRec.SETFILTER("Line Amount", '<>%1', 0);
+      IF SalesLineRec.FINDSET(TRUE, TRUE) THEN BEGIN
+        IF (SalesHeadRec."Company Name" <> '') AND (SalesHeadRec."Company Name" <> COMPANYNAME) THEN
+          ProjRec.CHANGECOMPANY(SalesHeadRec."Company Name");
+        REPEAT
+          ProjRec.GET(SalesLineRec."Job No.");
+          IF (ProjRec."Single/Main/Sub Project" = ProjRec."Single/Main/Sub Project"::"Main Project") THEN BEGIN
+            IF CreateSalesLinesForSubProjects(SalesHeadRec, SalesLineRec, NextLineNo) THEN
+              SalesLineRec.DELETE(TRUE);
+          END;
+        UNTIL SalesLineRec.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE CreateSalesLinesForSubProjects@1100498000(SalesHeadRec@1100498000 : Record 36;SalesLineRec@1100485001 : Record 37;VAR NextLineNo@1100485005 : Integer) : Boolean;
+    VAR
+      ProjRec@1100525001 : Record 11072003;
+      BudgetLineRec@1100498002 : Record 11012001;
+      SalesLineRec2@1100525000 : Record 37;
+      PlantInventoryRec@1100525010 : Record 11012555;
+      PlantInventoryRec2@1100525011 : Record 11012555;
+      TmpProjRec@1100525003 : TEMPORARY Record 11012060;
+      TmpProjRec2@1100525009 : TEMPORARY Record 11012060;
+      FirstNewLine@1100525012 : Boolean;
+      BudgetLineAmt@1100525002 : Decimal;
+      TotalBudget@1100485000 : Decimal;
+      SubBudgetTotal@1100525006 : Decimal;
+      TotalDivided@1100525005 : Decimal;
+      LastSubProj@1100525004 : Code[20];
+    BEGIN
+      IF (SalesHeadRec."Company Name" <> '') AND (SalesHeadRec."Company Name" <> COMPANYNAME) THEN BEGIN
+        ProjRec.CHANGECOMPANY(SalesHeadRec."Company Name");
+        BudgetLineRec.CHANGECOMPANY(SalesHeadRec."Company Name");
+      END;
+
+      TotalBudget := 0;
+
+      ProjRec.SETCURRENTKEY("Main Project");
+      ProjRec.SETRANGE("Main Project", SalesLineRec."Job No.");
+      ProjRec.SETRANGE("Single/Main/Sub Project", ProjRec."Single/Main/Sub Project"::"Sub Project");
+      ProjRec.SETRANGE("Project Status", ProjRec."Project Status"::Production);
+      IF ProjRec.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          BudgetLineAmt := 0;
+          BudgetLineRec.RESET;
+          BudgetLineRec.SETCURRENTKEY("Project No.", "Cost Object");
+          BudgetLineRec.SETRANGE("Project No.", ProjRec."No.");
+          IF SalesLineRec."Shortcut Dimension 2 Code" <> '' THEN BEGIN
+            BudgetLineRec.SETRANGE("Cost Object", SalesLineRec."Shortcut Dimension 2 Code");
+            BudgetLineRec.CALCSUMS(Amount);
+            IF BudgetLineRec.Amount > 0 THEN BEGIN
+              BudgetLineAmt := BudgetLineRec.Amount;
+              TotalBudget := TotalBudget + BudgetLineRec.Amount;
+            END;
+          END;
+          TmpProjRec.Code := ProjRec."No.";      //* Code is used for the project number
+          TmpProjRec.Quantity := BudgetLineAmt;  //* Quantity is used for the budget of the subproject
+          TmpProjRec.INSERT;                     //* Initially write all subproject in de tmp table!
+          IF (TotalBudget = 0) THEN BEGIN
+            //* Tmp table 2 for budget on project level, this is only needed if no budget is found on
+            //* cost object level of the subprojects.
+            BudgetLineRec.SETRANGE("Cost Object");  //* Reset the Cost Object filter
+            BudgetLineRec.CALCSUMS(Amount);
+            IF BudgetLineRec.Amount > 0 THEN BEGIN
+              TmpProjRec2.Code := ProjRec."No.";
+              TmpProjRec2.Quantity := BudgetLineRec.Amount;
+              TmpProjRec2.INSERT;
+            END;
+          END;
+        UNTIL ProjRec.NEXT = 0;
+      END;
+      IF NOT TmpProjRec.FINDFIRST THEN
+        EXIT(FALSE);
+      TmpProjRec.SETFILTER(Quantity, '>%1', 0);
+      IF NOT TmpProjRec.FINDFIRST THEN BEGIN  //* If all zero on project cost object level
+        TmpProjRec.RESET;
+        TmpProjRec2.RESET;
+        TmpProjRec2.SETFILTER(Quantity, '>%1', 0);
+        IF TmpProjRec2.FINDSET(FALSE, FALSE) THEN BEGIN
+          //* Divide proportional over the subprojects with budget on project level
+          TmpProjRec.DELETEALL;
+          TotalBudget := 0;
+          REPEAT
+            TmpProjRec := TmpProjRec2;
+            TmpProjRec.INSERT;
+            TotalBudget := TotalBudget + TmpProjRec.Quantity;
+          UNTIL TmpProjRec2.NEXT = 0;
+        END ELSE BEGIN
+          //* Divide proportional over all subprojects (all same amount)
+          TmpProjRec.MODIFYALL(Quantity, 1);
+          TotalBudget := TmpProjRec.COUNT;
+        END;
+      END ELSE BEGIN
+        TmpProjRec.SETRANGE(Quantity, 0);
+        TmpProjRec.DELETEALL;
+      END;
+
+      TmpProjRec.RESET;
+      TmpProjRec.SETFILTER(Quantity, '>%1', 0);
+      IF NOT TmpProjRec.FINDLAST THEN
+        EXIT(FALSE)
+      ELSE
+        LastSubProj := TmpProjRec.Code;
+
+      IF TmpProjRec.FINDSET(FALSE, FALSE) THEN BEGIN
+        TotalDivided := 0;
+        FirstNewLine := TRUE;
+        REPEAT
+          SalesLineRec2 := SalesLineRec;
+          SalesLineRec2."Line No." := NextLineNo;
+          SalesLineRec2.INSERT(FALSE);
+          SalesLineRec2."Job No." := TmpProjRec.Code;
+          SubBudgetTotal := SubBudgetTotal + TmpProjRec.Quantity;
+          IF TmpProjRec.Code = LastSubProj THEN
+            SalesLineRec2.VALIDATE("Line Amount", SalesLineRec."Line Amount" - TotalDivided)
+          ELSE
+            SalesLineRec2.VALIDATE("Line Amount", (SalesLineRec."Line Amount" * (SubBudgetTotal / TotalBudget)) - TotalDivided);
+          TotalDivided := TotalDivided + SalesLineRec2."Line Amount";
+          SalesLineRec2.MODIFY;
+          NextLineNo := NextLineNo + 10000;
+
+          IF FirstNewLine AND SalesHeadRec."Plant Invoice" AND
+             (SalesLineRec."Plant Invoice Origin" = SalesLineRec."Plant Invoice Origin"::"Plant Inventory") AND
+             (SalesHeadRec."Document Type" IN
+              [SalesHeadRec."Document Type"::"Invoice Proposal",
+               SalesHeadRec."Document Type"::Invoice,
+               SalesHeadRec."Document Type"::"Credit Memo"])
+          THEN BEGIN
+            PlantInventoryRec.RESET;
+            PlantInventoryRec.SETCURRENTKEY("Invoice Status","Last Invoice No.","Last Invoice Line No.");
+            IF SalesHeadRec."Document Type" = SalesHeadRec."Document Type"::"Invoice Proposal" THEN
+              PlantInventoryRec.SETRANGE("Invoice Status", PlantInventoryRec."Invoice Status"::Proposal)
+            ELSE
+              PlantInventoryRec.SETRANGE("Invoice Status", PlantInventoryRec."Invoice Status"::"Temporary");
+            PlantInventoryRec.SETRANGE("Last Invoice No.", SalesHeadRec."No.");
+            PlantInventoryRec.SETRANGE("Last Invoice Line No.",SalesLineRec."Line No.");
+            IF PlantInventoryRec.FINDSET(TRUE, TRUE) THEN
+              REPEAT
+                PlantInventoryRec2 := PlantInventoryRec;
+                PlantInventoryRec2."Last Invoice Line No." := SalesLineRec2."Line No.";
+                PlantInventoryRec2.MODIFY;
+              UNTIL PlantInventoryRec.NEXT = 0;
+          END;
+
+          FirstNewLine := FALSE;
+        UNTIL TmpProjRec.NEXT = 0;
+      END;
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE CheckDistrOverSubProjects@1100525000(SalesHeadRec@1100485000 : Record 36) : Boolean;
+    VAR
+      SalesLineRec@1100485001 : Record 37;
+      ProjRec@1100485003 : Record 11072003;
+      ProjRec2@1100525000 : Record 11072003;
+    BEGIN
+      SalesLineRec.SETRANGE("Document Type", SalesHeadRec."Document Type");
+      SalesLineRec.SETRANGE("Document No.", SalesHeadRec."No.");
+      SalesLineRec.SETFILTER("Job No.", '<>%1', '');
+      SalesLineRec.SETFILTER("Line Amount", '<>%1', 0);
+      IF NOT SalesLineRec.FINDSET(FALSE, FALSE) THEN
+        EXIT(FALSE);
+
+      IF (SalesHeadRec."Company Name" <> '') AND (SalesHeadRec."Company Name" <> COMPANYNAME) THEN BEGIN
+        ProjRec.CHANGECOMPANY(SalesHeadRec."Company Name");
+        ProjRec2.CHANGECOMPANY(SalesHeadRec."Company Name");
+      END;
+      ProjRec2.SETCURRENTKEY("Main Project");
+      ProjRec2.SETRANGE("Single/Main/Sub Project", ProjRec2."Single/Main/Sub Project"::"Sub Project");
+      ProjRec2.SETRANGE("Project Status", ProjRec."Project Status"::Production);
+
+      REPEAT
+        ProjRec.GET(SalesLineRec."Job No.");
+        IF (ProjRec."Single/Main/Sub Project" = ProjRec."Single/Main/Sub Project"::"Main Project") THEN BEGIN
+          ProjRec2.SETRANGE("Main Project", SalesLineRec."Job No.");
+          IF ProjRec2.FINDFIRST THEN
+            EXIT(TRUE)
+        END;
+      UNTIL SalesLineRec.NEXT = 0;
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE CheckPlantDistrOverSubProjects@1100525002(SalesHeadRec@1100525003 : Record 36) : Boolean;
+    VAR
+      PlantSetupRec@1100525000 : Record 11012550;
+      DistrOverSubProjectsCU@1100525001 : Codeunit 11020222;
+      lvText001@1100525002 : TextConst 'ENU=%1 %2 must be distributed over the sub projects first.';
+    BEGIN
+      //* Check on posting the Plant Invoice Proposal.
+      PlantSetupRec.GET;
+      IF PlantSetupRec."Distr. Inv. over Sub Projects" = PlantSetupRec."Distr. Inv. over Sub Projects"::No THEN
+        EXIT;
+      IF NOT DistrOverSubProjectsCU.CheckDistrOverSubProjects(SalesHeadRec) THEN
+        EXIT;
+
+      CASE PlantSetupRec."Distr. Inv. over Sub Projects" OF
+        PlantSetupRec."Distr. Inv. over Sub Projects"::Yes:
+          ERROR(lvText001, SalesHeadRec."Document Type", SalesHeadRec."No.");
+        PlantSetupRec."Distr. Inv. over Sub Projects"::Automatically:
+          DistrOverSubProjectsCU.DistrSalesLinesOverSubProjects(SalesHeadRec);
+      END;
+    END;
+
+    BEGIN
+    {
+      //* Call C-015204  Distribute (divide) sales lines with a Main Project over the Sub Projects (split sales lines of Main Project).
+    }
+    END.
+  }
+}
+

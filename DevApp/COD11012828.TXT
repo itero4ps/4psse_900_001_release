@@ -1,0 +1,1445 @@
+OBJECT Codeunit 11012828 Maintenance Invoice Mgt
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      gvTempSalesLineRec@1100526202 : TEMPORARY Record 37;
+      gvLineNoInt@1100525001 : Integer;
+      Text002@1100526203 : TextConst 'ENU=days';
+      Text003@1100528600 : TextConst 'ENU=Invoice Proposal %1 not processed';
+      Text004@1100528601 : TextConst 'ENU=Customer %1 is blocked for Invoicing';
+      Text005@1210190000 : TextConst 'ENU=Sales Invoice %1 not processed';
+      Text006@1210190001 : TextConst 'ENU=Credit Memo %1 not processed';
+      Text007@1100528300 : TextConst 'ENU=There are not invoiced %1 Lines in a previous %2 present.';
+      Text008@1100528602 : TextConst 'ENU=Contract Invoicing Lines of Collective-List %1 not processed';
+      Text009@1100525002 : TextConst 'ENU=Invoiced Quantity:';
+      Text010@1100528603 : TextConst 'ENU=None or Several Active Installments Found per %1';
+      SalesCalcDiscount@1100409000 : Codeunit 60;
+
+    PROCEDURE CreateInvoiceProposal@1100526223(IServiceContract@1100525000 : Record 11012812;IInvUntilForehandDate@1100525003 : Date;IInvUntilAfterwardsDate@1100525009 : Date;IPostingDate@1100525011 : Date;IDocumentDate@1100525012 : Date;ISingleContract@1100528601 : Boolean;IBatchSeqNo@1100528608 : Code[20]) : Code[20];
+    VAR
+      SalesHeader@1100409001 : Record 36;
+      ContractObject@1100525001 : Record 11071702;
+      Customer@1100526201 : Record 18;
+      SalesLine@1210190001 : Record 37;
+      ServiceCollectiveListMgt@1100528606 : Codeunit 11012850;
+      lvRevPerDayDecLCY@1100525006 : Decimal;
+      lvRevPerDayDec@1100528801 : Decimal;
+      lvNoOfDaysInt@1100525005 : Integer;
+      lvRevPerYearDecLCY@1100525004 : Decimal;
+      lvRevPerYearDec@1100528800 : Decimal;
+      lvProposalCde@1100525007 : Code[20];
+      lvInvoiceFromDate@1100525008 : Date;
+      lvInvoiceUntilDate@1100525010 : Date;
+      InstallmInvUntilDate@1100528603 : Date;
+      ContractInstallment@1100526200 : Record 11071707;
+      NewInvoicedDate@1100528600 : Date;
+      FoundInvoiceProposalCode@1100528602 : Code[20];
+      DocumentType@1210190000 : Option;
+      ContractObjectInvoiceFrom@1100528604 : Date;
+      CollectiveListNo@1100528605 : Code[20];
+      InvoiceUntilPostponeDate@1100528607 : Date;
+      ContractObjectInvoiceUntil@1100409000 : Date;
+      ContractObjectInvIntervalUntil@1100525002 : Date;
+      InvoicePeriod@1100528609 : Option;
+      DiscountSurchargeAdded@1100528611 : Boolean;
+    BEGIN
+      IF ISingleContract THEN BEGIN
+        IServiceContract.TESTFIELD(Status, IServiceContract.Status::"Invoicing Allowed");
+        IF IServiceContract."Invoice Type" = IServiceContract."Invoice Type"::Dynamic THEN
+          IServiceContract.TESTFIELD("Invoicing via Collective List", FALSE);
+        IF IServiceContract."Contract Form" = IServiceContract."Contract Form"::"Framework Contract" THEN
+          IServiceContract.FIELDERROR("Contract Form");
+        IServiceContract.TESTFIELD("Service Type");
+      END ELSE BEGIN
+        IF IServiceContract.Status <> IServiceContract.Status::"Invoicing Allowed" THEN
+          EXIT;
+        IF IServiceContract."Invoice Type" = IServiceContract."Invoice Type"::Dynamic THEN
+          IF IServiceContract."Invoicing via Collective List" THEN
+            EXIT;
+        IF IServiceContract."Contract Form" = IServiceContract."Contract Form"::"Framework Contract" THEN
+          EXIT;
+        IF IServiceContract."Service Type" = '' THEN
+          EXIT;
+      END;
+
+      FoundInvoiceProposalCode := ProposalInvoiceExists(IServiceContract."No.", IBatchSeqNo, DocumentType);
+      IF FoundInvoiceProposalCode <> '' THEN
+        IF ISingleContract THEN BEGIN
+          CASE DocumentType OF
+            SalesLine."Document Type"::"Invoice Proposal":
+              ERROR(Text003, FoundInvoiceProposalCode);
+            SalesLine."Document Type"::Invoice:
+              ERROR(Text005, FoundInvoiceProposalCode);
+            SalesLine."Document Type"::"Credit Memo":
+              ERROR(Text006, FoundInvoiceProposalCode);
+          END;
+        END ELSE
+          EXIT;
+
+      IF ServiceCollectiveListMgt.CollectiveListSCInvoicingExist(IServiceContract."No.", CollectiveListNo) THEN
+        ERROR(Text008, CollectiveListNo);
+
+      IF Customer.GET(IServiceContract."Bill-to Customer No. (Contr.)") THEN BEGIN
+        IF ISingleContract THEN BEGIN
+          IF Customer.Blocked >= Customer.Blocked::Invoice THEN
+            ERROR(Text004, Customer."No.");
+        END ELSE BEGIN
+          IF Customer.Blocked >= Customer.Blocked::Invoice THEN
+            EXIT;
+        END;
+      END;
+
+      WITH IServiceContract DO BEGIN
+        IF ISingleContract THEN BEGIN
+          TESTFIELD("Customer No.");
+          TESTFIELD("VAT Prod. Posting Group");
+          TESTFIELD("Starting Date");
+        END ELSE BEGIN
+          IF "Customer No." = '' THEN
+            EXIT;
+          IF "VAT Prod. Posting Group" = '' THEN
+            EXIT;
+          IF "Starting Date" = 0D THEN
+            EXIT;
+        END;
+        gvLineNoInt := 0;
+        InvoicePeriod := "Invoice Period";
+
+        CASE "Invoice Period" OF
+          "Invoice Period"::Forehand:
+            lvInvoiceUntilDate := IInvUntilForehandDate;
+          "Invoice Period"::Afterwards:
+            lvInvoiceUntilDate := IInvUntilAfterwardsDate;
+        END;
+
+        IF ("Invoice Type" = "Invoice Type"::Dynamic) AND (FORMAT("Invoice Interval") <> '') THEN BEGIN
+          IF "Invoiced Until" <> 0D THEN
+            lvInvoiceUntilDate := "Invoiced Until" +1
+          ELSE
+            lvInvoiceUntilDate := "Starting Date";
+          CASE "Invoice Period" OF
+            "Invoice Period"::Forehand:
+              BEGIN
+                InvoiceUntilPostponeDate := lvInvoiceUntilDate;
+                IF FORMAT("Invoice Postpone Period") <> '' THEN
+                  InvoiceUntilPostponeDate := CALCDATE("Invoice Postpone Period", InvoiceUntilPostponeDate);
+                IF IInvUntilForehandDate >= InvoiceUntilPostponeDate THEN BEGIN
+                  lvInvoiceUntilDate := CALCDATE("Invoice Interval", lvInvoiceUntilDate) -1;
+                  IF lvInvoiceUntilDate < IInvUntilForehandDate THEN
+                    lvInvoiceUntilDate := IInvUntilForehandDate;
+                END ELSE
+                  EXIT;
+              END;
+            "Invoice Period"::Afterwards:
+              BEGIN
+                lvInvoiceUntilDate := CALCDATE("Invoice Interval", lvInvoiceUntilDate) -1;
+                IF IInvUntilAfterwardsDate < lvInvoiceUntilDate THEN
+                  EXIT
+                ELSE
+                  lvInvoiceUntilDate := IInvUntilAfterwardsDate;
+              END;
+          END;
+        END;
+
+        IF (lvInvoiceUntilDate > "Ending Date") AND ("Ending Date" <> 0D) THEN
+          lvInvoiceUntilDate := "Ending Date";
+
+        CASE "Invoice Type" OF
+          "Invoice Type"::Dynamic:
+            BEGIN
+              IF "Invoiced Until" <> 0D THEN
+                NewInvoicedDate := CALCDATE("Invoice Interval", "Invoiced Until")
+              ELSE
+                NewInvoicedDate := "Starting Date";
+              IF lvInvoiceUntilDate >= NewInvoicedDate THEN BEGIN
+                ContractObject.SETRANGE("Service Contract No.", "No.");
+                IF NOT ISingleContract THEN
+                  ContractObject.SETFILTER("Invoice From", '<>%1', 0D);
+                IF ContractObject.FINDSET(TRUE,FALSE) THEN BEGIN
+                  REPEAT
+                    ContractObject.TESTFIELD("Invoice From");
+                    IF ContractObject."Invoiced Until" <> 0D THEN
+                      ContractObjectInvoiceFrom := ContractObject."Invoiced Until" +1
+                    ELSE
+                      ContractObjectInvoiceFrom := ContractObject."Invoice From";
+                    ContractObjectInvoiceUntil := lvInvoiceUntilDate;
+                    IF (ContractObject."Ending Date" <> 0D) AND (ContractObjectInvoiceUntil > ContractObject."Ending Date") THEN
+                      ContractObjectInvoiceUntil := ContractObject."Ending Date";
+                    IF (ContractObjectInvoiceFrom <= lvInvoiceUntilDate) AND
+                       (ContractObjectInvoiceFrom <= ContractObjectInvoiceUntil)
+                    THEN BEGIN
+                      ContractObject.CALCFIELDS("Standard Object No.","Object Group");
+                      CASE "Dynamic Invoice Type" OF
+                        "Dynamic Invoice Type"::Days:
+                          BEGIN
+                            DetermineInvoiceAmount(ContractObject,ContractObjectInvoiceUntil,IServiceContract,lvRevPerDayDecLCY,
+                              lvNoOfDaysInt, lvRevPerYearDecLCY,lvInvoiceFromDate,lvRevPerDayDec,lvRevPerYearDec);
+                            IF (lvRevPerDayDec <> 0) AND (lvNoOfDaysInt <> 0) THEN BEGIN
+                              CreateTempDynamicInvLine(ContractObject,ContractObjectInvoiceUntil,lvRevPerDayDec,lvNoOfDaysInt,
+                                                       lvInvoiceFromDate, "VAT Prod. Posting Group", ContractObject."Last Invoiced Until",
+                                                       IBatchSeqNo);
+
+                              ContractObject."Last Invoiced Until" := ContractObject."Invoiced Until";
+                              ContractObject."Invoiced Until" := ContractObjectInvoiceUntil;
+                              ContractObject.MODIFY(TRUE);
+                            END;
+                          END;
+                        "Dynamic Invoice Type"::"Invoice Interval":
+                          BEGIN
+                            TESTFIELD("Invoice Interval");
+                            IF ContractObject."Invoiced Until" <> 0D THEN
+                              lvInvoiceFromDate := ContractObject."Invoiced Until" +1
+                            ELSE
+                              lvInvoiceFromDate := ContractObject."Invoice From";
+                            WHILE CALCDATE('-' + FORMAT("Invoice Interval"), lvInvoiceFromDate) >= ContractObjectInvoiceFrom DO
+                              lvInvoiceFromDate := CALCDATE('-' + FORMAT("Invoice Interval"), lvInvoiceFromDate);
+                            ContractObjectInvIntervalUntil := lvInvoiceFromDate;
+                            WHILE CALCDATE("Invoice Interval", ContractObjectInvIntervalUntil) <= ContractObjectInvoiceUntil DO
+                              ContractObjectInvIntervalUntil := CALCDATE("Invoice Interval", ContractObjectInvIntervalUntil);
+                            IF "Invoice Period" = "Invoice Period"::Forehand THEN
+                              ContractObjectInvIntervalUntil := CALCDATE("Invoice Interval", ContractObjectInvIntervalUntil);
+                            ContractObjectInvIntervalUntil := ContractObjectInvIntervalUntil -1;
+                            WHILE lvInvoiceFromDate < ContractObjectInvoiceFrom DO
+                              lvInvoiceFromDate := CALCDATE("Invoice Interval", lvInvoiceFromDate);
+                            WHILE lvInvoiceFromDate < ContractObjectInvIntervalUntil DO BEGIN
+                              CreateTempDynInvLineFixedAmt(
+                                ContractObject, lvInvoiceFromDate, "Invoice Interval", "VAT Prod. Posting Group");
+                              ContractObject."Last Invoiced Until" := ContractObject."Invoiced Until";
+                              ContractObject."Invoiced Until" := CALCDATE("Invoice Interval", lvInvoiceFromDate) -1;
+                              ContractObject.MODIFY(TRUE);
+                              lvInvoiceFromDate := CALCDATE("Invoice Interval", lvInvoiceFromDate);
+                            END;
+                            lvInvoiceUntilDate := ContractObjectInvIntervalUntil;
+                          END;
+                      END;
+                    END;
+                  UNTIL ContractObject.NEXT = 0;
+                  IF "Invoiced Until" <> lvInvoiceUntilDate THEN BEGIN
+                    "Last Invoiced Until" := "Invoiced Until";
+                    "Invoiced Until" := lvInvoiceUntilDate;
+                    MODIFY(TRUE);
+                  END;
+                END;
+              END;
+            END;
+          "Invoice Type"::Installments:
+            BEGIN
+              ContractInstallment.SETRANGE("Service Contract No.","No.");
+              ContractInstallment.SETRANGE("Invoicing via Collective List", FALSE);
+              IF ContractInstallment.FINDSET(TRUE, FALSE) THEN BEGIN
+                REPEAT
+                  IF (ContractInstallment."Ending Date" <> 0D) AND (lvInvoiceUntilDate > ContractInstallment."Ending Date") THEN
+                    InstallmInvUntilDate := ContractInstallment."Ending Date"
+                  ELSE
+                    InstallmInvUntilDate := lvInvoiceUntilDate;
+                  IF NOT HandleInstallmentLines(ContractInstallment, InstallmInvUntilDate,
+                    "VAT Prod. Posting Group", ISingleContract, IBatchSeqNo)
+                  THEN
+                    EXIT;
+                UNTIL ContractInstallment.NEXT = 0;
+              END;
+            END;
+        END;
+      END;
+
+      WITH gvTempSalesLineRec DO BEGIN
+        IF FINDSET THEN BEGIN
+          IF IServiceContract."Collect Installment Invoice By" = IServiceContract."Collect Installment Invoice By"::Customer THEN
+            lvProposalCde :=
+              FindExistingProposalHeader(
+                IServiceContract,IPostingDate,IInvUntilForehandDate, IInvUntilAfterwardsDate,IDocumentDate, IBatchSeqNo)
+          ELSE
+            lvProposalCde :=
+              CreateInvProposalHeader(
+                IServiceContract,IServiceContract."No.",IPostingDate,IInvUntilForehandDate, IInvUntilAfterwardsDate,IDocumentDate, IBatchSeqNo);
+
+          REPEAT
+            CreateInvProposalLine(lvProposalCde, IBatchSeqNo);
+          UNTIL gvTempSalesLineRec.NEXT = 0;
+        END;
+      END;
+
+      DiscountSurchargeAdded := ProcessInvoiceDiscountSurcharge(lvProposalCde, IServiceContract, IBatchSeqNo, IPostingDate);
+      IF NOT DiscountSurchargeAdded THEN
+        IF SalesHeader.GET(SalesHeader."Document Type"::"Invoice Proposal", lvProposalCde) THEN
+          SalesCalcDiscount.CalculateIncDiscForHeader(SalesHeader);
+
+      EXIT(lvProposalCde);
+    END;
+
+    PROCEDURE HandleInstallmentLines@1100526225(VAR lvContrInstalmRec@1100526202 : Record 11071707;lvInvoiceUntilDate@1100526201 : Date;lvVATPostingGroupCde@1100526204 : Code[20];ISingleContract@1100528601 : Boolean;IBatchSeqNo@1100528603 : Code[20]) : Boolean;
+    VAR
+      ServiceContract@1100528300 : Record 11012812;
+      lvInvoiceDate@1100526200 : Date;
+      lvNextInvoiceDate@1100526203 : Date;
+      InvoiceUntilPostponeDate@1100528602 : Date;
+    BEGIN
+      ServiceContract.GET(lvContrInstalmRec."Service Contract No.");
+
+      IF (ServiceContract."Installments based on Progress") THEN BEGIN
+        HandleInstallmentLineProgress(lvContrInstalmRec, lvInvoiceUntilDate, lvVATPostingGroupCde, IBatchSeqNo);
+        EXIT;
+      END;
+
+      lvContrInstalmRec.TESTFIELD("Invoice Interval");
+      //lvContrInstalmRec."Last Invoiced Until" := lvContrInstalmRec."Invoiced Until";
+
+      REPEAT
+        IF lvContrInstalmRec."Invoiced Until" = 0D THEN
+          lvInvoiceDate := lvContrInstalmRec."Invoice From"
+        ELSE
+          lvInvoiceDate := lvContrInstalmRec."Invoiced Until"+1;
+        InvoiceUntilPostponeDate := lvInvoiceDate;
+        IF (FORMAT(ServiceContract."Invoice Postpone Period") <> '') AND (lvContrInstalmRec."Invoice Period" = lvContrInstalmRec."Invoice Period"::Forehand) THEN
+          InvoiceUntilPostponeDate := CALCDATE(ServiceContract."Invoice Postpone Period", lvInvoiceDate);
+        lvNextInvoiceDate := CALCDATE(lvContrInstalmRec."Invoice Interval",lvInvoiceDate)-1;
+
+        IF ((lvContrInstalmRec."Invoice Period" = lvContrInstalmRec."Invoice Period"::Forehand) AND (InvoiceUntilPostponeDate <= lvInvoiceUntilDate)) OR
+           ((lvContrInstalmRec."Invoice Period" = lvContrInstalmRec."Invoice Period"::Afterwards) AND (lvNextInvoiceDate <= lvInvoiceUntilDate))
+        THEN BEGIN
+          IF ServiceContract."Installment Type" = ServiceContract."Installment Type"::Object THEN
+            IF NOT DetermineInstallmentAmount(ServiceContract."No.", lvInvoiceDate, ISingleContract) THEN
+              EXIT;
+
+          CreateTempInstalmInvLine(lvContrInstalmRec, lvInvoiceDate, lvNextInvoiceDate, lvVATPostingGroupCde,lvInvoiceDate);
+          lvContrInstalmRec."Last Invoiced Until" := lvContrInstalmRec."Invoiced Until";
+          lvContrInstalmRec."Invoiced Until" := lvNextInvoiceDate;
+        END;
+      UNTIL ((lvContrInstalmRec."Invoice Period" = lvContrInstalmRec."Invoice Period"::Forehand) AND (InvoiceUntilPostponeDate >= lvInvoiceUntilDate)) OR
+            ((lvContrInstalmRec."Invoice Period" = lvContrInstalmRec."Invoice Period"::Afterwards) AND (lvNextInvoiceDate >= lvInvoiceUntilDate));
+      lvContrInstalmRec.MODIFY(TRUE);
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE HandleInstallmentLineProgress@1100528301(VAR IOContrInstalmRec@1100526202 : Record 11071707;IInvoiceUntilDate@1100526201 : Date;IVATPostingGroupCde@1100526204 : Code[20];IBatchSeqNo@1100528600 : Code[20]);
+    VAR
+      ServiceContract@1100528300 : Record 11012812;
+      MaintenanceMgt@1100528301 : Codeunit 11012829;
+      InvoiceDate@1100526200 : Date;
+      CurrentPeriod@1100528302 : Code[20];
+      ProgressPercentage@1100528303 : Decimal;
+    BEGIN
+      ServiceContract.GET(IOContrInstalmRec."Service Contract No.");
+
+      IF (NOT ServiceContract."Installments based on Progress") THEN
+        EXIT;
+
+      TestInvoicingAllowed(IOContrInstalmRec."Service Contract No.", IInvoiceUntilDate);
+
+      IOContrInstalmRec.TESTFIELD("Progress %");
+
+      CurrentPeriod := MaintenanceMgt.GetControlPeriod(IOContrInstalmRec."Service Contract No.", IInvoiceUntilDate);
+
+      IF (NOT IOContrInstalmRec."Invoice Directly") AND
+         (IOContrInstalmRec."Invoiced Until" <> 0D) AND
+         (MaintenanceMgt.GetControlPeriod(IOContrInstalmRec."Service Contract No.", IOContrInstalmRec."Invoiced Until") =
+          CurrentPeriod)
+      THEN
+        EXIT;
+
+      IF IOContrInstalmRec."Invoiced Until" = 0D THEN
+        InvoiceDate := IOContrInstalmRec."Invoice From"
+      ELSE
+        InvoiceDate := IOContrInstalmRec."Invoiced Until"+1;
+
+      IOContrInstalmRec."Last Invoiced Until" := IOContrInstalmRec."Invoiced Until";
+
+      IF (IOContrInstalmRec."Invoice Directly") THEN BEGIN
+        CreateTempInstalmInvLine(IOContrInstalmRec, InvoiceDate, IInvoiceUntilDate, IVATPostingGroupCde, InvoiceDate);
+        IOContrInstalmRec."Last Invoiced Until" := IOContrInstalmRec."Invoiced Until";
+        IOContrInstalmRec."Invoiced Until" := IInvoiceUntilDate;
+        IOContrInstalmRec."Invoice Directly" := FALSE;
+        IOContrInstalmRec.MODIFY(TRUE);
+      END ELSE BEGIN
+        ProgressPercentage :=
+           MaintenanceMgt.GetProgressPercentage(IOContrInstalmRec."Service Contract No.", IInvoiceUntilDate);
+        IF (ProgressPercentage >= IOContrInstalmRec."Progress %") THEN BEGIN
+          CreateTempInstalmInvLine(IOContrInstalmRec, InvoiceDate, IInvoiceUntilDate, IVATPostingGroupCde, InvoiceDate);
+          IOContrInstalmRec."Last Invoiced Until" := IOContrInstalmRec."Invoiced Until";
+          IOContrInstalmRec."Invoiced Until" := IInvoiceUntilDate;
+          IOContrInstalmRec.MODIFY(TRUE);
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE TestInvoicingAllowed@1100528300(ContractNo@1100528300 : Code[20];ReferenceDate@1100528301 : Date);
+    VAR
+      ServiceContractCtrlPeriod@1100528302 : Record 11071746;
+      ContractInstallment@1100528303 : Record 11071707;
+    BEGIN
+      ServiceContractCtrlPeriod.SETRANGE("Service Contract No.", ContractNo);
+      ServiceContractCtrlPeriod.SETFILTER("Ending Date", '<%1', ReferenceDate);
+      IF NOT ServiceContractCtrlPeriod.FINDLAST THEN
+        EXIT;
+
+      ContractInstallment.SETRANGE("Service Contract No.", ContractNo);
+      IF (NOT ContractInstallment.FINDFIRST) THEN
+        EXIT;
+
+      REPEAT
+        IF (ContractInstallment."Invoiced Until" > 0D) AND
+           (ContractInstallment."Invoiced Until" < ServiceContractCtrlPeriod."Starting Date")
+        THEN
+          ERROR(Text007, ContractInstallment.TABLECAPTION, ServiceContractCtrlPeriod.TABLECAPTION);
+      UNTIL (ContractInstallment.NEXT = 0);
+    END;
+
+    PROCEDURE GetInstallmAmntByDate@1100526200(IContractInstallment@1100526201 : Record 11071707) InstalmAmntDec : Decimal;
+    VAR
+      IndexDate@1100528600 : Date;
+    BEGIN
+      IF (IContractInstallment."Invoiced Until" <> 0D) AND (FORMAT(IContractInstallment."Invoice Interval") <> '')THEN
+        IndexDate := CALCDATE(IContractInstallment."Invoice Interval", IContractInstallment."Invoiced Until") -1
+      ELSE
+        IndexDate := IContractInstallment."Invoice From";
+      EXIT(GetInstallmAmntByGivenDate(IContractInstallment, IndexDate));
+    END;
+
+    PROCEDURE GetInstallmAmntLCYByDate@1100528801(lvContrInstalmRec@1100526201 : Record 11071707) InstalmAmntDec : Decimal;
+    VAR
+      lvInstallmAmntsRec@1100526200 : Record 11071708;
+      lvIndexDate@1100528600 : Date;
+    BEGIN
+      // dp00116.n
+      WITH lvInstallmAmntsRec DO BEGIN
+        SETRANGE(Type,Type::Installment);
+        SETRANGE("Service Contract No.",lvContrInstalmRec."Service Contract No.");
+        SETRANGE("Installment Line No.",lvContrInstalmRec."Line No.");
+
+        IF (lvContrInstalmRec."Invoiced Until" <> 0D) AND (FORMAT(lvContrInstalmRec."Invoice Interval") <> '')THEN
+          lvIndexDate := CALCDATE(lvContrInstalmRec."Invoice Interval",lvContrInstalmRec."Invoiced Until") -1
+        ELSE
+          lvIndexDate := lvContrInstalmRec."Invoice From";
+
+        SETFILTER("Index Date",'<=%1', lvIndexDate);
+        IF FINDLAST THEN
+          EXIT(lvInstallmAmntsRec."Amount (LCY)")
+        ELSE
+          EXIT(0);
+      END;
+    END;
+
+    PROCEDURE GetInstallmAmntByGivenDate@1100525001(IContractInstallment@1100526201 : Record 11071707;IIndexDate@1100525000 : Date) : Decimal;
+    VAR
+      ContractAmountsbyDate@1100526200 : Record 11071708;
+    BEGIN
+      ContractAmountsbyDate.SETRANGE(Type, ContractAmountsbyDate.Type::Installment);
+      ContractAmountsbyDate.SETRANGE("Service Contract No.", IContractInstallment."Service Contract No.");
+      ContractAmountsbyDate.SETRANGE("Service Object No.", '');
+      ContractAmountsbyDate.SETRANGE("Installment Line No.",IContractInstallment."Line No.");
+      ContractAmountsbyDate.SETFILTER("Index Date",'<=%1', IIndexDate);
+      IF ContractAmountsbyDate.FINDLAST THEN
+        EXIT(ContractAmountsbyDate.Amount);
+    END;
+
+    PROCEDURE GetContractAmntByDate@1100526201(lvContractRec@1100526201 : Record 11012812;lvRefDate@1100526202 : Date) InstalmAmntDec : Decimal;
+    VAR
+      lvInstallmAmntsRec@1100526200 : Record 11071708;
+    BEGIN
+      WITH lvInstallmAmntsRec DO BEGIN
+        SETRANGE(Type,Type::"Service Contract");
+        SETRANGE("Service Contract No.",lvContractRec."No.");
+        SETRANGE("Service Object No.", '');
+        SETFILTER("Index Date",'<=%1', lvRefDate);
+        IF FINDLAST THEN
+          EXIT(lvInstallmAmntsRec.Amount)
+        ELSE
+          EXIT(0);
+      END;
+    END;
+
+    PROCEDURE GetContractAmntLCYByDate@1100528802(lvContractRec@1100526201 : Record 11012812;lvRefDate@1100526202 : Date) InstalmAmntDec : Decimal;
+    VAR
+      lvInstallmAmntsRec@1100526200 : Record 11071708;
+    BEGIN
+      // dp00116.n
+      WITH lvInstallmAmntsRec DO BEGIN
+        SETRANGE(Type,Type::"Service Contract");
+        SETRANGE("Service Contract No.",lvContractRec."No.");
+        SETFILTER("Index Date",'<=%1', lvRefDate);
+        IF FINDLAST THEN
+          EXIT(lvInstallmAmntsRec."Amount (LCY)")
+        ELSE
+          EXIT(0);
+      END;
+    END;
+
+    PROCEDURE GetContractCurrency@1100528805(ServiceContractNo@1100528800 : Code[20]) CurrencyCode : Code[10];
+    VAR
+      ServiceContract@1100526200 : Record 11012812;
+    BEGIN
+      // dp00116.n
+      IF ServiceContract.GET(ServiceContractNo) THEN
+          EXIT(ServiceContract."Currency Code")
+        ELSE
+          EXIT('');
+    END;
+
+    PROCEDURE DetermineInvoiceAmount@1100525000(IContractObject@1100525000 : Record 11071702;IInvoiceUntilDate@1100525001 : Date;IServiceContract@1100525007 : Record 11012812;VAR ORevPerDayDecLCY@1100525004 : Decimal;VAR ONoOfDaysInt@1100525008 : Integer;VAR ORevPerYearDecLCY@1100525009 : Decimal;VAR OInvoiceFromDate@1100525002 : Date;VAR ORevPerDayDec@1100528800 : Decimal;VAR ORevPerYearDec@1100528801 : Decimal);
+    VAR
+      ServiceMaintAgreement@1100409001 : Record 11071973;
+      lvSalesAndCostCU@1100525003 : Codeunit 11012827;
+      RecordFound@1100409000 : Boolean;
+    BEGIN
+      ORevPerDayDec := 0;
+      ONoOfDaysInt := 0;
+      ORevPerYearDec := 0;
+      OInvoiceFromDate := 0D;
+
+      WITH IContractObject DO BEGIN
+        CALCFIELDS("Standard Object No.");
+        CALCFIELDS(Quantity, "Object Group"); // A bit tricky. Object Group depends on Standard Object No.
+        ORevPerYearDec :=
+          GetSCObjectPriceAgreementByDat(
+            IContractObject."Service Contract No.", IContractObject."Service Object No.", IInvoiceUntilDate, RecordFound) * Quantity;
+        ORevPerYearDecLCY :=
+          CalcAmountLCYFromAmount(ORevPerYearDec, IServiceContract."Currency Code", IInvoiceUntilDate);
+        IF NOT RecordFound THEN BEGIN
+          IF IContractObject.DetermineAgreement(ServiceMaintAgreement) THEN BEGIN
+            ORevPerYearDec := ServiceMaintAgreement.GetServiceRate(IInvoiceUntilDate, RecordFound) * Quantity;
+            ORevPerYearDecLCY :=
+              CalcAmountLCYFromAmount(ORevPerYearDec, IServiceContract."Currency Code", IInvoiceUntilDate);
+          END;
+        END;
+        IF NOT RecordFound THEN BEGIN
+          ORevPerYearDecLCY :=
+            lvSalesAndCostCU.GetRate(
+              IServiceContract."Customer No.", IInvoiceUntilDate, "Object Group", "Customer Object Group", "Service Package") * Quantity;
+          ORevPerYearDec :=
+            CalcAmountFromAmountLCY(ORevPerYearDecLCY, IServiceContract."Currency Code", IInvoiceUntilDate); // dp00116.n
+        END;
+
+        IF "Invoiced Until" = 0D THEN BEGIN
+          ONoOfDaysInt := IInvoiceUntilDate - "Invoice From" + 1;
+          OInvoiceFromDate := "Invoice From";
+        END ELSE BEGIN
+          ONoOfDaysInt := IInvoiceUntilDate - "Invoiced Until";
+          OInvoiceFromDate := "Invoiced Until" + 1;
+        END;
+        ORevPerDayDec := ORevPerYearDec / lvSalesAndCostCU.NoOfDaysPerYear(OInvoiceFromDate);
+        ORevPerDayDecLCY := ORevPerYearDecLCY / lvSalesAndCostCU.NoOfDaysPerYear(OInvoiceFromDate);  // dp00116.n
+      END;
+    END;
+
+    PROCEDURE CreateInvProposalHeader@1100526204(lvServContractRec@1100525001 : Record 11012812;lvServContrCde@1100525002 : Code[20];lvPostingDate@1100525003 : Date;lvForehandDate@1100525004 : Date;lvAfterwardsDate@1100525005 : Date;lvDocumentDate@1100525006 : Date;IBatchSeqNo@1100528600 : Code[20]) ProposalCde : Code[20];
+    VAR
+      SalesHeader@1100525000 : Record 36;
+      SalesHeaderExtension@1100528400 : Record 11071868;
+      Customer@1100526200 : Record 18;
+      ServiceSetup@1100525008 : Record 11012800;
+      RevenueCostObject@1100525007 : Code[20];
+    BEGIN
+      WITH SalesHeader DO BEGIN
+        INIT;
+        "Document Type" := "Document Type"::"Invoice Proposal";
+        "Service Invoice" := TRUE;
+        VALIDATE("No.");
+        INSERT(TRUE);
+        lvServContractRec.CALCFIELDS(Name,"Name 2",Address,"Address 2","Post Code",City,"Bill-to Name (Contract)","Bill-to Address (Contract)",
+                                     "Bill-to Address 2 (Contract)","Bill-to Post Code (Contract)","Bill-to City (Contract)");
+        IF lvServContractRec."Use Bill-to as Sell-to (Contr)" THEN
+          VALIDATE("Sell-to Customer No.", lvServContractRec."Bill-to Customer No. (Contr.)")
+        ELSE
+          VALIDATE("Sell-to Customer No.", lvServContractRec."Customer No.");
+        "Service Contract No." := lvServContrCde;
+        "Posting Date" := lvPostingDate;
+        "Document Date" := lvDocumentDate;
+        SetHideValidationDialog(TRUE);
+        VALIDATE("Bill-to Customer No.", lvServContractRec."Bill-to Customer No. (Contr.)");
+        VALIDATE("Alternative Bill-to Address", lvServContractRec."Alt. Bill-to Address (Contr.)");
+        IF lvServContractRec."Contract Manager" <> '' THEN
+          VALIDATE("Salesperson Code", lvServContractRec."Contract Manager");  //voor kostenplaats valideren
+        "Specific WKA Percentages" :=
+          (lvServContractRec."% Labor" <> 0) OR (lvServContractRec."% to B Account" <> 0); //mg.c, 29-05-12: C000558
+        "% Labor" := lvServContractRec."% Labor";
+        "% to B Account" := lvServContractRec."% to B Account";
+        "Calculate B Amounts based on" := "Calculate B Amounts based on"::"Invoice Amount";
+        Customer.GET(lvServContractRec."Bill-to Customer No. (Contr.)");
+        RevenueCostObject := Customer."Cost Object";
+        IF RevenueCostObject = '' THEN BEGIN
+          ServiceSetup.GET;
+          ServiceSetup.TESTFIELD("Cost Object Revenues");
+          RevenueCostObject := ServiceSetup."Cost Object Revenues";
+        END;
+        IF (lvServContrCde <> '') THEN //C024735.n
+          VALIDATE("Shortcut Dimension 1 Code", lvServContractRec."Global Dimension 1 Code");
+        VALIDATE("Shortcut Dimension 2 Code", RevenueCostObject);
+        "Installment Invoice" := lvServContractRec."Invoice Type" = lvServContractRec."Invoice Type"::Installments;
+        "Invoice Text" := lvServContractRec."Invoice Text Installments";
+        IF lvServContractRec."Compress Dyn. Inv. Prop. Lines" THEN BEGIN
+          SalesHeaderExtension.GetSalesHeadExtension("Document Type", "No.");
+          SalesHeaderExtension."Compress Dyn. Inv. Prop. Lines" :=
+            lvServContractRec."Compress Dyn. Inv. Prop. Lines";
+          SalesHeaderExtension.UpdateSalesHeadExtension("Document Type", "No.");
+        END;
+        "Currency Code" := GetContractCurrency(lvServContrCde); // dp00116.n
+        "Principal Reference" := lvServContractRec."Your Reference"; //mg, 09-01-13: C004222
+        UpdateCurrencyFactor; // dp00116.n
+        IF lvServContractRec."Payment Method Code (Con.Inv.)" <> '' THEN
+          VALIDATE("Payment Method Code", lvServContractRec."Payment Method Code (Con.Inv.)");
+        IF lvServContractRec."Payment Terms Code" <> '' THEN BEGIN
+          VALIDATE("Payment Terms Code", lvServContractRec."Payment Terms Code");
+          VALIDATE("Prepmt. Payment Terms Code", lvServContractRec."Payment Terms Code");
+        END;
+        GetDirectDebitMandateServiceOrProject('', "Service Contract No.", '', ''); //DP00613 (DP00640)
+        VALIDATE("Batch Seq. No.", IBatchSeqNo);
+        MODIFY(TRUE);
+        EXIT("No.");
+      END;
+    END;
+
+    PROCEDURE FindExistingProposalHeader@1100526219(lvServContrRec@1100525000 : Record 11012812;lvPostingDate@1100525002 : Date;lvForehandDate@1100525005 : Date;lvAfterwardsDate@1100525004 : Date;lvDocumentDate@1100525003 : Date;IBatchSeqNo@1100528600 : Code[20]) ProposalCde : Code[20];
+    VAR
+      SalesHeader@1100525001 : Record 36;
+      SalesHeader2@1100528402 : Record 36;
+      SalesLine@1100526200 : Record 37;
+      SalesHeaderExtension@1100528401 : Record 11071868;
+      ExistingProposalHeaderFound@1100528400 : Boolean;
+    BEGIN
+      SalesHeader2.SETRANGE("Document Type", SalesHeader2."Document Type"::"Invoice Proposal");
+      SalesHeader2.SETRANGE("Service Invoice", TRUE);
+      SalesHeader2.SETRANGE("Sell-to Customer No.", lvServContrRec."Customer No.");
+      SalesHeader2.SETRANGE("Bill-to Customer No.", lvServContrRec."Bill-to Customer No. (Contr.)");
+      SalesHeader2.SETRANGE("Alternative Bill-to Address", lvServContrRec."Alt. Bill-to Address (Contr.)");
+      SalesHeader2.SETRANGE("Batch Seq. No.", IBatchSeqNo);
+      IF SalesHeader2.FINDSET THEN
+        REPEAT
+          SalesHeaderExtension.GetSalesHeadExtension(
+            SalesHeader2."Document Type", SalesHeader2."No.");
+          IF SalesHeaderExtension."Compress Dyn. Inv. Prop. Lines" =
+             lvServContrRec."Compress Dyn. Inv. Prop. Lines"
+          THEN BEGIN
+            SalesHeader := SalesHeader2;
+            ExistingProposalHeaderFound := TRUE;
+          END;
+        UNTIL ExistingProposalHeaderFound OR (SalesHeader2.NEXT = 0);
+      WITH SalesHeader DO BEGIN
+        IF ExistingProposalHeaderFound THEN BEGIN
+          SalesLine.SETRANGE("Document Type", "Document Type");
+          SalesLine.SETRANGE("Document No.", "No.");
+          IF SalesLine.FINDLAST THEN
+            gvLineNoInt := SalesLine."Line No.";
+          EXIT("No.")
+        END ELSE
+          EXIT(
+            CreateInvProposalHeader(
+              lvServContrRec,'',lvPostingDate,lvForehandDate, lvAfterwardsDate,lvDocumentDate,IBatchSeqNo));
+      END;
+    END;
+
+    PROCEDURE CreateInvProposalLine@1100526207(IProposalCode@1100526201 : Code[20];IBatchSeqNo@1100528600 : Code[20]);
+    VAR
+      SalesHeader@1100526202 : Record 36;
+      SalesLine@1100526200 : Record 37;
+    BEGIN
+      SalesHeader.GET(SalesHeader."Document Type"::"Invoice Proposal", IProposalCode);
+      WITH SalesLine DO BEGIN
+        SuspendUpdateVATAmounts(TRUE); //mg, 13-08-2014: C016876
+        COPY(gvTempSalesLineRec);
+        "Document Type" := "Document Type"::"Invoice Proposal";
+        "Document No." := IProposalCode;
+        "Line No." := LineCounter;
+        VALIDATE(Quantity);
+        IF "Service Contract No." <> '' THEN
+          VALIDATE("Service Contract No.");
+        IF "Object No." <> '' THEN
+          VALIDATE("Object No.");
+        VALIDATE("VAT Prod. Posting Group", gvTempSalesLineRec."VAT Prod. Posting Group"); //prev. overrules by validate on serv.contr.
+        VALIDATE("Shortcut Dimension 2 Code", SalesHeader."Shortcut Dimension 2 Code");
+        Description := gvTempSalesLineRec.Description; // The prev. validate overwrites the Description field
+        "Unit of Measure" := gvTempSalesLineRec."Unit of Measure";
+        VALIDATE("Gen. Bus. Posting Group", SalesHeader."Gen. Bus. Posting Group");
+        IF (gvTempSalesLineRec."No." <> '') AND ("No." <> gvTempSalesLineRec."No.") THEN
+          VALIDATE("No.", gvTempSalesLineRec."No.");
+        // dp00116.sn
+        "Currency Code" := GetContractCurrency("Service Contract No.");
+        "Amount (LCY)" := CalcAmountLCYFromAmount(Amount,"Currency Code","FA Posting Date");
+        "Outstanding Amount (LCY)" := CalcAmountLCYFromAmount("Outstanding Amount","Currency Code","FA Posting Date");
+        "FA Posting Date" := 0D;
+        "Batch Seq. No." := IBatchSeqNo;
+        // dp00116.en
+        //mg.sn, 13-08-2014: C016876
+        SuspendUpdateVATAmounts(FALSE);
+        IF Type <> Type::" " THEN
+          UpdateAmounts;
+        //mg.en, 13-08-2014: C016876
+        INSERT;
+      END;
+    END;
+
+    PROCEDURE CreateTempDynamicInvLine@1100526212(IObjByServContrRec@1100525000 : Record 11071702;IInvoiceUntilDate@1100525003 : Date;IRevPerDayDec@1100525006 : Decimal;INoOfDaysInt@1100525005 : Integer;IInvoiceFromDate@1100525001 : Date;IVATProdPostGroupCde@1100525002 : Code[10];ILastInvoicedUntil@1100528600 : Date;IBatchSeqNo@1100528601 : Code[20]);
+    VAR
+      UnitPrice@1100525004 : Decimal;
+    BEGIN
+      //DP00628 function rewritten
+      WITH gvTempSalesLineRec DO BEGIN
+        "Document No." := '9999999999';
+        "Service Invoice" := TRUE;
+        "Installment Invoice" := FALSE;
+        Type := Type::"G/L Account";
+        "Service Contract No." := IObjByServContrRec."Service Contract No.";
+        "Object No." := IObjByServContrRec."Service Object No.";
+        IObjByServContrRec.CALCFIELDS("Service Object Description", "Service Object Description 2", Quantity);
+        Description := COPYSTR(STRSUBSTNO('%1 %2', IObjByServContrRec."Service Object Description", IObjByServContrRec."Service Object Description 2"), 1, MAXSTRLEN(Description));
+        "Description 2" := STRSUBSTNO('%1 - %2', IInvoiceFromDate, IInvoiceUntilDate);
+        "Service Control Period Date" := GetServiceControlPeriodDate(IObjByServContrRec."Service Contract No.", IInvoiceUntilDate);
+        // If filling Description 2 is changed, please also change function GetInvoicedFromToOfDescription2 of table 37!
+        IF IObjByServContrRec.Quantity <> 1 THEN
+          "Description 2" := STRSUBSTNO('%1 (%2 %3)', "Description 2", Text009, IObjByServContrRec.Quantity);
+        "Service Location No." := IObjByServContrRec."Service Location No.";
+        Quantity := INoOfDaysInt;
+        "Currency Code" := GetContractCurrency(IObjByServContrRec."Service Contract No."); // dp00116.n
+        "Unit of Measure" := Text002;
+
+        "Object No." := IObjByServContrRec."Service Object No.";
+        "Prev. Invoiced Until" := IObjByServContrRec."Invoiced Until";
+        "Prev. Last Invoiced Until" := IObjByServContrRec."Last Invoiced Until";
+
+        UnitPrice := IRevPerDayDec;
+        VATBreakDown(gvTempSalesLineRec,UnitPrice,IVATProdPostGroupCde);
+      END;
+      CreateTempDynamicInvDiscountLine(IObjByServContrRec, IInvoiceFromDate, UnitPrice, INoOfDaysInt, IVATProdPostGroupCde);
+    END;
+
+    PROCEDURE CreateTempDynInvLineFixedAmt@1100528608(IContractObject@1100528606 : Record 11071702;IInvoiceFrom@1100528602 : Date;IInvoiceInterval@1100528600 : DateFormula;IVATProdPostGroup@1100528601 : Code[10]);
+    VAR
+      MaintenanceManagement@1100528603 : Codeunit 11012829;
+      Factor@1100528604 : Decimal;
+      InvoiceUntil@1100528607 : Date;
+      UnitPrice@1100525000 : Decimal;
+    BEGIN
+      //DP00628 function rewritten
+      InvoiceUntil := CALCDATE(IInvoiceInterval, IInvoiceFrom) -1;
+      WITH gvTempSalesLineRec DO BEGIN
+        "Document No." := '9999999999';
+        "Service Invoice" := TRUE;
+        "Installment Invoice" := FALSE;
+        Type := Type::"G/L Account";
+        "Service Contract No." := IContractObject."Service Contract No.";
+        "Object No." := IContractObject."Service Object No.";
+        IContractObject.CALCFIELDS("Service Object Description", Quantity);
+        Description := IContractObject."Service Object Description";
+        "Description 2" := STRSUBSTNO('%1 - %2', IInvoiceFrom, InvoiceUntil);
+        "Service Control Period Date" := GetServiceControlPeriodDate(IContractObject."Service Contract No.", InvoiceUntil);
+        "Service Location No." := IContractObject."Service Location No.";
+        Factor := MaintenanceManagement.ConvPeriodToTimesPerYear(IInvoiceInterval);
+        Quantity := IContractObject.Quantity;
+        "Currency Code" := GetContractCurrency(IContractObject."Service Contract No.");
+
+        "Object No." := IContractObject."Service Object No.";
+        "Prev. Invoiced Until" := IContractObject."Invoiced Until";
+        "Prev. Last Invoiced Until" := IContractObject."Last Invoiced Until";
+
+        UnitPrice := IContractObject.GetObjectInvAmountPerYear(InvoiceUntil) / Factor;
+        IF UnitPrice <> 0 THEN
+          VATBreakDown(gvTempSalesLineRec,UnitPrice,IVATProdPostGroup);
+      END;
+      CreateTempDynInvLineFixedAmtDiscount(IContractObject, IInvoiceFrom, IInvoiceInterval, IVATProdPostGroup);
+    END;
+
+    PROCEDURE CreateTempInstalmInvLine@1100526213(IContrInstalmRec@1100526206 : Record 11071707;IInvoiceFromDate@1100526201 : Date;IInvoiceUntilDate@1100528600 : Date;IVATProdPostGroupCde@1100526200 : Code[10];IRefDate@1100526202 : Date);
+    VAR
+      ServiceContract@1100525000 : Record 11012812;
+      UnitPrice@1100525003 : Decimal;
+    BEGIN
+      //DP00628 function rewritten
+      ServiceContract.GET(IContrInstalmRec."Service Contract No.");
+      WITH gvTempSalesLineRec DO BEGIN
+        "Document No." := '9999999999';
+        Type := Type::"G/L Account";
+        "Service Invoice" := TRUE;
+        "Installment Invoice" := TRUE;
+        "Service Contract No." := IContrInstalmRec."Service Contract No.";
+        "Installment Line No." := IContrInstalmRec."Line No.";
+        Quantity := 1;
+        "Currency Code" := ServiceContract."Currency Code";
+        "FA Posting Date" := IInvoiceFromDate;  // dp00116.n
+        // LET OP: Veld 'FA Posting Date' wordt gebruikt als hulpveld. Dit veld wordt na gebruik weer op 0 gezet. // dp00116.n
+        Description := IContrInstalmRec.Description;
+        "Description 2" := STRSUBSTNO('%1 - %2', FORMAT(IInvoiceFromDate), FORMAT(IInvoiceUntilDate));
+        "Service Control Period Date" := GetServiceControlPeriodDate("Service Contract No.", IInvoiceUntilDate);
+        "Prev. Invoiced Until" := IContrInstalmRec."Invoiced Until";
+        "Prev. Last Invoiced Until" := IContrInstalmRec."Last Invoiced Until";
+
+        IF ServiceContract."Installments based on Progress" THEN
+          UnitPrice := GetInstallmAmntByGivenDate(IContrInstalmRec, IInvoiceUntilDate)
+        ELSE
+          UnitPrice := GetInstallmAmntByDate(IContrInstalmRec);
+        VATBreakDown(gvTempSalesLineRec, UnitPrice, IVATProdPostGroupCde);
+      END;
+      CreateTempInstalmInvDiscountLine(IContrInstalmRec, IInvoiceFromDate, IVATProdPostGroupCde, UnitPrice);
+    END;
+
+    LOCAL PROCEDURE CreateTempDynamicInvDiscountLine@1100528609(IContractObject@1100525000 : Record 11071702;IInvoiceFromDate@1100525001 : Date;IUnitPrice@1100528600 : Decimal;INoOfDaysInt@1100528603 : Integer;IVATProdPostGroup@1100528601 : Code[10]);
+    VAR
+      ServiceSalesDiscSurch@1100528602 : Record 11072237;
+      LastServiceSalesDiscSurch@1100528611 : Record 11072237;
+      Date@1100528604 : Record 2000000007;
+      NoOfDiscountDays@1100528605 : Integer;
+      InvoiceUntil@1100528608 : Date;
+      LastDiscountCalcStartDate@1100528609 : Date;
+      LastDiscountCalcEndDate@1100528610 : Date;
+      UnitPrice@1100528606 : Decimal;
+      DiscountPeriodEnd@1100528607 : Date;
+    BEGIN
+      InvoiceUntil := IInvoiceFromDate + INoOfDaysInt -1;
+      Date.SETRANGE("Period Type", Date."Period Type"::Month);
+      Date.SETRANGE("Period Start", IInvoiceFromDate, InvoiceUntil);
+      IF NOT Date.FINDSET THEN BEGIN
+        IF IInvoiceFromDate > InvoiceUntil THEN
+          EXIT;
+        Date."Period Start" := IInvoiceFromDate;
+        Date."Period End" := InvoiceUntil;
+      END;
+      LastDiscountCalcStartDate := IInvoiceFromDate;
+      REPEAT
+        IF IContractObject.GetServiceSalesDiscount(Date."Period Start", ServiceSalesDiscSurch, DiscountPeriodEnd) THEN BEGIN
+          IF FORMAT(LastServiceSalesDiscSurch) <> FORMAT(ServiceSalesDiscSurch) THEN BEGIN
+            gvTempSalesLineRec."Service Location No." := IContractObject."Service Location No.";
+            gvTempSalesLineRec."Prev. Invoiced Until" := 0D;
+            gvTempSalesLineRec."Prev. Last Invoiced Until" := 0D;
+            IF LastServiceSalesDiscSurch.Code <> '' THEN BEGIN
+              gvTempSalesLineRec.Description := LastServiceSalesDiscSurch.Description;
+              gvTempSalesLineRec."Description 2" := STRSUBSTNO('%1 - %2', FORMAT(LastDiscountCalcStartDate), FORMAT(LastDiscountCalcEndDate));
+              gvTempSalesLineRec.Quantity := LastDiscountCalcEndDate - LastDiscountCalcStartDate +1;
+              UnitPrice := -IUnitPrice * LastServiceSalesDiscSurch.Percentage / 100;
+              IF UnitPrice <> 0 THEN
+                VATBreakDown(gvTempSalesLineRec, UnitPrice, IVATProdPostGroup);
+              LastDiscountCalcStartDate := LastDiscountCalcEndDate +1;
+              IF LastDiscountCalcStartDate < ServiceSalesDiscSurch."Starting Date" THEN
+                LastDiscountCalcStartDate := ServiceSalesDiscSurch."Starting Date";
+              UnitPrice := 0;
+            END;
+            LastServiceSalesDiscSurch := ServiceSalesDiscSurch;
+          END;
+
+          LastDiscountCalcEndDate := NORMALDATE(Date."Period End");
+          IF LastDiscountCalcEndDate > InvoiceUntil THEN
+            LastDiscountCalcEndDate := InvoiceUntil;
+          IF LastDiscountCalcEndDate > DiscountPeriodEnd THEN
+            LastDiscountCalcEndDate := DiscountPeriodEnd;
+        END;
+      UNTIL Date.NEXT = 0;
+      UnitPrice := -IUnitPrice * LastServiceSalesDiscSurch.Percentage / 100;
+      IF UnitPrice <> 0 THEN BEGIN
+        gvTempSalesLineRec.Description := LastServiceSalesDiscSurch.Description;
+        gvTempSalesLineRec."Description 2" := STRSUBSTNO('%1 - %2', FORMAT(LastDiscountCalcStartDate), FORMAT(LastDiscountCalcEndDate));
+        gvTempSalesLineRec.Quantity := LastDiscountCalcEndDate - LastDiscountCalcStartDate +1;
+        VATBreakDown(gvTempSalesLineRec, UnitPrice, IVATProdPostGroup);
+      END;
+    END;
+
+    LOCAL PROCEDURE CreateTempDynInvLineFixedAmtDiscount@1100528613(IContractObject@1100528606 : Record 11071702;IInvoiceFrom@1100528602 : Date;IInvoiceInterval@1100528600 : DateFormula;IVATProdPostGroup@1100528601 : Code[10]);
+    VAR
+      ServiceSalesDiscSurch@1100528605 : Record 11072237;
+      LastServiceSalesDiscSurch@1100528618 : Record 11072237;
+      Date@1100528614 : Record 2000000007;
+      MaintenanceManagement@1100528603 : Codeunit 11012829;
+      InvoiceUntil@1100528607 : Date;
+      UnitPrice@1100525000 : Decimal;
+      AmountPerMonth@1100528615 : Decimal;
+      LastDiscountCalcStartDate@1100528616 : Date;
+      LastDiscountCalcEndDate@1100528604 : Date;
+      DiscountPeriodEnd@1100528608 : Date;
+    BEGIN
+      InvoiceUntil := CALCDATE(IInvoiceInterval, IInvoiceFrom) -1;
+      Date.SETRANGE("Period Type", Date."Period Type"::Month);
+      Date.SETRANGE("Period Start", IInvoiceFrom, InvoiceUntil);
+      IF NOT Date.FINDSET THEN
+        EXIT;
+      LastDiscountCalcStartDate := IInvoiceFrom;
+      REPEAT
+        IF IContractObject.GetServiceSalesDiscount(Date."Period Start", ServiceSalesDiscSurch, DiscountPeriodEnd) THEN BEGIN
+          IF FORMAT(LastServiceSalesDiscSurch) <> FORMAT(ServiceSalesDiscSurch) THEN BEGIN
+            gvTempSalesLineRec."Service Location No." := IContractObject."Service Location No.";
+            gvTempSalesLineRec."Prev. Invoiced Until" := 0D;
+            gvTempSalesLineRec."Prev. Last Invoiced Until" := 0D;
+            IF LastServiceSalesDiscSurch.Code <> '' THEN BEGIN
+              gvTempSalesLineRec.Description := LastServiceSalesDiscSurch.Description;
+              gvTempSalesLineRec."Description 2" := STRSUBSTNO('%1 - %2', FORMAT(LastDiscountCalcStartDate), FORMAT(LastDiscountCalcEndDate));
+              IF UnitPrice <> 0 THEN
+                VATBreakDown(gvTempSalesLineRec, UnitPrice, IVATProdPostGroup);
+              LastDiscountCalcStartDate := LastDiscountCalcEndDate +1;
+              IF LastDiscountCalcStartDate < ServiceSalesDiscSurch."Starting Date" THEN
+                LastDiscountCalcStartDate := ServiceSalesDiscSurch."Starting Date";
+              UnitPrice := 0;
+            END;
+            LastServiceSalesDiscSurch := ServiceSalesDiscSurch;
+          END;
+
+          IF ServiceSalesDiscSurch.Percentage <> 0 THEN BEGIN
+            AmountPerMonth := IContractObject.GetObjectInvAmountPerYear(InvoiceUntil) / 12;
+            UnitPrice += -AmountPerMonth * ServiceSalesDiscSurch.Percentage / 100
+          END ELSE
+            UnitPrice += -ServiceSalesDiscSurch.Amount / ConvertPeriodToNoOfMonths(ServiceSalesDiscSurch.Period);
+          LastDiscountCalcEndDate := NORMALDATE(Date."Period End");
+          IF LastDiscountCalcEndDate > InvoiceUntil THEN
+            LastDiscountCalcEndDate := InvoiceUntil;
+          IF LastDiscountCalcEndDate > DiscountPeriodEnd THEN
+            LastDiscountCalcEndDate := DiscountPeriodEnd;
+        END;
+      UNTIL Date.NEXT = 0;
+      IF UnitPrice <> 0 THEN BEGIN
+        gvTempSalesLineRec.Description := LastServiceSalesDiscSurch.Description;
+        gvTempSalesLineRec."Description 2" := STRSUBSTNO('%1 - %2', FORMAT(LastDiscountCalcStartDate), FORMAT(LastDiscountCalcEndDate));
+        VATBreakDown(gvTempSalesLineRec, UnitPrice, IVATProdPostGroup);
+      END;
+    END;
+
+    LOCAL PROCEDURE CreateTempInstalmInvDiscountLine@1100528605(IContractInstallment@1100526206 : Record 11071707;IInvoiceFrom@1100526201 : Date;IVATProdPostGroup@1100526200 : Code[10];IUnitPrice@1100526202 : Decimal);
+    VAR
+      ServiceSalesDiscSurch@1100528601 : Record 11072237;
+      LastServiceSalesDiscSurch@1100528612 : Record 11072237;
+      Date@1100528609 : Record 2000000007;
+      MaintenanceManagement@1100528602 : Codeunit 11012829;
+      AmountPerMonth@1100528600 : Decimal;
+      UnitPrice@1100525003 : Decimal;
+      InvoiceUntil@1100528606 : Date;
+      LastDiscountCalcStartDate@1100528610 : Date;
+      LastDiscountCalcEndDate@1100528611 : Date;
+      DiscountPeriodEnd@1100528603 : Date;
+    BEGIN
+      InvoiceUntil := CALCDATE(IContractInstallment."Invoice Interval", IInvoiceFrom) -1;
+      Date.SETRANGE("Period Type", Date."Period Type"::Month);
+      Date.SETRANGE("Period Start", IInvoiceFrom, InvoiceUntil);
+      IF NOT Date.FINDSET THEN
+        EXIT;
+      LastDiscountCalcStartDate := IInvoiceFrom;
+      REPEAT
+        IF IContractInstallment.GetServiceSalesDiscount(Date."Period Start", ServiceSalesDiscSurch, DiscountPeriodEnd) THEN BEGIN
+          IF FORMAT(LastServiceSalesDiscSurch) <> FORMAT(ServiceSalesDiscSurch) THEN BEGIN
+            gvTempSalesLineRec."Prev. Invoiced Until" := 0D;
+            gvTempSalesLineRec."Prev. Last Invoiced Until" := 0D;
+            IF LastServiceSalesDiscSurch.Code <> '' THEN BEGIN
+              gvTempSalesLineRec.Description := LastServiceSalesDiscSurch.Description;
+              gvTempSalesLineRec."Description 2" := STRSUBSTNO('%1 - %2', FORMAT(LastDiscountCalcStartDate), FORMAT(LastDiscountCalcEndDate));
+              IF UnitPrice <> 0 THEN
+                VATBreakDown(gvTempSalesLineRec, UnitPrice, IVATProdPostGroup);
+              LastDiscountCalcStartDate := LastDiscountCalcEndDate +1;
+              IF LastDiscountCalcStartDate < ServiceSalesDiscSurch."Starting Date" THEN
+                LastDiscountCalcStartDate := ServiceSalesDiscSurch."Starting Date";
+              UnitPrice := 0;
+            END;
+            LastServiceSalesDiscSurch := ServiceSalesDiscSurch;
+          END;
+
+          IF ServiceSalesDiscSurch.Percentage <> 0 THEN BEGIN
+            AmountPerMonth := IUnitPrice / ConvertPeriodToNoOfMonths(IContractInstallment."Invoice Interval");
+            UnitPrice += -AmountPerMonth * ServiceSalesDiscSurch.Percentage / 100
+          END ELSE
+            UnitPrice += -ServiceSalesDiscSurch.Amount / ConvertPeriodToNoOfMonths(ServiceSalesDiscSurch.Period);
+          LastDiscountCalcEndDate := NORMALDATE(Date."Period End");
+          IF LastDiscountCalcEndDate > InvoiceUntil THEN
+            LastDiscountCalcEndDate := InvoiceUntil;
+          IF LastDiscountCalcEndDate > DiscountPeriodEnd THEN
+            LastDiscountCalcEndDate := DiscountPeriodEnd;
+        END;
+      UNTIL Date.NEXT = 0;
+      IF UnitPrice <> 0 THEN BEGIN
+        gvTempSalesLineRec.Description := LastServiceSalesDiscSurch.Description;
+        gvTempSalesLineRec."Description 2" := STRSUBSTNO('%1 - %2', FORMAT(LastDiscountCalcStartDate), FORMAT(LastDiscountCalcEndDate));
+        VATBreakDown(gvTempSalesLineRec, UnitPrice, IVATProdPostGroup);
+      END;
+    END;
+
+    LOCAL PROCEDURE VATBreakDown@1100525003(VAR SalesLine@1100525002 : Record 37;UnitPrice@1100525004 : Decimal;VATProdPostGroupCde@1100525005 : Code[10]);
+    VAR
+      ServiceContractVATBreakdown@1100525001 : Record 11071995;
+      TotalVATBreakdownPercentage@1100525000 : Decimal;
+    BEGIN
+      //DP00628
+      ServiceContractVATBreakdown.SETRANGE("Service Contract No.",SalesLine."Service Contract No.");
+      ServiceContractVATBreakdown.SETFILTER("Breakdown Percentage", '>0');
+      IF ServiceContractVATBreakdown.FINDSET THEN
+        REPEAT
+          InsertTempSalesLine(SalesLine,ServiceContractVATBreakdown."VAT Prod. Posting Group",UnitPrice*ServiceContractVATBreakdown."Breakdown Percentage"/100);
+          TotalVATBreakdownPercentage := TotalVATBreakdownPercentage + ServiceContractVATBreakdown."Breakdown Percentage";
+        UNTIL ServiceContractVATBreakdown.NEXT = 0;
+
+      IF TotalVATBreakdownPercentage < 100 THEN
+        InsertTempSalesLine(SalesLine,VATProdPostGroupCde,UnitPrice*(100-TotalVATBreakdownPercentage)/100);
+    END;
+
+    LOCAL PROCEDURE InsertTempSalesLine@1100525002(VAR SalesLine@1100525000 : Record 37;VATProdPostGroupCde@1100525001 : Code[10];UnitPrice@1100525002 : Decimal);
+    BEGIN
+      //DP00628
+      WITH SalesLine DO BEGIN
+        "Line No." := LineCounter;
+        "Unit Price" := UnitPrice;
+        "Line Amount" := "Unit Price" * Quantity;
+        "VAT Prod. Posting Group" := VATProdPostGroupCde;
+        INSERT;
+      END;
+    END;
+
+    PROCEDURE LineCounter@1100525032() LineNo : Integer;
+    BEGIN
+      gvLineNoInt += 10000;
+      EXIT(gvLineNoInt);
+    END;
+
+    PROCEDURE GetContractObjectEndingDate@1100526215(IContractObject@1100526200 : Record 11071702) : Date;
+    VAR
+      ServiceContract@1100526201 : Record 11012812;
+    BEGIN
+      IF IContractObject."Ending Date" <> 0D THEN
+        EXIT(IContractObject."Ending Date");
+
+      ServiceContract.GET(IContractObject."Service Contract No.");
+      EXIT(ServiceContract."Ending Date");
+    END;
+
+    PROCEDURE ProposalInvoiceExists@1100526202(IServiceContractNo@1100526201 : Code[20];IBatchSeqNo@1100525002 : Code[20];VAR ODocumentType@1210190000 : Option) : Code[20];
+    VAR
+      SalesHeader@1100528601 : Record 36;
+      SalesLine@1100526200 : Record 37;
+      ServiceOrder@1100525000 : Record 11012823;
+      CollectiveListSCInvLine@1100525001 : Record 11071931;
+    BEGIN
+      SalesLine.SETCURRENTKEY("Document Type","Service Invoice","Service Contract No.");
+      SalesLine.SETFILTER("Document Type", '%1|%2|%3',
+        SalesLine."Document Type"::"Invoice Proposal",
+        SalesLine."Document Type"::Invoice,
+        SalesLine."Document Type"::"Credit Memo");
+      SalesLine.SETRANGE("Service Invoice", TRUE);
+      SalesLine.SETRANGE("Service Order No.", '');
+      SalesLine.SETRANGE("Service Contract No.", IServiceContractNo);
+      IF SalesLine.FINDSET THEN
+        REPEAT
+          IF (SalesHeader."Document Type" <> SalesLine."Document Type") OR (SalesHeader."No." <> SalesLine."Document No.") THEN
+            SalesHeader.GET(SalesLine."Document Type", SalesLine."Document No.");
+          IF SalesHeader."Batch Seq. No." <> IBatchSeqNo THEN BEGIN
+            ODocumentType := SalesLine."Document Type";
+            EXIT(SalesLine."Document No.");
+          END;
+        UNTIL SalesLine.NEXT = 0;
+
+      SalesLine.SETFILTER("Service Order No.", '<>%1', '');
+      IF SalesLine.FINDSET THEN
+      REPEAT
+        IF ServiceOrder.GET(SalesLine."Service Order No.") THEN BEGIN
+          IF ServiceOrder."Collective List No." <> '' THEN BEGIN
+            CollectiveListSCInvLine.SETRANGE("Collective List No.", ServiceOrder."Collective List No.");
+            CollectiveListSCInvLine.SETRANGE("Service Contract No.", IServiceContractNo);
+            CollectiveListSCInvLine.SETRANGE(Invoiced, FALSE);
+            IF NOT CollectiveListSCInvLine.ISEMPTY THEN BEGIN
+              ODocumentType := SalesLine."Document Type";
+              EXIT(SalesLine."Document No.");
+            END;
+          END;
+        END;
+      UNTIL SalesLine.NEXT = 0;
+    END;
+
+    PROCEDURE GetSCObjectPriceAgreementByDat@1100528607(IServiceContractNo@1100528600 : Code[20];IServiceObjectNo@1100528602 : Code[20];IIndexDate@1100528603 : Date;VAR ORecordFound@1100409000 : Boolean) : Decimal;
+    VAR
+      ContrInstallmAmntsbyDate@1100528601 : Record 11071708;
+    BEGIN
+      IF (IServiceContractNo = '') OR (IServiceObjectNo = '') THEN
+        EXIT;
+      ContrInstallmAmntsbyDate.SETRANGE("Service Contract No.", IServiceContractNo);
+      ContrInstallmAmntsbyDate.SETRANGE("Service Object No.", IServiceObjectNo);
+      ContrInstallmAmntsbyDate.SETRANGE("Installment Line No.", 0);
+      ContrInstallmAmntsbyDate.SETFILTER("Index Date", '<=%1', IIndexDate);
+      ContrInstallmAmntsbyDate.SETFILTER("Ending Date", '%1|>=%2', 0D, IIndexDate);
+      IF ContrInstallmAmntsbyDate.FINDLAST THEN BEGIN
+        ORecordFound := TRUE;
+        EXIT(ContrInstallmAmntsbyDate.Amount);
+      END ELSE
+        ORecordFound := FALSE;
+    END;
+
+    PROCEDURE GetSCObjectPriceLCYAgreemByDat@1100528804(IServiceContractNo@1100528600 : Code[20];IServiceObjectNo@1100528602 : Code[20];IIndexDate@1100528603 : Date;VAR ORecordFound@1100525000 : Boolean) : Decimal;
+    VAR
+      ContrInstallmAmntsbyDate@1100528601 : Record 11071708;
+    BEGIN
+      IF (IServiceContractNo = '') OR (IServiceObjectNo = '') THEN
+        EXIT;
+      // dp00116.n
+      ContrInstallmAmntsbyDate.SETRANGE("Service Contract No.", IServiceContractNo);
+      ContrInstallmAmntsbyDate.SETRANGE("Service Object No.", IServiceObjectNo);
+      ContrInstallmAmntsbyDate.SETRANGE("Installment Line No.", 0);
+      ContrInstallmAmntsbyDate.SETFILTER("Index Date", '<=%1', IIndexDate);
+      ContrInstallmAmntsbyDate.SETFILTER("Ending Date", '%1|>=%2', 0D, IIndexDate);
+      IF ContrInstallmAmntsbyDate.FINDLAST THEN BEGIN
+        ORecordFound := TRUE;
+        EXIT(ContrInstallmAmntsbyDate."Amount (LCY)");
+      END ELSE
+        ORecordFound := FALSE;
+    END;
+
+    PROCEDURE CalcAmountFromAmountLCY@1100528809(AmountLCY@1100528803 : Decimal;CurrencyCode@1100528804 : Code[10];CurrencyDate@1100528600 : Date) Amount : Decimal;
+    VAR
+      CurrencyExchangeRate@1100528801 : Record 330;
+      Currency2@1100528800 : Record 4;
+    BEGIN
+      // dp00116.n
+      Currency2.InitRoundingPrecision;
+      IF CurrencyCode <> '' THEN BEGIN
+        Amount :=
+        ROUND(
+          CurrencyExchangeRate.ExchangeAmtLCYToFCY(
+            0, '', CurrencyDate, CurrencyCode, AmountLCY,
+             CurrencyExchangeRate.ExchangeRate(0, '', CurrencyDate, CurrencyCode,TRUE),TRUE),
+             Currency2."Amount Rounding Precision");
+      END ELSE BEGIN
+        Amount := ROUND(AmountLCY,Currency2."Amount Rounding Precision");
+      END;
+    END;
+
+    PROCEDURE CalcAmountLCYFromAmount@1100528811(Amount@1100528803 : Decimal;CurrencyCode@1100528804 : Code[10];CurrencyDate@1100528805 : Date) AmountLCY : Decimal;
+    VAR
+      CurrencyExchangeRate@1100528801 : Record 330;
+      Currency2@1100528800 : Record 4;
+    BEGIN
+      // dp00116.n
+      Currency2.InitRoundingPrecision;
+      IF CurrencyCode <> '' THEN BEGIN
+        AmountLCY :=
+        ROUND(
+          CurrencyExchangeRate.ExchangeAmtFCYToLCY(
+            0, '', CurrencyDate, CurrencyCode, Amount,
+             CurrencyExchangeRate.ExchangeRate(0, '', CurrencyDate, CurrencyCode,TRUE),TRUE),
+             Currency2."Amount Rounding Precision");
+      END ELSE BEGIN
+        AmountLCY := ROUND(Amount,Currency2."Amount Rounding Precision");
+      END;
+    END;
+
+    PROCEDURE CalcPriceFromPriceLCY@1100528601(PriceLCY@1100528803 : Decimal;CurrencyCode@1100528804 : Code[10];CurrencyDate@1100528600 : Date) Price : Decimal;
+    VAR
+      CurrencyExchangeRate@1100528801 : Record 330;
+      Currency2@1100528800 : Record 4;
+    BEGIN
+      // dp00116.n
+      Currency2.InitRoundingPrecision;
+      IF CurrencyCode <> '' THEN BEGIN
+        Price :=
+        ROUND(
+          CurrencyExchangeRate.ExchangeAmtLCYToFCY(
+            0, '', CurrencyDate, CurrencyCode, PriceLCY,
+             CurrencyExchangeRate.ExchangeRate(0, '', CurrencyDate, CurrencyCode,TRUE),TRUE),
+             Currency2."Unit-Amount Rounding Precision");
+      END ELSE BEGIN
+        Price := ROUND(PriceLCY,Currency2."Unit-Amount Rounding Precision");
+      END;
+    END;
+
+    PROCEDURE CalcPriceLCYFromPrice@1100528600(Price@1100528803 : Decimal;CurrencyCode@1100528804 : Code[10];CurrencyDate@1100528805 : Date) PriceLCY : Decimal;
+    VAR
+      CurrencyExchangeRate@1100528801 : Record 330;
+      Currency2@1100528800 : Record 4;
+    BEGIN
+      // dp00116.n
+      Currency2.InitRoundingPrecision;
+      IF CurrencyCode <> '' THEN BEGIN
+        PriceLCY :=
+        ROUND(
+          CurrencyExchangeRate.ExchangeAmtFCYToLCY(
+            0, '', CurrencyDate, CurrencyCode, Price,
+             CurrencyExchangeRate.ExchangeRate(0, '', CurrencyDate, CurrencyCode,TRUE),TRUE),
+             Currency2."Unit-Amount Rounding Precision");
+      END ELSE BEGIN
+        PriceLCY := ROUND(Price, Currency2."Unit-Amount Rounding Precision");
+      END;
+    END;
+
+    PROCEDURE GetObjectInstallmAmountPerYear@1100528602(IServiceContractNo@1100528600 : Code[20];ISeekDate@1100528601 : Date) : Decimal;
+    VAR
+      ServiceContract@1100528602 : Record 11012812;
+      ContractObject@1100528603 : Record 11071702;
+      RevenuePerYear@1100528605 : Decimal;
+      RecordFound@1100528606 : Boolean;
+    BEGIN
+      IF NOT ServiceContract.GET(IServiceContractNo) THEN
+        EXIT;
+      ContractObject.SETRANGE("Service Contract No.", IServiceContractNo);
+      ContractObject.SETFILTER("Starting Date", '<=%1', ISeekDate);
+      ContractObject.SETFILTER("Ending Date", '%1|>=%2', 0D, ISeekDate);
+      IF ContractObject.FINDSET THEN
+        REPEAT
+          ContractObject.CALCFIELDS("Standard Object No.");
+          ContractObject.CALCFIELDS("Object Group", Quantity);
+          RevenuePerYear +=
+           GetSCObjectPriceLCYAgreemByDat(
+              IServiceContractNo, ContractObject."Service Object No.", ISeekDate, RecordFound) * ContractObject.Quantity;
+
+          IF NOT RecordFound THEN BEGIN
+            RevenuePerYear += ContractObject.GetMaintSalesRate(ISeekDate) * ContractObject.Quantity;
+          END;
+        UNTIL ContractObject.NEXT = 0;
+      EXIT(RevenuePerYear);
+    END;
+
+    PROCEDURE DetermineInstallmentAmount@1100528603(IServiceContractNo@1100528600 : Code[20];ISeekDate@1100528601 : Date;ISingleContract@1100528607 : Boolean) : Boolean;
+    VAR
+      ServiceContract@1100528602 : Record 11012812;
+      ContractInstallment@1100528603 : Record 11071707;
+      ContractAmountsbyDate@1100528604 : Record 11071708;
+      InstallmentAmountPerYear@1100528605 : Decimal;
+      Factor@1100528606 : Decimal;
+    BEGIN
+      IF NOT ServiceContract.GET(IServiceContractNo) THEN
+        EXIT;
+      ServiceContract.TESTFIELD("Invoice Type", ServiceContract."Invoice Type"::Installments);
+      ServiceContract.TESTFIELD("Installment Type", ServiceContract."Installment Type"::Object);
+
+      ContractInstallment.SETRANGE("Service Contract No.", IServiceContractNo);
+      ContractInstallment.SETFILTER("Invoice From", '<=%1', ISeekDate);
+      ContractInstallment.SETFILTER("Ending Date", '%1|>=%2', 0D, ISeekDate);
+      IF ContractInstallment.COUNT <> 1 THEN
+        IF ISingleContract THEN
+          ERROR(Text010, ISeekDate)
+        ELSE
+          EXIT;
+      ContractInstallment.FINDFIRST;
+
+      InstallmentAmountPerYear := GetObjectInstallmAmountPerYear(IServiceContractNo, ISeekDate);
+      Factor := ConvPeriodToTimesPerYear(ContractInstallment."Invoice Interval");
+      IF Factor = 0 THEN
+        IF ISingleContract THEN
+          ERROR(Text010, ISeekDate)
+        ELSE
+          EXIT;
+
+      ContractAmountsbyDate.SETRANGE(Type, ContractAmountsbyDate.Type::Installment);
+      ContractAmountsbyDate.SETRANGE("Service Contract No.", ContractInstallment."Service Contract No.");
+      ContractAmountsbyDate.SETRANGE("Service Object No.", '');
+      ContractAmountsbyDate.SETRANGE("Installment Line No.", ContractInstallment."Line No.");
+      ContractAmountsbyDate.SETFILTER("Index Date", '>=%1', ISeekDate);
+      ContractAmountsbyDate.DELETEALL(TRUE);
+
+      ContractAmountsbyDate.SETFILTER("Index Date", '<%1', ISeekDate);
+      IF NOT ContractAmountsbyDate.FINDLAST OR
+         (ContractAmountsbyDate."Amount (LCY)" <> InstallmentAmountPerYear / Factor)
+      THEN BEGIN
+        ContractAmountsbyDate.INIT;
+        ContractAmountsbyDate.Type := ContractAmountsbyDate.Type::Installment;
+        ContractAmountsbyDate."Service Contract No." := ContractInstallment."Service Contract No.";
+        ContractAmountsbyDate."Service Object No." := '';
+        ContractAmountsbyDate."Installment Line No." := ContractInstallment."Line No.";
+        ContractAmountsbyDate.VALIDATE("Index Date", ISeekDate);
+        ContractAmountsbyDate.VALIDATE("Amount (LCY)", InstallmentAmountPerYear / Factor);
+        ContractAmountsbyDate.INSERT(TRUE);
+      END;
+
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE ConvPeriodToTimesPerYear@1100525008(PeriodFormula@1100525000 : DateFormula) : Decimal;
+    VAR
+      PeriodFormText@1100525001 : Text[30];
+      NumberPart@1100485001 : Decimal;
+      PeriodPart@1100485002 : Text[30];
+    BEGIN
+      //db, 16-03-11: M26299
+      PeriodFormText := FORMAT(PeriodFormula);
+      IF PeriodFormText = '' THEN
+        EXIT(1);
+
+      PeriodPart := DELCHR(PeriodFormText,'=','0123456789');
+      IF (PeriodPart = '') THEN
+        EXIT(0);
+
+      EVALUATE(NumberPart, COPYSTR(PeriodFormText,1,STRPOS(PeriodFormText,PeriodPart) - 1));
+      IF NumberPart = 0 THEN
+        EXIT(0);
+
+      CASE GLOBALLANGUAGE OF
+        1031:  //DEU
+          BEGIN
+            CASE PeriodPart OF
+             'T': EXIT(365/NumberPart);  //tag
+             'W': EXIT(52/NumberPart);   //woche
+             'M': EXIT(12/NumberPart);   //monat
+             'V': EXIT(4/NumberPart);    //viertel
+             'J': EXIT(1/NumberPart);    //jahr
+            END;
+          END;
+        1033,  //ENU
+        2057:  //ENG
+          BEGIN
+            CASE PeriodPart OF
+             'D': EXIT(365/NumberPart);  //day
+             'W': EXIT(52/NumberPart);   //week
+             'M': EXIT(12/NumberPart);   //month
+             'Q': EXIT(4/NumberPart);    //quarter
+             'Y': EXIT(1/NumberPart);    //year
+            END;
+          END;
+        1036,  //FRA
+        2067:  //FRB
+          BEGIN
+            CASE PeriodPart OF
+             'J': EXIT(365/NumberPart);  //jour
+             'S': EXIT(52/NumberPart);   //semaine
+             'M': EXIT(12/NumberPart);   //mois
+             'T': EXIT(4/NumberPart);    //trimestre
+             'A': EXIT(1/NumberPart);    //annee
+            END;
+          END;
+        1043,  //NLD
+        2067:  //NLB
+          BEGIN
+            CASE PeriodPart OF
+             'D': EXIT(365/NumberPart);  //dag
+             'W': EXIT(52/NumberPart);   //week
+             'M': EXIT(12/NumberPart);   //maand
+             'K': EXIT(4/NumberPart);    //kwartaal
+             'J': EXIT(1/NumberPart);    //jaar
+            END;
+          END;
+        ELSE
+          MESSAGE('Conversion between Maintenance Interval and Time Quantity not available in current Language');
+      END;
+    END;
+
+    PROCEDURE GetServiceControlPeriodDate@1100528604(IServiceContractNo@1100528602 : Code[20];IUntilDate@1100528600 : Date) : Date;
+    VAR
+      ServiceContractCtrlPeriod@1100528601 : Record 11071746;
+    BEGIN
+      ServiceContractCtrlPeriod.UpdateControlPeriodsUntil(IServiceContractNo, IUntilDate);
+      ServiceContractCtrlPeriod.SETRANGE("Service Contract No.", IServiceContractNo);
+      ServiceContractCtrlPeriod.SETFILTER("Starting Date", '<=%1', IUntilDate);
+      ServiceContractCtrlPeriod.SETFILTER("Ending Date", '>=%1', IUntilDate);
+      ServiceContractCtrlPeriod.SETRANGE("Date Finished", 0D);
+      IF NOT ServiceContractCtrlPeriod.ISEMPTY THEN
+        EXIT(IUntilDate)
+      ELSE BEGIN
+        ServiceContractCtrlPeriod.SETRANGE("Starting Date");
+        ServiceContractCtrlPeriod.SETRANGE("Ending Date");
+        ServiceContractCtrlPeriod.FINDFIRST;
+        EXIT(ServiceContractCtrlPeriod."Starting Date");
+      END;
+    END;
+
+    LOCAL PROCEDURE ProcessInvoiceDiscountSurcharge@1100528622(IInvoiceProposalCode@1100528605 : Code[20];IServiceContract@1100528600 : Record 11012812;IBatchSeqNo@1100528615 : Code[20];IInvoiceFromDate@1100528603 : Date) : Boolean;
+    VAR
+      SalesHeader@1100528607 : Record 36;
+      SalesLine@1100528614 : Record 37;
+      Customer@1100528608 : Record 18;
+      ServiceSalesDiscSurch@1100528602 : Record 11072237;
+      ContractInstallment@1100528611 : Record 11071707;
+      CustomerPostingGroup@1100528613 : Record 92;
+      UnitPrice@1100528604 : Decimal;
+      DiscountSurcharge@1100528606 : 'Discount,Surcharge';
+      EmptyDateFormula@1100528601 : DateFormula;
+      InvoiceInterval@1100528610 : DateFormula;
+      CurrencyCode@1100528609 : Code[20];
+      DiscountSurchargeAdded@1100528612 : Boolean;
+    BEGIN
+      gvTempSalesLineRec.DELETEALL;
+      IF NOT Customer.GET(IServiceContract."Bill-to Customer No. (Contr.)") THEN
+        EXIT;
+      IF Customer."Customer Price Group" = '' THEN
+        EXIT;
+      CASE IServiceContract."Invoice Type" OF
+        IServiceContract."Invoice Type"::Dynamic:
+          InvoiceInterval := IServiceContract."Invoice Interval";
+        IServiceContract."Invoice Type"::Installments:
+          BEGIN
+            ContractInstallment.SETRANGE("Service Contract No.", IServiceContract."No.");
+            IF ContractInstallment.FINDFIRST THEN
+              InvoiceInterval := ContractInstallment."Invoice Interval";
+          END;
+      END;
+      IF CustomerPostingGroup.GET(Customer."Customer Posting Group") THEN
+        CustomerPostingGroup.TESTFIELD(CustomerPostingGroup."Service Charge Acc.");
+
+      SalesLine.SETRANGE("Document Type", SalesLine."Document Type"::"Invoice Proposal");
+      SalesLine.SETRANGE("Document No.", IInvoiceProposalCode);
+      SalesLine.SETRANGE("Service Invoice", TRUE);
+      SalesLine.SETRANGE(Type, SalesLine.Type::"G/L Account");
+      SalesLine.SETRANGE("No.", CustomerPostingGroup."Service Charge Acc.");
+      SalesLine.SETRANGE("System-Created Entry", TRUE);
+      SalesLine.DELETEALL(TRUE);
+
+      FOR DiscountSurcharge := DiscountSurcharge::Discount TO DiscountSurcharge::Surcharge DO BEGIN
+        ServiceSalesDiscSurch.SETRANGE(Type, ServiceSalesDiscSurch.Type::"Customer Group");
+        ServiceSalesDiscSurch.SETRANGE(Code, Customer."Customer Price Group");
+        ServiceSalesDiscSurch.SETRANGE("Object No.", '');
+        ServiceSalesDiscSurch.SETRANGE("Discount/Surcharge", DiscountSurcharge);
+        ServiceSalesDiscSurch.SETFILTER("Starting Date", '<>%1&<=%2', 0D, IInvoiceFromDate);
+        ServiceSalesDiscSurch.SETFILTER("Ending Date", '%1|>%2', 0D, IInvoiceFromDate);
+        ServiceSalesDiscSurch.SETFILTER(Source, '%1|%2', ServiceSalesDiscSurch.Source::" ", ServiceSalesDiscSurch.Source::Contract);
+        ServiceSalesDiscSurch.SETFILTER("Contract Group", '%1|%2', '', IServiceContract."Contract Group");
+        ServiceSalesDiscSurch.SETFILTER("Invoice Period", '%1|%2', EmptyDateFormula, InvoiceInterval);
+        IF ServiceSalesDiscSurch.FIND('+') THEN BEGIN
+          gvTempSalesLineRec.INIT;
+          gvTempSalesLineRec."Document No." := '9999999999';
+          gvTempSalesLineRec."Service Invoice" := TRUE;
+          gvTempSalesLineRec."Installment Invoice" := FALSE;
+          gvTempSalesLineRec.Type := gvTempSalesLineRec.Type::"G/L Account";
+          gvTempSalesLineRec."No." := CustomerPostingGroup."Service Charge Acc.";
+          gvTempSalesLineRec."System-Created Entry" := TRUE;
+          REPEAT
+            IF IsCorrectTransactionMode(ServiceSalesDiscSurch, IInvoiceProposalCode) THEN BEGIN
+              IF ServiceSalesDiscSurch.Percentage <> 0 THEN BEGIN
+                SalesLine.RESET;
+                SalesLine.SETRANGE("Document Type", SalesLine."Document Type"::"Invoice Proposal");
+                SalesLine.SETRANGE("Document No.", IInvoiceProposalCode);
+                SalesLine.CALCSUMS("Line Amount");
+                UnitPrice := SalesLine."Line Amount" * ServiceSalesDiscSurch.Percentage / 100;
+              END ELSE BEGIN
+                CurrencyCode := GetContractCurrency(IServiceContract."No.");
+                IF CurrencyCode = '' THEN
+                  UnitPrice := ServiceSalesDiscSurch.Amount
+                ELSE
+                  UnitPrice := CalcAmountFromAmountLCY(ServiceSalesDiscSurch."Amount (LCY)", CurrencyCode, IInvoiceFromDate);
+              END;
+              IF UnitPrice <> 0 THEN BEGIN
+                gvTempSalesLineRec."Line No." := LineCounter;
+                gvTempSalesLineRec.Description := ServiceSalesDiscSurch.Description;
+                gvTempSalesLineRec.Quantity := 1;
+                IF ServiceSalesDiscSurch."Discount/Surcharge" = ServiceSalesDiscSurch."Discount/Surcharge"::Discount THEN
+                  UnitPrice := -UnitPrice;
+                VATBreakDown(gvTempSalesLineRec, UnitPrice, IServiceContract."VAT Prod. Posting Group");
+                DiscountSurchargeAdded := TRUE;
+              END;
+            END;
+          UNTIL ServiceSalesDiscSurch.NEXT(-1) = 0;
+        END;
+      END;
+      IF gvTempSalesLineRec.FINDSET THEN
+        REPEAT
+          CreateInvProposalLine(IInvoiceProposalCode, IBatchSeqNo);
+        UNTIL gvTempSalesLineRec.NEXT = 0;
+      EXIT(DiscountSurchargeAdded);
+    END;
+
+    LOCAL PROCEDURE IsCorrectTransactionMode@1100528615(IServiceSalesDiscSurch@1100528600 : Record 11072237;IInvoiceProposalCode@1100528601 : Code[20]) : Boolean;
+    VAR
+      SalesHeader@1100528602 : Record 36;
+    BEGIN
+      IF IServiceSalesDiscSurch."Transaction Mode Filter" = '' THEN
+        EXIT(TRUE);
+      SalesHeader.SETRANGE("Document Type", SalesHeader."Document Type"::"Invoice Proposal");
+      SalesHeader.SETRANGE("No.", IInvoiceProposalCode);
+      EXIT(NOT SalesHeader.ISEMPTY);
+    END;
+
+    PROCEDURE ConvertPeriodToNoOfMonths@1100528606(IInterval@1100528600 : DateFormula) : Integer;
+    VAR
+      MaintenanceManagement@1100528601 : Codeunit 11012829;
+    BEGIN
+      EXIT(12 / MaintenanceManagement.ConvPeriodToTimesPerYear(IInterval));
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

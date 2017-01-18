@@ -1,0 +1,427 @@
+OBJECT Codeunit 11012009 Post Hours to G/L
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=11072005;
+    Permissions=TableData 11072005=rimd;
+    OnRun=BEGIN
+            JobLedgerEntry.COPY(Rec);
+            gvSupplyingCompany := '';
+            gvReceivingCompany := '';
+            ProcessJobEntry;
+            Rec := JobLedgerEntry;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      JobSetup@11012000 : Record 315;
+      JobLedgerEntry@11012001 : Record 11072005;
+      GenJnlLine@11012002 : Record 81;
+      EmplRec@11012005 : Record 5200;
+      ICRec@1000000001 : Record 11012057;
+      TradeAssRec@1100525000 : Record 11012015;
+      DimValRec@1100485000 : Record 349;
+      DimMgt@11012013 : Codeunit 408;
+      PostGenJnlLine@11012009 : Codeunit 12;
+      PostPlantHoursCost@1100485010 : Codeunit 11012571;
+      NextLineNo@11012010 : Integer;
+      gvSupplyingCompany@1210190000 : Text[30];
+      gvReceivingCompany@1000000000 : Text[30];
+      gAmntInclVatDec@1210190007 : Decimal;
+      SurchargeDepartment@1210190009 : Code[20];
+      IsSurchargeDepartmentUsed@1210190010 : Boolean;
+      gvSurchargeReceiverSide@1100525001 : Boolean;
+      DimensionSetIDGenJnlLine@1100525002 : Integer;
+      gvDetailedBalancePosting@1100525003 : Boolean;
+
+    PROCEDURE RunPost@2(VAR Rec@1000000000 : Record 11072005;lvSupplyingCompany@1210190001 : Text[30];lvReceivingCompany@1000000001 : Text[30];VAR lAmntInclVatDec@1210190000 : Decimal;lvSurchargeReceiverSide@1100525000 : Boolean;lvCompress@1100525001 : Boolean);
+    BEGIN
+      JobLedgerEntry.COPY(Rec);
+      gvSupplyingCompany := lvSupplyingCompany;
+      gvReceivingCompany := lvReceivingCompany;
+      gvSurchargeReceiverSide := lvSurchargeReceiverSide;
+      gvDetailedBalancePosting := NOT lvCompress;      //Call C006064 n
+      ProcessJobEntry;
+      lAmntInclVatDec := gAmntInclVatDec;
+      Rec := JobLedgerEntry;
+    END;
+
+    PROCEDURE ProcessJobEntry@1();
+    VAR
+      lGenJnlTempLine@1210190001 : Record 81;
+    BEGIN
+      IF NextLineNo = 0 THEN BEGIN
+        GenJnlLine.LOCKTABLE;
+        JobSetup.GET;
+        GenJnlLine.SETRANGE("Journal Batch Name",JobSetup."Hours Journal Batch");
+        GenJnlLine.SETRANGE("Journal Template Name",JobSetup."Hours Journal Template");
+        IF GenJnlLine.FIND('+') THEN
+          NextLineNo := GenJnlLine."Line No." + 10000
+        ELSE
+          NextLineNo := 1;
+      END;
+
+      WITH GenJnlLine DO BEGIN
+
+        CLEAR(GenJnlLine);
+        JobSetup.GET;
+
+        IsSurchargeDepartmentUsed := FALSE;
+        IF JobLedgerEntry.Surcharge AND (JobLedgerEntry."Location Code" = 'SURCH-DEP') THEN BEGIN
+          IsSurchargeDepartmentUsed := TRUE;
+          SurchargeDepartment := JobLedgerEntry."Resource Group No.";
+          JobLedgerEntry."Resource Group No." := '';
+          JobLedgerEntry."Location Code" := '';
+        END;
+
+        "Employee No." := JobLedgerEntry."Employee No.";
+        "Document No." := JobLedgerEntry."Document No.";
+        "Job No." := JobLedgerEntry."Job No.";
+        Element := JobLedgerEntry.Element;
+        "Extension Contract" := JobLedgerEntry."Extension Contract";
+        "Service Order No." := JobLedgerEntry."Service Order No.";
+        "Service Contract No." := JobLedgerEntry."Service Contract No.";
+        "Source Code" := JobLedgerEntry."Source Code";
+        "Reason Code" := JobLedgerEntry."Reason Code";
+        "Shortcut Dimension 1 Code" := JobLedgerEntry."Global Dimension 1 Code";
+        "Shortcut Dimension 2 Code" := JobLedgerEntry."Global Dimension 2 Code";
+        "Dimension Set ID" := JobLedgerEntry."Dimension Set ID";
+        "Cost Component" := JobLedgerEntry."Cost Component";
+        "Journal Batch Name" := JobSetup."Hours Journal Batch";
+        "Journal Template Name" := JobSetup."Hours Journal Template";
+        "System-Created Entry" := TRUE;
+        IF ("Service Order No." <> '') OR ("Service Contract No." <> '') THEN
+          "Origin Type" := "Origin Type"::Service
+        ELSE
+          IF "Job No." <> '' THEN
+            "Origin Type" := "Origin Type"::Project;
+
+        IF (gvReceivingCompany <> '') THEN BEGIN
+          // Standard intercompany project
+          ICRec.GET(COMPANYNAME, gvReceivingCompany);
+          "Intercompany Transaction" := TRUE;
+          "Receiving Company" := gvReceivingCompany;  //Call 29089 new
+          "Job No." := '';
+          Element   := '';
+          "Extension Contract" := '';
+          "Service Order No." := '';
+          "Service Contract No." := '';
+          "Shortcut Dimension 1 Code" := '';
+          "Shortcut Dimension 2 Code" := '';
+          "Dimension Set ID" := 0;
+          //Next code line is to make sure that the program will pass upcoming test
+          JobLedgerEntry."WIP Account Costs" := ICRec.GetICAccountOfCurrentCompany;
+        END;
+
+        IF (gvSupplyingCompany <> '') AND (NOT gvSurchargeReceiverSide) THEN BEGIN
+          //Standard intercompany employee
+          ICRec.GET(gvSupplyingCompany, COMPANYNAME);
+          JobLedgerEntry."WIP Balance Account" := ICRec.GetICAccountOfCurrentCompany;
+        END;
+
+        //Post Debit Line
+        "Account Type" := "Account Type"::"G/L Account";
+        "Posting Date" := JobLedgerEntry."Posting Date";
+        "Line No." := NextLineNo;
+        "Account No." := JobLedgerEntry."WIP Account Costs";
+        "Bal. Account No." := '';
+        "Gen. Prod. Posting Group" := '';
+        "Gen. Bus. Posting Group" := '';
+        "VAT Prod. Posting Group" :='';
+        "VAT Bus. Posting Group" := '';
+        "Gen. Posting Type" := 0;
+        Description := JobLedgerEntry.Description;
+        "Interest Date" := "Posting Date";
+
+        IF JobSetup."VAT for Hours IC Entry" AND (gvReceivingCompany <> '') THEN BEGIN
+          lGenJnlTempLine.COPY(GenJnlLine);
+          lGenJnlTempLine.VALIDATE("Gen. Prod. Posting Group",JobSetup."Gen. Prod. Posting Group");
+          lGenJnlTempLine.VALIDATE("Gen. Bus. Posting Group",JobSetup."Gen. Bus. Posting Group");
+          lGenJnlTempLine.VALIDATE("VAT Prod. Posting Group",JobSetup."VAT Prod. Posting Group");
+          lGenJnlTempLine.VALIDATE("VAT Bus. Posting Group",JobSetup."VAT Bus. Posting Group");
+          lGenJnlTempLine.VALIDATE("Gen. Posting Type","Gen. Posting Type"::Sale);
+          lGenJnlTempLine."VAT Base Amount" := JobLedgerEntry."Total Cost (LCY)";
+          lGenJnlTempLine.VALIDATE("VAT Base Amount");
+          Amount := lGenJnlTempLine.Amount;
+        END ELSE
+          Amount := JobLedgerEntry."Total Cost (LCY)";
+        VALIDATE(Amount);
+        Quantity := JobLedgerEntry.Quantity;  //*34225
+
+        //**4PS01.sn
+        //No dimension support for IC yet
+        IF gvSupplyingCompany <> '' THEN
+          "Supplying Company" := gvSupplyingCompany;
+
+        GetDimensionSetID(GenJnlLine); //T002369
+
+        GenJnlLine."Skip WIP Check" := FALSE;      //Call C006064 n
+
+        PostGenJnlLine.RunWithCheck(GenJnlLine);
+        DimensionSetIDGenJnlLine := GenJnlLine."Dimension Set ID"; //T003442
+
+        NextLineNo := NextLineNo + 1;
+
+        //Post Credit Line
+        "Account Type" := "Bal. Account Type"::"G/L Account";
+        "Account No." := JobLedgerEntry."WIP Balance Account";
+
+        IF NOT gvDetailedBalancePosting THEN BEGIN  //Call C006064 n
+          "Job No." := '';
+          Element := '';
+          "Extension Contract" := '';
+          "Service Order No." := '';
+          "Service Contract No." := '';
+        END ELSE BEGIN                              //Call C006064 n
+          GenJnlLine."Skip WIP Check" := TRUE;      //Call C006064 n
+        END;                                        //Call C006064 n
+
+      //  "Dimension Set ID" := JobLedgerEntry."Dimension Set ID"; Call C028334 o
+        "Shortcut Dimension 1 Code" := '';                      // Call C028334 n
+        "Shortcut Dimension 2 Code" := '';                      // Call C028334 n
+        "Dimension Set ID" := 0;                                // Call C028334 n
+
+        IF gvReceivingCompany = '' THEN //DP00387 new
+          "Shortcut Dimension 2 Code" := JobLedgerEntry."Global Dimension 2 Code";
+
+        DimMgt.ValidateShortcutDimValues(2,"Shortcut Dimension 2 Code","Dimension Set ID");  //DP00387 n
+
+        "Shortcut Dimension 1 Code" := '';
+        IF JobLedgerEntry.Surcharge THEN BEGIN
+          IF IsSurchargeDepartmentUsed THEN BEGIN
+            IF SurchargeDepartment <> '' THEN
+              "Shortcut Dimension 1 Code" := SurchargeDepartment
+            ELSE
+              IF (JobLedgerEntry."Employee No." <> '') AND (gvSupplyingCompany = '') THEN
+                "Shortcut Dimension 1 Code" := EmplTradeAssDepartment("Shortcut Dimension 1 Code");
+          END ELSE
+            "Shortcut Dimension 1 Code" := JobLedgerEntry."Global Dimension 1 Code";
+        END ELSE
+          IF (JobLedgerEntry."Employee No." <> '') AND (gvSupplyingCompany = '') THEN
+            IF JobLedgerEntry."Cost Type" = JobLedgerEntry."Cost Type"::Plant THEN BEGIN
+              DimMgt.GetDimValueRec(2, JobLedgerEntry."Global Dimension 2 Code", DimValRec, FALSE,'');
+              "Shortcut Dimension 1 Code" := DimValRec."Global Dimension 1 Code";
+            END ELSE BEGIN
+              "Shortcut Dimension 1 Code" := EmplTradeAssDepartment("Shortcut Dimension 1 Code");
+            END;
+
+        DimMgt.ValidateShortcutDimValues(1,"Shortcut Dimension 1 Code","Dimension Set ID");
+
+        IF JobSetup."VAT for Hours IC Entry" AND (gvReceivingCompany <> '') THEN BEGIN
+          VALIDATE("Gen. Prod. Posting Group",JobSetup."Gen. Prod. Posting Group");
+          VALIDATE("Gen. Bus. Posting Group",JobSetup."Gen. Bus. Posting Group");
+          VALIDATE("VAT Prod. Posting Group",JobSetup."VAT Prod. Posting Group");
+          VALIDATE("VAT Bus. Posting Group",JobSetup."VAT Bus. Posting Group");
+          VALIDATE("Gen. Posting Type","Gen. Posting Type"::Sale);
+          "VAT Base Amount" := JobLedgerEntry."Total Cost (LCY)" * -1;
+          VALIDATE("VAT Base Amount");
+          gAmntInclVatDec := Amount * -1;
+        END ELSE BEGIN
+          "Gen. Prod. Posting Group" := '';
+          "Gen. Bus. Posting Group" := '';
+          "VAT Prod. Posting Group" :='';
+          "VAT Bus. Posting Group" := '';
+          "Gen. Posting Type" := 0;
+          Amount := JobLedgerEntry."Total Cost (LCY)" * -1;
+          VALIDATE(Amount);
+        END;
+        Description := JobLedgerEntry.Description;
+        "Line No." := NextLineNo;
+        "Bal. Account No." := '';
+
+        //No dimension support for IC yet
+        IF gvSupplyingCompany = '' THEN
+          AddEmployeeDimensions(JobLedgerEntry."Employee No.", GenJnlLine);
+        "Receiving Company" := '';  //Call 29089 new
+
+        PostGenJnlLine.RunWithCheck(GenJnlLine);
+
+        NextLineNo := NextLineNo + 1;
+      END;
+    END;
+
+    PROCEDURE ProcessCostEntry@1210190003(VAR lGenJnlLine@1210190000 : Record 81);
+    VAR
+      GenJnlLine2@1210190001 : Record 81;
+    BEGIN
+      WITH lGenJnlLine DO BEGIN
+        IF NextLineNo = 0 THEN BEGIN
+          LOCKTABLE;
+          JobSetup.GET;
+          GenJnlLine2.SETRANGE("Journal Batch Name",JobSetup."Hours Journal Batch");
+          GenJnlLine2.SETRANGE("Journal Template Name",JobSetup."Hours Journal Template");
+          IF GenJnlLine2.FIND('+') THEN
+            NextLineNo := GenJnlLine2."Line No." + 1
+          ELSE
+            NextLineNo := 1;
+        END;
+        "Line No." := NextLineNo;
+
+        GenJnlLine := lGenJnlLine;
+        IF gvSupplyingCompany = '' THEN
+          AddEmployeeDimensions("Employee No.", GenJnlLine);
+        //**4PS01.en
+
+        PostGenJnlLine.RunWithCheck(lGenJnlLine);
+        NextLineNo := NextLineNo + 1;
+      END;
+    END;
+
+    PROCEDURE AddEmployeeDimensions@1100485001(EmployeeNo@1100485000 : Code[20];VAR GenJnlLine@1100485001 : Record 81);
+    VAR
+      DefaultDim@1100485003 : Record 352;
+      Employee@1100485004 : Record 5200;
+      DimVal@1100485005 : Record 349;
+    BEGIN
+      //**4PS01.sn
+      IF EmployeeNo = '' THEN
+        EXIT;
+
+      IF NOT Employee.GET(EmployeeNo) THEN //**4PS02.n
+        EXIT;
+
+      DefaultDim.SETCURRENTKEY("Table ID", "No.");
+      DefaultDim.SETRANGE("Table ID", DATABASE::Employee);
+      DefaultDim.SETRANGE("No.", EmployeeNo);
+      IF DefaultDim.FINDSET THEN
+        REPEAT
+          IF DimVal.GET(DefaultDim."Dimension Code",DefaultDim."Dimension Value Code") THEN
+            IF DimVal."Global Dimension No." = 0 THEN  //Non global dimensions only
+              GenJnlLine."Dimension Set ID" :=
+                DimMgt.GetDimSetAddedDimVal(GenJnlLine."Dimension Set ID",DefaultDim."Dimension Code",DefaultDim."Dimension Value Code")
+        UNTIL DefaultDim.NEXT = 0;
+    END;
+
+    PROCEDURE PostPlantHourCost@1100485000(IYear@1100485000 : Integer;IWeek@1100525000 : Integer;IEmplComp@1100525003 : Text[30];IEmplNo@1100525001 : Code[20];ILineNo@1100525002 : Integer;IDocNo@1100485001 : Code[20]);
+    BEGIN
+      PostPlantHoursCost.PostHourAcc(IYear, IWeek, IEmplComp, IEmplNo, ILineNo, IDocNo, PostGenJnlLine);
+    END;
+
+    PROCEDURE PostTempPlantHourCost@1100525001(VAR lvTempPlantHoursCostRec@1100525004 : TEMPORARY Record 11012578;IYear@1100485000 : Integer;IWeek@1100525000 : Integer;IEmplComp@1100525003 : Text[30];IEmplNo@1100525001 : Code[20];ILineNo@1100525002 : Integer;IDocNo@1100485001 : Code[20]);
+    BEGIN
+      PostPlantHoursCost.PostHourAccFromTemp(lvTempPlantHoursCostRec, IYear, IWeek,
+                                             IEmplComp, IEmplNo, ILineNo, IDocNo, PostGenJnlLine);
+    END;
+
+    PROCEDURE ProcessComplWIP@1100485002(lvRecord@1100485000 : Record 11072005);
+    BEGIN
+      JobLedgerEntry.COPY(lvRecord);
+
+      gvSupplyingCompany := '';
+      gvReceivingCompany := '';
+      PostComplWIP;
+    END;
+
+    PROCEDURE PostComplWIP@1100485003();
+    BEGIN
+      WITH JobLedgerEntry DO BEGIN
+        GenJnlLine.INIT;
+        GenJnlLine."Line No." := 1;
+        GenJnlLine."Source Code" := "Source Code";
+        GenJnlLine."Reason Code":= "Reason Code";
+        GenJnlLine."Account Type" := GenJnlLine."Account Type"::"G/L Account";
+        GenJnlLine."Bal. Account No." := "WIP Balance Account";
+        GenJnlLine."Account No." := "WIP Account Costs";
+        GenJnlLine."Posting Date" := "Posting Date";
+       // GenJnlLine."Document Type" := GenJnlLineDocType;
+        GenJnlLine."Document No." := "Document No.";
+        GenJnlLine."System-Created Entry" := TRUE;
+        GenJnlLine."Document Date" := "Document Date";
+        GenJnlLine.Description := Description;
+        GenJnlLine."Description 2" := "Description 2";
+        GenJnlLine.VALIDATE(Amount, "Total Cost (LCY)");
+        GenJnlLine.Quantity := Quantity;  //*34225
+        GenJnlLine."Shortcut Dimension 1 Code" := "Global Dimension 1 Code";
+        GenJnlLine."Shortcut Dimension 2 Code" := "Global Dimension 2 Code";
+        GenJnlLine."Dimension Set ID" := "Dimension Set ID";
+        GenJnlLine."Cost Component" := "Cost Component";
+        GenJnlLine."Closed Project No." := "Job No.";
+        GenJnlLine."Closed Service Order No." := "Service Order No.";
+        GenJnlLine."Closed Service Contract No." := "Service Contract No.";
+        GenJnlLine."Origin Type" :=  GenJnlLine."Origin Type"::Project;
+        PostGenJnlLine.RunWithCheck(GenJnlLine);
+      END;
+    END;
+
+    PROCEDURE EmplTradeAssDepartment@1100409000(iDepartmentCode@1100409000 : Code[20]) DepartmentCode : Code[20];
+    BEGIN
+      DepartmentCode := iDepartmentCode;
+      IF EmplRec.GET(JobLedgerEntry."Employee No.") THEN BEGIN
+        EmplRec.TESTFIELD("Trade Association");
+        TradeAssRec.GET(EmplRec."Trade Association");
+        IF TradeAssRec."Source Department Code" = TradeAssRec."Source Department Code"::"Trade Association" THEN
+          DepartmentCode := TradeAssRec."Department Code"
+        ELSE
+          DepartmentCode := EmplRec."Global Dimension 1 Code";
+      END;
+    END;
+
+    LOCAL PROCEDURE GetDimensionSetID@1100525002(VAR GenJnlLine@1100525000 : Record 81) : Integer;
+    VAR
+      GenJnlLine2@1100525001 : Record 81;
+    BEGIN
+      //T003442
+      IF JobLedgerEntry.Surcharge THEN
+        EXIT;
+      //
+
+      IF (GenJnlLine."Job No." <> '') OR (GenJnlLine."Service Order No." <> '') THEN BEGIN //db, 04-01-07
+        GenJnlLine2.COPY(GenJnlLine);
+        //**Call C006343 new
+        GenJnlLine2.CreateDimForHourAccLine(
+          DimMgt.TypeToTableID1(GenJnlLine2."Account Type"),GenJnlLine2."Account No.",
+          DimMgt.TypeToTableID1(GenJnlLine2."Bal. Account Type"),GenJnlLine2."Bal. Account No.",
+          DATABASE::"Plant Number", DimMgt.MakeCombinedPlantNo(GenJnlLine2."Plant Type",GenJnlLine2."Plant No."),
+          DATABASE::"Plant Type", GenJnlLine2."Plant Type",
+          DATABASE::Job,GenJnlLine2."Job No.",
+          DATABASE::"Service Order",GenJnlLine2."Service Order No.",
+          DATABASE::"Salesperson/Purchaser",GenJnlLine2."Salespers./Purch. Code",
+          DATABASE::Employee,GenJnlLine2."Employee No.");
+        //** new call C003940 en
+
+        //** Call T003796 so
+        //GenJnlLine."Shortcut Dimension 1 Code" := GenJnlLine2."Shortcut Dimension 1 Code";
+        //GenJnlLine."Shortcut Dimension 2 Code" := GenJnlLine2."Shortcut Dimension 2 Code";
+        //** Call T003796 eo
+        //** Call T003796 sn
+        IF GenJnlLine."Shortcut Dimension 1 Code" <> '' THEN
+          GenJnlLine2."Shortcut Dimension 1 Code" := GenJnlLine."Shortcut Dimension 1 Code";
+        IF GenJnlLine."Shortcut Dimension 2 Code" <> '' THEN
+          GenJnlLine2."Shortcut Dimension 2 Code" := GenJnlLine."Shortcut Dimension 2 Code";
+        DimMgt.ValidateShortcutDimValues(1, GenJnlLine2."Shortcut Dimension 1 Code", GenJnlLine2."Dimension Set ID");
+        DimMgt.ValidateShortcutDimValues(2, GenJnlLine2."Shortcut Dimension 2 Code", GenJnlLine2."Dimension Set ID");
+        //** Call T003796 en
+        GenJnlLine."Dimension Set ID" := GenJnlLine2."Dimension Set ID";
+      END ELSE
+        IF gvSupplyingCompany = '' THEN //** Call C003940
+          AddEmployeeDimensions(JobLedgerEntry."Employee No.", GenJnlLine);
+    END;
+
+    PROCEDURE GetDimensionSetIDGenJnl@1100525003() : Integer;
+    BEGIN
+      //T003442
+      EXIT(DimensionSetIDGenJnlLine);
+    END;
+
+    PROCEDURE GetDimensionSetIDXtraDims@1100525006(AddEmployeeDims@1100525006 : Boolean;VAR DefaultDim@1100525002 : Record 352;GlobalDimVal1@1100525001 : Code[20];GlobalDimVal2@1100525000 : Code[20];Company@1100525004 : Text[80]) : Integer;
+    VAR
+      DimMgt@1100525003 : Codeunit 408;
+    BEGIN
+      //C021176
+      DimMgt.SetCompany(Company);
+      EXIT(DimMgt.GetDimSetIDXtraDims(AddEmployeeDims,DefaultDim,GlobalDimVal1,GlobalDimVal2));
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

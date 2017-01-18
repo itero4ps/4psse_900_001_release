@@ -1,0 +1,944 @@
+OBJECT Codeunit 8800 Custom Layout Reporting
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      TempBlobReqParamStore@1005 : TEMPORARY Record 99008535;
+      ReportSelections@1009 : Record 77;
+      CustomReportSelection@1004 : Record 9657;
+      ReportLayoutSelection@1010 : Record 9651;
+      RequestPageParametersHelper@1119 : Codeunit 1530;
+      FileManagement@1110 : Codeunit 419;
+      ReportDataRecordRef@1111 : RecordRef;
+      IteratorRecordRef@1015 : RecordRef;
+      ReportDataIteratorFieldRef@1112 : FieldRef;
+      IteratorJoinFieldRef@1113 : FieldRef;
+      OutputType@1001 : 'Print,Preview,PDF,Email,Excel,Word,XML';
+      SaveFolderMsg@1003 : TextConst 'ENU=Select folder to save reports to.';
+      NotInitializedErr@1000 : TextConst 'ENU=Report data not initialized.';
+      OutputNotSupportedErr@1012 : TextConst 'ENU=The chosen output method is not supported.';
+      SMTPNotSetupErr@1002 : TextConst 'ENU=SMTP has not yet been set up, SMTP is required for the email output option.';
+      ReportingType@1014 : 'Object,Layout';
+      ZipFileName@1017 : Text;
+      ZipDownloadTxt@1019 : TextConst 'ENU=AllReports.zip';
+      Path@1056 : Text;
+      OutputFileBaseName@1013 : Text;
+      Initialized@1057 : Boolean;
+      ReportDataAndIteratorDiffer@1058 : Boolean;
+      SupressOutput@1006 : Boolean;
+      PrintRemaining@1007 : Boolean;
+      OverrideOutput@1011 : Boolean;
+      TestModeWebClient@1008 : Boolean;
+
+    PROCEDURE GetLayoutIteratorKeyFilter@22(VAR FilterRecordRef@1080 : RecordRef;VAR FilterRecordKeyFieldRef@1081 : FieldRef;CustomReportLayoutID@1003 : Integer);
+    VAR
+      CustomReportSelection2@1058 : Record 9657;
+      Filter@1083 : Text;
+    BEGIN
+      // Further filters the items in FilterRecordRef by restricting them only to items who have entries in the "* Report Selection" tables
+      // This prevents us from iterating over items that aren't related to the custom layouts
+      CustomReportSelection2.SETVIEW(CustomReportSelection.GETVIEW);
+
+      // Set the filters on the "* Report Selection" table and iterate through
+      CustomReportSelection2.SETRANGE("Custom Report Layout ID",CustomReportLayoutID);
+      CustomReportSelection2.SETFILTER("Source No.",GetKeyFilterFromRecord(FilterRecordRef,FilterRecordKeyFieldRef));
+
+      IF CustomReportSelection2.FIND('-') THEN BEGIN
+        REPEAT
+          IF Filter <> '' THEN
+            Filter := Filter + '|';
+          Filter := STRSUBSTNO('%1%2',Filter,CustomReportSelection2."Source No.");
+        UNTIL CustomReportSelection2.NEXT = 0;
+      END;
+
+      // Set the more restrictive filter
+      FilterRecordKeyFieldRef.SETFILTER(Filter);
+    END;
+
+    PROCEDURE GetKeyFilterFromRecord@16(VAR FilterSourceRecordRef@1000 : RecordRef;VAR KeyFieldRef@1084 : FieldRef) : Text;
+    VAR
+      Filter@1001 : Text;
+    BEGIN
+      IF FilterSourceRecordRef.FINDSET THEN BEGIN
+        REPEAT
+          IF Filter <> '' THEN
+            Filter := Filter + '|';
+          Filter := STRSUBSTNO('%1%2',Filter,KeyFieldRef.VALUE);
+        UNTIL FilterSourceRecordRef.NEXT = 0;
+      END;
+      EXIT(Filter);
+    END;
+
+    PROCEDURE ProcessReport@43();
+    VAR
+      RequestPageParamsView@1000 : Text;
+    BEGIN
+      // If we're not yet initialized, exit - data needs to be set up before reports can be run
+      IF NOT Initialized THEN
+        EXIT;
+      // Iterate through the selections and run the reports.
+      IF ReportSelections.FINDSET THEN BEGIN
+        REPEAT
+          SetOutputType(ReportSelections."Report ID");
+
+          CustomReportSelection.SETFILTER("Report ID",STRSUBSTNO('0|%1',ReportSelections."Report ID"));
+          CustomReportSelection.SETRANGE(Usage,ReportSelections.Usage);
+
+          PrintRemaining := FALSE;
+          // Set the iterator view based on if we need to 'join' the iterator and data item records on a field
+          // If we do not need to join (e.g. the report data item and iterator are the same), then we will use the report request page filter as
+          // the iterator
+          IF ReportDataAndIteratorDiffer THEN
+            IteratorJoinFieldRef.SETFILTER(GetKeyFilterFromRecord(ReportDataRecordRef,ReportDataIteratorFieldRef))
+          ELSE BEGIN
+            RequestPageParamsView := GetViewFromParameters(ReportSelections."Report ID",IteratorRecordRef.NUMBER);
+            IteratorRecordRef.SETVIEW(RequestPageParamsView)
+          END;
+          // Set the data item filters from the request page
+          // Add the request page filters to the passed-in data record ref filters
+          ReportDataRecordRef.FILTERGROUP(10); // Set the request page filters separately to preserve the existing filters
+          RequestPageParamsView := GetViewFromParameters(ReportSelections."Report ID",ReportDataRecordRef.NUMBER);
+          ReportDataRecordRef.SETVIEW(RequestPageParamsView);
+          CASE OutputType OF
+            OutputType::Email:
+              BEGIN
+                EVALUATE(
+                  PrintRemaining,GetOptionValueFromRequestPage(GetRequestParametersText(ReportSelections."Report ID"),'PrintRemaining'));
+                ProcessReportPerObject;
+              END;
+            OutputType::PDF,
+            OutputType::Word,
+            OutputType::Excel,
+            OutputType::XML:
+              ProcessReportPerObject;
+            OutputType::Preview,
+            OutputType::Print:
+              ProcessReportPerLayout;
+          END;
+        UNTIL ReportSelections.NEXT = 0;
+      END;
+
+      // Download the .zip file containing the reports if one was generated (usually from being on the web client)
+      IF (ZipFileName <> '') AND NOT SupressOutput THEN BEGIN
+        FileManagement.CloseZipArchive;
+        // If we're in test mode, save the zip to the save path. Otherwise send to the client.
+        IF IsTestMode THEN
+          FileManagement.CopyServerFile(ZipFileName,FileManagement.CombinePath(TEMPORARYPATH,ZipDownloadTxt),TRUE)
+        ELSE
+          FileManagement.DownloadHandler(ZipFileName,'','','',ZipDownloadTxt);
+      END;
+    END;
+
+    PROCEDURE ProcessReportForData@27(ReportSelectionUsage@1005 : Integer;VAR DataRecordRef@1004 : RecordRef;SourceJoinFieldName@1003 : Text;DataRecordJoinTable@1002 : Integer;IteratorTableFieldName@1001 : Text;DataItemTableSameAsIterator@1000 : Boolean);
+    BEGIN
+      // Provides a single function to run initialization code, check for issues, and start report processing
+      IF NOT Initialized THEN
+        InitializeData(
+          ReportSelectionUsage,DataRecordRef,SourceJoinFieldName,DataRecordJoinTable,IteratorTableFieldName,
+          DataItemTableSameAsIterator);
+      // If there was an error during initalization, exit
+      IF NOT Initialized THEN
+        EXIT;
+      ProcessReport;
+    END;
+
+    LOCAL PROCEDURE ProcessReportPerLayout@7();
+    VAR
+      ReportedLayouts@1086 : DotNet "'mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Collections.ArrayList";
+      ReportedObjects@1087 : DotNet "'mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Collections.ArrayList";
+      TempRecordRef@1000 : RecordRef;
+      TempRecordKeyFieldRef@1088 : FieldRef;
+      CustomReportLayoutID@1089 : Integer;
+      DefaultLayoutIteratorFilter@1090 : Text;
+      ReportedRecordKeyVal@1091 : Text;
+    BEGIN
+      ReportingType := ReportingType::Layout;
+      // Prevent early calls to the function
+      IF NOT Initialized THEN
+        ERROR(NotInitializedErr);
+      // Temporary lists to keep track of what we've reported over, used to determine what to report on using the default layout
+      ReportedLayouts := ReportedLayouts.ArrayList;
+      ReportedObjects := ReportedObjects.ArrayList;
+
+      // Get the 'join' values in the iterator record and use it to filter the Custom Report Selection table to find which layouts we should run
+      CustomReportSelection.SETFILTER("Source No.",GetKeyFilterFromRecord(IteratorRecordRef,IteratorJoinFieldRef));
+
+      TempRecordRef := ReportDataRecordRef.DUPLICATE;
+      TempRecordKeyFieldRef := TempRecordRef.FIELD(ReportDataIteratorFieldRef.NUMBER);
+
+      // Iterate through the layouts in the Custom Report Selection table
+      IF CustomReportSelection.FINDSET THEN BEGIN
+        REPEAT
+          CustomReportLayoutID := CustomReportSelection."Custom Report Layout ID";
+
+          // If we've not already reported on this layout and it truly is a custom layout, then report on it
+          IF NOT ReportedLayouts.Contains(CustomReportLayoutID) AND
+             (ResolveCustomReportLayoutID(CustomReportSelection) <> 0)
+          THEN BEGIN
+            ReportedLayouts.Add(CustomReportLayoutID);
+            // Find the intersection of the iterator filter and the report selection filter (the items for which this report selection is valid
+            TempRecordKeyFieldRef.SETFILTER(IteratorJoinFieldRef.GETFILTER);
+            GetLayoutIteratorKeyFilter(TempRecordRef,TempRecordKeyFieldRef,CustomReportLayoutID); // set view based on intersection of lists
+
+            // Run the report on the data record, using the above filter
+            RunReportWithCustomReportSelection(TempRecordRef,ReportSelections."Report ID",CustomReportSelection,PrintRemaining);
+
+            // Save this list of objects reported on, using the 'iterator field', they will not get the default report layout later
+            IF TempRecordRef.FINDFIRST THEN
+              REPEAT
+                ReportedRecordKeyVal := FORMAT(TempRecordKeyFieldRef.VALUE);
+                IF NOT ReportedObjects.Contains(ReportedRecordKeyVal) THEN
+                  ReportedObjects.Add(ReportedRecordKeyVal);
+              UNTIL TempRecordRef.NEXT = 0;
+          END;
+        UNTIL CustomReportSelection.NEXT = 0;
+      END;
+
+      // Construct the filter for the remaining objects - iterate through all items in the data record and build a filter that contains the
+      // items that are not in the list of already reported items.
+      TempRecordRef := ReportDataRecordRef.DUPLICATE;
+      TempRecordKeyFieldRef := TempRecordRef.FIELD(ReportDataIteratorFieldRef.NUMBER);
+
+      // Limit to the iterator values for the joined field
+      TempRecordKeyFieldRef.SETFILTER(IteratorJoinFieldRef.GETFILTER);
+
+      IF TempRecordRef.FINDFIRST THEN
+        REPEAT
+          IF NOT ReportedObjects.Contains(FORMAT(TempRecordKeyFieldRef.VALUE)) THEN BEGIN
+            IF DefaultLayoutIteratorFilter <> '' THEN
+              DefaultLayoutIteratorFilter := DefaultLayoutIteratorFilter + '|';
+            DefaultLayoutIteratorFilter := STRSUBSTNO('%1%2',DefaultLayoutIteratorFilter,FORMAT(TempRecordKeyFieldRef.VALUE));
+          END;
+        UNTIL TempRecordRef.NEXT = 0;
+      TempRecordKeyFieldRef.SETFILTER(DefaultLayoutIteratorFilter);
+
+      // Only run the report if there is explicitly a filter - an empty filter here implies no records were left to report on.
+      IF (DefaultLayoutIteratorFilter <> '') AND TempRecordRef.FIND('-') THEN
+        RunReport(TempRecordRef,ReportSelections."Report ID",PrintRemaining);
+    END;
+
+    LOCAL PROCEDURE ProcessReportPerObject@21();
+    VAR
+      ObjectRecordRef@1093 : RecordRef;
+      DataFilterFieldRef@1094 : FieldRef;
+      IteratorJoinFieldValue@1095 : Code[20];
+      ReportID@1096 : Integer;
+    BEGIN
+      ReportingType := ReportingType::Object;
+      IF NOT Initialized THEN
+        ERROR(NotInitializedErr);
+
+      ReportID := ReportSelections."Report ID";
+
+      // Make a copy of the RecordRef/FieldRef that we can make filter changes on
+      ObjectRecordRef := ReportDataRecordRef.DUPLICATE;
+      DataFilterFieldRef := ReportDataRecordRef.FIELD(ReportDataIteratorFieldRef.NUMBER);
+
+      IF IteratorRecordRef.FINDSET THEN
+        REPEAT
+          EVALUATE(IteratorJoinFieldValue,FORMAT(IteratorJoinFieldRef.VALUE));
+
+          // Get and set the report selection for this particular object/report combination
+          CustomReportSelection.SETRANGE("Source No.",IteratorJoinFieldValue);
+
+          // Set the data filter to be the item we're iterating over:
+          DataFilterFieldRef.SETRANGE(IteratorJoinFieldValue);
+
+          IF ReportDataRecordRef.FIND('-') THEN BEGIN
+            // If the object has custom layouts defined - process each one based on the selected output type, otherwise use the default layout
+            IF CustomReportSelection.FIND('-') THEN
+              REPEAT
+                RunReportWithCustomReportSelection(ReportDataRecordRef,ReportID,CustomReportSelection,PrintRemaining);
+              UNTIL CustomReportSelection.NEXT = 0
+            ELSE
+              RunReport(ReportDataRecordRef,ReportID,PrintRemaining);
+          END;
+        UNTIL IteratorRecordRef.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE RunReportWithCustomReportSelection@24(VAR DataRecRef@1000 : RecordRef;ReportID@1001 : Integer;VAR CustomReportSelection@1002 : Record 9657;EmailPrintRemaining@1003 : Boolean);
+    VAR
+      CustomReportLayoutID@1005 : Integer;
+      EmailAddresses@1096 : Text;
+    BEGIN
+      // Set the custom report layout
+      CustomReportLayoutID := ResolveCustomReportLayoutID(CustomReportSelection);
+      ReportLayoutSelection.SetTempLayoutSelected(CustomReportLayoutID);
+      CLEARLASTERROR;
+
+      // Get the email address of the current object-specific report selection
+      EmailAddresses := CustomReportSelection."Send To Email";
+      CASE OutputType OF
+        OutputType::Email:
+          IF EmailAddresses <> '' THEN BEGIN
+            IF NOT EmailReport(DataRecRef,CustomReportSelection,ReportID) AND (GETLASTERRORTEXT <> '') THEN
+              ERROR(GETLASTERRORTEXT);
+          END ELSE
+            IF EmailPrintRemaining THEN BEGIN
+              IF NOT PrintReport(DataRecRef,ReportID,CustomReportLayoutID) AND (GETLASTERRORTEXT <> '') THEN;
+            END;
+        OutputType::PDF:
+          IF NOT SaveAsReport(DataRecRef,ReportID,REPORTFORMAT::Pdf) AND (GETLASTERRORTEXT <> '') THEN
+            ERROR(GETLASTERRORTEXT);
+        OutputType::Excel:
+          IF NOT SaveAsReport(DataRecRef,ReportID,REPORTFORMAT::Excel) AND (GETLASTERRORTEXT <> '') THEN
+            ERROR(GETLASTERRORTEXT);
+        OutputType::Word:
+          IF NOT SaveAsReport(DataRecRef,ReportID,REPORTFORMAT::Word) AND (GETLASTERRORTEXT <> '') THEN
+            ERROR(GETLASTERRORTEXT);
+        OutputType::Print:
+          IF NOT PrintReport(DataRecRef,ReportID,CustomReportLayoutID) AND (GETLASTERRORTEXT <> '') THEN
+            ERROR(GETLASTERRORTEXT);
+        OutputType::Preview:
+          IF NOT PreviewReport(DataRecRef,ReportID,CustomReportLayoutID) AND (GETLASTERRORTEXT <> '') THEN
+            ERROR(GETLASTERRORTEXT);
+        OutputType::XML:
+          IF NOT SaveAsReport(DataRecRef,ReportID,REPORTFORMAT::Xml) AND (GETLASTERRORTEXT <> '') THEN
+            ERROR(GETLASTERRORTEXT);
+      END;
+      IF CustomReportLayoutID <> 0 THEN
+        ReportLayoutSelection.SetTempLayoutSelected(0);
+    END;
+
+    LOCAL PROCEDURE RunReport@25(VAR DataRecRef@1003 : RecordRef;ReportID@1002 : Integer;EmailPrintRemaining@1000 : Boolean);
+    VAR
+      NullCustomReportSelection@1004 : Record 9657;
+    BEGIN
+      // If we know we don't need a custom report selection, e.g. we don't need layouts or won't be sending email
+      NullCustomReportSelection.INIT;
+      RunReportWithCustomReportSelection(DataRecRef,ReportID,NullCustomReportSelection,EmailPrintRemaining);
+    END;
+
+    PROCEDURE SetOutputOption@26(OutputOption@1000 : Integer);
+    BEGIN
+      OutputType := OutputOption;
+    END;
+
+    PROCEDURE GetOutputOption@1(ReportID@1002 : Integer) : Integer;
+    VAR
+      OptionText@1001 : Text;
+      OptionInt@1000 : Integer;
+    BEGIN
+      // Given a report ID, get the currently selected output option
+      OptionText := GetOptionValueFromRequestPageForReport(ReportID,'ChosenOutputMethod');
+      IF EVALUATE(OptionInt,OptionText) THEN
+        EXIT(OptionInt);
+
+      EXIT(-1); // Invalid output option, still a valid return code - signals no output
+    END;
+
+    PROCEDURE GetPrintOption@3() : Integer;
+    BEGIN
+      EXIT(OutputType::Print);
+    END;
+
+    PROCEDURE GetEmailOption@4() : Integer;
+    BEGIN
+      EXIT(OutputType::Email);
+    END;
+
+    PROCEDURE GetPreviewOption@5() : Integer;
+    BEGIN
+      EXIT(OutputType::Preview);
+    END;
+
+    PROCEDURE GetExcelOption@6() : Integer;
+    BEGIN
+      EXIT(OutputType::Excel);
+    END;
+
+    PROCEDURE GetPDFOption@8() : Integer;
+    BEGIN
+      EXIT(OutputType::PDF);
+    END;
+
+    PROCEDURE GetWordOption@13() : Integer;
+    BEGIN
+      EXIT(OutputType::Word);
+    END;
+
+    PROCEDURE GetXMLOption@30() : Integer;
+    BEGIN
+      EXIT(OutputType::XML);
+    END;
+
+    [TryFunction]
+    LOCAL PROCEDURE PrintReport@12(VAR DataRecRef@1003 : RecordRef;ReportID@1002 : Integer;CustomReportLayoutID@1000 : Integer);
+    BEGIN
+      // If the print action is selected and we're on the web, shunt over to PDF output and ZIP file download
+      IF IsWebClient AND NOT IsWordLayout(ReportID,CustomReportLayoutID) THEN
+        SaveAsReport(DataRecRef,ReportID,REPORTFORMAT::Pdf);
+
+      // If we're on the web client, and Word layout, then run the default
+      IF IsWebClient AND IsWordLayout(ReportID,CustomReportLayoutID) THEN
+        SaveAsReport(DataRecRef,ReportID,REPORTFORMAT::Word);
+
+      // Local client - print
+      IF NOT IsWebClient AND NOT SupressOutput THEN
+        REPORT.PRINT(ReportID,GetRequestParametersText(ReportID),'',DataRecRef);
+    END;
+
+    [TryFunction]
+    LOCAL PROCEDURE EmailReport@11(VAR DataRecRef@1006 : RecordRef;VAR CustomReportSelection@1008 : Record 9657;ReportID@1002 : Integer);
+    VAR
+      FileManagement@1000 : Codeunit 419;
+      DocumentMailing@1001 : Codeunit 260;
+      FieldRef1@1097 : FieldRef;
+      FieldRef2@1098 : FieldRef;
+      File@1099 : File;
+      FileStream@1070 : OutStream;
+      TempFilePath@1071 : Text[250];
+      FileName@1072 : Text[250];
+      ReportSaved@1073 : Boolean;
+    BEGIN
+      TempFilePath := COPYSTR(FileManagement.ServerTempFileName('pdf'),1,250);
+      FileName := GenerateFileNameForReport(ReportID,'pdf','',FALSE);
+
+      IF EXISTS(TempFilePath) THEN
+        ERASE(TempFilePath);
+      File.CREATE(TempFilePath);
+      File.CREATEOUTSTREAM(FileStream);
+      ReportSaved := REPORT.SAVEAS(ReportID,GetRequestParametersText(ReportID),REPORTFORMAT::Pdf,FileStream,DataRecRef);
+      File.CLOSE;
+
+      // Use the iterator values if the data item and iterator differ
+      IF ReportDataAndIteratorDiffer THEN BEGIN
+        FieldRef1 := IteratorRecordRef.FIELD(1);
+        FieldRef2 := IteratorRecordRef.FIELD(2);
+      END ELSE BEGIN
+        FieldRef1 := DataRecRef.FIELD(1);
+        FieldRef2 := DataRecRef.FIELD(2);
+      END;
+
+      IF NOT SupressOutput AND ReportSaved AND NOT RemoveEmptyFile(TempFilePath) THEN BEGIN
+        //**4PS.so
+        //DocumentMailing.EmailFile(
+        //  COPYSTR(TempFilePath,1,250),FileName,'',STRSUBSTNO('%1',FieldRef1.VALUE),STRSUBSTNO('%1',FieldRef2.VALUE),TRUE,
+        //  CustomReportSelection);
+        //**4PS.eo
+        //**4PS.sn
+        DocumentMailing.EmailFile(
+          COPYSTR(TempFilePath,1,250),FileName,'',STRSUBSTNO('%1',FieldRef1.VALUE),
+          '',0,0,0,'','',DataRecRef,'',STRSUBSTNO('%1',FieldRef2.VALUE),TRUE,CustomReportSelection);
+        //**4PS.en
+        ERASE(TempFilePath);
+      END;
+    END;
+
+    [TryFunction]
+    LOCAL PROCEDURE PreviewReport@10(VAR DataRecRef@1001 : RecordRef;ReportID@1000 : Integer;CustomReportLayoutID@1006 : Integer);
+    VAR
+      File@1073 : File;
+      FileStream@1074 : OutStream;
+      FileName@1075 : Text;
+      TempFilePath@1076 : Text;
+      ReportSaved@1077 : Boolean;
+    BEGIN
+      IF IsWebClient AND IsWordLayout(ReportID,CustomReportLayoutID) THEN BEGIN
+        TempFilePath := FileManagement.ServerTempFileName('.docx');
+        FileName := GenerateFileNameForReportLayout(ReportID,'.docx','');
+        File.CREATE(TempFilePath);
+        File.CREATEOUTSTREAM(FileStream);
+        ReportSaved := REPORT.SAVEAS(ReportID,GetRequestParametersText(ReportID),REPORTFORMAT::Word,FileStream,DataRecRef);
+        File.CLOSE;
+        IF FileManagement.ServerFileExists(TempFilePath) AND ReportSaved AND NOT RemoveEmptyFile(TempFilePath) THEN BEGIN
+          AddFileToClientZip(TempFilePath,FileName);
+          ERASE(TempFilePath);
+        END;
+      END ELSE
+        IF NOT SupressOutput THEN
+          REPORT.EXECUTE(ReportID,GetRequestParametersText(ReportID),DataRecRef);
+    END;
+
+    [TryFunction]
+    LOCAL PROCEDURE SaveAsReport@9(VAR DataRecRef@1002 : RecordRef;ReportID@1000 : Integer;Format@1059 : ReportFormat);
+    VAR
+      File@1077 : File;
+      FileStream@1078 : OutStream;
+      FileName@1079 : Text;
+      Extension@1080 : Text;
+      TempFilePath@1070 : Text;
+      ReportSaved@1071 : Boolean;
+      BasePath@1001 : Text;
+    BEGIN
+      // Handle both 'save file' types of reports together - PDF and Excel
+      CASE Format OF
+        REPORTFORMAT::Excel:
+          Extension := '.xlsx';
+        REPORTFORMAT::Pdf:
+          Extension := '.pdf';
+        REPORTFORMAT::Word:
+          Extension := '.docx';
+        REPORTFORMAT::Xml:
+          Extension := '.xml';
+        ELSE
+          ERROR(OutputNotSupportedErr);
+      END;
+
+      // If no path was given (often during test runs), use a temp directory on the server
+      IF FileManagement.IsWindowsClient AND (Path = '') THEN
+        Path := FileManagement.ServerCreateTempSubDirectory;
+
+      TempFilePath := FileManagement.ServerTempFileName(Extension);
+      // If we're not on the web client, use the path that was selected for saving
+      // In the web client, the path isn't used since we zip up the files and send them to the client
+      IF NOT IsWebClient THEN
+        BasePath := Path;
+      CASE ReportingType OF
+        ReportingType::Object:
+          FileName := GenerateFileNameForReport(ReportID,Extension,BasePath,TRUE);
+        ReportingType::Layout:
+          FileName := GenerateFileNameForReportLayout(ReportID,Extension,BasePath);
+      END;
+
+      IF EXISTS(TempFilePath) THEN
+        ERASE(TempFilePath);
+      File.CREATE(TempFilePath);
+      File.CREATEOUTSTREAM(FileStream);
+      ReportSaved := REPORT.SAVEAS(ReportID,GetRequestParametersText(ReportID),Format,FileStream,DataRecRef);
+      File.CLOSE;
+      IF ReportSaved AND NOT RemoveEmptyFile(TempFilePath) AND FileManagement.ServerFileExists(TempFilePath) THEN BEGIN
+        IF IsWebClient THEN
+          AddFileToClientZip(TempFilePath,FileName)
+        ELSE
+          FileManagement.DownloadToFile(TempFilePath,FileName);
+        ERASE(TempFilePath);
+      END;
+    END;
+
+    LOCAL PROCEDURE GenerateFileNameForReport@2(ReportID@1005 : Integer;Extension@1001 : Text;FilePath@1002 : Text;IncludeLayoutName@1004 : Boolean) : Text[250];
+    VAR
+      NameFieldRef@1072 : FieldRef;
+      ObjectName@1000 : Text;
+      Caption@1003 : Text;
+    BEGIN
+      // If we're iterating through Customer or Vendor, get the appropriate name
+      CASE IteratorRecordRef.NUMBER OF
+        DATABASE::Customer:
+          BEGIN
+            NameFieldRef := IteratorRecordRef.FIELD(2);
+            ObjectName := STRSUBSTNO('%1',NameFieldRef.VALUE);
+          END;
+        DATABASE::Vendor:
+          BEGIN
+            NameFieldRef := IteratorRecordRef.FIELD(2);
+            ObjectName := STRSUBSTNO('%1',NameFieldRef.VALUE);
+          END;
+        ELSE
+          ObjectName := '';
+      END;
+      IF IncludeLayoutName THEN BEGIN
+        Caption := GetTempLayoutReportCaption(ReportID);
+        ObjectName := STRSUBSTNO('%1_%2',ObjectName,Caption);
+      END;
+
+      EXIT(GenerateFileName(ObjectName,ReportID,Extension,FilePath));
+    END;
+
+    LOCAL PROCEDURE GenerateFileNameForReportLayout@31(ReportID@1005 : Integer;Extension@1001 : Text;FilePath@1002 : Text) : Text[250];
+    BEGIN
+      // Get report caption if we're not on a custom layout, otherwise get the custom layout caption
+      EXIT(GenerateFileName(GetTempLayoutReportCaption(ReportID),ReportID,Extension,FilePath));
+    END;
+
+    LOCAL PROCEDURE GenerateFileName@32(ObjectName@1003 : Text;ReportID@1002 : Integer;Extension@1001 : Text;FilePath@1000 : Text) : Text;
+    VAR
+      FileName@1004 : Text;
+      EndDate@1005 : Text;
+      ReportParameters@1006 : Text;
+    BEGIN
+      ReportParameters := GetRequestParametersText(ReportID);
+
+      IF STRPOS(Extension,'.') <> 1 THEN
+        Extension := '.' + Extension;
+
+      // We need to limit the file name - limit of other functions
+      IF (STRLEN(ObjectName) + STRLEN(FilePath)) >= 250 THEN
+        ObjectName := FORMAT(ObjectName,250 - STRLEN(FilePath));
+
+      // Fetch request page parameters
+      EndDate := GetOptionValueFromRequestPage(ReportParameters,'EndDate');
+
+      // Construct with the end date, if it exists. Format the object name to adhere to filename size limits
+      IF OutputFileBaseName = '' THEN
+        OutputFileBaseName := 'Report';
+      IF EndDate <> '' THEN
+        FileName := OutputFileBaseName + ' for ' + ObjectName + ' as of ' + EndDate + Extension
+      ELSE
+        FileName := OutputFileBaseName + ' for ' + ObjectName + Extension;
+
+      FileName := FileManagement.StripNotsupportChrInFileName(FileName);
+
+      IF FilePath <> '' THEN
+        FileName := FileManagement.CombinePath(FilePath,FileName);
+
+      EXIT(FileName);
+    END;
+
+    LOCAL PROCEDURE GetOptionValueFromRequestPage@45(ReportParameters@1002 : Text;OptionName@1001 : Text) : Text;
+    BEGIN
+      EXIT(RequestPageParametersHelper.GetRequestPageOptionValue(OptionName,ReportParameters));
+    END;
+
+    PROCEDURE GetOptionValueFromRequestPageForReport@48(ReportID@1002 : Integer;OptionName@1001 : Text) : Text;
+    BEGIN
+      // Given a report ID - get the option from the request parameters page
+      IF NOT TempBlobReqParamStore.GET(ReportID) THEN
+        EXIT('');
+      EXIT(GetOptionValueFromRequestPage(GetRequestParametersText(ReportID),OptionName));
+    END;
+
+    LOCAL PROCEDURE GetTempLayoutReportCaption@42(ReportID@1000 : Integer) : Text;
+    VAR
+      CustomReportLayout@1004 : Record 9650;
+      AllObjWithCaption@1003 : Record 2000000058;
+      ReportCaption@1002 : Text;
+      CurrentCustomLayoutID@1001 : Integer;
+    BEGIN
+      CurrentCustomLayoutID := ReportLayoutSelection.GetTempLayoutSelected;
+      IF CurrentCustomLayoutID = 0 THEN BEGIN
+        AllObjWithCaption.GET(AllObjWithCaption."Object Type"::Report,ReportID);
+        ReportCaption := AllObjWithCaption."Object Caption";
+      END ELSE BEGIN
+        CustomReportLayout.GET(CurrentCustomLayoutID);
+        ReportCaption := CustomReportLayout.Description;
+      END;
+      EXIT(ReportCaption);
+    END;
+
+    PROCEDURE SetSavePath@29(SavePath@1000 : Text);
+    BEGIN
+      // This allows us to set the path ahead of setting request parameters if we know it or need to set it ahead of time
+      // e.g. for unit tests
+      Path := SavePath;
+    END;
+
+    LOCAL PROCEDURE GetViewFromParameters@75(ReportID@1004 : Integer;TableNumber@1075 : Integer) : Text;
+    VAR
+      RecordRef@1005 : RecordRef;
+    BEGIN
+      TempBlobReqParamStore.GET(ReportID);
+      TempBlobReqParamStore.SETRECFILTER;
+      TempBlobReqParamStore.CALCFIELDS(Blob);
+      // Use the request page helper to parse the parameters and set the view to the RecordRef and the Record
+      RecordRef.OPEN(TableNumber);
+      RequestPageParametersHelper.ConvertParametersToFilters(RecordRef,TempBlobReqParamStore);
+
+      EXIT(RecordRef.GETVIEW);
+    END;
+
+    [TryFunction]
+    LOCAL PROCEDURE GetRequestParameters@23();
+    VAR
+      SMTPMailSetup@1001 : Record 409;
+      DataVariant@1002 : Variant;
+      TempReqParams@1000 : Text;
+      FilterGroup@1003 : Integer;
+    BEGIN
+      ReportSelections.SETFILTER("Report ID",'<>0');
+      ReportSelections.FIND('-');
+      FilterGroup := 10;
+      IF ReportSelections.FINDSET THEN
+        REPEAT
+          // If we're at this point, and we're set in test mode with XML output - run the report directly from here
+          // This is done to retain compatibility with report testing (which uses RequestPage.SaveAsXML and needs the traditional output options buttons)
+          // XML output can't use the layouts anyways.
+          IF IsTestMode AND OverrideOutput AND (OutputType = OutputType::XML) THEN BEGIN
+            DataVariant := ReportDataRecordRef;
+            REPORT.RUNMODAL(ReportSelections."Report ID",TRUE,FALSE,DataVariant);
+            ERROR(''); // Exit early in an uninitialized state, prevents the full initialization flag from being set
+          END;
+
+          TempReqParams := REPORT.RUNREQUESTPAGE(ReportSelections."Report ID");
+          // If the user cancelled out of the request page - exclude this report ID from processing:
+          IF TempReqParams = '' THEN BEGIN
+            ReportSelections.FILTERGROUP(FilterGroup);
+            ReportSelections.SETFILTER("Report ID",STRSUBSTNO('<>%1',ReportSelections."Report ID"));
+            ReportSelections.FILTERGROUP(0); // Set back to default
+            FilterGroup := FilterGroup + 1; // Increment group to make sure each excluded report filter applies
+            BREAK;
+          END;
+
+          StoreRequestParameters(TempReqParams);
+
+          // Validate output type and get a file save path, if necessary, only prompt for windows clients that are not in test mode
+          SetOutputType(ReportSelections."Report ID");
+          IF (Path = '') AND
+             FileManagement.IsWindowsClient AND NOT IsTestMode AND
+             ((OutputType = OutputType::PDF) OR (OutputType = OutputType::Excel) OR (OutputType = OutputType::Word) OR
+              (OutputType = OutputType::XML))
+          THEN
+            FileManagement.SelectFolderDialog(SaveFolderMsg,Path);
+
+          // Use the temp path if we're set in test mode and the path wasn't already set
+          IF (Path = '') AND IsTestMode THEN
+            Path := TEMPORARYPATH;
+
+          // If email is chosen, ensure that SMTP is set up
+          IF (OutputType = OutputType::Email) AND NOT SMTPMailSetup.FINDFIRST AND NOT SupressOutput THEN
+            ERROR(SMTPNotSetupErr);
+        UNTIL ReportSelections.NEXT = 0;
+
+      Initialized := TRUE;
+    END;
+
+    LOCAL PROCEDURE SetOutputType@33(ReportID@1002 : Integer);
+    VAR
+      OutputMethod@1000 : Text;
+      OptionInt@1001 : Integer;
+    BEGIN
+      // Don't set based on the report ID if we're overriding the output type (for tests, output-specific functions)
+      IF OverrideOutput THEN
+        EXIT;
+      // The request page should have the appropriate parameters set for the chosen output method
+      OutputMethod := GetOptionValueFromRequestPage(GetRequestParametersText(ReportID),'ChosenOutputMethod');
+      IF OutputMethod <> '' THEN BEGIN
+        IF NOT EVALUATE(OptionInt,OutputMethod) THEN
+          ERROR(OutputNotSupportedErr);
+      END ELSE
+        ERROR(OutputNotSupportedErr);
+
+      SetOutputOption(OptionInt);
+    END;
+
+    [TryFunction]
+    LOCAL PROCEDURE SetReportUsage@37(ReportSelectionUsage@1000 : Integer);
+    BEGIN
+      ReportSelections.SETRANGE(Usage,ReportSelectionUsage);
+      CustomReportSelection.SETRANGE(Usage,ReportSelectionUsage);
+    END;
+
+    PROCEDURE SetOutputSupression@14(SupressOutputFlag@1000 : Boolean);
+    BEGIN
+      SupressOutput := SupressOutputFlag;
+    END;
+
+    LOCAL PROCEDURE StoreRequestParameters@15(Parameters@1000 : Text);
+    VAR
+      OutStr@1001 : OutStream;
+      ReportID@1002 : Integer;
+    BEGIN
+      EVALUATE(ReportID,RequestPageParametersHelper.GetReportID(Parameters));
+      // Insert or Modify - based on if it exists already or not
+      IF TempBlobReqParamStore.GET(ReportID) THEN BEGIN
+        TempBlobReqParamStore.Blob.CREATEOUTSTREAM(OutStr);
+        OutStr.WRITETEXT(Parameters);
+        TempBlobReqParamStore.MODIFY;
+      END ELSE BEGIN
+        TempBlobReqParamStore.INIT;
+        TempBlobReqParamStore.Blob.CREATEOUTSTREAM(OutStr);
+        OutStr.WRITETEXT(Parameters);
+        TempBlobReqParamStore."Primary Key" := ReportID;
+        TempBlobReqParamStore.INSERT;
+      END;
+      COMMIT;
+    END;
+
+    LOCAL PROCEDURE GetRequestParametersText@19(ReportID@1000 : Integer) : Text;
+    VAR
+      InStr@1001 : InStream;
+      ReqPageXML@1004 : Text;
+    BEGIN
+      TempBlobReqParamStore.GET(ReportID);
+      TempBlobReqParamStore.CALCFIELDS(Blob);
+      TempBlobReqParamStore.Blob.CREATEINSTREAM(InStr);
+      InStr.READTEXT(ReqPageXML);
+      EXIT(ReqPageXML);
+    END;
+
+    LOCAL PROCEDURE AddFileToClientZip@82(TempFileName@1000 : Text;ClientFileName@1001 : Text);
+    BEGIN
+      IF ZipFileName = '' THEN
+        ZipFileName := FileManagement.CreateZipArchiveObject;
+      FileManagement.AddFileToZipArchive(TempFileName,ClientFileName);
+    END;
+
+    LOCAL PROCEDURE IsWordLayout@88(ReportID@1000 : Integer;CustomReportLayoutID@1001 : Integer) : Boolean;
+    VAR
+      CustomReportLayout@1002 : Record 9650;
+    BEGIN
+      IF CustomReportLayoutID <> 0 THEN BEGIN
+        CustomReportLayout.ID := CustomReportLayoutID;
+        IF CustomReportLayout.FIND('=') THEN
+          EXIT(CustomReportLayout.Type = CustomReportLayout.Type::Word);
+
+        EXIT(REPORT.DEFAULTLAYOUT(ReportID) = DEFAULTLAYOUT::Word);
+      END;
+      EXIT(REPORT.DEFAULTLAYOUT(ReportID) = DEFAULTLAYOUT::Word)
+    END;
+
+    [TryFunction]
+    LOCAL PROCEDURE SetReportDataItem@1051(VAR DataRecordRef@1065 : RecordRef;SourceJoinFieldName@1066 : Text;DataRecordJoinTable@1067 : Integer;IteratorTableFieldName@1069 : Text;DataItemTableSameAsIterator@1068 : Boolean);
+    VAR
+      ConfigValidateManagement@1076 : Codeunit 8617;
+      RelationTable@1077 : Integer;
+      RelationField@1079 : Integer;
+      i@1078 : Integer;
+    BEGIN
+      // Copy the RecordRef so as to not disturb the original
+      ReportDataRecordRef := DataRecordRef.DUPLICATE;
+
+      // Find the fields that relate the iterator to the data record - based on caption:
+      FOR i := 1 TO ReportDataRecordRef.FIELDCOUNT DO
+        IF ReportDataRecordRef.FIELDEXIST(i) THEN
+          IF ReportDataRecordRef.FIELD(i).NAME = SourceJoinFieldName THEN BEGIN
+            ReportDataIteratorFieldRef := ReportDataRecordRef.FIELD(i);
+            BREAK;
+          END;
+      IF DataItemTableSameAsIterator THEN BEGIN
+        IteratorRecordRef.OPEN(ReportDataRecordRef.NUMBER);
+        IteratorJoinFieldRef := IteratorRecordRef.FIELD(ReportDataIteratorFieldRef.NUMBER);
+        ReportDataAndIteratorDiffer := FALSE;
+      END ELSE BEGIN
+        ConfigValidateManagement.GetRelationInfoByIDs(
+          ReportDataRecordRef.NUMBER,ReportDataIteratorFieldRef.NUMBER,RelationTable,RelationField);
+        IteratorRecordRef.OPEN(DataRecordJoinTable);
+        FOR i := 1 TO IteratorRecordRef.FIELDCOUNT DO
+          IF IteratorRecordRef.FIELD(i).NAME = IteratorTableFieldName THEN BEGIN
+            IteratorJoinFieldRef := IteratorRecordRef.FIELD(i);
+            BREAK;
+          END;
+        ReportDataAndIteratorDiffer := TRUE;
+      END;
+
+      CustomReportSelection.SETRANGE("Source Type",IteratorRecordRef.NUMBER);
+
+      // Set the iterator record to the items that exist in the join field from the data record (given existing filters in the data record)
+      IteratorJoinFieldRef.SETFILTER(GetKeyFilterFromRecord(ReportDataRecordRef,ReportDataIteratorFieldRef));
+    END;
+
+    LOCAL PROCEDURE RemoveEmptyFile@1050(FileName@1060 : Text) : Boolean;
+    VAR
+      File@1061 : File;
+    BEGIN
+      // This function cleans up empty files, allowing us to remove reports that do not save correctly or error out/have no output.
+      File.OPEN(FileName);
+      IF File.LEN = 0 THEN BEGIN
+        File.CLOSE;
+        ERASE(FileName);
+        EXIT(TRUE);
+      END;
+      File.CLOSE;
+      EXIT(FALSE);
+    END;
+
+    LOCAL PROCEDURE IsWebClient@18() : Boolean;
+    BEGIN
+      IF TestModeWebClient THEN
+        EXIT(TRUE);
+      EXIT(FileManagement.IsWebClient);
+    END;
+
+    PROCEDURE SetOutputFileBaseName@20(FileBaseName@1000 : Text);
+    BEGIN
+      // Sets a text base name for the output files:
+      // e.g. code calling reports with usage of 'Statement' would set 'Statement' here
+      OutputFileBaseName := FileBaseName;
+    END;
+
+    [Normal]
+    PROCEDURE SetTestMode@35(TestMode@1000 : Boolean);
+    VAR
+      TempBlob@1002 : Record 99008535;
+      BlobOutStream@1001 : OutStream;
+    BEGIN
+      // Sets test mode for this codeunit - enables unit test scenarios
+      TempBlob.INIT;
+      TempBlob."Primary Key" := CODEUNIT::"Custom Layout Reporting";
+      IF TempBlob.FINDFIRST THEN
+        TempBlob.DELETE;
+
+      TempBlob.Blob.CREATEOUTSTREAM(BlobOutStream);
+      BlobOutStream.WRITETEXT(FORMAT(TestMode));
+      TempBlob.INSERT;
+      COMMIT;
+
+      OverrideOutput := TestMode;
+    END;
+
+    LOCAL PROCEDURE IsTestMode@36() : Boolean;
+    VAR
+      TempBlob@1003 : Record 99008535;
+      TestModeInStream@1002 : InStream;
+      ReadText@1001 : Text[10];
+      ReadBoolean@1000 : Boolean;
+    BEGIN
+      // Check to see if the test mode flag is set (usually via test codeunits before calling this codeunit directly)
+      // Alternatively, check tempblob for a sentinel value (set via test codeunits that do not/cannot call this codeunit directly)
+      ReadBoolean := FALSE;
+      IF TempBlob.GET(8800) THEN BEGIN
+        TempBlob.CALCFIELDS(Blob);
+        TempBlob.Blob.CREATEINSTREAM(TestModeInStream);
+        TestModeInStream.READTEXT(ReadText,10);
+        EVALUATE(ReadBoolean,ReadText);
+      END;
+      EXIT(ReadBoolean);
+    END;
+
+    PROCEDURE SetTestModeWebClient@38(TestModeSpoofWebClient@1000 : Boolean);
+    BEGIN
+      TestModeWebClient := TestModeSpoofWebClient;
+    END;
+
+    LOCAL PROCEDURE ResolveCustomReportLayoutID@46(VAR CustomReportSelection@1000 : Record 9657) : Integer;
+    BEGIN
+      // Given a custom report selection, return the custom layout, unless report ID  = 0, then resolve to the appropriate company-wide layout for the report ID
+      IF CustomReportSelection."Custom Report Layout ID" <> 0 THEN
+        EXIT(CustomReportSelection."Custom Report Layout ID");
+
+      // If we don't have a custom layout defined in this selection record, get the default for the report number
+      IF ReportLayoutSelection.GET(CustomReportSelection."Report ID",COMPANYNAME) THEN
+        EXIT(ReportLayoutSelection."Custom Report Layout ID");
+
+      EXIT(0); // We haven't found any custom report layouts
+    END;
+
+    PROCEDURE InitializeData@49(ReportSelectionUsage@1005 : Integer;VAR DataRecordRef@1004 : RecordRef;SourceJoinFieldName@1003 : Text;DataRecordJoinTable@1002 : Integer;IteratorTableFieldName@1001 : Text;DataItemTableSameAsIterator@1000 : Boolean);
+    BEGIN
+      // Initialize parameters and request pages, but do not run the reports yet
+      Initialized := TRUE;
+      IF NOT SetReportUsage(ReportSelectionUsage) THEN
+        Initialized := FALSE;
+      IF NOT SetReportDataItem(DataRecordRef,SourceJoinFieldName,DataRecordJoinTable,IteratorTableFieldName,DataItemTableSameAsIterator) THEN
+        Initialized := FALSE;
+      IF NOT GetRequestParameters THEN
+        Initialized := FALSE;
+    END;
+
+    PROCEDURE HasRequestParameterData@50(ReportID@1000 : Integer) : Boolean;
+    BEGIN
+      // Allows the caller to determine if valid request parameters XML is stored for the given report ID.
+      // This is mostly useful to determine if a given report's request page has been canceled or not.
+      EXIT(TempBlobReqParamStore.GET(ReportID));
+    END;
+
+    BEGIN
+    {
+      This codeunit implements batch printing and custom layout association on a per-object basis.
+      Reports may be based on one table, but we may want to sepcific a layout per-customer, or per-vendor.
+      This codeunit provides functions to help manage the association between the table that backs the report and the object we want custom layouts on.
+
+      Example code below, for Customer Statements, backed by Customer and associating custom reports per-Customer:
+
+      // Get the RecordRef of the table that will source the data for our report - Statements should be backed by Customer
+      RecRef.OPEN(DATABASE::Customer);
+      // Set up the association between the Table that is the source of the report and the association to the table we want layouts for
+      // In this case, we are using Customer for the report and Customer for the layouts.
+      CustomerLayoutReporting.ProcessReport(ReportSelections.Usage::"C.Statement",RecRef,'No.',DATABASE::Customer,'No.',TRUE);
+    }
+    END.
+  }
+}
+

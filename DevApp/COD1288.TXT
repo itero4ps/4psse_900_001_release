@@ -1,0 +1,188 @@
+OBJECT Codeunit 1288 Imp. Bank Conv. Ext. Data Hndl
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00;
+  }
+  PROPERTIES
+  {
+    TableNo=1220;
+    Permissions=TableData 1260=r,
+                TableData 1261=r;
+    OnRun=VAR
+            TempBankStmtTempBlob@1003 : TEMPORARY Record 99008535;
+            FileMgt@1001 : Codeunit 419;
+          BEGIN
+            "File Name" :=
+              COPYSTR(FileMgt.BLOBImportWithFilter(TempBankStmtTempBlob,ImportBankStmtTxt,'',FileFilterTxt,FileFilterExtensionTxt),1,250);
+            IF "File Name" = '' THEN
+              EXIT;
+
+            ConvertBankStatementToFormat(TempBankStmtTempBlob,Rec);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      NoRequestBodyErr@1005 : TextConst 'ENU=The request body is not set.';
+      FileFilterTxt@1016 : TextConst 'ENU="All Files(*.*)|*.*|XML Files(*.xml)|*.xml|Text Files(*.txt;*.csv;*.asc)|*.txt;*.csv;*.asc"';
+      FileFilterExtensionTxt@1015 : TextConst '@@@={Locked};ENU=txt,csv,asc,xml';
+      FinstaNotCollectedErr@1006 : TextConst 'ENU=The bank data conversion service has not returned any statement transactions.\\For more information, go to %1.';
+      ResponseNodeTxt@1000 : TextConst '@@@={Locked};ENU=reportExportResponse';
+      ImportBankStmtTxt@1003 : TextConst 'ENU=Select a file to import.';
+      BankDataConvServSysErr@1007 : TextConst 'ENU=The bank data conversion service has returned the following error message:';
+      AddnlInfoTxt@1002 : TextConst 'ENU=For more information, go to %1.';
+      BankDataConvServMgt@1001 : Codeunit 1265;
+
+    PROCEDURE ConvertBankStatementToFormat@2(VAR TempBankStatementTempBlob@1000 : TEMPORARY Record 99008535;VAR DataExch@1002 : Record 1220);
+    VAR
+      TempResultTempBlob@1001 : TEMPORARY Record 99008535;
+    BEGIN
+      SendDataToConversionService(TempResultTempBlob,TempBankStatementTempBlob);
+      DataExch."File Content" := TempResultTempBlob.Blob;
+    END;
+
+    LOCAL PROCEDURE SendDataToConversionService@1(VAR TempStatementTempBlob@1003 : TEMPORARY Record 99008535;VAR TempBodyTempBlob@1004 : TEMPORARY Record 99008535);
+    VAR
+      BankDataConvServiceSetup@1005 : Record 1260;
+      SOAPWebServiceRequestMgt@1001 : Codeunit 1290;
+      ResponseInStream@1002 : InStream;
+      InStream@1006 : InStream;
+    BEGIN
+      BankDataConvServMgt.CheckCredentials;
+
+      IF NOT TempBodyTempBlob.Blob.HASVALUE THEN
+        ERROR(NoRequestBodyErr);
+
+      PrepareSOAPRequestBody(TempBodyTempBlob);
+
+      BankDataConvServiceSetup.GET;
+
+      TempBodyTempBlob.Blob.CREATEINSTREAM(InStream);
+
+      SOAPWebServiceRequestMgt.SetGlobals(InStream,
+        BankDataConvServiceSetup."Service URL",BankDataConvServiceSetup."User Name",BankDataConvServiceSetup.GetPassword);
+
+      IF NOT SOAPWebServiceRequestMgt.SendRequestToWebService THEN
+        SOAPWebServiceRequestMgt.ProcessFaultResponse(STRSUBSTNO(AddnlInfoTxt,BankDataConvServiceSetup."Support URL"));
+
+      SOAPWebServiceRequestMgt.GetResponseContent(ResponseInStream);
+
+      CheckIfErrorsOccurred(ResponseInStream);
+
+      ReadContentFromResponse(TempStatementTempBlob,ResponseInStream);
+    END;
+
+    LOCAL PROCEDURE PrepareSOAPRequestBody@12(VAR TempBodyTempBlob@1000 : TEMPORARY Record 99008535);
+    VAR
+      XMLDOMMgt@1006 : Codeunit 6224;
+      BodyContentOutputStream@1005 : OutStream;
+      BodyContentXmlDoc@1003 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      EnvelopeXmlNode@1012 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      HeaderXmlNode@1011 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      PackXmlNode@1010 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      DataXmlNode@1009 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      MsgTypeXmlNode@1001 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+    BEGIN
+      BodyContentXmlDoc := BodyContentXmlDoc.XmlDocument;
+
+      WITH XMLDOMMgt DO BEGIN
+        AddRootElementWithPrefix(BodyContentXmlDoc,'reportExport','',BankDataConvServMgt.GetNamespace,EnvelopeXmlNode);
+
+        AddElementWithPrefix(EnvelopeXmlNode,'amcreportreq','','','',HeaderXmlNode);
+        AddAttribute(HeaderXmlNode,'xmlns','');
+
+        AddElementWithPrefix(HeaderXmlNode,'pack','','','',PackXmlNode);
+
+        AddNode(PackXmlNode,'journalnumber',DELCHR(LOWERCASE(FORMAT(CREATEGUID)),'=','{}'));
+        AddElementWithPrefix(PackXmlNode,'data',EncodeBankStatementFile(TempBodyTempBlob),'','',DataXmlNode);
+
+        AddElementWithPrefix(EnvelopeXmlNode,'messagetype','finsta','','',MsgTypeXmlNode);
+      END;
+
+      CLEAR(TempBodyTempBlob.Blob);
+      TempBodyTempBlob.Blob.CREATEOUTSTREAM(BodyContentOutputStream);
+      BodyContentXmlDoc.Save(BodyContentOutputStream);
+    END;
+
+    LOCAL PROCEDURE EncodeBankStatementFile@7(TempBodyTempBlob@1000 : TEMPORARY Record 99008535) : Text;
+    VAR
+      FileMgt@1001 : Codeunit 419;
+      Convert@1003 : DotNet "'mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Convert";
+      File@1004 : DotNet "'mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.IO.File";
+      FileName@1002 : Text;
+    BEGIN
+      FileName := FileMgt.ServerTempFileName('txt');
+      FileMgt.BLOBExportToServerFile(TempBodyTempBlob,FileName);
+      EXIT(Convert.ToBase64String(File.ReadAllBytes(FileName)));
+    END;
+
+    LOCAL PROCEDURE CheckIfErrorsOccurred@8(VAR ResponseInStream@1001 : InStream);
+    VAR
+      ResponseXmlDoc@1000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+    BEGIN
+      ResponseXmlDoc := ResponseXmlDoc.XmlDocument;
+      ResponseXmlDoc.Load(ResponseInStream);
+
+      IF ResponseHasErrors(ResponseXmlDoc) THEN
+        DisplayErrorFromResponse(ResponseXmlDoc);
+    END;
+
+    LOCAL PROCEDURE ResponseHasErrors@3(ResponseXmlDoc@1000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument") : Boolean;
+    VAR
+      XMLDOMMgt@1001 : Codeunit 6224;
+      XmlNode@1002 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+    BEGIN
+      EXIT(XMLDOMMgt.FindNodeWithNamespace(ResponseXmlDoc.DocumentElement,
+          BankDataConvServMgt.GetErrorXPath(ResponseNodeTxt),'amc',BankDataConvServMgt.GetNamespace,XmlNode));
+    END;
+
+    LOCAL PROCEDURE DisplayErrorFromResponse@5(ResponseXmlDoc@1000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument");
+    VAR
+      XMLDOMMgt@1003 : Codeunit 6224;
+      XMLNodeList@1001 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+      Found@1002 : Boolean;
+      ErrorText@1005 : Text;
+      i@1004 : Integer;
+    BEGIN
+      Found := XMLDOMMgt.FindNodesWithNamespace(ResponseXmlDoc.DocumentElement,
+          BankDataConvServMgt.GetErrorXPath(ResponseNodeTxt),'amc',BankDataConvServMgt.GetNamespace,XMLNodeList);
+      IF Found THEN BEGIN
+        ErrorText := BankDataConvServSysErr;
+        FOR i := 1 TO XMLNodeList.Count DO
+          ErrorText += '\\' + XMLDOMMgt.FindNodeText(XMLNodeList.Item(i - 1),'text') + '\' +
+            XMLDOMMgt.FindNodeText(XMLNodeList.Item(i - 1),'hinttext') + '\\' +
+            STRSUBSTNO(AddnlInfoTxt,BankDataConvServMgt.GetSupportURL(XMLNodeList.Item(i - 1)));
+
+        ERROR(ErrorText);
+      END;
+    END;
+
+    LOCAL PROCEDURE ReadContentFromResponse@4(VAR TempStatementTempBlob@1000 : TEMPORARY Record 99008535;ResponseInStream@1002 : InStream);
+    VAR
+      XMLDOMMgt@1005 : Codeunit 6224;
+      FinstaXmlNode@1004 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      ResponseXmlDoc@1003 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      ResponseOutStream@1001 : OutStream;
+      Found@1006 : Boolean;
+    BEGIN
+      ResponseXmlDoc := ResponseXmlDoc.XmlDocument;
+      ResponseXmlDoc.Load(ResponseInStream);
+
+      Found := XMLDOMMgt.FindNodeWithNamespace(ResponseXmlDoc.DocumentElement,
+          BankDataConvServMgt.GetFinstaXPath(ResponseNodeTxt),'amc',BankDataConvServMgt.GetNamespace,FinstaXmlNode);
+      IF NOT Found THEN
+        ERROR(FinstaNotCollectedErr,BankDataConvServMgt.GetSupportURL(FinstaXmlNode));
+
+      TempStatementTempBlob.Blob.CREATEOUTSTREAM(ResponseOutStream);
+      COPYSTREAM(ResponseOutStream,ResponseInStream);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

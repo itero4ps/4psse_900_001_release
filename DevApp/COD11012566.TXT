@@ -1,0 +1,535 @@
+OBJECT Codeunit 11012566 InventoryMngmnt
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@11012005 : TextConst 'ENU=Negative quantities not allowed for Plant Orders.';
+      Text001@11012006 : TextConst 'ENU=Insufficient negative stock for Plant No. %1-%2 present on Location ''%3'' per %4.';
+      PlantSetup@11012000 : Record 11012550;
+      InventoryRec@11012001 : Record 11012555;
+      InventoryHistRec@11012002 : Record 11012555;
+      OrderRec@11012003 : Record 11012556;
+      OrderLineRec@1210190000 : Record 11012557;
+      PlantRec@11012004 : Record 11012551;
+      Text002@1100485000 : TextConst 'ENU=Insufficient negative stock for Plant No. ''%1-%2'', Rate Code ''%3'' present on Location ''%4'' per %5.';
+      ExitOrderRec@1100485004 : Record 11012559;
+      TmpOrderLineRec@1100485003 : TEMPORARY Record 11012557;
+      gApprovalMode@1100485001 : Boolean;
+      Text003@1100485002 : TextConst 'ENU=Negative stock not allowed in Order Line ''%1-%2'', stock for Plant No. ''%3-%4'', Rate Code ''%5'' is insufficient.\On %6 there is stock present on other Rate Code(s), f.i. Rate Code ''%7''.';
+
+    PROCEDURE PostInventory@1(OrderType@11012000 : 'Receipt,Plant Order,Exit Order';OrderNo@11012001 : Code[20];OrderLineNo@11012002 : Integer;FromLoc@11012003 : Code[20];ToLoc@11012004 : Code[20];PlntType@11012005 : Code[20];PlntNo@11012006 : Code[10];Date@11012007 : Date;OrderQuantity@11012008 : Decimal;NegInventCorr@11012009 : Boolean;RentalType@11012010 : ' ,Rental,Sales,Buy Back,Buy Back and Sales';FromRateCode@1100485000 : Code[10];ToRateCode@1100485001 : Code[10];ToEmplNo@1100485002 : Code[20];ToEmplComp@1100485003 : Text[30];FromOrderNo@1100485004 : Code[20]) : Boolean;
+    BEGIN
+      PlantSetup.GET;
+
+      //From Location
+      IF NOT EditInventoryFromLoc(
+         OrderType,OrderNo,OrderLineNo,FromLoc,PlntType,PlntNo,Date,OrderQuantity,RentalType,FromRateCode,NegInventCorr,FromOrderNo,
+         ToLoc)  //*26721
+      THEN
+        EXIT(FALSE);
+
+      //To Location
+      IF NegInventCorr THEN
+        CorrNegStockToLocation(
+          OrderType,OrderNo,OrderLineNo,ToLoc,PlntType,PlntNo,Date,OrderQuantity,RentalType,FromRateCode,ToRateCode)
+      ELSE
+        CreateStockToLocation(
+          OrderType,OrderNo,OrderLineNo,ToLoc,PlntType,PlntNo,Date,OrderQuantity,RentalType,ToRateCode,ToEmplNo,ToEmplComp);
+
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE EditInventoryFromLoc@4(OrderType@11012000 : 'Receipt,Plant Order,Exit Order';OrderNo@11012001 : Code[20];OrderLineNo@11012002 : Integer;FromLoc@11012003 : Code[20];PlntType@11012004 : Code[20];PlntNo@11012005 : Code[10];Date@11012006 : Date;OrderQuantity@11012007 : Decimal;RentalType@11012008 : ' ,Rental,Sales,Buy Back,Buy Back and Sales';FromRateCode@1100485000 : Code[10];NegInventCorr@1100485001 : Boolean;FromOrderNo@1100485002 : Code[20];ToLoc@1210190000 : Code[20]) : Boolean;
+    VAR
+      PostQuantity@11012009 : Decimal;
+      QuantityPosted@11012010 : Decimal;
+      TryAgainWithoutFromOrderFilter@1100485003 : Boolean;
+    BEGIN
+      IF OrderQuantity < 0 THEN BEGIN
+        CreateStockCorrectionFromLoc(OrderType,OrderNo,OrderLineNo,FromLoc,PlntType,PlntNo,Date,OrderQuantity,FromRateCode);
+        EXIT(TRUE);
+      END;
+
+      QuantityPosted := 0;
+
+      WITH InventoryRec DO BEGIN
+        RESET;
+        SETCURRENTKEY(Removed,Location,"Plant Type","Plant No.","Rate Code","Present from");
+        SETRANGE(Removed,FALSE);
+        SETRANGE(Location,FromLoc);
+        SETRANGE("Plant Type",PlntType);
+        SETRANGE("Plant No.",PlntNo);
+        SETRANGE("Rate Code",FromRateCode);
+        SETRANGE(Sold,RentalType IN [RentalType::"Buy Back",RentalType::"Buy Back and Sales"]);
+        SETFILTER("Present from",'..%1',Date);
+        SETFILTER(Quantity,'>0');
+        IF FromOrderNo <> '' THEN BEGIN
+          //This can only occur with Sales Rental Order
+          SETRANGE("Arrival Order Type", "Arrival Order Type"::"Plant Order");
+          SETFILTER("Arrival Order", '%1|%2', FromOrderNo, FromOrderNo + '-*');
+        END;
+        REPEAT
+          IF FIND('+') THEN
+            REPEAT
+              IF Quantity <= (OrderQuantity - QuantityPosted) THEN BEGIN
+                PostQuantity := Quantity;
+                DELETE(TRUE);
+              END ELSE BEGIN
+                PostQuantity := OrderQuantity - QuantityPosted;
+                Quantity := Quantity - PostQuantity;
+                MODIFY(TRUE);
+              END;
+              SaveStockHistoryFromLoc(OrderType,OrderNo,OrderLineNo,Date,PostQuantity,RentalType,FromRateCode);
+              QuantityPosted := QuantityPosted + PostQuantity;
+            UNTIL (NEXT(-1) = 0) OR (QuantityPosted >= OrderQuantity);
+
+          TryAgainWithoutFromOrderFilter := FALSE;
+          IF (QuantityPosted < OrderQuantity) AND (FromOrderNo <> '') THEN BEGIN
+            TryAgainWithoutFromOrderFilter := TRUE;
+            FromOrderNo := '';
+            SETRANGE("Arrival Order Type");
+            SETRANGE("Arrival Order");
+          END;
+        UNTIL NOT TryAgainWithoutFromOrderFilter;
+      END;
+
+      IF (QuantityPosted < OrderQuantity) AND (NOT NegInventCorr) THEN
+        IF CreateNegativeInventoryFromLoc(
+          OrderType,OrderNo,OrderLineNo,FromLoc,PlntType,PlntNo,Date,OrderQuantity - QuantityPosted,RentalType,FromRateCode,
+          ToLoc)  //*26721
+        THEN
+          QuantityPosted := OrderQuantity;
+
+      IF QuantityPosted < OrderQuantity THEN
+        EXIT(FALSE);
+
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE CreateStockCorrectionFromLoc@8(OrderType@11012000 : 'Receipt,Plant Order,Exit Order';OrderNo@11012001 : Code[20];OrderLineNo@11012002 : Integer;FromLoc@11012003 : Code[20];PlntType@11012004 : Code[20];PlntNo@11012005 : Code[10];Date@11012006 : Date;OrderQuantity@11012007 : Decimal;FromRateCode@1100485000 : Code[10]) : Boolean;
+    BEGIN
+      IF OrderType = OrderType::"Plant Order" THEN
+        ERROR(Text000);
+
+      WITH InventoryRec DO BEGIN
+        INIT;
+        Removed := FALSE;
+        Location := FromLoc;
+        "Plant Type" := PlntType;
+        "Plant No." := PlntNo;
+        "Rate Code" := FromRateCode;
+        "Line No." := GetLineNo(InventoryRec);
+        Quantity := OrderQuantity * -1;
+        "Present from" := Date;
+        "Arrival Order Type" := OrderType;
+        "Arrival Order" := OrderNo;
+        "Arrival Order Line" := OrderLineNo;
+        INSERT(TRUE);
+      END;
+    END;
+
+    PROCEDURE SaveStockHistoryFromLoc@5(OrderType@11012000 : 'Receipt,Plant Order,Exit Order';OrderNo@11012001 : Code[20];OrderLineNo@11012002 : Integer;Date@11012003 : Date;PostQuantity@11012004 : Decimal;RentalType@11012005 : ' ,Rental,Sales,Buy Back,Buy Back and Sales';FromRateCode@1100485000 : Code[10]);
+    BEGIN
+      WITH InventoryHistRec DO BEGIN
+        TRANSFERFIELDS(InventoryRec,FALSE);
+        Removed := TRUE;
+        Location := InventoryRec.Location;
+        "Plant Type" := InventoryRec."Plant Type";
+        "Plant No." := InventoryRec."Plant No.";
+        "Rate Code" := InventoryRec."Rate Code";
+        "Line No." := GetLineNo(InventoryHistRec);
+        Quantity := PostQuantity;
+        "Removed on" := Date;
+        "Rental End Date" := GetRentalEndDate(OrderType,OrderNo,OrderLineNo,Date,RentalType);
+        IF PostQuantity < 0 THEN BEGIN
+          "Arrival Order Type" := OrderType;
+          "Arrival Order" := OrderNo;
+          "Arrival Order Line" := OrderLineNo;
+        END ELSE BEGIN
+          "Removal Order Type" := OrderType;
+          "Removal Order" := OrderNo;
+          "Removal Order Line" := OrderLineNo;
+        END;
+        "Original Stock Line No." := InventoryRec."Line No.";
+        INSERT(TRUE);
+      END;
+    END;
+
+    PROCEDURE CreateNegativeInventoryFromLoc@2(OrderType@11012000 : 'Receipt,Plant Order,Exit Order';OrderNo@11012001 : Code[20];OrderLineNo@11012002 : Integer;FromLoc@11012003 : Code[20];PlntType@11012004 : Code[20];PlntNo@11012005 : Code[10];Date@11012006 : Date;PostQuantity@11012007 : Decimal;RentalType@11012008 : ' ,Rental,Sales,Buy Back,Buy Back and Sales';FromRateCode@1100485000 : Code[10];ToLoc@1210190000 : Code[20]) : Boolean;
+    VAR
+      lvFromLocRec@1100485001 : Record 11012554;
+      lvInventoryRec@1100485002 : Record 11012555;
+      PlantRateCode@1210190001 : Record 11020502;
+    BEGIN
+      IF (PlntNo <> '0') THEN  //* 31-05-2006 Test zit ook bij boeken materieel- en exitorder, dan moet het hier ook.
+        EXIT(FALSE);           //* Zie opmerking in CU 11012553/559 ('Post Plant Order'/'Post Exit Order').
+
+      //*26721.sn
+      IF FromLoc = ToLoc THEN  //* Do not create neg stock when moved to the same location
+        EXIT(FALSE);           //* (fi to another rate code on a rental free order)
+      //*26721.en
+
+      //*24451.o
+      //IF (NOT PlantSetup."Negative Bulk Stock") OR (PlantSetup."Rate Codes") THEN BEGIN
+      //  //* Test op "Rate Codes" is eigenlijk overbodig, want negatieve bulkvoorraad in combinatie met tariefcodes is niet
+      //  //* mogelijk/toegestaan (zit al test in materieelinstellingen).
+      //  //* NB: Combinatie van tariefcodes en negatieve bulkvoorraad op depot kan wel.
+      //  IF NOT PlantSetup."Negative Bulk Stock Depot" THEN
+      //    EXIT(FALSE);
+      //  IF (NOT (RentalType IN [RentalType::"Buy Back",RentalType::"Buy Back and Sales"])) THEN BEGIN
+      //    lvFromLocRec.GET(FromLoc);
+      //    IF NOT lvFromLocRec.Depot THEN
+      //      EXIT(FALSE);
+      //  END;
+      //END;
+
+      //*24451.n
+      IF (NOT PlantSetup."Negative Bulk Stock Location") OR (NOT PlantSetup."Negative Bulk Stock Depot") THEN BEGIN
+        lvFromLocRec.GET(FromLoc);
+        IF lvFromLocRec.Depot THEN BEGIN
+          IF NOT PlantSetup."Negative Bulk Stock Depot" THEN
+            EXIT(FALSE);
+        END ELSE BEGIN
+          IF (NOT (RentalType IN [RentalType::"Buy Back",RentalType::"Buy Back and Sales"])) THEN BEGIN
+            IF NOT PlantSetup."Negative Bulk Stock Location" THEN
+              EXIT(FALSE);
+          END;
+        END;
+      END;
+
+      PlantRec.GET(PlntType);
+      IF NOT PlantRec.Bulk THEN
+        EXIT(FALSE);
+
+      { //*26721.so (21-06-2011)   No check anymore if bulk plant was present on location
+      //*26721.o (24-05-2011)
+      //IF (PlantSetup."Rate Codes") AND (NOT (RentalType IN [RentalType::"Buy Back",RentalType::"Buy Back and Sales"])) THEN BEGIN
+      IF (NOT (RentalType IN [RentalType::"Buy Back",RentalType::"Buy Back and Sales"])) THEN BEGIN   //*26721.n (24-05-2011)
+        //* Moet ooit aanwezig geweest zijn, al dan niet met tariefcode (zal er niet meer zijn, anders zou geen neg. voorraad
+        //* gecreeerd worden). Alleen bij terugkoop hoeft het er niet gestaan te hebben.
+        WITH lvInventoryRec DO BEGIN
+          SETCURRENTKEY(Removed, Location, "Plant Type", "Plant No.", "Rate Code", "Present from");
+          SETRANGE(Removed, TRUE);
+          SETRANGE(Location, FromLoc);
+          SETRANGE("Plant Type", PlntType);
+          SETRANGE("Plant No.", PlntNo);
+          SETRANGE("Rate Code", FromRateCode);  // FromRateCode can be empty if not PlantSetup."Rate Codes"
+          SETRANGE("Present from", 0D, Date);
+          SETFILTER(Quantity, '>%1', 0);
+          IF NOT FINDFIRST THEN
+            EXIT(FALSE);
+        END;
+      END;
+      } //*26721.eo (21-06-2011)
+
+      WITH InventoryRec DO BEGIN
+        INIT;
+        Removed := FALSE;
+        Location := FromLoc;
+        "Plant Type" := PlntType;
+        "Plant No." := PlntNo;
+        Sold := RentalType IN [RentalType::"Buy Back",RentalType::"Buy Back and Sales"];  //*28163.n
+        "Rate Code" := FromRateCode;
+        //*28163.sn   Note: It does not matter if rate code stays enpty because neg. inventory is not invoiced, but if
+        //*                 possible and allowed then fill rate code. Not for Buy Back of S/B plant, then must be empty.
+        IF ("Rate Code" = '') AND PlantSetup."Rate Codes" AND (PlantSetup."Default Rate Code" <> '') AND (NOT Sold) THEN BEGIN
+          IF PlantRateCode.CheckPlantRateCode(Location, PlantSetup."Default Rate Code", FALSE, '') THEN
+            "Rate Code" := PlantSetup."Default Rate Code";
+        END;
+        //*28163.sn
+        "Line No." := GetLineNo(InventoryRec);
+        Quantity := PostQuantity * -1;
+        "Present from" := Date;
+        "Removal Order Type" := OrderType;
+        "Removal Order" := OrderNo;
+        "Removal Order Line" := OrderLineNo;
+        //Sold := RentalType IN [RentalType::"Buy Back",RentalType::"Buy Back and Sales"];  //*28163.o
+        INSERT(TRUE);
+        IF Depot AND Sold THEN BEGIN
+          Sold := FALSE;
+          MODIFY(TRUE);
+        END;
+
+        IF NOT TmpOrderLineRec.GET(OrderNo, OrderLineNo) THEN BEGIN  //*26566.n
+          TmpOrderLineRec.INIT;
+          TmpOrderLineRec."Plant Order No." := OrderNo;
+          TmpOrderLineRec."Line No." := OrderLineNo;
+          TmpOrderLineRec."Plant Type" := PlntType;
+          TmpOrderLineRec."No." := PlntNo;
+          TmpOrderLineRec."From Location" := FromLoc;
+          TmpOrderLineRec."From Rate Code" := FromRateCode; //From MO-line, not Rate Code from Neg.Invent. record (can be another)
+          TmpOrderLineRec."Transfer Date" := Date;
+          TmpOrderLineRec.INSERT;
+        END;  //*26566.n
+      END;
+
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE CreateStockToLocation@6(OrderType@11012000 : 'Receipt,Plant Order,Exit Order';OrderNo@11012001 : Code[20];OrderLineNo@11012002 : Integer;ToLoc@11012003 : Code[20];PlntType@11012004 : Code[20];PlntNo@11012005 : Code[10];Date@11012006 : Date;OrderQuantity@11012007 : Decimal;RentalType@11012008 : ' ,Rental,Sales,Buy Back,Buy Back and Sales';ToRateCode@1100485000 : Code[10];ToEmplNo@1100485002 : Code[20];ToEmplComp@1100485001 : Text[30]);
+    BEGIN
+      IF OrderType = OrderType::"Exit Order" THEN
+        EXIT;
+
+      WITH InventoryRec DO BEGIN
+        INIT;
+        Removed := FALSE;
+        Location := ToLoc;
+        "Plant Type" := PlntType;
+        "Plant No." := PlntNo;
+        "Rate Code" := ToRateCode;
+        "Line No." := GetLineNo(InventoryRec);
+        Quantity := OrderQuantity;
+        "Present from" := Date;
+        "Rental Start Date" := GetRentalStartDate(OrderType,OrderNo,OrderLineNo,Date,RentalType);
+        "Expected return on" := GetExpectedReturnDate(OrderType,OrderNo,OrderLineNo);
+        "Arrival Order Type" := OrderType;
+        "Arrival Order" := OrderNo;
+        "Arrival Order Line" := OrderLineNo;
+        Sold := RentalType IN [RentalType::Sales,RentalType::"Buy Back and Sales"];
+        "Employee Company" := ToEmplComp;
+        "Employee No." := ToEmplNo;
+        INSERT(TRUE);
+        IF Depot AND Sold THEN BEGIN
+          Sold := FALSE;
+          MODIFY(TRUE);
+        END;
+      END;
+    END;
+
+    PROCEDURE CorrNegStockToLocation@3(OrderType@11012000 : 'Receipt,Plant Order,Exit Order';OrderNo@11012001 : Code[20];OrderLineNo@11012002 : Integer;ToLoc@11012003 : Code[20];PlntType@11012004 : Code[20];PlntNo@11012005 : Code[10];Date@11012006 : Date;OrderQuantity@11012007 : Decimal;RentalType@11012008 : ' ,Rental,Sales,Buy Back,Buy Back and Sales';FromRateCode@1100485001 : Code[10];ToRateCode@1100485000 : Code[10]);
+    VAR
+      lvToLocRec@1100485002 : Record 11012554;
+      PostQuantityNegative@11012009 : Decimal;
+      QuantityNegPosted@11012010 : Decimal;
+    BEGIN
+      WITH InventoryRec DO BEGIN
+        QuantityNegPosted := 0;
+        lvToLocRec.GET(ToLoc);
+        RESET;
+        SETCURRENTKEY(Removed,Location,"Plant Type","Plant No.","Rate Code","Present from");
+        SETRANGE(Removed,FALSE);
+        SETRANGE(Location,ToLoc);
+        SETRANGE("Plant Type",PlntType);
+        SETRANGE("Plant No.",PlntNo);
+        SETRANGE("Rate Code", ToRateCode);
+        IF NOT lvToLocRec.Depot THEN
+          SETRANGE(Sold,RentalType IN [RentalType::Sales,RentalType::"Buy Back and Sales"]);
+        SETFILTER("Present from",'..%1',Date);
+        SETFILTER(Quantity,'<0');
+        IF FIND('+') THEN
+          REPEAT
+            IF ABS(Quantity) <= (OrderQuantity - QuantityNegPosted) THEN BEGIN
+              PostQuantityNegative := Quantity;
+              DELETE(TRUE);
+            END ELSE BEGIN
+              PostQuantityNegative := -(OrderQuantity - QuantityNegPosted);
+              Quantity := Quantity - PostQuantityNegative;
+              MODIFY(TRUE);
+            END;
+            SaveStockHistoryFromLoc(OrderType,OrderNo,OrderLineNo,Date,PostQuantityNegative,RentalType,FromRateCode);
+            QuantityNegPosted := QuantityNegPosted + ABS(PostQuantityNegative);
+          UNTIL (NEXT(-1) = 0) OR (QuantityNegPosted >= OrderQuantity);
+
+        IF QuantityNegPosted <> OrderQuantity THEN
+          IF (NOT PlantSetup."Rate Codes") AND (ToRateCode = '') THEN
+            ERROR(Text001, PlntType,PlntNo,ToLoc,Date)
+          ELSE
+            ERROR(Text002, PlntType,PlntNo,ToRateCode,ToLoc,Date);
+
+      END;
+    END;
+
+    PROCEDURE GetRentalEndDate@12(OrderType@11012000 : 'Receipt,Plant Order,Exit Order';OrderNo@11012001 : Code[20];OrderLineNo@1210190000 : Integer;RemovalDate@11012002 : Date;RentalType@11012003 : ' ,Rental,Sales,Buy Back,Buy Back and Sales') : Date;
+    BEGIN
+      IF (OrderType = OrderType::"Exit Order") THEN BEGIN
+        IF ExitOrderRec."No." <> OrderNo THEN
+          ExitOrderRec.GET(OrderNo);
+        OrderRec.SETCURRENTKEY(Posted,"To Location Invoiced","To Location","Transfer Date");
+        OrderRec.SETRANGE("To Location", ExitOrderRec.Location);
+        OrderRec.SETRANGE("Exit Order No.", OrderNo);
+        IF OrderRec.FINDFIRST THEN
+          IF OrderRec.Type =OrderRec.Type::Arrival THEN
+            EXIT(CALCDATE('<-1D>', RemovalDate));
+      END;
+
+      IF (OrderType <> OrderType::"Plant Order") OR gApprovalMode THEN
+        EXIT(RemovalDate);
+
+      IF RentalType IN [RentalType::"Buy Back",RentalType::"Buy Back and Sales"] THEN
+        EXIT(0D);
+
+      OrderLineRec.GET(OrderNo, OrderLineNo);
+      IF OrderLineRec."Rental Shift" THEN BEGIN
+        IF (OrderLineRec."Rental Enddate (From Location)" > RemovalDate) OR
+           (OrderLineRec."Rental Enddate (From Location)" = 0D)
+        THEN
+          EXIT(RemovalDate)
+        ELSE
+          EXIT(OrderLineRec."Rental Enddate (From Location)");
+      END;
+
+      IF OrderRec."No." <> OrderNo THEN
+        OrderRec.GET(OrderNo);
+
+      IF NOT OrderRec."Rental Shift" THEN BEGIN
+        IF (OrderRec.Type = OrderRec.Type::"Other Transfers") AND (OrderRec."From Location" = OrderRec."To Location") THEN
+          EXIT(RemovalDate - 1);
+        EXIT(RemovalDate);
+      END;
+
+      IF (OrderRec."Rental Enddate (From Location)" > RemovalDate) OR (OrderRec."Rental Enddate (From Location)" = 0D) THEN
+        EXIT(RemovalDate)
+      ELSE
+        EXIT(OrderRec."Rental Enddate (From Location)");
+    END;
+
+    PROCEDURE GetRentalStartDate@19(OrderType@11012000 : 'Receipt,Plant Order,Exit Order';OrderNo@11012001 : Code[20];OrderLineNo@1210190000 : Integer;ArrivalDate@11012002 : Date;RentalType@11012003 : ' ,Rental,Sales,Buy Back,Buy Back and Sales') : Date;
+    BEGIN
+      IF (OrderType <> OrderType::"Plant Order") OR gApprovalMode THEN
+        EXIT(ArrivalDate);
+
+      IF RentalType IN [RentalType::Sales,RentalType::"Buy Back and Sales"] THEN
+        EXIT(0D);
+
+      OrderLineRec.GET(OrderNo, OrderLineNo);
+      IF OrderLineRec."Rental Shift" THEN BEGIN
+        IF OrderLineRec."Rental Startdate (To Location)" < ArrivalDate THEN
+          EXIT(ArrivalDate)
+        ELSE
+          EXIT(OrderLineRec."Rental Startdate (To Location)");
+      END;
+
+      IF OrderRec."No." <> OrderNo THEN
+        OrderRec.GET(OrderNo);
+
+      IF NOT OrderRec."Rental Shift" THEN
+        EXIT(ArrivalDate);
+
+      IF OrderRec."Rental Startdate (To Location)" < ArrivalDate THEN
+        EXIT(ArrivalDate)
+      ELSE
+        EXIT(OrderRec."Rental Startdate (To Location)");
+    END;
+
+    PROCEDURE GetExpectedReturnDate@1210190000(OrderType@11012000 : 'Receipt,Plant Order,Exit Order';OrderNo@11012001 : Code[20];OrderLineNo@1210190000 : Integer) : Date;
+    BEGIN
+      IF (OrderType <> OrderType::"Plant Order") OR gApprovalMode THEN
+        EXIT(0D);
+
+      IF OrderLineRec.GET(OrderNo, OrderLineNo) THEN BEGIN
+        IF (OrderLineRec."Expected return on" <> 0D) AND (OrderLineRec."Expected return on" < OrderLineRec."Transfer Date") THEN
+          EXIT(OrderLineRec."Transfer Date")
+        ELSE
+          EXIT(OrderLineRec."Expected return on");
+      END;
+      EXIT(0D);
+    END;
+
+    PROCEDURE SetApprovalMode@1100485000();
+    BEGIN
+      gApprovalMode := TRUE;
+    END;
+
+    PROCEDURE InitializeNegStockProcess@1100485001();
+    BEGIN
+      TmpOrderLineRec.RESET;
+      TmpOrderLineRec.DELETEALL;
+    END;
+
+    PROCEDURE ProcessNegStockProcess@1100485002();
+    VAR
+      lvInventoryRec@1100485000 : Record 11012555;
+    BEGIN
+      //* Als er negatieve voorraad is gecreeerd dan moet gecontroleerd worden of er van het materieel geen voorraad aanwezig
+      //* is op een andere tariefcode. Dit is namelijk niet toegestaan.
+      //* Dit kan pas getest worden als de hele order (materieelorder/exitorder) verwerkt is, want een materieelnummer kan
+      //* meerdere keren op een order aanwezig zijn met verschillende tariefcodes.
+
+      WITH lvInventoryRec DO BEGIN
+        TmpOrderLineRec.RESET;
+        IF NOT TmpOrderLineRec.FINDSET THEN
+          EXIT;
+
+        SETCURRENTKEY(Removed, Location, "Plant Type", "Plant No.", "Rate Code", "Present from");
+        SETRANGE(Removed, FALSE);
+
+        REPEAT
+          SETRANGE(Location, TmpOrderLineRec."From Location");
+          SETRANGE("Plant Type", TmpOrderLineRec."Plant Type");
+          SETRANGE("Plant No.", TmpOrderLineRec."No.");
+          SETFILTER("Rate Code", '<>%1', TmpOrderLineRec."From Rate Code");
+          SETRANGE("Present from", 0D, TmpOrderLineRec."Transfer Date");
+          SETFILTER(Quantity, '>%1', 0);
+          IF FIND('-') THEN BEGIN
+            ERROR(Text003,
+                  TmpOrderLineRec."Plant Order No.", TmpOrderLineRec."Line No.",
+                  "Plant Type", "Plant No.", TmpOrderLineRec."From Rate Code",
+                  TmpOrderLineRec."Transfer Date", "Rate Code");
+          END;
+        UNTIL TmpOrderLineRec.NEXT = 0;
+
+        TmpOrderLineRec.DELETEALL;
+      END;
+    END;
+
+    PROCEDURE PostExitSoldSBBOnLocation@1100529000(OrderType@11012000 : 'Receipt,Plant Order,Exit Order';OrderNo@11012001 : Code[20];OrderLineNo@11012002 : Integer;FromLoc@11012003 : Code[20];PlntType@11012005 : Code[20];PlntNo@11012006 : Code[10];Date@11012007 : Date;OrderQuantity@11012008 : Decimal;RentalType@11012010 : ' ,Rental,Sales,Buy Back,Buy Back and Sales';FromRateCode@1100485000 : Code[10]) : Boolean;
+    VAR
+      PostQuantity@1100529001 : Decimal;
+      QuantityPosted@1100529000 : Decimal;
+    BEGIN
+      //DP00241 (26972)
+      // Exit of Sales/Buy Back Plant is already sold to the locatie. Only exit from the location.
+      // The sold S-BB plant is missing or damaged and will not come back to the depot. Only update the inventory
+      // on the 'From location'(current location) with status 'Sold'is True. Do not create neg. stock!
+
+      QuantityPosted := 0;
+      WITH InventoryRec DO BEGIN
+        RESET;
+        SETCURRENTKEY(Removed,Location,"Plant Type","Plant No.","Rate Code","Present from");
+        SETRANGE(Removed,FALSE);
+        SETRANGE(Location,FromLoc);
+        SETRANGE("Plant Type",PlntType);
+        SETRANGE("Plant No.",PlntNo);
+        SETRANGE("Rate Code",FromRateCode);
+        SETRANGE(Sold,TRUE);
+        SETFILTER("Present from",'..%1',Date);
+        SETFILTER(Quantity,'>0');
+        IF FINDLAST THEN BEGIN
+          REPEAT
+            IF Quantity <= (OrderQuantity - QuantityPosted) THEN BEGIN
+              PostQuantity := Quantity;
+              DELETE(TRUE);
+            END ELSE BEGIN
+              PostQuantity := OrderQuantity - QuantityPosted;
+              Quantity := Quantity - PostQuantity;
+              MODIFY(TRUE);
+            END;
+            SaveStockHistoryFromLoc(OrderType,OrderNo,OrderLineNo,Date,PostQuantity,RentalType,FromRateCode);
+            QuantityPosted := QuantityPosted + PostQuantity;
+          UNTIL (NEXT(-1) = 0) OR (QuantityPosted >= OrderQuantity);
+        END;
+      END;
+
+      IF QuantityPosted < OrderQuantity THEN
+        EXIT(FALSE);
+      EXIT(TRUE);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

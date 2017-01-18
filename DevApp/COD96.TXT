@@ -1,0 +1,644 @@
+OBJECT Codeunit 96 Purch.-Quote to Order
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00.00.45480,4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=38;
+    OnRun=VAR
+            OldPurchCommentLine@1001 : Record 43;
+            Vend@1002 : Record 23;
+            ApprovalsMgmt@1000 : Codeunit 1535;
+            RecordLinkManagement@1004 : Codeunit 447;
+            ShouldRedistributeInvoiceAmount@1003 : Boolean;
+            lvLinesCopied@1100485000 : Boolean;
+          BEGIN
+            TESTFIELD("Document Type","Document Type"::Quote);
+            TESTFIELD("Buy-from Vendor No.");  //**4PS.n
+            ShouldRedistributeInvoiceAmount := PurchCalcDiscByType.ShouldRedistributeInvoiceDiscountAmount(Rec);
+
+            OnCheckPurchasePostRestrictions;
+
+            Vend.GET("Buy-from Vendor No.");
+            Vend.CheckBlockedVendOnDocs(Vend,FALSE);
+
+            //**4PS.sn
+            IF "Purchase Action" <> '' THEN BEGIN
+              IF PurchActrec.GET("Job No.","Purchase Action") THEN BEGIN
+                //IF PurchActrec.Status = PurchActrec.Status::Definitive THEN  //*28774.o
+                //  ERROR(STRSUBSTNO(Text001,"Job No.","Purchase Action"));    //*28774.o
+                IF NOT (PurchActrec.Status IN [PurchActrec.Status::Approved, PurchActrec.Status::Definitive]) THEN  //*28774.n
+                  PurchActrec.FIELDERROR(PurchActrec.Status);                                                       //*28774.n
+              END;
+            END;
+
+            CheckIfMakingOrderAllowedForQuoteStatus;
+            CheckIfNoQuoteConsentLinesAvailable;
+
+            PurchQuoteLine.SETRANGE("Document Type","Document Type");
+            PurchQuoteLine.SETRANGE("Document No.","No.");
+            PurchQuoteLine.SETRANGE("Quote Selected", TRUE);
+            IF NOT PurchQuoteLine.FINDFIRST THEN
+              ERROR(Text11012001, PurchQuoteLine.FIELDCAPTION("Quote Selected"));
+
+            LastRefNo := '';
+            lvLinesCopied := FALSE;
+
+            IF gOnExistingOrder THEN BEGIN
+              PurchOrderHeader.GET(PurchOrderHeader."Document Type"::Order, gOrderNo);
+              PurchOrderHeader.TESTFIELD("Buy-from Vendor No.", "Buy-from Vendor No.");
+              PurchOrderHeader.TESTFIELD(Status, PurchOrderHeader.Status::Open);
+              PurchOrderHeader.TESTFIELD("Copied from Purchase Quote No.", "No.");
+
+              PurchOrderLine.LOCKTABLE;
+            END ELSE BEGIN
+            //**4PS.en
+
+              PurchOrderHeader := Rec;
+              PurchOrderHeader."Document Type" := PurchOrderHeader."Document Type"::Order;
+              PurchOrderHeader."No. Printed" := 0;
+              PurchOrderHeader.Status := PurchOrderHeader.Status::Open;
+              PurchOrderHeader."No." := '';
+              PurchOrderHeader."Quote No." := "No.";
+
+              PurchOrderLine.LOCKTABLE;
+
+              //**4PS.sn
+              IF gAskForNoSerie THEN BEGIN
+                PurchOrderHeader."No. Series" := gNoSeries;
+                PurchOrderHeader.GetNoForSelectedNoSeries(PurchOrderHeader);
+                PurchOrderHeader.InitRecord; //C030976.n
+              END;
+              //**4PS.en
+
+              PurchOrderHeader.INSERT(TRUE);
+
+
+              PurchHeadExtRec.CopyPurchHeadExtension("Document Type","No.",PurchOrderHeader."Document Type",PurchOrderHeader."No.");//**4PS.n
+
+              { //**4PS.so  Dates are already filled with the WORKDATE on the 'Insert trigger', don't use date of quote
+              PurchOrderHeader."Order Date" := "Order Date";
+              IF "Posting Date" <> 0D THEN
+                PurchOrderHeader."Posting Date" := "Posting Date";
+              PurchOrderHeader."Document Date" := "Document Date";
+              } //**4PS.eo
+              PurchOrderHeader."Expected Receipt Date" := "Expected Receipt Date";
+              PurchOrderHeader."Shortcut Dimension 1 Code" := "Shortcut Dimension 1 Code";
+              PurchOrderHeader."Shortcut Dimension 2 Code" := "Shortcut Dimension 2 Code";
+              PurchOrderHeader."Dimension Set ID" := "Dimension Set ID";
+
+              PurchOrderHeader."Location Code" := "Location Code";
+              PurchOrderHeader."Inbound Whse. Handling Time" := "Inbound Whse. Handling Time";
+              PurchOrderHeader."Ship-to Name" := "Ship-to Name";
+              PurchOrderHeader."Ship-to Name 2" := "Ship-to Name 2";
+              PurchOrderHeader."Ship-to Address" := "Ship-to Address";
+              PurchOrderHeader."Ship-to Address 2" := "Ship-to Address 2";
+              PurchOrderHeader."Ship-to City" := "Ship-to City";
+              PurchOrderHeader."Ship-to Post Code" := "Ship-to Post Code";
+              PurchOrderHeader."Ship-to County" := "Ship-to County";
+              PurchOrderHeader."Ship-to Country/Region Code" := "Ship-to Country/Region Code";
+              PurchOrderHeader."Ship-to Contact" := "Ship-to Contact";
+
+              PurchOrderHeader."Prepayment %" := Vend."Prepayment %";
+              IF PurchOrderHeader."Posting Date" = 0D THEN
+                PurchOrderHeader."Posting Date" := WORKDATE;
+
+              //**4PS.sn
+              PurchOrderHeader."Copied from Purchase Quote No." := "No.";
+              PurchOrderHeader."Amounts only" := "Amounts only";
+              //**4PS.en
+              PurchOrderHeader.MODIFY;
+            END;  //**4PS.n
+
+            PurchQuoteLine.SETRANGE("Document Type","Document Type");
+            PurchQuoteLine.SETRANGE("Document No.","No.");
+            PurchQuoteLine.SETRANGE("Quote Selected", TRUE);  //**4PS.n
+
+            IF PurchQuoteLine.FINDSET THEN
+              REPEAT
+               IF NOT CheckQuoteLineAlreadyCopied(PurchQuoteLine."Purchase Route Reference") THEN BEGIN  //**4PS.n
+                PurchOrderLine := PurchQuoteLine;
+                PurchOrderLine."Document Type" := PurchOrderHeader."Document Type";
+                PurchOrderLine."Document No." := PurchOrderHeader."No.";
+                //**4PS.sn
+                IF gOnExistingOrder THEN
+                  PurchOrderLine."Line No." := DetermineNextOrderLine(PurchOrderLine."Document Type", PurchOrderLine."Document No.");
+                //**4PS.en
+                ReservePurchLine.TransferPurchLineToPurchLine(
+                  PurchQuoteLine,PurchOrderLine,PurchQuoteLine."Outstanding Qty. (Base)");
+                PurchOrderLine."Shortcut Dimension 1 Code" := PurchQuoteLine."Shortcut Dimension 1 Code";
+                PurchOrderLine."Shortcut Dimension 2 Code" := PurchQuoteLine."Shortcut Dimension 2 Code";
+                PurchOrderLine."Dimension Set ID" := PurchQuoteLine."Dimension Set ID";
+                IF Vend."Prepayment %" <> 0 THEN
+                  PurchOrderLine."Prepayment %" := Vend."Prepayment %";
+                PrepmtMgt.SetPurchPrepaymentPct(PurchOrderLine,PurchOrderHeader."Posting Date");
+                PurchOrderLine.VALIDATE("Prepayment %");
+                PurchOrderLine.DefaultDeferralCode;
+
+                //**4PS.sn
+                PurchOrderLine."Order Date" := PurchOrderHeader."Order Date";
+                PurchOrderLine.VALIDATE("Purchase Action"); //Check Action Status
+                IF PurchOrderHeader."Amounts only" THEN
+                  PurchOrderLine.InitAmntToReceive
+                ELSE
+                  PurchOrderLine.InitQtyToReceive;
+                PurchOrderLine.CalculateICMQuantity;  //db, 04-10-12: C001492
+                //**4PS.en
+
+                //**4PS.sn
+                PurchOrderLine."Input by" := USERID; //DP00469
+                PurchOrderLine."Input Date" := TODAY; //DP00469
+                //**4PS.en
+                PurchOrderLine.INSERT;
+
+                ReservePurchLine.VerifyQuantity(PurchOrderLine,PurchQuoteLine);
+
+                //**4PS.sn
+                lvLinesCopied := TRUE;
+                PurchOrderLine.CreatePurchOrderControl(FALSE);
+                PurchaseLineExtension.CopyPurchLineExtension(
+                  PurchQuoteLine."Document Type", PurchQuoteLine."Document No.", PurchQuoteLine."Line No.",
+                  PurchOrderLine."Document Type", PurchOrderLine."Document No.", PurchOrderLine."Line No.");
+
+                //kzwerver, 111027, sn, #29841
+                PurchaseLineExtension.GetPurchLineExtension(
+                  PurchOrderLine."Document Type", PurchOrderLine."Document No.", PurchOrderLine."Line No.");
+                PurchaseLineExtension."GS1 Quantity Confirmed" := 0;
+                PurchaseLineExtension.UpdatePurchLineExtension(
+                  PurchOrderLine."Document Type", PurchOrderLine."Document No.", PurchOrderLine."Line No.");
+                //kzwerver, 111027, sn, #29841
+
+                ItemChargeAssgntPurch.RESET;
+                ItemChargeAssgntPurch.SETRANGE("Document Type","Document Type");
+                ItemChargeAssgntPurch.SETRANGE("Document No.","No.");
+                ItemChargeAssgntPurch.SETRANGE("Document Line No.",PurchQuoteLine."Line No.");
+                IF ItemChargeAssgntPurch.FIND('-') THEN BEGIN
+                  REPEAT
+                    ItemChargeAssgntPurch2 := ItemChargeAssgntPurch;
+                    ItemChargeAssgntPurch2."Document Type" := PurchOrderHeader."Document Type";
+                    ItemChargeAssgntPurch2."Document No." := PurchOrderHeader."No.";
+                    ItemChargeAssgntPurch2."Document Line No." := PurchOrderLine."Line No.";
+                    IF NOT (ItemChargeAssgntPurch."Applies-to Doc. Type" IN
+                      [ItemChargeAssgntPurch."Applies-to Doc. Type"::Receipt,
+                       ItemChargeAssgntPurch."Applies-to Doc. Type"::"Return Shipment"])
+                    THEN BEGIN
+                      ItemChargeAssgntPurch2."Applies-to Doc. Type" := PurchOrderHeader."Document Type";
+                      ItemChargeAssgntPurch2."Applies-to Doc. No." := PurchOrderHeader."No.";
+                    END;
+                    ItemChargeAssgntPurch2.INSERT;
+                  UNTIL ItemChargeAssgntPurch.NEXT = 0;
+                END;
+
+                IF (PurchQuoteLine."Purchase Route Reference" <> '') THEN BEGIN
+                  PurchOrderLine."Purchase Route Reference" := PurchQuoteLine."Purchase Route Reference";
+                  //**4PS.sn
+                  PurchOrderLine."Modified by" := USERID; //DP00469
+                  PurchOrderLine."Last Date Modified" := TODAY;//DP00469
+                  //**4PS.en
+                  PurchOrderLine.MODIFY;
+                  RouteRefMgtCU.CloseAdvOrderFromPurchOrderLin(PurchQuoteLine);
+                END ELSE BEGIN
+                  IF (LastRefNo = '') THEN
+                    LastRefNo := RouteRefMgtCU.GetLastRefNo();
+                  LastRefNo := INCSTR(LastRefNo);
+                  PurchOrderLine."Purchase Route Reference" := LastRefNo;
+                  //**4PS.sn
+                  PurchOrderLine."Modified by" := USERID; //DP00469
+                  PurchOrderLine."Last Date Modified" := TODAY;//DP00469
+                  //**4PS.en
+                  PurchOrderLine.MODIFY;
+                  PurchQuoteLine."Purchase Route Reference" := LastRefNo;
+                  //**4PS.sn
+                  PurchQuoteLine."Modified by" := USERID; //DP00469
+                  PurchQuoteLine."Last Date Modified" := TODAY;//DP00469
+                  //**4PS.en
+                  PurchQuoteLine.MODIFY;
+                END;
+                IF PurchQuoteLine."Purchase Action" <> '' THEN BEGIN
+                  BudgetLineRec.SETRANGE("Project No.",PurchQuoteLine."Job No.");
+                  BudgetLineRec.SETRANGE("Purchase Action",PurchQuoteLine."Purchase Action");
+                  BudgetLineRec.SETRANGE(Advised,FALSE);
+                  BudgetLineRec.MODIFYALL(Advised,TRUE);
+                END;
+               END;
+               //**4PS.en
+              UNTIL PurchQuoteLine.NEXT = 0;
+
+            PurchSetup.GET;
+            IF PurchSetup."Archive Quotes and Orders" THEN
+              ArchiveManagement.ArchPurchDocumentNoConfirm(Rec);
+
+            IF PurchSetup."Default Posting Date" = PurchSetup."Default Posting Date"::"No Date" THEN BEGIN
+              PurchOrderHeader."Posting Date" := 0D;
+              PurchOrderHeader.MODIFY;
+            END;
+            //**4PS.sn
+            IF (LastRefNo <> '') THEN
+              RouteRefMgtCU.WriteLastRefNo(LastRefNo);
+
+            IF (NOT gOnExistingOrder) THEN BEGIN
+            //**4PS.en
+              PurchCommentLine.SETRANGE("Document Type","Document Type");
+              PurchCommentLine.SETRANGE("No.","No.");
+              IF NOT PurchCommentLine.ISEMPTY THEN BEGIN
+                PurchCommentLine.LOCKTABLE;
+                IF PurchCommentLine.FINDSET THEN
+                  REPEAT
+                    OldPurchCommentLine := PurchCommentLine;
+                    //PurchCommentLine.DELETE; //**4PS.o
+                    PurchCommentLine."Document Type" := PurchOrderHeader."Document Type";
+                    PurchCommentLine."No." := PurchOrderHeader."No.";
+                    PurchCommentLine.INSERT;
+                    PurchCommentLine := OldPurchCommentLine;
+                  UNTIL PurchCommentLine.NEXT = 0;
+              END;
+              RecordLinkManagement.CopyLinks(Rec,PurchOrderHeader);
+
+              //**4PS.sn
+              DocRelRec.SETRANGE("Document Type",DocRelRec."Document Type"::"Purchase Quote");
+              DocRelRec.SETRANGE("No.","No.");
+              IF DocRelRec.FIND('-') THEN BEGIN
+                REPEAT
+                  DocRel1Rec.COPY(DocRelRec);
+                  DocRel1Rec."Document Type" := DocRelRec."Document Type"::"Purchase Order";
+                  DocRel1Rec."No." := PurchOrderHeader."No.";
+                  DocRel1Rec."Document No." := DocRelRec."Document No.";
+                  DocRel1Rec.INSERT;
+                  ParRec.SETRANGE(Type,ParRec.Type::Quote);
+                  ParRec.SETRANGE("No.","No.");
+                  ParRec.SETRANGE("Document No.",DocRel1Rec."Related Document No.");
+                  IF ParRec.FIND('-') THEN BEGIN
+                    REPEAT
+                      Par1Rec.COPY(ParRec);
+                      Par1Rec.Type := ParRec.Type::Order;
+                      Par1Rec."No." := PurchOrderHeader."No.";
+                      Par1Rec.INSERT;
+                    UNTIL ParRec.NEXT = 0;
+                  END;
+                UNTIL DocRelRec.NEXT = 0;
+              END;
+
+              PurchTextRec.SETRANGE("Line Type",PurchTextRec."Line Type"::"Purchase Quote");
+              PurchTextRec.SETRANGE("No.","No.");
+              IF PurchTextRec.FIND('-') THEN BEGIN
+                REPEAT
+                  PurchText1Rec.COPY(PurchTextRec);
+                  PurchText1Rec."Line Type" := PurchText1Rec."Line Type"::"Purchase Order";
+                  PurchText1Rec."No." := PurchOrderHeader."No.";
+                  PurchText1Rec.INSERT;
+                UNTIL PurchTextRec.NEXT = 0;
+              END;
+            END;
+
+            { //**4PS.so
+            ItemChargeAssgntPurch.RESET;
+            ItemChargeAssgntPurch.SETRANGE("Document Type","Document Type");
+            ItemChargeAssgntPurch.SETRANGE("Document No.","No.");
+
+            WHILE ItemChargeAssgntPurch.FINDFIRST DO BEGIN
+              ItemChargeAssgntPurch.DELETE;
+              ItemChargeAssgntPurch."Document Type" := PurchOrderHeader."Document Type";
+              ItemChargeAssgntPurch."Document No." := PurchOrderHeader."No.";
+              IF NOT (ItemChargeAssgntPurch."Applies-to Doc. Type" IN
+                      [ItemChargeAssgntPurch."Applies-to Doc. Type"::Receipt,
+                       ItemChargeAssgntPurch."Applies-to Doc. Type"::"Return Shipment"])
+              THEN BEGIN
+                ItemChargeAssgntPurch."Applies-to Doc. Type" := PurchOrderHeader."Document Type";
+                ItemChargeAssgntPurch."Applies-to Doc. No." := PurchOrderHeader."No.";
+              END;
+              ItemChargeAssgntPurch.INSERT;
+            END;
+
+            DELETELINKS;
+            DELETE;
+            ApprovalsMgmt.CopyApprovalEntryQuoteToOrder(DATABASE::"Purchase Header","No.",PurchOrderHeader."No.",PurchOrderHeader.RECORDID);
+            ApprovalsMgmt.DeleteApprovalEntry(DATABASE::"Purchase Header","Document Type","No.");
+
+            PurchQuoteLine.DELETEALL;
+
+            IF NOT ShouldRedistributeInvoiceAmount THEN
+              PurchCalcDiscByType.ResetRecalculateInvoiceDisc(PurchOrderHeader);
+            } //**4PS.eo
+
+            //**4PS.sn
+            IF (NOT lvLinesCopied) THEN
+              ERROR(Text11012002);
+            //**4PS.en
+
+            COMMIT;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      PurchQuoteLine@1000 : Record 39;
+      PurchOrderHeader@1001 : Record 38;
+      PurchOrderLine@1002 : Record 39;
+      PurchCommentLine@1003 : Record 43;
+      ItemChargeAssgntPurch@1004 : Record 5805;
+      ItemChargeAssgntPurch2@1100485002 : Record 5805;
+      ReservePurchLine@1006 : Codeunit 99000834;
+      PrepmtMgt@1007 : Codeunit 441;
+      PurchCalcDiscByType@1005 : Codeunit 66;
+      PurchSetup@1009 : Record 312;
+      ArchiveManagement@1010 : Codeunit 5063;
+      RouteRefMgtCU@1210190010 : Codeunit 11012045;
+      BudgetLineRec@1210190000 : Record 11012001;
+      PurchActrec@1210190003 : Record 11012026;
+      DocRelRec@1210190004 : Record 11012407;
+      DocRel1Rec@1210190005 : Record 11012407;
+      ParRec@1210190006 : Record 11012072;
+      Par1Rec@1210190007 : Record 11012072;
+      PurchTextRec@1210190008 : Record 11012067;
+      PurchText1Rec@1210190009 : Record 11012067;
+      PurchHeadExtRec@1100525000 : Record 11020398;
+      PurchaseLineExtension@1100525001 : Record 11020644;
+      LastRefNo@1210190011 : Code[20];
+      Text11012001@1210190012 : TextConst 'ENU=Quote has no lines with ''%1'' switched on.';
+      gAskForNoSerie@1210190013 : Boolean;
+      gOnExistingOrder@1100485000 : Boolean;
+      gNoSeries@1210190014 : Code[10];
+      gOrderNo@1100485001 : Code[20];
+      Text11012002@1100485003 : TextConst 'ENU=Quote has no lines that (still) must be copied.';
+
+    PROCEDURE GetPurchOrderHeader@1(VAR PurchHeader@1000 : Record 38);
+    BEGIN
+      PurchHeader := PurchOrderHeader;
+    END;
+
+    PROCEDURE PurchQuoteToBlanketPurchOrder@1210190000(VAR PurchaseQuoteHeaderRec@1210190000 : Record 38);
+    VAR
+      OldPurchCommentLine@1210190003 : Record 43;
+      Vend@1100485001 : Record 23;
+      lvLinesCopied@1100485000 : Boolean;
+    BEGIN
+      //**4PS
+      WITH PurchaseQuoteHeaderRec DO BEGIN
+        TESTFIELD("Document Type","Document Type"::Quote);
+        TESTFIELD("Buy-from Vendor No.");
+        Vend.GET("Buy-from Vendor No.");
+        Vend.CheckBlockedVendOnDocs(Vend,FALSE);
+
+        IF "Purchase Action" <> '' THEN BEGIN
+          IF PurchActrec.GET("Job No.","Purchase Action") THEN BEGIN
+            //IF PurchActrec.Status = PurchActrec.Status::Definitive THEN  //*28774.o
+            //  ERROR(STRSUBSTNO(Text001,"Job No.","Purchase Action"));    //*28774.o
+            IF NOT (PurchActrec.Status IN [PurchActrec.Status::Approved, PurchActrec.Status::Definitive]) THEN  //*28774.n
+              PurchActrec.FIELDERROR(PurchActrec.Status);                                                       //*28774.n
+          END;
+        END;
+
+        PurchQuoteLine.SETRANGE("Document Type","Document Type");
+        PurchQuoteLine.SETRANGE("Document No.","No.");
+        PurchQuoteLine.SETRANGE("Quote Selected", TRUE);
+        IF NOT PurchQuoteLine.FINDFIRST THEN
+          ERROR(Text11012001, PurchQuoteLine.FIELDCAPTION("Quote Selected"));
+
+        LastRefNo := '';
+        lvLinesCopied := FALSE;
+
+        IF gOnExistingOrder THEN BEGIN
+          PurchOrderHeader.GET(PurchOrderHeader."Document Type"::"Blanket Order", gOrderNo);
+          PurchOrderHeader.TESTFIELD("Buy-from Vendor No.", "Buy-from Vendor No.");
+          PurchOrderHeader.TESTFIELD(Status, PurchOrderHeader.Status::Open);
+          PurchOrderHeader.TESTFIELD("Copied from Purchase Quote No.", "No.");
+
+          PurchOrderLine.LOCKTABLE;
+        END ELSE BEGIN
+          PurchOrderHeader := PurchaseQuoteHeaderRec;
+          PurchOrderHeader."Document Type" := PurchOrderHeader."Document Type"::"Blanket Order";
+          PurchOrderHeader."No. Printed" := 0;
+          PurchOrderHeader.Status := PurchOrderHeader.Status::Open;
+          PurchOrderHeader."No." := '';
+
+          PurchOrderLine.LOCKTABLE;
+
+          IF gAskForNoSerie THEN BEGIN
+            PurchOrderHeader."No. Series" := gNoSeries;
+            PurchOrderHeader.GetNoForSelectedNoSeries(PurchOrderHeader);
+            PurchOrderHeader.InitRecord; //C030976.n
+          END;
+
+          PurchOrderHeader.INSERT(TRUE);
+
+          PurchHeadExtRec.CopyPurchHeadExtension(
+            PurchaseQuoteHeaderRec."Document Type", PurchaseQuoteHeaderRec."No.",
+            PurchOrderHeader."Document Type", PurchOrderHeader."No.");
+
+          PurchOrderHeader."Order Date" := "Order Date";
+          PurchOrderHeader."Posting Date" := "Posting Date";
+          PurchOrderHeader."Document Date" := "Document Date";
+          PurchOrderHeader."Expected Receipt Date" := "Expected Receipt Date";
+          PurchOrderHeader."Shortcut Dimension 1 Code" := "Shortcut Dimension 1 Code";
+          PurchOrderHeader."Shortcut Dimension 2 Code" := "Shortcut Dimension 2 Code";
+          PurchOrderHeader."Dimension Set ID" := "Dimension Set ID";
+          PurchOrderHeader."Copied from Purchase Quote No." := "No.";
+          PurchOrderHeader.MODIFY;
+        END;
+
+        PurchQuoteLine.SETRANGE("Document Type","Document Type");
+        PurchQuoteLine.SETRANGE("Document No.","No.");
+        PurchQuoteLine.SETRANGE("Quote Selected", TRUE);  //**4PS.n
+        IF PurchQuoteLine.FINDSET(TRUE, FALSE) THEN
+          REPEAT
+            IF NOT CheckQuoteLineAlreadyCopied(PurchQuoteLine."Purchase Route Reference") THEN BEGIN
+              PurchOrderLine := PurchQuoteLine;
+              PurchOrderLine."Document Type" := PurchOrderHeader."Document Type";
+              PurchOrderLine."Document No." := PurchOrderHeader."No.";
+              IF gOnExistingOrder THEN
+                PurchOrderLine."Line No." := DetermineNextOrderLine(PurchOrderLine."Document Type",PurchOrderLine."Document No.");
+              ReservePurchLine.TransferPurchLineToPurchLine(
+                PurchQuoteLine,PurchOrderLine,PurchQuoteLine."Reserved Qty. (Base)");
+              PurchOrderLine."Shortcut Dimension 1 Code" := PurchQuoteLine."Shortcut Dimension 1 Code";
+              PurchOrderLine."Shortcut Dimension 2 Code" := PurchQuoteLine."Shortcut Dimension 2 Code";
+              PurchOrderLine."Dimension Set ID" := PurchQuoteLine."Dimension Set ID";
+              PurchOrderLine.VALIDATE("Purchase Action"); //**4PS Check Action Status
+              //**4PS.sn
+              PurchOrderLine."Input by" := USERID; //DP00469
+              PurchOrderLine."Input Date" := TODAY; //DP00469
+              //**4PS.en
+              PurchOrderLine.INSERT;
+
+              lvLinesCopied := TRUE;
+
+              ItemChargeAssgntPurch.RESET;
+              ItemChargeAssgntPurch.SETRANGE("Document Type","Document Type");
+              ItemChargeAssgntPurch.SETRANGE("Document No.","No.");
+              ItemChargeAssgntPurch.SETRANGE("Document Line No.",PurchQuoteLine."Line No.");
+              IF ItemChargeAssgntPurch.FIND('-') THEN BEGIN
+                REPEAT
+                  ItemChargeAssgntPurch2 := ItemChargeAssgntPurch;
+                  ItemChargeAssgntPurch2."Document Type" := PurchOrderHeader."Document Type";
+                  ItemChargeAssgntPurch2."Document No." := PurchOrderHeader."No.";
+                  ItemChargeAssgntPurch2."Document Line No." := PurchOrderLine."Line No.";
+                  IF NOT (ItemChargeAssgntPurch."Applies-to Doc. Type" IN
+                    [ItemChargeAssgntPurch."Applies-to Doc. Type"::Receipt,
+                     ItemChargeAssgntPurch."Applies-to Doc. Type"::"Return Shipment"])
+                  THEN BEGIN
+                    ItemChargeAssgntPurch2."Applies-to Doc. Type" := PurchOrderHeader."Document Type";
+                    ItemChargeAssgntPurch2."Applies-to Doc. No." := PurchOrderHeader."No.";
+                  END;
+                  ItemChargeAssgntPurch2.INSERT;
+                UNTIL ItemChargeAssgntPurch.NEXT = 0;
+              END;
+
+              IF (PurchQuoteLine."Purchase Route Reference" <> '') THEN BEGIN
+                PurchOrderLine."Purchase Route Reference" := PurchQuoteLine."Purchase Route Reference";
+                //**4PS.sn
+                PurchOrderLine."Modified by" := USERID; //DP00469
+                PurchOrderLine."Last Date Modified" := TODAY;//DP00469
+                //**4PS.en
+                PurchOrderLine.MODIFY;
+                RouteRefMgtCU.CloseAdvOrderFromPurchOrderLin(PurchQuoteLine);
+              END ELSE BEGIN
+                IF (LastRefNo = '') THEN
+                  LastRefNo := RouteRefMgtCU.GetLastRefNo();
+                LastRefNo := INCSTR(LastRefNo);
+                PurchOrderLine."Purchase Route Reference" := LastRefNo;
+                //**4PS.sn
+                PurchOrderLine."Modified by" := USERID; //DP00469
+                PurchOrderLine."Last Date Modified" := TODAY;//DP00469
+                //**4PS.en
+                PurchOrderLine.MODIFY;
+                PurchQuoteLine."Purchase Route Reference" := LastRefNo;
+                //**4PS.sn
+                PurchQuoteLine."Modified by" := USERID; //DP00469
+                PurchQuoteLine."Last Date Modified" := TODAY;//DP00469
+                //**4PS.en
+                PurchQuoteLine.MODIFY;
+              END;
+              IF PurchQuoteLine."Purchase Action" <> '' THEN BEGIN
+                BudgetLineRec.SETRANGE("Project No.",PurchQuoteLine."Job No.");
+                BudgetLineRec.SETRANGE("Purchase Action",PurchQuoteLine."Purchase Action");
+                BudgetLineRec.SETRANGE(Advised,FALSE);
+                BudgetLineRec.MODIFYALL(Advised,TRUE);
+              END;
+            END;
+          UNTIL PurchQuoteLine.NEXT = 0;
+
+        IF (LastRefNo <> '') THEN
+          RouteRefMgtCU.WriteLastRefNo(LastRefNo);
+
+        IF (NOT gOnExistingOrder) THEN BEGIN
+          PurchCommentLine.SETRANGE("Document Type","Document Type");
+          PurchCommentLine.SETRANGE("No.","No.");
+          IF NOT PurchCommentLine.ISEMPTY THEN BEGIN
+            PurchCommentLine.LOCKTABLE;
+            IF PurchCommentLine.FIND('-') THEN BEGIN
+              REPEAT
+                OldPurchCommentLine := PurchCommentLine;
+                PurchCommentLine."Document Type" := PurchOrderHeader."Document Type";
+                PurchCommentLine."No." := PurchOrderHeader."No.";
+                PurchCommentLine.INSERT;
+                PurchCommentLine := OldPurchCommentLine;
+              UNTIL PurchCommentLine.NEXT = 0;
+            END;
+          END;
+
+          //22-12-03 JTH, new document relation type in blanke contract
+          DocRelRec.SETRANGE("Document Type",DocRelRec."Document Type"::"Purchase Quote");
+          DocRelRec.SETRANGE("No.","No.");
+          IF DocRelRec.FIND('-') THEN BEGIN
+            REPEAT
+              DocRel1Rec.COPY(DocRelRec);
+              DocRel1Rec."Document Type" := DocRelRec."Document Type"::"Blanket Order";
+              DocRel1Rec."No." := PurchOrderHeader."No.";
+              DocRel1Rec."Document No." := DocRelRec."Document No.";
+              DocRel1Rec.INSERT;
+              ParRec.SETRANGE(Type,ParRec.Type::Quote);
+              ParRec.SETRANGE("No.","No.");
+              ParRec.SETRANGE("Document No.",DocRel1Rec."Related Document No.");
+              IF ParRec.FIND('-') THEN BEGIN
+                REPEAT
+                  Par1Rec.COPY(ParRec);
+                  Par1Rec.Type := ParRec.Type::BlanketOrder;
+                  Par1Rec."No." := PurchOrderHeader."No.";
+                  Par1Rec.INSERT;
+               UNTIL ParRec.NEXT = 0;
+              END;
+            UNTIL DocRelRec.NEXT = 0;
+          END;
+
+          //22-12-03 JTH, new document type in purchase texts (blanket contract)
+          PurchTextRec.SETRANGE("Line Type",PurchTextRec."Line Type"::"Purchase Quote");
+          PurchTextRec.SETRANGE("No.","No.");
+          IF PurchTextRec.FIND('-') THEN BEGIN
+            REPEAT
+              PurchText1Rec.COPY(PurchTextRec);
+              PurchText1Rec."Line Type" := PurchText1Rec."Line Type"::"Blanket Order";
+              PurchText1Rec."No." := PurchOrderHeader."No.";
+              PurchText1Rec.INSERT;
+            UNTIL PurchTextRec.NEXT = 0;
+          END;
+        END;
+
+        IF (NOT lvLinesCopied) THEN
+          ERROR(Text11012002);
+
+        COMMIT;
+
+      END;
+    END;
+
+    PROCEDURE SetAskForNoSerie@1210190001(INoSeries@1210190000 : Code[10]);
+    BEGIN
+      //**4PS
+      gAskForNoSerie := TRUE;
+      gNoSeries := INoSeries;
+    END;
+
+    PROCEDURE SetOnExistingOrder@1100485000(IOrderNo@1100485000 : Code[20]);
+    BEGIN
+      //**4PS
+      gOnExistingOrder := TRUE;
+      gOrderNo := IOrderNo;
+    END;
+
+    PROCEDURE CheckQuoteLineAlreadyCopied@1100485004(IRefNo@1100485000 : Code[20]) : Boolean;
+    VAR
+      lvPurchLineRec@1100485001 : Record 39;
+    BEGIN
+      //**4PS
+      IF (IRefNo = '') THEN
+        EXIT(FALSE);
+
+      lvPurchLineRec.SETCURRENTKEY("Document Type","Purchase Route Reference");
+
+      lvPurchLineRec.SETRANGE("Document Type", lvPurchLineRec."Document Type"::Order);
+      lvPurchLineRec.SETRANGE("Purchase Route Reference", IRefNo);
+      IF lvPurchLineRec.FINDFIRST THEN
+        EXIT(TRUE);
+
+      lvPurchLineRec.SETRANGE("Document Type", lvPurchLineRec."Document Type"::"Blanket Order");
+      lvPurchLineRec.SETRANGE("Purchase Route Reference", IRefNo);
+      IF lvPurchLineRec.FINDFIRST THEN
+        EXIT(TRUE);
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE DetermineNextOrderLine@1100485005(IDocType@1100485000 : Option;IDocNo@1100485001 : Code[20]) : Integer;
+    VAR
+      lvPurchLineRec@1100485002 : Record 39;
+    BEGIN
+      //**4PS
+      WITH lvPurchLineRec DO BEGIN
+        SETRANGE("Document Type", IDocType);
+        SETRANGE("Document No.", IDocNo);
+        IF FINDLAST THEN
+          EXIT(("Line No." + 10000));
+
+        EXIT(10000);
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

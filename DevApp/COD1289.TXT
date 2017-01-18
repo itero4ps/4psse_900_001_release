@@ -1,0 +1,175 @@
+OBJECT Codeunit 1289 Imp. Bank List Ext. Data Hndl
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00;
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 1259=rimd,
+                TableData 1260=r;
+    OnRun=BEGIN
+            GetBankListFromConversionService(TRUE,'',5000);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      AddnlInfoTxt@1000 : TextConst 'ENU=For more information, go to %1.';
+      BankDataConvServMgt@1001 : Codeunit 1265;
+      ResponseNodeTxt@1002 : TextConst '@@@={Locked};ENU=bankListResponse';
+      BankDataConvServSysErr@1003 : TextConst 'ENU=The bank data conversion service has returned the following error message:';
+
+    PROCEDURE GetBankListFromConversionService@7(ShowErrors@1000 : Boolean;CountryFilter@1001 : Text;Timeout@1003 : Integer);
+    VAR
+      RequestBodyTempBlob@1002 : Record 99008535;
+    BEGIN
+      RequestBodyTempBlob.INIT;
+
+      SendRequestToConversionService(RequestBodyTempBlob,ShowErrors,Timeout,CountryFilter);
+
+      InsertBankData(RequestBodyTempBlob,CountryFilter);
+    END;
+
+    LOCAL PROCEDURE SendRequestToConversionService@1(VAR BodyTempBlob@1004 : Record 99008535;EnableUI@1003 : Boolean;Timeout@1005 : Integer;CountryFilter@1007 : Text);
+    VAR
+      BankDataConvServiceSetup@1000 : Record 1260;
+      SOAPWebServiceRequestMgt@1001 : Codeunit 1290;
+      ResponseInStream@1002 : InStream;
+      InStream@1006 : InStream;
+      ResponseOutStream@1008 : OutStream;
+    BEGIN
+      BankDataConvServMgt.CheckCredentials;
+
+      PrepareSOAPRequestBody(BodyTempBlob,CountryFilter);
+
+      BankDataConvServiceSetup.GET;
+      BodyTempBlob.Blob.CREATEINSTREAM(InStream);
+      SOAPWebServiceRequestMgt.SetGlobals(InStream,
+        BankDataConvServiceSetup."Service URL",BankDataConvServiceSetup."User Name",BankDataConvServiceSetup.GetPassword);
+      SOAPWebServiceRequestMgt.SetTimeout(Timeout);
+      IF NOT EnableUI THEN
+        SOAPWebServiceRequestMgt.DisableProgressDialog;
+
+      IF SOAPWebServiceRequestMgt.SendRequestToWebService THEN BEGIN
+        SOAPWebServiceRequestMgt.GetResponseContent(ResponseInStream);
+
+        IF EnableUI THEN
+          CheckIfErrorsOccurred(ResponseInStream);
+
+        BodyTempBlob.Blob.CREATEOUTSTREAM(ResponseOutStream);
+        COPYSTREAM(ResponseOutStream,ResponseInStream);
+      END ELSE
+        IF EnableUI THEN
+          SOAPWebServiceRequestMgt.ProcessFaultResponse(STRSUBSTNO(AddnlInfoTxt,BankDataConvServiceSetup."Support URL"));
+    END;
+
+    LOCAL PROCEDURE PrepareSOAPRequestBody@12(VAR BodyTempBlob@1000 : Record 99008535;CountryFilter@1002 : Text);
+    VAR
+      XMLDOMMgt@1006 : Codeunit 6224;
+      BodyContentInputStream@1004 : InStream;
+      BodyContentOutputStream@1005 : OutStream;
+      BodyContentXmlDoc@1003 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      OperationXmlNode@1012 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      ElementXmlNode@1001 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+    BEGIN
+      BodyTempBlob.Blob.CREATEINSTREAM(BodyContentInputStream);
+      BodyContentXmlDoc := BodyContentXmlDoc.XmlDocument;
+
+      XMLDOMMgt.AddRootElementWithPrefix(BodyContentXmlDoc,'bankList','',BankDataConvServMgt.GetNamespace,OperationXmlNode);
+      XMLDOMMgt.AddElementWithPrefix(OperationXmlNode,'compressed','true','','',ElementXmlNode);
+      XMLDOMMgt.AddElementWithPrefix(OperationXmlNode,'filterbycountry',CountryFilter,'','',ElementXmlNode);
+
+      CLEAR(BodyTempBlob.Blob);
+      BodyTempBlob.Blob.CREATEOUTSTREAM(BodyContentOutputStream);
+      BodyContentXmlDoc.Save(BodyContentOutputStream);
+    END;
+
+    LOCAL PROCEDURE InsertBankData@4(ResponseBodyTempBlob@1000 : Record 99008535;CountryFilter@1001 : Text);
+    VAR
+      BankDataConvBank@1008 : Record 1259;
+      XMLDOMMgt@1006 : Codeunit 6224;
+      XMLDocOut@1012 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      InStream@1009 : InStream;
+      XmlNodeList@1007 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+      index@1005 : Integer;
+      XPath@1010 : Text;
+      Found@1002 : Boolean;
+    BEGIN
+      ResponseBodyTempBlob.Blob.CREATEINSTREAM(InStream);
+      XMLDocOut := XMLDocOut.XmlDocument;
+      XMLDocOut.Load(InStream);
+
+      XPath := '/amc:bankListResponse/return/pack/bank';
+
+      Found := XMLDOMMgt.FindNodesWithNamespace(XMLDocOut.DocumentElement,XPath,'amc',BankDataConvServMgt.GetNamespace,XmlNodeList);
+
+      IF NOT Found THEN
+        EXIT;
+
+      IF XmlNodeList.Count > 0 THEN BEGIN
+        IF CountryFilter <> '' THEN
+          BankDataConvBank.SETRANGE("Country/Region Code",CountryFilter);
+        BankDataConvBank.DELETEALL;
+        FOR index := 0 TO XmlNodeList.Count DO
+          IF NOT ISNULL(XmlNodeList.Item(index)) THEN BEGIN
+            CLEAR(BankDataConvBank);
+            BankDataConvBank.Bank := XmlNodeList.Item(index).Attributes.GetNamedItem('bank').Value;
+            BankDataConvBank."Bank Name" := XmlNodeList.Item(index).Attributes.GetNamedItem('bankname').Value;
+            BankDataConvBank."Country/Region Code" := COPYSTR(XmlNodeList.Item(index).Attributes.GetNamedItem('countryoforigin').Value,
+                1,10);
+            BankDataConvBank."Last Update Date" := TODAY;
+            BankDataConvBank.INSERT;
+          END;
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckIfErrorsOccurred@8(VAR ResponseInStream@1001 : InStream);
+    VAR
+      ResponseXmlDoc@1000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+    BEGIN
+      ResponseXmlDoc := ResponseXmlDoc.XmlDocument;
+      ResponseXmlDoc.Load(ResponseInStream);
+
+      IF ResponseHasErrors(ResponseXmlDoc) THEN
+        DisplayErrorFromResponse(ResponseXmlDoc);
+    END;
+
+    LOCAL PROCEDURE ResponseHasErrors@3(ResponseXmlDoc@1000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument") : Boolean;
+    VAR
+      XMLDOMMgt@1001 : Codeunit 6224;
+      XmlNode@1002 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+    BEGIN
+      EXIT(XMLDOMMgt.FindNodeWithNamespace(ResponseXmlDoc.DocumentElement,
+          BankDataConvServMgt.GetErrorXPath(ResponseNodeTxt),'amc',BankDataConvServMgt.GetNamespace,XmlNode));
+    END;
+
+    LOCAL PROCEDURE DisplayErrorFromResponse@5(ResponseXmlDoc@1000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument");
+    VAR
+      XMLDOMMgt@1003 : Codeunit 6224;
+      XMLNodeList@1001 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+      Found@1002 : Boolean;
+      ErrorText@1005 : Text;
+      i@1004 : Integer;
+    BEGIN
+      Found := XMLDOMMgt.FindNodesWithNamespace(ResponseXmlDoc.DocumentElement,
+          BankDataConvServMgt.GetErrorXPath(ResponseNodeTxt),'amc',BankDataConvServMgt.GetNamespace,XMLNodeList);
+      IF Found THEN BEGIN
+        ErrorText := BankDataConvServSysErr;
+        FOR i := 1 TO XMLNodeList.Count DO
+          ErrorText += '\\' + XMLDOMMgt.FindNodeText(XMLNodeList.Item(i - 1),'text') + '\' +
+            XMLDOMMgt.FindNodeText(XMLNodeList.Item(i - 1),'hinttext') + '\\' +
+            STRSUBSTNO(AddnlInfoTxt,BankDataConvServMgt.GetSupportURL(XMLNodeList.Item(i - 1)));
+
+        ERROR(ErrorText);
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

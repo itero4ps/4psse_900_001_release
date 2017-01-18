@@ -1,0 +1,1237 @@
+OBJECT Codeunit 6086305 EM Online Mgt.
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=EMW16.00.10.1.02.00;
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 6086300=rimd,
+                TableData 6086345=rimd,
+                TableData 6086346=rimd;
+    OnRun=VAR
+            Window@1160040005 : Dialog;
+            DisplayMsg@1160040006 : Text[1024];
+            NoofTransactions@1160040002 : Integer;
+            NoOfExpenses@1160040000 : Integer;
+            NoOfExpensesProcessed@1160040001 : Integer;
+            NoOfTransactionsProcessed@1160040003 : Integer;
+            Reget@1160040004 : Boolean;
+          BEGIN
+            CheckCompanyCode;
+
+            IF GUIALLOWED THEN
+              Window.OPEN(SyncMsg);
+
+            SetupCloud;
+
+            NoOfExpenses := GetNewExpenses;
+            COMMIT;
+
+            NoOfExpensesProcessed := ProcessExpenseInbox;
+            COMMIT;
+
+            Reget := FALSE;
+            IF Reget THEN
+              NoofTransactions := GetNotconfirmedTransactions
+            ELSE
+              NoofTransactions := GetNewTransactions;
+            COMMIT;
+
+            NoOfTransactionsProcessed := ProcessTransactionInbox;
+            COMMIT;
+
+            Match;
+
+            Window.CLOSE;
+
+            IF GUIALLOWED THEN BEGIN
+              DisplayMsg := SyncWithCOCompletedMsg + '\';
+              IF NoOfExpenses <> 0 THEN
+                DisplayMsg := DisplayMsg + STRSUBSTNO(NewUpdateExpMsg,NoOfExpenses)
+              ELSE
+                DisplayMsg := DisplayMsg + NoNewUpdateExpMsg;
+
+              IF NoofTransactions <> 0 THEN
+                DisplayMsg := DisplayMsg + '\' + STRSUBSTNO(NewBankTransMsg,NoofTransactions);
+
+              IF (NoOfExpInboxWithError <> 0) OR (NoOfBankTransInboxWithError <> 0) THEN BEGIN
+                DisplayMsg := DisplayMsg + '\\' + WarningMsg;
+                IF NoOfExpInboxWithError <> 0 THEN
+                  DisplayMsg := DisplayMsg + '\' + STRSUBSTNO(ExpWithErrMsg,NoOfExpInboxWithError);
+
+                IF NoOfBankTransInboxWithError <> 0 THEN
+                  DisplayMsg := DisplayMsg + '\' + STRSUBSTNO(BankTransWithErrMsg,NoOfBankTransInboxWithError);
+              END;
+
+              MESSAGE(DisplayMsg);
+            END;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      OnlineMgt@1160040005 : Codeunit 6086500;
+      HttpActions@1160040001 : 'PUT,DELETE,GET';
+      DifferentCompanyCodesErr@1160040014 : TextConst 'ENU=%1 in %2 must be the same as %3 in %4.';
+      MissingMandatoryFieldErr@1160040015 : TextConst 'ENU=Not all mandatory fields have been configured. The full list of mandatory fields to be configured is: %1.';
+      PrefixId@1160040008 : TextConst 'ENU=id-';
+      SyncMsg@1160040016 : TextConst 'ENU=Synchronizing with Continia Online';
+      SyncWithCOCompletedMsg@1160040000 : TextConst 'ENU=Synchronization with Continia Online has completed\-----------------------------------------------------------------------';
+      NewUpdateExpMsg@1160040002 : TextConst 'ENU=%1 new or updated expenses imported.';
+      NoNewUpdateExpMsg@1160040006 : TextConst 'ENU=No new expenses imported.';
+      NewBankTransMsg@1160040003 : TextConst 'ENU=%1 new bank transactions imported.';
+      WarningMsg@1160040004 : TextConst 'ENU=WARNING!';
+      ExpWithErrMsg@1160040007 : TextConst 'ENU=There are one or more expenses in the Expense Inbox that needs to be processed manually.';
+      BankTransWithErrMsg@1160040009 : TextConst 'ENU=There are one or more entries in the Bank Transaction Inbox that needs to be processed manually.';
+      Text007@1160040011 : TextConst 'ENU=Update and activate the existing company,Create and activate a new company,Cancel';
+      Text008@1160040012 : TextConst 'ENU=%1 has been activated for %2.';
+      Text009@1160040013 : TextConst 'ENU=Number of Expenses: %1';
+      ActivatedMsg@1160040010 : TextConst 'ENU=The Bank Agreement was activated.';
+      DoubleConfigErrMsg@1160040017 : TextConst 'ENU=The field %1 has been configured more than once. This is not allowed.';
+      CannotLoadFile@1160040018 : TextConst 'ENU=Could not find the file %1';
+
+    PROCEDURE IsCompanyActive@1160040035(ShowError@1160040001 : Boolean) : Boolean;
+    VAR
+      LicenseMgt@1160040002 : Codeunit 6086501;
+    BEGIN
+      EXIT(LicenseMgt.IsActive('CEM','Expense Management',ShowError));
+    END;
+
+    PROCEDURE TestConnection@1160040070();
+    VAR
+      ContinaOnline@1160040000 : Codeunit 6086500;
+    BEGIN
+      ContinaOnline.TestConnection;
+    END;
+
+    PROCEDURE ActivateCompany@1160040083() : Boolean;
+    VAR
+      Expense@1160040001 : Record 6086320;
+      AboutMgt@1160040002 : Codeunit 6086306;
+      LicenseMgt@1160040000 : Codeunit 6086501;
+      LicenseInfo@1160040004 : ARRAY [100] OF Text[250];
+      i@1160040005 : Integer;
+    BEGIN
+      CheckCompanyCode;
+
+      i := LicenseMgt.GetStandardLicenseInfo(LicenseInfo);
+      LicenseInfo[i + 1] := STRSUBSTNO(Text009,Expense.COUNT);
+
+      IF NOT LicenseMgt.ShowAgreement('CEM',AboutMgt.VersionDetails,LicenseInfo) THEN
+        EXIT;
+
+      IF NOT LicenseMgt.AcceptAgreement('CEM',AboutMgt.VersionDetails,LicenseInfo,FALSE) THEN
+        CASE STRMENU(Text007,1) OF
+          1:
+            LicenseMgt.AcceptAgreement('CEM',AboutMgt.VersionDetails,LicenseInfo,TRUE);
+          2:
+            BEGIN
+              OnlineMgt.CreateNewCompanyGUID;
+              IF NOT LicenseMgt.AcceptAgreement('CEM',AboutMgt.VersionDetails,LicenseInfo,FALSE) THEN
+                EXIT;
+            END;
+          ELSE
+            EXIT;
+        END;
+
+      MESSAGE(Text008,AboutMgt.VersionDetails,COMPANYNAME);
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE MarkDownloadedExpense@1160040008(ExpenseGUID@1160040003 : GUID);
+    VAR
+      XmlLib@1160040004 : Codeunit 6085573;
+      XmlDoc@1160040005 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      XmlNode@1160040001 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      XmlNode2@1160040000 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+    BEGIN
+      XmlDoc := XmlDoc.XmlDocument;
+      XmlNode2 := XmlDoc.CreateNode('element','Receipts','');
+      XmlDoc.AppendChild(XmlNode2);
+
+      XmlNode := XmlDoc.CreateNode('element','Receipt','');
+      XmlLib.SetXmlNodeAttr(XmlNode,'Downloaded',OnlineMgt.GetBoolAsText(TRUE));
+      XmlNode2.AppendChild(XmlNode);
+
+      OnlineMgt.ExecuteRequest(GetOneExpenseUrl(ExpenseGUID),HttpActions::PUT,FALSE,XmlDoc);
+
+      CLEAR(XmlDoc);
+    END;
+
+    PROCEDURE GetNewExpenses@1160040018() : Integer;
+    VAR
+      XmlDoc@1160040001 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+    BEGIN
+      OnlineMgt.ExecuteRequest(GetNewExpenseUrl,HttpActions::GET,TRUE,XmlDoc);
+      EXIT(GetExpenseFiles(XmlDoc,FALSE));
+    END;
+
+    PROCEDURE CreateNewExpense@1160040047() : GUID;
+    VAR
+      ExpenseInbox@1160040001 : Record 6086323;
+      XmlDoc@1160040000 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+    BEGIN
+      OnlineMgt.ExecuteRequest(GetCreateNewExpenseUrl,HttpActions::GET,TRUE,XmlDoc);
+
+      CLEAR(ExpenseInbox."Expense GUID");
+      ExpenseInbox."Expense GUID" := GetGuid(XmlDoc);
+      EXIT(ExpenseInbox."Expense GUID");
+    END;
+
+    PROCEDURE UpdateExpense@1160040058(Expense@1160040000 : Record 6086320);
+    VAR
+      Log@1160040009 : Record 6086329;
+      ExpenseDim@1160040006 : Record 6086353;
+      ConfigField@1160040007 : Record 6086346;
+      XmlLib@1160040004 : Codeunit 6085573;
+      DimNode@1160040005 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      DimsNode@1160040001 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      XmlDoc@1160040003 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      XmlNode@1160040002 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      Anydims@1160040008 : Boolean;
+    BEGIN
+      XmlDoc := XmlDoc.XmlDocument;
+
+      XmlNode := XmlDoc.CreateNode('element','Receipt','');
+
+      XmlLib.SetXmlNodeAttr(XmlNode,'EmployeeNo',Expense."Employee No.");
+      XmlLib.SetXmlNodeAttr(XmlNode,'Description',Expense.Description);
+      XmlLib.SetXmlNodeAttr(XmlNode,'DocumentDate',FORMAT(Expense."Document Date",0,9));
+      XmlLib.SetXmlNodeAttr(XmlNode,'CountryRegion',Expense."Country/Region Code");
+      XmlLib.SetXmlNodeAttr(XmlNode,'CurrencyCode',GetCurrencyCodeFromExpense(Expense."Currency Code"));
+      XmlLib.SetXmlNodeAttr(XmlNode,'Amount',FORMAT(Expense.Amount,0,9));
+      XmlLib.SetXmlNodeAttr(XmlNode,'ReceiptType',Expense."Expense Type");
+      XmlLib.SetXmlNodeAttr(XmlNode,'UserId',Expense.GetEmployeeEmail);
+
+      XmlDoc.AppendChild(XmlNode);
+
+      Anydims := FALSE;
+      CLEAR(DimsNode);
+      DimsNode := XmlDoc.CreateNode('element','Dims','');
+
+      ExpenseDim.SETRANGE("Expense Entry No.",Expense."Entry No.");
+      IF ExpenseDim.FINDFIRST THEN
+        REPEAT
+          CLEAR(DimNode);
+          DimNode := XmlDoc.CreateNode('element','Dim','');
+          IF ExpenseDim."Dimension Code" <> '' THEN BEGIN
+            XmlLib.SetXmlNodeAttr(DimNode,'FieldName',ExpenseDim.GetFieldFromDim(ExpenseDim."Dimension Code"));
+            XmlLib.SetXmlNodeAttr(DimNode,'FieldValue',ExpenseDim."Dimension Value Code");
+          END ELSE BEGIN
+            XmlLib.SetXmlNodeAttr(DimNode,'FieldName',ExpenseDim."Field Code");
+            XmlLib.SetXmlNodeAttr(DimNode,'FieldValue',MapToOnlineValue(ExpenseDim."Field Code",ExpenseDim."Field Value"));
+          END;
+          DimsNode.AppendChild(DimNode);
+          Anydims := TRUE;
+        UNTIL ExpenseDim.NEXT = 0;
+
+      IF Expense."Job No." <> '' THEN
+        IF ConfigFieldActive('JOBNO') THEN BEGIN
+          DimNode := XmlDoc.CreateNode('element','Dim','');
+          XmlLib.SetXmlNodeAttr(DimNode,'FieldName','JOBNO');
+          XmlLib.SetXmlNodeAttr(DimNode,'FieldValue',Expense."Job No.");
+          DimsNode.AppendChild(DimNode);
+          Anydims := TRUE;
+        END;
+
+      IF Expense."Job Task No." <> '' THEN
+        IF ConfigFieldActive('TASK') THEN BEGIN
+          DimNode := XmlDoc.CreateNode('element','Dim','');
+          XmlLib.SetXmlNodeAttr(DimNode,'FieldName','TASK');
+          XmlLib.SetXmlNodeAttr(DimNode,'FieldValue',Expense."Job Task No.");
+          DimsNode.AppendChild(DimNode);
+          Anydims := TRUE;
+        END;
+
+      IF ConfigFieldActive('CASH/PRIVATE CARD') THEN BEGIN
+        DimNode := XmlDoc.CreateNode('element','Dim','');
+        XmlLib.SetXmlNodeAttr(DimNode,'FieldName','CASH/PRIVATE CARD');
+        XmlLib.SetXmlNodeAttr(DimNode,'FieldValue',OnlineMgt.GetBoolAsText(Expense."Cash/Private Card"));
+        DimsNode.AppendChild(DimNode);
+        Anydims := TRUE;
+      END;
+
+      IF (Expense.Status = Expense.Status::Rejected) OR (Expense.Status = Expense.Status::Approved) THEN BEGIN
+        CLEAR(DimNode);
+        DimNode := XmlDoc.CreateNode('element','Dim','');
+        XmlLib.SetXmlNodeAttr(DimNode,'FieldName','APPROVAL STATUS');
+        IF Expense.Status = Expense.Status::Rejected THEN
+          XmlLib.SetXmlNodeAttr(DimNode,'FieldValue','Rejected')
+        ELSE
+          XmlLib.SetXmlNodeAttr(DimNode,'FieldValue','Approved');
+        DimsNode.AppendChild(DimNode);
+        Anydims := TRUE;
+      END;
+
+      IF Anydims THEN
+        XmlNode.AppendChild(DimsNode);
+
+      OnlineMgt.ExecuteRequest(UpdateExistingUrl(Expense."Expense GUID"),HttpActions::PUT,TRUE,XmlDoc);
+
+      IF Expense."Transfer Attachments to CO" THEN
+        SendAttachments(Expense);
+
+      Log.LogSentToCO(Expense);
+
+      SetUploadComplete(Expense);
+      COMMIT;
+    END;
+
+    PROCEDURE SendAttachments@1160040064(Expense@1160040000 : Record 6086320);
+    VAR
+      ExpenseAttachments@1160040001 : Record 6086326;
+      OnlineMgtLocal@1160040002 : Codeunit 6086500;
+    BEGIN
+      ExpenseAttachments.SETRANGE("Expense Entry No.",Expense."Entry No.");
+      IF ExpenseAttachments.FINDFIRST THEN
+        REPEAT
+          OnlineMgtLocal.AddFileToBatchUpload(ExpenseAttachments.GetServerFilenameAndPath,ExpenseAttachments.Filename);
+        UNTIL ExpenseAttachments.NEXT = 0;
+
+      OnlineMgtLocal.BatchUploadFiles(UploadfilesUrl(Expense."Expense GUID"),TRUE);
+    END;
+
+    PROCEDURE SetUploadComplete@1160040066(Expense@1160040000 : Record 6086320);
+    VAR
+      XmlDoc@1160040001 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+    BEGIN
+      CLEAR(XmlDoc);
+      OnlineMgt.ExecuteRequest(SetUploadCompleteUrl(Expense."Expense GUID"),HttpActions::PUT,FALSE,XmlDoc);
+      OnlineMgt.ExecuteRequest(SetAppUploadCompleteUrl(Expense."Expense GUID"),HttpActions::PUT,FALSE,XmlDoc);
+    END;
+
+    PROCEDURE DeleteExpense@1160040078(ExpenseGuid@1160040000 : GUID);
+    VAR
+      XmlDoc@1160040001 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+    BEGIN
+      // This function is called when an expense is deleted.
+      // The function marks the expense as downloaded such that this delete ca be sent to app
+      // and deleted when this download of state has been done to app
+      CLEAR(XmlDoc);
+      OnlineMgt.ExecuteRequest(SetDeleteUrl(ExpenseGuid),HttpActions::PUT,TRUE,XmlDoc);
+    END;
+
+    PROCEDURE GetGuid@1160040059(XmlDoc@1160040001 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument") : GUID;
+    VAR
+      XMLNodeList@1160040000 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+      ExpenseGUID@1160040003 : GUID;
+      i@1160040002 : Integer;
+    BEGIN
+      CLEAR(XMLNodeList);
+      XMLNodeList := XmlDoc.DocumentElement.SelectNodes('Receipt');
+      FOR i := 0 TO XMLNodeList.Count - 1 DO
+        ExpenseGUID := OnlineMgt.GetAttribAsGuid(XMLNodeList,'Id',i);
+      EXIT(ExpenseGUID);
+    END;
+
+    PROCEDURE GetExpenseFiles@1160040010(XmlDoc@1160040005 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";ReDownLoad@1160040022 : Boolean) Count : Integer;
+    VAR
+      ExpSetup@1160040013 : Record 6086300;
+      Expense@1160040031 : Record 6086320;
+      ExpenseInbox@1160040000 : Record 6086323;
+      ExpenseInboxDim@1160040014 : Record 6086324;
+      ExpenseInboxAttachment@1160040021 : Record 6086328;
+      Log@1160040036 : Record 6086329;
+      FieldType@1160040024 : Record 6086345;
+      ConfigField@1160040015 : Record 6086346;
+      Dummytext@1160040029 : Text[1024];
+      FieldValue@1160040011 : Text[250];
+      FileLink@1160040004 : Text[1024];
+      Filename@1160040033 : Text[1024];
+      ToEmail@1160040009 : Text[1024];
+      FieldNameCode@1160040027 : Code[20];
+      DimCode@1160040006 : Code[20];
+      ExpenseGUID@1160040001 : GUID;
+      Count2@1160040016 : Integer;
+      ImportCounter@1160040010 : Integer;
+      LastEntryNo@1160040007 : Integer;
+      AttachementNode@1160040019 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      AttachementNodeList@1160040018 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+      DimsNode@1160040017 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      ExpenseNode@1160040012 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      XmlDimNodeList@1160040008 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+      XMLDoc2@1160040003 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      XMLNodeList@1160040002 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+    BEGIN
+      CLEAR(XMLNodeList);
+      XMLNodeList := XmlDoc.DocumentElement.SelectNodes('Receipt');
+
+      FOR Count := 0 TO XMLNodeList.Count - 1 DO BEGIN
+        IF LastEntryNo = 0 THEN BEGIN
+          ExpSetup.GET;
+          ExpenseInbox.LOCKTABLE;
+          IF ExpenseInbox.FINDLAST THEN
+            LastEntryNo := ExpenseInbox."Entry No.";
+        END;
+        LastEntryNo += 1;
+        ImportCounter += 1;
+        ExpenseGUID := OnlineMgt.GetAttribAsGuid(XMLNodeList,'Id',Count);
+
+        CLEAR(ExpenseNode);
+        CLEAR(AttachementNodeList);
+        ExpenseNode := XMLNodeList.Item(Count);
+        AttachementNode := ExpenseNode.SelectSingleNode('Attachments');
+        IF ISNULL(AttachementNode) THEN
+          CLEAR(AttachementNodeList)
+        ELSE
+          AttachementNodeList := AttachementNode.SelectNodes('Attachment');
+
+        Expense.SETCURRENTKEY("Expense GUID");
+        Expense.SETRANGE("Expense GUID",ExpenseGUID);
+        IF NOT Expense.FINDFIRST THEN
+          CLEAR(Expense);
+
+        ExpenseInbox.INIT;
+        ExpenseInbox."Entry No." := LastEntryNo;
+        ExpenseInbox."Expense Entry No." := Expense."Entry No.";
+        ExpenseInbox."Expense GUID" := ExpenseGUID;
+
+        ExpenseInbox.Status := ExpenseInbox.Status::Pending;
+        ExpenseInbox."Employee No." := FindEmployeeFromEmail(OnlineMgt.GetAttribAsCode(XMLNodeList,'EmployeeNo',Count));
+
+        OnlineMgt.GetAttribAsText(XMLNodeList,'Description',Count,Dummytext);
+        ExpenseInbox.Description := COPYSTR(Dummytext,1,MAXSTRLEN(ExpenseInbox.Description));
+
+        OnlineMgt.GetAttribAsText(XMLNodeList,'Description2',Count,Dummytext);
+        ExpenseInbox."Description 2" := COPYSTR(Dummytext,1,MAXSTRLEN(ExpenseInbox."Description 2"));
+
+        ExpenseInbox."Document Date" := OnlineMgt.GetAttribAsDateUTC(XMLNodeList,'DocumentDate',Count);
+        ExpenseInbox."Country/Region Code" :=
+          GetAttribAsCodeLength(XMLNodeList,'CountryRegion',Count,
+           MAXSTRLEN(ExpenseInbox."Country/Region Code"));
+
+        ExpenseInbox."Currency Code" :=
+          GetCurrencyCodeFromXML(
+          GetAttribAsCodeLength(XMLNodeList,'CurrencyCode',
+           Count,MAXSTRLEN(ExpenseInbox."Currency Code")));
+
+        ExpenseInbox.Amount := OnlineMgt.GetAttribAsDecimal(XMLNodeList,'Amount',Count);
+        ExpenseInbox."Expense Type" := OnlineMgt.GetAttribAsCode(XMLNodeList,'ReceiptType',Count);
+        OnlineMgt.GetAttribAsText(XMLNodeList,'ToEmail',Count,ToEmail);
+
+        IF ToEmail <> '' THEN
+          ExpenseInbox."Transaction Id" := ExtractIdfromEmail(ToEmail);
+
+        ExpenseInbox."Imported Date/Time" := CURRENTDATETIME;
+        ExpenseInbox."Imported by User-ID" := USERID;
+        IF ExpenseInbox."Date Created" = 0D THEN
+          ExpenseInbox."Date Created" := TODAY;
+        IF NOT ExpenseInbox.INSERT THEN
+          ExpenseInbox.MODIFY;
+
+        //INSERT DIMENSIONS
+        DimsNode := ExpenseNode.SelectSingleNode('Dims');
+        XmlDimNodeList := DimsNode.SelectNodes('Dim');
+        ExpenseInboxDim.SETRANGE("Inbox Entry No.",ExpenseInbox."Entry No.");
+        ExpenseInboxDim.DELETEALL;
+
+        IF NOT ISNULL(XmlDimNodeList) THEN
+          FOR Count2 := 0 TO XmlDimNodeList.Count - 1 DO BEGIN
+            FieldNameCode := OnlineMgt.GetAttribAsCode(XmlDimNodeList,'FieldName',Count2);
+
+            FieldValue := '';
+            OnlineMgt.GetAttribAsText(XmlDimNodeList,'FieldValue',Count2,FieldValue);
+
+            CASE UPPERCASE(FieldNameCode) OF
+              'CASH/PRIVATE CARD':
+                ExpenseInbox."Cash/Private Card" := OnlineMgt.GetAttribAsBool(XmlDimNodeList,'FieldValue',Count2);
+              'JOBNO':
+                ExpenseInbox."Job No." := OnlineMgt.GetAttribAsCode(XmlDimNodeList,'FieldValue',Count2);
+              'TASK':
+                ExpenseInbox."Job Task No." := OnlineMgt.GetAttribAsCode(XmlDimNodeList,'FieldValue',Count2);
+            END;
+
+            IF NOT (FieldNameCode IN ['JOBNO','TASK','CASH/PRIVATE CARD']) THEN
+              IF FieldType.GET(FieldNameCode) THEN BEGIN
+                CLEAR(ExpenseInboxDim);
+                DimCode := FieldType.GetDimCode;
+                IF DimCode <> '' THEN BEGIN
+                  ExpenseInboxDim."Inbox Entry No." := ExpenseInbox."Entry No.";
+                  ExpenseInboxDim."Dimension Code" := DimCode;
+                  ExpenseInboxDim."Dimension Value Code" := UPPERCASE(FieldValue);
+                END ELSE BEGIN
+                  ExpenseInboxDim."Inbox Entry No." := ExpenseInbox."Entry No.";
+                  ExpenseInboxDim."Field Code" := FieldNameCode;
+                  ExpenseInboxDim."Field Value" := FieldValue;
+                END;
+                ExpenseInboxDim.INSERT(TRUE);
+              END;
+          END;
+
+        IF ISNULL(XMLDoc2) THEN
+          XMLDoc2 := XmlDoc.XmlDocument;
+
+        IF NOT ISNULL(AttachementNodeList) THEN
+          FOR Count2 := 0 TO AttachementNodeList.Count - 1 DO BEGIN
+            OnlineMgt.GetAttribAsText(AttachementNodeList,'AttachmentLink',Count2,FileLink);
+            OnlineMgt.GetAttribAsText(AttachementNodeList,'OriginalFilename',Count2,Filename);
+
+            IF FileLink <> '' THEN BEGIN
+              ExpenseInboxAttachment.INIT;
+              ExpenseInboxAttachment."Expense Inbox Entry No." := ExpenseInbox."Entry No.";
+              ExpenseInboxAttachment.Filename := Filename;
+              ExpenseInboxAttachment.INSERT(TRUE);
+
+              OnlineMgt.DownloadFile(FileLink,ExpenseInboxAttachment.GetServerFilenameAndPath,FALSE);
+            END;
+          END;
+
+        ConfigField.SETRANGE("Field Code",'CASH/PRIVATE CARD');
+        IF ConfigField.ISEMPTY THEN
+          ExpenseInbox."Cash/Private Card" := TRUE;
+        ExpenseInbox.MODIFY;
+
+        COMMIT;
+
+        MarkDownloadedExpense(ExpenseGUID);
+        Log.LogRreceivedFromCO(Expense);
+      END;
+      Count := ImportCounter;
+    END;
+
+    PROCEDURE GetBaseUrl@1160040024() : Text[1024];
+    BEGIN
+      EXIT(GetBaseServerUrl + 'api/v1/');
+    END;
+
+    PROCEDURE GetBaseServerUrl@1160040081() : Text[1024];
+    BEGIN
+      IF OnlineMgt.IsDemo THEN
+        EXIT('https://democem.continiaonline.com/')
+      ELSE
+        IF OnlineMgt.IsDev THEN
+          EXIT('https://devcem.continiaonline.com/')
+        ELSE
+          EXIT('https://cem.continiaonline.com/');
+    END;
+
+    PROCEDURE GetClientUrl@1160040005() : Text[1024];
+    BEGIN
+      EXIT(GetBaseUrl + 'client');
+    END;
+
+    PROCEDURE GetCompanyUrl@1160040029() : Text[1024];
+    BEGIN
+      EXIT(GetBaseUrl + 'company/' + OnlineMgt.GetCompanyGUID);
+    END;
+
+    PROCEDURE GetExpenseUrl@1160040022() : Text[1024];
+    BEGIN
+      EXIT(GetCompanyUrl + '/receipt/');
+    END;
+
+    PROCEDURE GetAllExpenseUrl@1160040006() : Text[1024];
+    BEGIN
+      EXIT(GetExpenseUrl + 'all');
+    END;
+
+    PROCEDURE GetNewExpenseUrl@1160040007() : Text[1024];
+    BEGIN
+      EXIT(GetExpenseUrl + 'new');
+    END;
+
+    PROCEDURE GetCreateNewExpenseUrl@1160040051() : Text[1024];
+    BEGIN
+      EXIT(GetExpenseUrl + 'createnew');
+    END;
+
+    PROCEDURE GetOneExpenseUrl@1160040009(ExpenseGUID@1160040001 : GUID) : Text[1024];
+    BEGIN
+      EXIT(GetExpenseUrl + OnlineMgt.GetGUIDAsText(ExpenseGUID));
+    END;
+
+    PROCEDURE GetReminderUrl@1160040082(Expense@1160040000 : Record 6086320) : Text[1024];
+    BEGIN
+      EXIT(GetBaseServerUrl + 'receipt/' + OnlineMgt.GetCompanyGUID + '/' + OnlineMgt.GetGUIDAsText(Expense."Expense GUID"));
+    END;
+
+    PROCEDURE UpdateExistingUrl@1160040060(ExpenseGUID@1160040000 : GUID) : Text[1024];
+    BEGIN
+      EXIT(GetCompanyUrl + '/receipt/' + OnlineMgt.GetGUIDAsText(ExpenseGUID) + '/updateexisting');
+    END;
+
+    PROCEDURE SetUploadCompleteUrl@1160040067(ExpenseGUID@1160040000 : GUID) : Text[1024];
+    BEGIN
+      EXIT(GetCompanyUrl + '/receipt/' + OnlineMgt.GetGUIDAsText(ExpenseGUID) + '/SetUpdatedFromNAV');
+    END;
+
+    PROCEDURE SetAppUploadCompleteUrl@1160040072(ExpenseGUID@1160040000 : GUID) : Text[1024];
+    BEGIN
+      EXIT(SetAppUrl + '/' + OnlineMgt.GetGUIDAsText(ExpenseGUID) + '/SetUploadComplete');
+    END;
+
+    PROCEDURE NewPasswordUrl@1160040068() : Text[1024];
+    BEGIN
+      EXIT(GetCompanyUrl + '/AppController/requestpassword?username=');
+    END;
+
+    PROCEDURE SetDeleteUrl@1160040079(ExpenseGUID@1160040000 : GUID) : Text[1024];
+    BEGIN
+      EXIT(GetCompanyUrl + '/receipt/' + OnlineMgt.GetGUIDAsText(ExpenseGUID) + '/delete');
+    END;
+
+    PROCEDURE ProcessExpenseInbox@1160040000() Count : Integer;
+    VAR
+      ExpenseInbox@1160040000 : Record 6086323;
+      Process@1160040001 : Codeunit 6086307;
+    BEGIN
+      ExpenseInbox.SETFILTER(Status,'%1',ExpenseInbox.Status::Pending);
+      IF ExpenseInbox.ISEMPTY THEN
+        ExpenseInbox.SETFILTER(Status,'<>%1',ExpenseInbox.Status::Accepted);
+
+      IF ExpenseInbox.FINDFIRST THEN
+        REPEAT
+          Count += 1;
+          Process.RUN(ExpenseInbox);
+          COMMIT;
+        UNTIL ExpenseInbox.NEXT = 0;
+    END;
+
+    PROCEDURE ProcessTransactionInbox@1160040033() Count : Integer;
+    VAR
+      BankTransactionInbox@1160040003 : Record 6086331;
+      Process@1160040002 : Codeunit 6086309;
+      dt@1160040000 : DateTime;
+    BEGIN
+      BankTransactionInbox.SETFILTER(Status, '%1',BankTransactionInbox.Status::Pending);
+      IF BankTransactionInbox.ISEMPTY THEN BEGIN
+        BankTransactionInbox.SETFILTER(Status, '<>%1',BankTransactionInbox.Status::Accepted);
+        BankTransactionInbox.SETFILTER("Try Processed Date/Time",'%1|<%2',dt,CREATEDATETIME(CALCDATE('<-1D>',TODAY),TIME));
+      END;
+      IF BankTransactionInbox.FINDFIRST THEN
+        REPEAT
+          Count += 1;
+          Process.RUN(BankTransactionInbox);
+          COMMIT;
+        UNTIL BankTransactionInbox.NEXT = 0;
+    END;
+
+    PROCEDURE GetTransactionUrl@1160040013() : Text[1024];
+    BEGIN
+      EXIT(GetCompanyUrl + '/transaction/');
+    END;
+
+    PROCEDURE GetAllTransactionUrl@1160040012() : Text[1024];
+    BEGIN
+      EXIT(GetTransactionUrl + 'all');
+    END;
+
+    PROCEDURE GetNewTransactionUrl@1160040011() : Text[1024];
+    BEGIN
+      EXIT(GetTransactionUrl + 'new');
+    END;
+
+    PROCEDURE GetNotConfirmedTransactionUrl@1160040076() : Text[1024];
+    BEGIN
+      EXIT(GetTransactionUrl + 'sentnotconfirmed');
+    END;
+
+    PROCEDURE GetOneTransactionUrl@1160040004(TransactionGUID@1160040001 : GUID) : Text[1024];
+    BEGIN
+      EXIT(GetTransactionUrl + OnlineMgt.GetGUIDAsText(TransactionGUID));
+    END;
+
+    PROCEDURE GetNewTransactions@1160040027() : Integer;
+    VAR
+      XmlDoc@1160040001 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+    BEGIN
+      OnlineMgt.ExecuteRequest(GetNewTransactionUrl,HttpActions::GET,TRUE,XmlDoc);
+      EXIT(GetTransactionsFiles(XmlDoc));
+    END;
+
+    PROCEDURE GetNotconfirmedTransactions@1160040075() : Integer;
+    VAR
+      XmlDoc@1160040001 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+    BEGIN
+      OnlineMgt.ExecuteRequest(GetNotConfirmedTransactionUrl,HttpActions::GET,TRUE,XmlDoc);
+      EXIT(GetTransactionsFiles(XmlDoc));
+    END;
+
+    PROCEDURE GetTransactionsFiles@1160040020(XmlDoc@1160040005 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument") Count : Integer;
+    VAR
+      ExpSetup@1160040013 : Record 6086300;
+      BankTransactionInbox@1160040000 : Record 6086331;
+      XMLNodeList@1160040002 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+      ImportCounter@1160040010 : Integer;
+      LastEntryNo@1160040007 : Integer;
+      ExpEntryNo@1160040001 : Integer;
+    BEGIN
+      XMLNodeList := XmlDoc.DocumentElement.SelectNodes('Transaction');
+
+      FOR Count := 0 TO XMLNodeList.Count - 1 DO BEGIN
+        IF LastEntryNo = 0 THEN BEGIN
+          ExpSetup.GET;
+          BankTransactionInbox.LOCKTABLE;
+          IF BankTransactionInbox.FINDLAST THEN
+            LastEntryNo := BankTransactionInbox."Entry No.";
+        END;
+        LastEntryNo += 1;
+        ImportCounter += 1;
+        ExpEntryNo := OnlineMgt.GetAttribAsInt(XMLNodeList,'InternalId',Count);
+
+        BankTransactionInbox.SETCURRENTKEY("Entry No.");
+        BankTransactionInbox.SETRANGE("Entry No.",ExpEntryNo);
+        IF BankTransactionInbox.ISEMPTY THEN BEGIN
+          BankTransactionInbox.INIT;
+          BankTransactionInbox."Entry No." := ExpEntryNo;
+          BankTransactionInbox."Card ID" := OnlineMgt.GetAttribAsCode(XMLNodeList,'CardId',Count);
+          OnlineMgt.GetAttribAsText(XMLNodeList,'CardName',Count,BankTransactionInbox."Card Name");
+          BankTransactionInbox."Posting Date" := OnlineMgt.GetAttribAsDateUTC(XMLNodeList,'PostingDate',Count);
+          BankTransactionInbox."Document Date" := OnlineMgt.GetAttribAsDateUTC(XMLNodeList,'DocumentDate',Count);
+          BankTransactionInbox."Currency Code" := GetCurrencyCodeFromXML(OnlineMgt.GetAttribAsCode(XMLNodeList,'CurrencyCode',Count));
+          BankTransactionInbox."Currency Exch. Rate" := OnlineMgt.GetAttribAsDecimal(XMLNodeList,'CurrencyExchRate',Count);
+          BankTransactionInbox.Amount := OnlineMgt.GetAttribAsDecimal(XMLNodeList,'Amount',Count);
+          BankTransactionInbox."Amount (LCY)" := OnlineMgt.GetAttribAsDecimal(XMLNodeList,'AmountLCY',Count);
+          BankTransactionInbox."Entry Type" := OnlineMgt.GetAttribAsInt(XMLNodeList,'EntryType',Count);
+          BankTransactionInbox."Business Category ID" := OnlineMgt.GetAttribAsCode(XMLNodeList,'BusinessCategoryId',Count);
+          BankTransactionInbox."Business No." := OnlineMgt.GetAttribAsCode(XMLNodeList,'BusinessNo',Count);
+
+          BankTransactionInbox."Bank Code" := OnlineMgt.GetAttribAsCode(XMLNodeList,'BankNameShort',Count);
+          IF UPPERCASE(BankTransactionInbox."Bank Code") <> 'TEST' THEN
+            BankTransactionInbox."Bank Country/Region" := OnlineMgt.GetAttribAsCode(XMLNodeList,'BankCountry',Count);
+
+          BankTransactionInbox."Agreement ID" := OnlineMgt.GetAttribAsCode(XMLNodeList,'AgreementNumber',Count);
+
+          OnlineMgt.GetAttribAsText(XMLNodeList,'BusinessName',Count,BankTransactionInbox."Business Name");
+          OnlineMgt.GetAttribAsText(XMLNodeList,'BusinessAddress',Count,BankTransactionInbox."Business Address");
+          BankTransactionInbox."Business Country/Region" := OnlineMgt.GetAttribAsCode(XMLNodeList,'BusinessCountryRegion',Count);
+          BankTransactionInbox."Exclude Entry" := OnlineMgt.GetAttribAsBool(XMLNodeList,'AppliedtoClaim',Count);
+
+          BankTransactionInbox."Transaction Type" := BankTransactionInbox."Transaction Type"::Normal;
+          IF (BankTransactionInbox."Card Name" = '') AND (BankTransactionInbox."Business No." = '') AND
+             (BankTransactionInbox."Business Category ID" = '')
+          THEN
+            BankTransactionInbox."Transaction Type" := BankTransactionInbox."Transaction Type"::Balancing;
+
+          BankTransactionInbox."Imported Date/Time" := CURRENTDATETIME;
+          BankTransactionInbox."Imported by User ID" := UPPERCASE(USERID);
+          BankTransactionInbox.INSERT(TRUE);
+
+          COMMIT;
+        END;
+
+      END;
+      Count := ImportCounter;
+    END;
+
+    PROCEDURE GetBanksUrl@1160040039() : Text[1024];
+    BEGIN
+      EXIT(GetTransactionUrl + '/GetBanks/');
+    END;
+
+    PROCEDURE GetBanks@1160040041() Count : Integer;
+    VAR
+      Bank@1160040002 : Record 6086314;
+      XmlDoc@1160040000 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      XMLNodeList@1160040001 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+    BEGIN
+      OnlineMgt.ExecuteRequest(GetBanksUrl,HttpActions::GET,FALSE,XmlDoc);
+
+      XMLNodeList := XmlDoc.DocumentElement.SelectNodes('Bank');
+      FOR Count := 0 TO XMLNodeList.Count - 1 DO BEGIN
+        CLEAR(Bank);
+        Bank.Code := OnlineMgt.GetAttribAsCode(XMLNodeList,'BankShort',Count);
+        OnlineMgt.GetAttribAsText(XMLNodeList,'BankName',Count,Bank.Name);
+        IF UPPERCASE(Bank.Code) <> 'TEST' THEN
+          Bank."Country/Region Code" := OnlineMgt.GetAttribAsCode(XMLNodeList,'CountryCode',Count);
+        IF NOT Bank.INSERT THEN
+          Bank.MODIFY;
+      END;
+
+      EXIT(Count);
+    END;
+
+    PROCEDURE SetAgreementUrl@1160040040() : Text[1024];
+    BEGIN
+      EXIT(GetTransactionUrl + '/CompanyBankAgreementData');
+    END;
+
+    PROCEDURE SetAppUrl@1160040050() : Text[1024];
+    BEGIN
+      EXIT(GetCompanyUrl + '/NAVApp/');
+    END;
+
+    PROCEDURE SetFieldUrl@1160040048() : Text[1024];
+    BEGIN
+      EXIT(SetAppUrl + 'FieldSetup');
+    END;
+
+    PROCEDURE SetLookupUrl@1160040049() : Text[1024];
+    BEGIN
+      EXIT(SetAppUrl + 'FieldsAndLookups');
+    END;
+
+    PROCEDURE SetExpSetupUrl@1160040052() : Text[1024];
+    BEGIN
+      EXIT(SetAppUrl + 'Setup');
+    END;
+
+    PROCEDURE SetExpSetup@1160040053();
+    VAR
+      EMSetup@1160040000 : Record 6086300;
+      XmlLib@1160040003 : Codeunit 6085573;
+      XmlDoc@1160040002 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      XmlNode@1160040001 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+    BEGIN
+      EMSetup.GET;
+
+      XmlDoc := XmlDoc.XmlDocument;
+      XmlNode := XmlDoc.CreateNode('element','Setup','');
+      XmlDoc.AppendChild(XmlNode);
+
+      EMSetup.TESTFIELD("Default Web/App Language");
+      XmlLib.SetXmlNodeAttr(XmlNode,'DefaultLCID',FORMAT(GetLanguageID(EMSetup."Default Web/App Language")));
+
+      OnlineMgt.ExecuteRequest(SetExpSetupUrl,HttpActions::PUT,TRUE,XmlDoc);
+    END;
+
+    PROCEDURE GetLanguageID@1160040056(Language@1160040000 : Code[10]) : Integer;
+    VAR
+      LanguageRec@1160040001 : Record 8;
+    BEGIN
+      IF LanguageRec.GET(Language) THEN
+        EXIT(LanguageRec."Windows Language ID");
+      EXIT(1033);
+    END;
+
+    PROCEDURE SetAgreement@1160040043();
+    VAR
+      Agreement@1160040003 : Record 6086315;
+      XmlLib@1160040002 : Codeunit 6085573;
+      XmlDoc@1160040001 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      XmlNode@1160040000 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      XmlNode2@1160040006 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      Counter@1160040007 : Integer;
+    BEGIN
+      IF Agreement.FINDFIRST THEN BEGIN
+        XmlDoc := XmlDoc.XmlDocument;
+
+        XmlNode2 := XmlDoc.CreateNode('element','CompanyAgreements','');
+        XmlDoc.AppendChild(XmlNode2);
+        Counter := 0;
+        REPEAT
+          CLEAR(XmlNode);
+          XmlNode := XmlDoc.CreateNode('element','CompanyAgreement','');
+          XmlLib.SetXmlNodeAttr(XmlNode,'BankName',Agreement."Bank Code");
+          XmlLib.SetXmlNodeAttr(XmlNode,'AgreementNumber',Agreement."Agreement Id");
+          XmlNode2.AppendChild(XmlNode);
+        UNTIL Agreement.NEXT <= 0;
+
+        OnlineMgt.ExecuteRequest(SetAgreementUrl,HttpActions::PUT,TRUE,XmlDoc);
+        Counter += 1;
+        CLEAR(XmlDoc);
+      END;
+      MESSAGE(ActivatedMsg);
+    END;
+
+    PROCEDURE SetupCloud@1160040014();
+    BEGIN
+      SetExpSetup;
+      IF SetupFields THEN
+        SetupValues;
+    END;
+
+    LOCAL PROCEDURE SetupFields@1160040030() : Boolean;
+    VAR
+      EMSetup@1160040002 : Record 6086300;
+      FieldType@1160040001 : Record 6086345;
+      ConfigField@1160040000 : Record 6086346;
+      PrimaryFieldSetup@1160040010 : Record 6086346;
+      XmlLib@1160040008 : Codeunit 6085573;
+      XmlDoc@1160040007 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      XmlNode@1160040006 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      XmlNode2@1160040005 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      EmptyDT@1160040004 : DateTime;
+      UploadFields@1160040009 : Boolean;
+    BEGIN
+      EMSetup.GET;
+      IF EMSetup."Force Field Update in CO" THEN BEGIN
+        UploadFields := TRUE;
+        EMSetup."Force Field Update in CO" := FALSE;
+        EMSetup.MODIFY;
+      END;
+
+      IF NOT UploadFields THEN
+        IF ConfigField.FINDFIRST THEN
+          REPEAT
+            FieldType.GET(ConfigField."Field Code");
+            IF (FieldType."Last Upload Date/Time" = EmptyDT) OR
+               (FieldType."Last Update Date/Time" > FieldType."Last Upload Date/Time")
+            THEN
+              UploadFields := TRUE;
+          UNTIL (ConfigField.NEXT = 0) OR UploadFields;
+
+      IF NOT UploadFields THEN
+        EXIT;
+
+      ConfigField.SETFILTER("Field Code",'%1|%2|%3|%4|%5','DOCUMENT DATE','CURRENCY','AMOUNT','EXPENSE TYPE','COUNTRY/REGION');
+      IF ConfigField.COUNT < 5 THEN
+        ERROR(MissingMandatoryFieldErr,ConfigField.GETFILTER("Field Code"));
+      ConfigField.SETRANGE("Field Code");
+
+      XmlDoc := XmlDoc.XmlDocument;
+      XmlNode2 := XmlDoc.CreateNode('element','FieldSetups','');
+      XmlDoc.AppendChild(XmlNode2);
+
+      ConfigField.FINDFIRST;
+      REPEAT
+        IF Doubleconfigured(ConfigField) THEN
+          ERROR(DoubleConfigErrMsg,ConfigField."Field Code");
+        FieldType.GET(ConfigField."Field Code");
+
+        CLEAR(XmlNode);
+        XmlNode := XmlDoc.CreateNode('element','FieldSetup','');
+        XmlLib.SetXmlNodeAttr(XmlNode,'BelongsTo',OnlineMgt.GetIntAsText(2));
+        XmlLib.SetXmlNodeAttr(XmlNode,'FieldName',FieldType.Code);
+        XmlLib.SetXmlNodeAttr(XmlNode,'FieldType',OnlineMgt.GetIntAsText(FieldType.Type));
+        IF (FieldType.Type = FieldType.Type::Text) OR
+           (FieldType.Type = FieldType.Type::Code)
+        THEN
+          FieldType.TESTFIELD(Length);
+        XmlLib.SetXmlNodeAttr(XmlNode,'Length',OnlineMgt.GetIntAsText(FieldType.Length));
+
+        XmlLib.SetXmlNodeAttr(XmlNode,'FieldCaption',FieldType.GetFieldCaptionForApp);
+        XmlLib.SetXmlNodeAttr(XmlNode,'Mandatory',OnlineMgt.GetBoolAsText(FieldType.Mandatory));
+        XmlLib.SetXmlNodeAttr(XmlNode,'Editable',OnlineMgt.GetBoolAsText(FieldType.Editable));
+        IF FieldType.GetParentFieldTypeCode <> '' THEN BEGIN
+          XmlLib.SetXmlNodeAttr(XmlNode,'PrimaryField',FieldType.GetParentFieldTypeCode);
+          PrimaryFieldSetup.SETRANGE(Type,PrimaryFieldSetup.Type::Expense);
+          PrimaryFieldSetup.SETRANGE("Field Code",FieldType.GetParentFieldTypeCode);
+          PrimaryFieldSetup.FINDFIRST;
+        END;
+
+        FieldType."Last Upload Date/Time" := CURRENTDATETIME;
+        FieldType.MODIFY;
+
+        XmlLib.SetXmlNodeAttr(XmlNode,'CreationTime',FORMAT(FieldType."Last Upload Date/Time",0,9));
+
+        XmlNode2.AppendChild(XmlNode);
+      UNTIL ConfigField.NEXT = 0;
+
+      OnlineMgt.ExecuteRequest(SetFieldUrl,HttpActions::PUT,TRUE,XmlDoc);
+
+      CLEAR(XmlDoc);
+
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE SetupValues@1160040032();
+    VAR
+      EMSetup@1160040002 : Record 6086300;
+      FieldType@1160040009 : Record 6086345;
+      ConfiguredField@1160040010 : Record 6086346;
+      LookupValues@1160040000 : Record 6086347;
+      XmlLib@1160040007 : Codeunit 6085573;
+      XmlDoc@1160040008 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      XmlNode@1160040006 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      XmlNode2@1160040005 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      XmlNode3@1160040001 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      CreationDT@1160040012 : DateTime;
+      EmptyDT@1160040011 : DateTime;
+    BEGIN
+      EMSetup.GET;
+      FieldType.FillAllLookupValues;
+
+      LookupValues.SETCURRENTKEY("Field Type Code");
+
+      IF LookupValues.FINDFIRST THEN BEGIN
+        XmlDoc := XmlDoc.XmlDocument;
+
+        XmlNode2 := XmlDoc.CreateNode('element','Fields','');
+        XmlDoc.AppendChild(XmlNode2);
+
+        REPEAT
+          // EXPORT FIELDVALUE
+          FieldType.GET(LookupValues."Field Type Code");
+          ConfiguredField.SETRANGE("Field Code",FieldType.Code);
+          IF ConfiguredField.FINDFIRST THEN BEGIN
+            CLEAR(XmlNode);
+            XmlNode := XmlDoc.CreateNode('element','Field','');
+            XmlLib.SetXmlNodeAttr(XmlNode,'BelongsTo',OnlineMgt.GetIntAsText(0));
+            XmlLib.SetXmlNodeAttr(XmlNode,'FieldName',LookupValues."Field Type Code");
+            IF FieldType."Last Update Date/Time" = EmptyDT THEN
+              CreationDT := CURRENTDATETIME
+            ELSE
+              CreationDT := FieldType."Last Update Date/Time";
+
+            XmlLib.SetXmlNodeAttr(XmlNode,'CreationTime',FORMAT(CreationDT,0,9));
+
+            XmlNode2.AppendChild(XmlNode);
+            LookupValues.SETRANGE("Field Type Code",LookupValues."Field Type Code");
+            IF LookupValues.FINDFIRST THEN BEGIN
+              CLEAR(XmlNode3);
+              REPEAT
+                XmlNode3 := XmlDoc.CreateNode('element','FieldValue','');
+                XmlLib.SetXmlNodeAttr(XmlNode3,'FieldName',LookupValues."Field Type Code");
+                IF LookupValues."Primary Code" <> '' THEN
+                  XmlLib.SetXmlNodeAttr(XmlNode3,'PrimaryCode',LookupValues."Primary Code");
+                XmlLib.SetXmlNodeAttr(XmlNode3,'Code',LookupValues.Code);
+                XmlLib.SetXmlNodeAttr(XmlNode3,'Description',LookupValues.Description);
+                XmlNode.AppendChild(XmlNode3);
+              UNTIL LookupValues.NEXT <= 0;
+            END;
+          END;
+          LookupValues.SETRANGE("Field Type Code",LookupValues."Field Type Code");
+          LookupValues.FINDLAST;
+          LookupValues.SETRANGE("Field Type Code");
+        UNTIL LookupValues.NEXT = 0;
+
+        OnlineMgt.ExecuteRequest(SetLookupUrl,HttpActions::PUT,TRUE,XmlDoc);
+        CLEAR(XmlDoc);
+      END;
+    END;
+
+    PROCEDURE ExtractIdfromEmail@1160040037(email@1160040000 : Text[1024]) transaction : Integer;
+    VAR
+      d@1160040001 : Integer;
+    BEGIN
+      d := STRPOS(email,'@');
+      IF d <> 0 THEN BEGIN
+        email := COPYSTR(email,1,d-1);
+        d := STRPOS(email,PrefixId);
+        IF d <> 0 THEN
+          IF EVALUATE(transaction,COPYSTR(email,d + STRLEN(PrefixId))) THEN
+            EXIT(transaction);
+      END;
+      EXIT(0);
+    END;
+
+    PROCEDURE AddIdToEmail@1160040036(transaction@1160040000 : Integer) : Text[1024];
+    BEGIN
+      EXIT(PrefixId + FORMAT(transaction));
+    END;
+
+    PROCEDURE SetUploadUrl@1160040042(Bank@1160040000 : Code[20];Countrycode@1160040001 : Code[20]) : Text[1024];
+    BEGIN
+      IF Countrycode = '' THEN
+        Countrycode := 'DK';
+      EXIT(GetTransactionUrl + Bank + '/' + Countrycode + '/upload');
+    END;
+
+    PROCEDURE UploadfilesUrl@1160040071(ExpenseGUID@1160040000 : GUID) : Text[1024];
+    BEGIN
+      EXIT(GetCompanyUrl + '/NAVApp/' + OnlineMgt.GetGUIDAsText(ExpenseGUID) + '/uploadfiles');
+    END;
+
+    PROCEDURE UploadBankFile@1160040038(Bank@1160040001 : Record 6086314;Filename@1160040000 : Text[1024]);
+    BEGIN
+      IF NOT EXISTS(Filename) THEN
+        ERROR(CannotLoadFile,Filename);
+      OnlineMgt.UploadFile(Filename,SetUploadUrl(Bank.Code,Bank."Country/Region Code"),TRUE);
+    END;
+
+    PROCEDURE NoOfExpInboxWithError@1160040055() : Integer;
+    VAR
+      ExpenseInbox@1160040000 : Record 6086323;
+    BEGIN
+      ExpenseInbox.SETCURRENTKEY(Status);
+      ExpenseInbox.SETRANGE(Status,ExpenseInbox.Status::Error);
+      EXIT(ExpenseInbox.COUNT);
+    END;
+
+    PROCEDURE NoOfBankTransInboxWithError@1160040057() : Integer;
+    VAR
+      BankTransInbox@1160040000 : Record 6086331;
+    BEGIN
+      BankTransInbox.SETCURRENTKEY(Status);
+      BankTransInbox.SETRANGE(Status,BankTransInbox.Status::Error);
+      EXIT(BankTransInbox.COUNT);
+    END;
+
+    PROCEDURE Match@1160040054();
+    VAR
+      Matching@1160040000 : Codeunit 6086311;
+    BEGIN
+      Matching.TryMatch;
+    END;
+
+    PROCEDURE SendNewPassword@1160040065(user@1160040000 : Code[20]);
+    VAR
+      XmlDoc@1160040001 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+    BEGIN
+      XmlDoc := XmlDoc.XmlDocument;
+      OnlineMgt.ExecuteRequest(NewPasswordUrl + user,HttpActions::PUT,TRUE,XmlDoc);
+    END;
+
+    PROCEDURE GetAttribAsCodeLength@1160040073(XMLNodeList@1160040001 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";AttribName@1160040003 : Text[30];Pos@1160040004 : Integer;MaxLenght@1160040000 : Integer) Result : Code[1024];
+    VAR
+      AttribText@1160040005 : Text[1024];
+    BEGIN
+      IF OnlineMgt.GetAttribAsText(XMLNodeList,AttribName,Pos,AttribText) THEN
+        EVALUATE(Result,AttribText);
+      Result := COPYSTR(Result,1,MaxLenght);
+    END;
+
+    LOCAL PROCEDURE GetCurrencyCodeFromXML@1160040074(CurrencyCode@1160040000 : Code[10]) : Code[10];
+    VAR
+      GeneralLedgerSetup@1160040001 : Record 98;
+    BEGIN
+      GeneralLedgerSetup.GET;
+
+      IF CurrencyCode = GeneralLedgerSetup."LCY Code" THEN
+        EXIT('');
+
+      EXIT(CurrencyCode);
+    END;
+
+    LOCAL PROCEDURE GetCurrencyCodeFromExpense@1160040077(CurrencyCode@1160040000 : Code[10]) : Code[10];
+    VAR
+      GeneralLedgerSetup@1160040001 : Record 98;
+    BEGIN
+      IF CurrencyCode = '' THEN BEGIN
+        GeneralLedgerSetup.GET;
+        EXIT(GeneralLedgerSetup."LCY Code");
+      END;
+
+      EXIT(CurrencyCode);
+    END;
+
+    PROCEDURE CheckCompanyCode@1160040002();
+    VAR
+      DCSetup@1160040001 : Record 6085573;
+      EMSetup@1160040000 : Record 6086300;
+    BEGIN
+      IF NOT DCSetup.GET THEN
+        EXIT;
+
+      IF DCSetup."Document Nos." = '' THEN
+        EXIT;
+
+      EMSetup.GET;
+      IF DCSetup."Company Code" <> EMSetup."Company Code" THEN
+        ERROR(DifferentCompanyCodesErr,EMSetup.FIELDCAPTION("Company Code"),EMSetup.TABLECAPTION,
+          DCSetup.FIELDCAPTION("Company Code"),DCSetup.TABLECAPTION);
+    END;
+
+    PROCEDURE FindEmployeeFromEmail@1160040023(Email@1160040000 : Text[250]) : Code[50];
+    VAR
+      EMSetup@1160040003 : Record 6086300;
+      ContiniaUser@1160040001 : Record 6086001;
+    BEGIN
+      EMSetup.GET;
+
+      IF Email = '' THEN
+        EXIT;
+
+      ContiniaUser.SETRANGE("E-Mail",LOWERCASE(Email));
+      IF ContiniaUser.FINDFIRST THEN
+        EXIT(ContiniaUser."User ID");
+
+      EXIT(COPYSTR(Email,1,50));
+    END;
+
+    PROCEDURE ConfigFieldActive@1160040001(Code@1160040001 : Code[20]) : Boolean;
+    VAR
+      ConfigField@1160040000 : Record 6086346;
+    BEGIN
+      ConfigField.SETRANGE(Type,ConfigField.Type::Expense);
+      ConfigField.SETRANGE("Field Code",Code);
+      EXIT(NOT ConfigField.ISEMPTY);
+    END;
+
+    PROCEDURE IsSyncRequired@1160040003(Expense@1160040000 : Record 6086320) : Boolean;
+    VAR
+      ConfiguredField@1160040004 : Record 6086346;
+      FieldType@1160040002 : Record 6086345;
+      ParentFieldType@1160040003 : Record 6086345;
+      LookupValue@1160040001 : Record 6086347;
+    BEGIN
+      IF ConfiguredField.FINDFIRST THEN
+        REPEAT
+          FieldType.GET(ConfiguredField."Field Code");
+          IF FieldType."Last Update Date/Time" > FieldType."Last Upload Date/Time" THEN BEGIN
+            FieldType.CALCFIELDS("No. of Lookup Values");
+            IF FieldType."No. of Lookup Values" > 0 THEN
+              IF FieldType.GetParentFieldTypeCode = '' THEN BEGIN
+                IF NOT LookupValue.GET(FieldType.Code,'',ValueOfField(Expense,FieldType)) THEN
+                  EXIT(TRUE);
+              END ELSE BEGIN
+                ParentFieldType.GET(FieldType.GetParentFieldTypeCode);
+                IF NOT LookupValue.GET(FieldType.Code,ValueOfField(Expense,ParentFieldType),ValueOfField(Expense,FieldType)) THEN
+                  EXIT(TRUE);
+              END;
+          END;
+        UNTIL ConfiguredField.NEXT = 0;
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE ValueOfField@1160040015(Expense@1160040001 : Record 6086320;FieldType@1160040000 : Record 6086345) : Text[20];
+    VAR
+      ExpenseDim@1160040002 : Record 6086353;
+      DimCode@1160040003 : Code[20];
+    BEGIN
+      CASE FieldType.Code OF
+        'COUNTRY/REGION':
+          EXIT(Expense."Country/Region Code");
+        'CURRENCY':
+          EXIT(Expense."Currency Code");
+        'EXPENSE TYPE':
+          EXIT(Expense."Expense Type");
+        'EMPLOYEE NO.':
+          EXIT(Expense."Employee No.");
+        'JOBNO':
+          EXIT(Expense."Job No.");
+        'TASK':
+          EXIT(Expense."Job Task No.");
+      END;
+
+      ExpenseDim.SETRANGE("Expense Entry No.",Expense."Entry No.");
+      DimCode := FieldType.GetDimCode;
+      IF DimCode <> '' THEN BEGIN
+        ExpenseDim.SETRANGE("Dimension Code",DimCode);
+        IF ExpenseDim.FINDFIRST THEN
+          EXIT(ExpenseDim."Dimension Value Code");
+      END ELSE BEGIN
+        ExpenseDim.SETRANGE("Field Code",FieldType.Code);
+        IF ExpenseDim.FINDFIRST THEN
+          EXIT(ExpenseDim."Field Value");
+      END;
+
+      EXIT('');
+    END;
+
+    PROCEDURE Doubleconfigured@1160040016(ConfiguredField@1160040000 : Record 6086346) : Boolean;
+    VAR
+      CheckConfig@1160040001 : Record 6086346;
+    BEGIN
+      CheckConfig.SETCURRENTKEY(Type,"Field Order");
+      CheckConfig.SETRANGE(Type,ConfiguredField.Type);
+      CheckConfig.SETFILTER("Field Order",'<%1',ConfiguredField."Field Order");
+      CheckConfig.SETRANGE("Field Code",ConfiguredField."Field Code");
+      EXIT(CheckConfig.FINDFIRST);
+    END;
+
+    PROCEDURE MapToOnlineValue@1160040019(FieldCode@1160040000 : Code[20];Value@1160040001 : Text[30]) : Text[250];
+    VAR
+      FieldType@1160040002 : Record 6086345;
+      BoolVar@1160040003 : Boolean;
+      DecVar@1160040005 : Decimal;
+      DateParserMgt@1160040007 : Codeunit 6085586;
+    BEGIN
+      IF NOT FieldType.GET(FieldCode) THEN
+        EXIT(Value);
+      IF FieldType.Type = FieldType.Type::Boolean THEN BEGIN
+        IF EVALUATE(BoolVar,Value,9) THEN;
+        EXIT(OnlineMgt.GetBoolAsText(BoolVar));
+      END;
+      IF FieldType.Type = FieldType.Type::Date THEN BEGIN
+        DateParserMgt.ParseUTC(Value);
+        EXIT(FORMAT(DateParserMgt.GetDate,0,9));
+      END;
+      IF FieldType.Type = FieldType.Type::Decimal THEN BEGIN
+        IF EVALUATE(DecVar,Value,9) THEN;
+        EXIT(FORMAT(DecVar,0,9));
+      END;
+      EXIT(Value);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

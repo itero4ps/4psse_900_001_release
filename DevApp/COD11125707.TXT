@@ -1,0 +1,318 @@
+OBJECT Codeunit 11125707 Request Activity Capacity Mgt.
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      ProjActCapComMgt@1100525002 : Codeunit 11125706;
+      ProjPlanActivityMgt@1100528400 : Codeunit 11125711;
+
+    PROCEDURE CalculatePeriodOrPlannedHours@1100525006(VAR ReqActCapRec@1100525000 : Record 11125708);
+    BEGIN
+      IF ReqActCapRec."Plan Method" = ReqActCapRec."Plan Method"::Forward THEN
+        ReqActCapRec."Ending Date" := CalculateEndingDate(ReqActCapRec);
+      //The plan hours are always recalculated, to make sure that the duration
+      //of the requested activity capacity is a whole number of days.
+      ReqActCapRec."Plan Hours" := CalculatePlannedHours(ReqActCapRec);
+    END;
+
+    PROCEDURE CalculateEndingDate@1100525001(ReqActCapRec@1100525000 : Record 11125708) EndingDate : Date;
+    VAR
+      Duration@1100525001 : Decimal;
+      HoursFactor@1100528400 : Decimal;
+    BEGIN
+      EndingDate := ReqActCapRec."Starting Date";
+      IF (ReqActCapRec."Resource Code" = '') OR (ReqActCapRec.Quantity = 0) OR
+         (ReqActCapRec."Starting Date" = 0D) OR (ReqActCapRec."Plan Hours" = 0)
+      THEN
+        EXIT;
+      HoursFactor := ProjActCapComMgt.GetReqActCapHoursFactor(ReqActCapRec);
+      IF (HoursFactor <= 0) THEN
+        EXIT;
+
+      Duration := ReqActCapRec."Plan Hours" / HoursFactor;
+
+      EndingDate :=
+        ProjActCapComMgt.CalculateEndingDate(ReqActCapRec."Starting Date", Duration, ReqActCapRec."Hours by Day");
+    END;
+
+    PROCEDURE CalculatePlannedHours@1100525002(ReqActCapRec@1100525000 : Record 11125708) PlanHours : Decimal;
+    VAR
+      HoursFactor@1100528400 : Decimal;
+    BEGIN
+      IF (ReqActCapRec."Resource Code" = '') OR (ReqActCapRec.Quantity = 0) OR
+         (ReqActCapRec."Starting Date" = 0D) OR (ReqActCapRec."Ending Date" = 0D)
+      THEN
+        EXIT;
+
+      HoursFactor := ProjActCapComMgt.GetReqActCapHoursFactor(ReqActCapRec);
+      IF (HoursFactor <= 0) THEN
+        EXIT;
+
+      PlanHours :=
+        HoursFactor * ProjActCapComMgt.CalculateDuration(
+                        ReqActCapRec."Starting Date",
+                        ReqActCapRec."Ending Date",
+                        ReqActCapRec."Hours by Day");
+    END;
+
+    PROCEDURE UpdateReqActCapByDay@1100525003(VAR RequestedActivityCapacity@1100528401 : Record 11125708;CalcPeriodOrPlannedHours@1100528405 : Boolean);
+    VAR
+      ProjPlanTeamTypeResource@1100525003 : Record 11125707;
+      ProjPlanTeamTypeResource2@1100528404 : Record 11125707;
+      LineNo@1100525004 : Integer;
+      HoursFactor@1100525009 : Decimal;
+      CalendarCode@1100525010 : Code[10];
+      JobsSetup@1100528402 : Record 315;
+      ProjectTimeTable@1100528403 : Record 11020684;
+    BEGIN
+      RequestedActivityCapacity.DeleteReqActCapByDay();
+      IF CalcPeriodOrPlannedHours THEN
+        CalculatePeriodOrPlannedHours(RequestedActivityCapacity);
+      IF (RequestedActivityCapacity."Resource Code" = '') OR
+         (RequestedActivityCapacity.Quantity = 0) OR
+         (RequestedActivityCapacity."Plan Hours" = 0) OR
+         (RequestedActivityCapacity."Starting Date" = 0D) OR
+         (RequestedActivityCapacity."Ending Date" = 0D)
+      THEN
+        EXIT;
+
+      JobsSetup.GET;
+      JobsSetup.TESTFIELD("Project Time Table");
+      ProjectTimeTable.GET(JobsSetup."Project Time Table");
+      CalendarCode := ProjActCapComMgt.GetCalendarCode;
+
+      CASE RequestedActivityCapacity."Resource Type" OF
+        RequestedActivityCapacity."Resource Type"::TeamType:
+          BEGIN
+            ProjPlanTeamTypeResource.SETRANGE("Team Type Code", RequestedActivityCapacity."Resource Code");
+            IF ProjPlanTeamTypeResource.FINDSET THEN BEGIN
+              LineNo := 1;
+              REPEAT
+                HoursFactor :=
+                  RequestedActivityCapacity.Quantity *
+                  ROUND(ProjPlanTeamTypeResource.Quantity * (ProjPlanTeamTypeResource.Percentage / 100), 0.01);
+                InsertReqActCapByDay(
+                  RequestedActivityCapacity,
+                  HoursFactor,
+                  GetByDayResourceType(RequestedActivityCapacity, ProjPlanTeamTypeResource),
+                  ProjPlanTeamTypeResource."Resource Code",
+                  LineNo,
+                  ProjectTimeTable,
+                  CalendarCode);
+                LineNo := LineNo + 1;
+              UNTIL ProjPlanTeamTypeResource.NEXT = 0;
+            END;
+          END;
+        RequestedActivityCapacity."Resource Type"::Discipline,
+        RequestedActivityCapacity."Resource Type"::Plant:
+          BEGIN
+            LineNo := 1;
+            HoursFactor := RequestedActivityCapacity.Quantity;
+            InsertReqActCapByDay(
+              RequestedActivityCapacity,
+              HoursFactor,
+              GetByDayResourceType(RequestedActivityCapacity, ProjPlanTeamTypeResource2),
+              RequestedActivityCapacity."Resource Code",
+              LineNo,
+              ProjectTimeTable,
+              CalendarCode);
+          END;
+      END;
+    END;
+
+    LOCAL PROCEDURE GetByDayResourceType@1100528405(RequestedActivityCapacity@1100528401 : Record 11125708;ProjPlanTeamTypeResource@1100528402 : Record 11125707) ResourceType : Integer;
+    VAR
+      RequestedActivCapByDay@1100528400 : Record 11125709;
+    BEGIN
+      CASE RequestedActivityCapacity."Resource Type" OF
+        RequestedActivityCapacity."Resource Type"::TeamType:
+          IF ProjPlanTeamTypeResource."Resource Type" =
+             ProjPlanTeamTypeResource."Resource Type"::Discipline
+          THEN
+            ResourceType := RequestedActivCapByDay."Resource Type"::Discipline
+          ELSE
+            ResourceType := RequestedActivCapByDay."Resource Type"::Plant;
+        RequestedActivityCapacity."Resource Type"::Discipline:
+          ResourceType := RequestedActivCapByDay."Resource Type"::Discipline;
+        RequestedActivityCapacity."Resource Type"::Plant:
+          ResourceType := RequestedActivCapByDay."Resource Type"::Plant;
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertReqActCapByDay@1100528406(RequestedActivityCapacity@1100528400 : Record 11125708;HoursFactor@1100528401 : Decimal;ByDayResourceType@1100528402 : Integer;ResourceCode@1100528403 : Code[20];LineNo@1100528404 : Integer;ProjectTimeTable@1100528405 : Record 11020684;CalendarCode@1100528406 : Code[10]);
+    VAR
+      RequestedActivCapByDay@1100528407 : Record 11125709;
+      Date@1100528408 : Record 2000000007;
+      HoursByDay@1100528409 : Decimal;
+    BEGIN
+      Date.SETRANGE("Period Type", Date."Period Type"::Date);
+      Date.SETRANGE("Period Start", RequestedActivityCapacity."Starting Date", RequestedActivityCapacity."Ending Date");
+
+      IF Date.FINDSET THEN
+        REPEAT
+          IF ProjActCapComMgt.DateIsWorkingDate(CalendarCode, Date."Period Start") THEN
+            BEGIN
+              RequestedActivCapByDay.INIT;
+              RequestedActivCapByDay."Project No." := RequestedActivityCapacity."Project No.";
+              RequestedActivCapByDay."Activity Code" := RequestedActivityCapacity."Activity Code";
+              RequestedActivCapByDay."Line No. Request" := RequestedActivityCapacity."Line No.";
+              RequestedActivCapByDay.Date := Date."Period Start";
+              RequestedActivCapByDay."Line No." := LineNo;
+              RequestedActivCapByDay."Resource Type" := ByDayResourceType;
+              RequestedActivCapByDay."Resource Code" := ResourceCode;
+
+              HoursByDay :=
+                ProjActCapComMgt.GetHoursByDay(
+                  ProjectTimeTable,
+                  Date."Period Start",
+                  RequestedActivityCapacity."Hours by Day");
+              RequestedActivCapByDay.Hours := HoursFactor * HoursByDay;
+
+              IF RequestedActivCapByDay.Hours > 0 THEN
+                RequestedActivCapByDay.INSERT;
+            END;
+        UNTIL Date.NEXT = 0;
+    END;
+
+    PROCEDURE UpdateProjActivityPeriod@1100525000(CurrReqActCapRec@1100525006 : Record 11125708;UpdateMode@1100525001 : 'AfterUpdate,BeforeInsert,BeforeModify,BeforeDelete');
+    VAR
+      JobsSetup@1100528400 : Record 315;
+      ProjectTimeTable@1100528401 : Record 11020684;
+      ReqActCapRec@1100525000 : Record 11125708;
+      ProjActRec@1100525004 : Record 11012431;
+      MinStartDate@1100525002 : Date;
+      MaxEndDate@1100525003 : Date;
+    BEGIN
+      //* UpdateMode:
+      //* - 0 AfterUpdate : Current record is already update in the table
+      //* - 1 BeforeInsert: Before INSERT of the current record, new record is not yet present in the table
+      //* - 2 BeforeModify: Before MODIFY of the current record, new values are not yet updated in the table
+      //* - 3 BeforeDelete: Before DELETE of the current record, so record is still present in the table
+
+      JobsSetup.GET;
+      JobsSetup.TESTFIELD("Project Time Table");
+      ProjectTimeTable.GET(JobsSetup."Project Time Table");
+
+      IF UpdateMode IN [UpdateMode::BeforeInsert, UpdateMode::BeforeModify] THEN BEGIN
+        MinStartDate := CurrReqActCapRec."Starting Date";  //* Start/End of the current record
+        MaxEndDate := CurrReqActCapRec."Ending Date"       //* (new values not yet updated in table)
+      END;
+      ReqActCapRec.SETRANGE("Project No.", CurrReqActCapRec."Project No.");
+      ReqActCapRec.SETRANGE("Activity Code", CurrReqActCapRec."Activity Code");
+      IF UpdateMode <> UpdateMode::AfterUpdate THEN
+        ReqActCapRec.SETFILTER("Line No.", '<>%1', CurrReqActCapRec."Line No.");  //* Skip current (not updated/deleted) record
+      IF ReqActCapRec.FINDSET(FALSE,FALSE) THEN BEGIN
+        REPEAT
+          IF (ReqActCapRec."Starting Date" <> 0D) AND ((ReqActCapRec."Starting Date" < MinStartDate) OR (MinStartDate = 0D)) THEN
+            MinStartDate := ReqActCapRec."Starting Date";
+          IF (ReqActCapRec."Ending Date" <> 0D) AND (ReqActCapRec."Ending Date" > MaxEndDate) THEN
+            MaxEndDate := ReqActCapRec."Ending Date";
+        UNTIL ReqActCapRec.NEXT = 0;
+      END;
+
+      ProjActRec.SETCURRENTKEY("Project No.",Code);
+      ProjActRec.SETRANGE("Project No.", CurrReqActCapRec."Project No.");
+      ProjActRec.SETRANGE(Code, CurrReqActCapRec."Activity Code");
+      IF ProjActRec.FINDFIRST THEN BEGIN
+        ProjActRec."Starting Date" :=
+          DetermineProjActStartDateTime(ProjActRec, MinStartDate, ProjectTimeTable);
+        ProjActRec."Ending Date" :=
+          DetermineProjActEndDateTime(ProjActRec, MaxEndDate, ProjectTimeTable);
+
+        // jhoek.270910.begin
+        ProjActRec."Constraint Type" := ProjActRec."Constraint Type"::"Start On";
+        ProjActRec."Constraint Date" := ProjActRec."Starting Date";
+        // jhoek.270910.end
+
+        ProjActRec.Duration := ProjPlanActivityMgt.CalcProjPlanActivityDuration(
+          ProjActRec."Starting Date",
+          ProjActRec."Ending Date");
+
+        ProjActRec.MODIFY;
+      END;
+    END;
+
+    LOCAL PROCEDURE DetermineProjActStartDateTime@1100528402(ProjectPlanningActivity@1100528400 : Record 11012431;MinStartDate@1100528401 : Date;ProjectTimeTable@1100528402 : Record 11020684) StartDateTime : DateTime;
+    VAR
+      StartDate@1100528403 : Date;
+    BEGIN
+      IF MinStartDate <> 0D THEN
+        StartDate := MinStartDate
+      ELSE
+        IF ProjectPlanningActivity."Starting Date" <> 0DT THEN
+          StartDate :=
+            ProjActCapComMgt.GetDateOfFirstWorkingDay(
+              DT2DATE(ProjectPlanningActivity."Starting Date"))
+        ELSE
+          StartDate :=
+            ProjActCapComMgt.GetDateOfFirstWorkingDay(
+              GetProjectStartDate(ProjectPlanningActivity."Project No."));
+
+      IF StartDate > 0D THEN
+        StartDateTime := CREATEDATETIME(StartDate, ProjectTimeTable.GetWorkFrom(StartDate));
+    END;
+
+    LOCAL PROCEDURE GetProjectStartDate@1100528404(ProjectNo@1100528400 : Code[20]) StartDate : Date;
+    VAR
+      Job@1100528401 : Record 11072003;
+    BEGIN
+      IF Job.GET(ProjectNo) THEN
+        StartDate := Job."Starting Date";
+    END;
+
+    LOCAL PROCEDURE DetermineProjActEndDateTime@1100528403(ProjectPlanningActivity@1100528402 : Record 11012431;MaxEndDate@1100528401 : Date;ProjectTimeTable@1100528400 : Record 11020684) EndDateTime : DateTime;
+    BEGIN
+      IF MaxEndDate <> 0D THEN
+        EndDateTime := CREATEDATETIME(MaxEndDate, ProjectTimeTable.GetWorkUntil(MaxEndDate))
+      ELSE
+        IF ProjectPlanningActivity."Starting Date" <> 0DT THEN
+          EndDateTime :=
+            CREATEDATETIME(
+              DT2DATE(ProjectPlanningActivity."Starting Date"),
+              ProjectTimeTable.GetWorkUntil(DT2DATE(ProjectPlanningActivity."Starting Date")));
+    END;
+
+    PROCEDURE UpdAllReqActCapChangedByGPP@1100528400();
+    VAR
+      RequestedActivityCapacity@1100528401 : Record 11125708;
+    BEGIN
+      RequestedActivityCapacity.SETCURRENTKEY(Changed);
+      RequestedActivityCapacity.SETRANGE(Changed, TRUE);
+      IF RequestedActivityCapacity.FINDSET THEN
+        REPEAT
+          UpdRequestedActCapAfterGPP(
+            RequestedActivityCapacity."Project No.",
+            RequestedActivityCapacity."Activity Code",
+            RequestedActivityCapacity."Line No.");
+        UNTIL RequestedActivityCapacity.NEXT = 0;
+    END;
+
+    PROCEDURE UpdRequestedActCapAfterGPP@1100528401(ProjectNo@1100528402 : Code[20];ActivityCode@1100528401 : Text[10];LineNo@1100528400 : Integer);
+    VAR
+      RequestedActivityCapacity@1100528404 : Record 11125708;
+    BEGIN
+      IF RequestedActivityCapacity.GET(ProjectNo, ActivityCode, LineNo) THEN BEGIN
+        RequestedActivityCapacity."Plan Hours" := CalculatePlannedHours(RequestedActivityCapacity);
+        UpdateReqActCapByDay(RequestedActivityCapacity, TRUE);
+        RequestedActivityCapacity.Changed := FALSE;
+        RequestedActivityCapacity.MODIFY(TRUE);
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

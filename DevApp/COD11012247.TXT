@@ -1,0 +1,565 @@
+OBJECT Codeunit 11012247 Export ICK Order
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      FileMgt@1100525501 : Codeunit 419;
+      LineTxt@1100525008 : Text[250];
+      OutStreamStrm@1100525002 : OutStream;
+      PathName@1100525011 : Text[250];
+      FileName@1100525001 : Text[250];
+      ServerTempFileName@1100525500 : Text[1024];
+      gvFile@1100525000 : File;
+      gvCounter@1100525004 : Integer;
+      Text001@1100525050 : TextConst 'ENU=Send to Vendor ?';
+      Text006@1100525025 : TextConst 'ENU=Post Code %1 must be max. 6 positions in ICM format for order %2';
+      Text007@1100525024 : TextConst 'ENU=No or to long house number specified for ship-to location for order %1';
+      Text008@1100525023 : TextConst 'ENU=More then 70 order lines for order %1, not allowed for ICM';
+      Text009@1100525022 : TextConst 'ENU=Quantity %1 is smaller then 0, not allowed in ICM for order %2';
+      Text011@1100525020 : TextConst 'ENU=Vendor Item must be filled in ICM for order %1';
+      Text012@1100525019 : TextConst 'ENU=Expected Receipt date for order %1 should occur in the future';
+      Text013@1100525018 : TextConst 'ENU=Login Code not present for Vendor %1';
+      Text014@1100525017 : TextConst 'ENU=Vendor %1 not present';
+      Text015@1100525016 : TextConst 'ENU=Our ICM customer number not present for Vendor %1';
+      Text018@1100525013 : TextConst 'ENU=Expected delivery date not present for Order %1';
+      Text019@1100525012 : TextConst 'ENU=Our ICM customer number by Project (Location) differs on line and header in orderno. %1';
+      InlogCode@1100525049 : Code[2];
+      PurchOrder@1100525010 : Code[20];
+      ExtraRefTxt@1100525048 : Text[35];
+      RefOrder@1100525047 : Code[10];
+      ProjectCode@1100525046 : Code[20];
+      CustCode@1100525045 : Code[10];
+      IcmProcedureTxt@1100525044 : Code[1];
+      AddressCode@1100525043 : Code[3];
+      VarName1Txt@1100525042 : Text[50];
+      VarName2Txt@1100525041 : Text[50];
+      VarStreetTxt@1100525040 : Text[30];
+      VarCityTxt@1100525039 : Text[18];
+      VarPostCode@1100525038 : Text[6];
+      VarHouseNumber@1100525037 : Text[5];
+      VarPhoneTxt@1100525036 : Text[13];
+      ShipmentDateTxt@1100525035 : Text[10];
+      ShipmMethodCde@1100525034 : Code[1];
+      ShipmInstruct1Txt@1100525033 : Text[38];
+      ShipmInstruct2Txt@1100525032 : Text[38];
+      OrderLinesTxt@1100525031 : Text[3];
+      ItemQuanTxt@1100525030 : Text[7];
+      ItemCode@1100525029 : Code[13];
+      ItemDescTxt@1100525028 : Text[38];
+      SalesPriceTxt@1100525027 : Text[9];
+      gTruncateAddress@1100525009 : Boolean;
+      TempVendorRec@1100525051 : TEMPORARY Record 23;
+
+    PROCEDURE ProcessAdviceOrder@1100525001(VAR TmpPurchHeader@1100525000 : TEMPORARY Record 38;VAR TmpPurchLine@1100525001 : TEMPORARY Record 39);
+    VAR
+      OrderHeaderOK@1100525002 : Boolean;
+      OrderLineOK@1100525003 : Boolean;
+    BEGIN
+      IF TmpPurchHeader.FINDSET THEN BEGIN
+        REPEAT
+          OrderHeaderOK := CheckPurchHeader(TmpPurchHeader);
+          OpenFile;
+          IF OrderHeaderOK THEN
+            FillHeader;
+          TmpPurchLine.SETRANGE("Document Type", TmpPurchHeader."Document Type");
+          TmpPurchLine.SETRANGE("Document No.", TmpPurchHeader."No.");
+          IF TmpPurchLine.FINDSET THEN BEGIN
+            REPEAT
+              IF (TmpPurchLine."ICM Quantity" <> 0) AND (TmpPurchLine."Trade Item" <> '') THEN BEGIN
+                OrderLineOK := CheckPurchLine(TmpPurchLine);
+                IF OrderHeaderOK AND OrderLineOK THEN
+                  FillLine;
+              END;
+            UNTIL TmpPurchLine.NEXT = 0;
+          END;
+          CloseFile;
+          IF NOT OrderHeaderOK OR NOT OrderLineOK THEN
+            FileMgt.DeleteClientFile4PS(FileName, TRUE);
+        UNTIL TmpPurchHeader.NEXT = 0;
+      END;
+
+      CheckError;
+    END;
+
+    PROCEDURE CheckPurchHeader@1210190000(VAR lPurchHeaderRec@1210190000 : Record 38) HeaderOkay@1210190001 : Boolean;
+    VAR
+      VendorRec@1100525007 : Record 23;
+      PurchLineRec@1100525008 : Record 39;
+      ErrorRec@1100525009 : Record 11012051;
+      ProjLocRec@1210190002 : Record 11012011;
+      ICMCustomerRec@1100485000 : Record 11012129;
+      ICMDeliverRec@1100485001 : Record 11012130;
+      NumLines@1100485002 : Integer;
+      MonthInt@1100525004 : Integer;
+      DayInt@1100525003 : Integer;
+      YearInt@1100525002 : Integer;
+      DayCde@1100525001 : Code[2];
+      MonthCde@1100525000 : Code[2];
+      Position@1100525006 : Integer;
+      Finished@1100525005 : Boolean;
+    BEGIN
+      WITH lPurchHeaderRec DO BEGIN
+        PurchOrder := "No.";
+        IF NOT VendorRec.GET("Buy-from Vendor No.") THEN
+          StoreMessage('', STRSUBSTNO(Text014, "Buy-from Vendor No."), "No.");
+
+        IF NOT TempVendorRec.GET("Buy-from Vendor No.") THEN BEGIN
+          TempVendorRec.TRANSFERFIELDS(VendorRec);
+          IF TempVendorRec.INSERT THEN;
+        END;
+
+        PathName := VendorRec."Pathname Purchase Exchange" + VendorRec."Directory ICK";
+        IF VendorRec."ICM Login Code" = '' THEN
+          StoreMessage('', STRSUBSTNO(Text013, VendorRec."No."), "No.")
+        ELSE
+          InlogCode := VendorRec."ICM Login Code";
+
+        IF "Expected Receipt Date" <= TODAY THEN
+          StoreMessage('', STRSUBSTNO(Text012, "No."), "No.");
+
+        RefOrder := GetRefOrderNo(lPurchHeaderRec); //C027875.n
+        ProjectCode := "Job No.";
+
+        IF VendorRec."ICM Customer No." = '' THEN
+          StoreMessage('', STRSUBSTNO(Text015, VendorRec."No."), "No.");
+
+        HandlePhoneICM(0, VarPhoneTxt);
+        HandleShipmentInstruction(0, ShipmInstruct1Txt, ShipmInstruct2Txt);
+        ExtraRefTxt := "Reference (ICM)";
+        CustCode := VendorRec."ICM Customer No.";
+
+        ICMCustomerRec.RESET;
+        ICMCustomerRec.SETRANGE(Vendor, "Buy-from Vendor No.");
+        ICMCustomerRec.SETFILTER(Project, '%1', '');
+        ICMCustomerRec.SETFILTER("ICM Customer No.", '<>%1', '');
+        IF ICMCustomerRec.FIND('-') THEN
+          CustCode := ICMCustomerRec."ICM Customer No.";
+
+        IF ProjectCode <> '' THEN BEGIN
+          ICMCustomerRec.SETRANGE(Project, ProjectCode);
+          IF (Deliver = Deliver::"Project Location") AND
+             ("Ship To Location" <> '') THEN BEGIN
+            ICMCustomerRec.SETRANGE("Project Location", "Ship To Location");
+            IF ICMCustomerRec.FIND('-') THEN BEGIN
+              CustCode := ICMCustomerRec."ICM Customer No.";
+            END ELSE BEGIN
+              ICMCustomerRec.SETFILTER("Project Location", '%1', '');
+              IF ICMCustomerRec.FIND('-') THEN
+                CustCode := ICMCustomerRec."ICM Customer No.";
+            END;
+          END ELSE BEGIN
+            ICMCustomerRec.SETFILTER("Project Location", '%1', '');
+            IF ICMCustomerRec.FIND('-') THEN
+              CustCode := ICMCustomerRec."ICM Customer No.";
+          END;
+        END;
+
+        CustCode := PADSTR(CustCode,10,' ');
+
+        IF "ICM Procedure" = "ICM Procedure"::Send THEN
+          IcmProcedureTxt := 'B'
+        ELSE
+          IcmProcedureTxt := 'A';
+
+        AddressCode := '';
+
+        IF (Deliver <> Deliver::" ") AND
+           ("Ship To Location" <> '') THEN
+        BEGIN
+          ICMDeliverRec.SETRANGE("ICM Vendor No.", "Buy-from Vendor No.");
+          ICMDeliverRec.SETRANGE(Deliver, Deliver);
+          ICMDeliverRec.SETRANGE("Ship To Location", "Ship To Location");
+          ICMDeliverRec.SETFILTER("ICM Deliver Code", '<>%1', '');
+
+          IF Deliver = Deliver::"Project Location" THEN
+            ICMDeliverRec.SETRANGE(Project, ProjectCode)
+          ELSE
+            ICMDeliverRec.SETFILTER(Project, '%1', '');
+
+          IF ICMDeliverRec.FIND('-') THEN
+            AddressCode := PADSTR('',3 - STRLEN(ICMDeliverRec."ICM Deliver Code"),'0') + ICMDeliverRec."ICM Deliver Code";
+        END;
+
+        IF AddressCode = '' THEN BEGIN
+          AddressCode := '993';
+          IF "Ship-to Name" = '' THEN
+            StoreMessage('', MissingField(lPurchHeaderRec, FIELDNO("Ship-to Name")), "No.");
+          IF "Ship-to Post Code" = '' THEN
+            StoreMessage('', MissingField(lPurchHeaderRec, FIELDNO("Ship-to Post Code")), "No.");
+          IF "Ship-to Address" = '' THEN
+            StoreMessage('', MissingField(lPurchHeaderRec, FIELDNO("Ship-to Address")), "No.");
+          IF "Ship-to City" = '' THEN
+            StoreMessage('', MissingField(lPurchHeaderRec, FIELDNO("Ship-to City")), "No.");
+          VarName1Txt := CheckFormat(lPurchHeaderRec,FIELDCAPTION("Ship-to Name"),"Ship-to Name",30,TRUE);
+          VarName2Txt := CheckFormat(lPurchHeaderRec,FIELDCAPTION("Ship-to Contact"),"Ship-to Contact",30,TRUE);
+          VarStreetTxt := CheckFormat(lPurchHeaderRec,FIELDCAPTION("Ship-to Address"),"Ship-to Address",30,TRUE);
+          VarCityTxt := CheckFormat(lPurchHeaderRec,FIELDCAPTION("Ship-to City"),"Ship-to City",18,TRUE);
+          VarPostCode := DELCHR("Ship-to Post Code",'=',' ');
+          IF STRLEN(VarPostCode) > 6 THEN
+            StoreMessage('', STRSUBSTNO(Text006, VarPostCode, "No."), "No.");
+          Position := STRLEN("Ship-to Address");
+          Finished := FALSE;
+          IF Deliver = Deliver::"Project Location" THEN BEGIN
+            IF ProjLocRec.GET(ProjectCode, "Ship To Location") THEN BEGIN
+              ProjLocRec."Phone No." := DELCHR(ProjLocRec."Phone No.",'=',' -+');
+              VarPhoneTxt := CheckFormat(lPurchHeaderRec,ProjLocRec.FIELDCAPTION("Phone No."),ProjLocRec."Phone No.",13,FALSE);
+            END;
+          END;
+          IF VarStreetTxt <> '' THEN BEGIN
+            WHILE Finished = FALSE DO BEGIN
+              IF COPYSTR(VarStreetTxt, Position - 1, 1) <> ' ' THEN BEGIN
+                Position := Position - 1;
+                IF Position = 1 THEN
+                  Finished := TRUE;
+              END ELSE BEGIN
+                Finished := TRUE;
+              END;
+            END;
+          END;
+          IF (STRLEN(VarStreetTxt) - Position < 5) AND (Position > 1) THEN BEGIN
+            VarHouseNumber := COPYSTR(VarStreetTxt, Position, STRLEN(VarStreetTxt) - (Position - 1));
+            VarStreetTxt := COPYSTR(VarStreetTxt, 1, Position - 1);
+          END ELSE BEGIN
+            StoreMessage('', STRSUBSTNO(Text007, "No."), "No.");
+          END;
+        END;
+
+        IF "Expected Receipt Date" = 0D THEN BEGIN
+          StoreMessage('', STRSUBSTNO(Text018, "No."), "No.");
+        END ELSE BEGIN
+          DayInt := DATE2DMY("Expected Receipt Date", 1);
+          IF DayInt < 10 THEN
+            DayCde := STRSUBSTNO('0%1',DayInt)
+          ELSE
+            DayCde := STRSUBSTNO('%1',DayInt);
+          MonthInt := DATE2DMY("Expected Receipt Date", 2);
+          IF MonthInt < 10 THEN
+            MonthCde := STRSUBSTNO('0%1', MonthInt)
+          ELSE
+            MonthCde := STRSUBSTNO('%1', MonthInt);
+          YearInt := DATE2DMY("Expected Receipt Date", 3);
+          ShipmentDateTxt := STRSUBSTNO('%1-%2-%3', DayCde, MonthCde, YearInt);
+        END;
+
+        PurchLineRec.SETRANGE("Document Type", "Document Type"::Order);
+        PurchLineRec.SETRANGE("Document No.", "No.");
+        PurchLineRec.SETRANGE("Removal Contribution",FALSE);
+        PurchLineRec.SETFILTER(Quantity, '<>%1', 0);
+        PurchLineRec.SETFILTER("Trade Item", '<>%1', '');
+        NumLines := PurchLineRec.COUNT;
+        IF NumLines > 999 THEN
+          StoreMessage('', STRSUBSTNO(Text008, "No."), "No.")
+        ELSE
+          IF NumLines < 10 THEN
+            OrderLinesTxt := STRSUBSTNO('00%1', NumLines)
+          ELSE
+            IF NumLines < 100 THEN
+              OrderLinesTxt := STRSUBSTNO('0%1', NumLines)
+            ELSE
+              OrderLinesTxt := STRSUBSTNO('%1', NumLines);
+      END;
+
+      WITH ErrorRec DO BEGIN
+        SETRANGE("User ID", USERID);
+        SETRANGE("Source Type", "Source Type"::"ICM Export");
+        IF FIND('-') THEN
+          EXIT(FALSE)
+        ELSE
+          EXIT(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE GetRefOrderNo@1100528400(PurchaseHeader@1100528400 : Record 38) RefOrderNo : Text;
+    BEGIN
+      //C027875
+      IF PurchaseHeader."Service Order No." <> '' THEN
+        RefOrderNo := PurchaseHeader."Service Order No."
+      ELSE
+        RefOrderNo := PurchaseHeader."Job No.";
+      IF STRLEN(RefOrderNo) > 10 THEN
+        RefOrderNo := '';
+    END;
+
+    PROCEDURE CheckPurchLine@1210190001(lPurchLineRec@1210190000 : Record 39) LineOkay@1210190002 : Boolean;
+    VAR
+      VendorRec@1100525000 : Record 23;
+      ErrorRec@1100525001 : Record 11012051;
+      ICMCustomerRec@1100485000 : Record 11012129;
+    BEGIN
+      WITH lPurchLineRec DO BEGIN
+        ItemCode := "Trade Item";
+        ItemDescTxt := COPYSTR(Description, 1, MAXSTRLEN(ItemDescTxt));
+        SalesPriceTxt := STRSUBSTNO('%1', "Direct Unit Cost");
+
+        IF "ICM Quantity" < 0 THEN
+          IF Quantity < 0 THEN
+            StoreMessage('', STRSUBSTNO(Text009, Quantity, "Document No."), "Document No.");
+
+        IF "ICM Quantity" <> 0 THEN
+          ItemQuanTxt := STRSUBSTNO('%1', "ICM Quantity")
+        ELSE
+          ItemQuanTxt := STRSUBSTNO('%1', Quantity);
+
+        //Remove dot for Thousands
+        ItemQuanTxt := DELCHR(ItemQuanTxt,'=','.');
+
+        //check quantity on decimal value
+        //IF STRPOS(ItemQuanTxt, ',' ) <> 0 THEN  //db, 17-09-12: 31238
+        //  StoreMessage('', STRSUBSTNO(Text010, Quantity, "Document No."), "Document No.");
+
+        IF Quantity <> 0 THEN
+          IF "Trade Item" = '' THEN
+            StoreMessage('', STRSUBSTNO(Text011, "Document No."), "Document No.");
+
+        IF ProjectCode <> "Job No." THEN BEGIN
+          ICMCustomerRec.SETRANGE(Vendor, VendorRec."No.");
+          ICMCustomerRec.SETRANGE(Project, "Job No.");
+          IF ICMCustomerRec.FIND('-') THEN BEGIN
+            ICMCustomerRec.SETRANGE("ICM Customer No.", CustCode);
+            IF NOT (ICMCustomerRec.FIND('-')) THEN
+              StoreMessage('', STRSUBSTNO(Text019, "Document No."), "Document No.");
+          END;
+        END;
+      END;
+
+      WITH ErrorRec DO BEGIN
+        SETRANGE("User ID", USERID);
+        SETRANGE("Source Type", "Source Type"::"ICM Export");
+        IF FIND('-') THEN
+          EXIT(FALSE)
+        ELSE
+          EXIT(TRUE);
+      END;
+    END;
+
+    PROCEDURE StoreMessage@5(lvDesc@11012000 : Text[50];lvMess@11012001 : Text[250];lvDoc@1210190000 : Code[20]);
+    VAR
+      LineNr@11012002 : Integer;
+      ErrorRec@1100525000 : Record 11012051;
+    BEGIN
+      WITH ErrorRec DO BEGIN
+        SETRANGE("User ID", USERID);
+        SETRANGE("Source Type", "Source Type"::"ICM Export");
+        IF FIND('+') THEN
+          LineNr := "Line No." + 1
+        ELSE
+          LineNr := 1;
+
+        INIT;
+        "User ID" := USERID;
+        "Source Type" := "Source Type"::"ICM Export";
+        "Line No." := LineNr;
+        "Document No." := lvDoc;
+        "Error message" := lvMess;
+        Description := lvDesc;
+        INSERT;
+      END;
+    END;
+
+    PROCEDURE CheckFormat@1100525006(iPurchHeaderRec@1100525004 : Record 38;iField@1100525002 : Text[250];iData@1100525000 : Text[250];iLength@1100525001 : Integer;iTruncateField@1100525005 : Boolean) Result : Text[250];
+    VAR
+      lvText000@1100525003 : TextConst 'ENU=%1 %2 exceeds maximum of %3 characters in ICM format for  %4 %5';
+    BEGIN
+      WITH iPurchHeaderRec DO BEGIN
+        IF STRLEN(iData) > iLength THEN BEGIN
+          IF (gTruncateAddress = FALSE) OR (iTruncateField = FALSE) THEN
+            ERROR(lvText000, iField, iData, iLength, "Document Type", "No.");
+        END;
+      END;
+
+      EXIT(COPYSTR(iData,1,iLength));
+    END;
+
+    PROCEDURE MissingField@1100525004(iPurchHeaderRec@1100525001 : Record 38;iField@1100525000 : Integer) Result : Text[250];
+    VAR
+      lvText000@1100525002 : TextConst 'ENU=%1 not present for %2 %3';
+    BEGIN
+      WITH iPurchHeaderRec DO BEGIN
+        CASE iField OF
+          FIELDNO("Ship-to Name"): Result := STRSUBSTNO(lvText000, FIELDCAPTION("Ship-to Name"), TABLECAPTION, "No.");
+          FIELDNO("Ship-to Address"): Result := STRSUBSTNO(lvText000, FIELDCAPTION("Ship-to Address"), TABLECAPTION, "No.");
+          FIELDNO("Ship-to Post Code"): Result := STRSUBSTNO(lvText000, FIELDCAPTION("Ship-to Post Code"), TABLECAPTION, "No.");
+          FIELDNO("Ship-to City"): Result := STRSUBSTNO(lvText000, FIELDCAPTION("Ship-to City"), TABLECAPTION, "No.");
+        END;
+      END;
+      EXIT(Result);
+    END;
+
+    PROCEDURE CheckError@1100525002();
+    VAR
+      ErrorRec@1100525000 : Record 11012051;
+    BEGIN
+      WITH ErrorRec DO BEGIN
+        SETRANGE("User ID", USERID);
+        SETRANGE("Source Type", "Source Type"::"ICM Export");
+        IF FIND('-') THEN BEGIN
+          COMMIT;
+          PAGE.RUNMODAL(PAGE::Errors, ErrorRec);
+        END ELSE BEGIN
+          SendToVendor;
+        END;
+      END;
+    END;
+
+    PROCEDURE SendToVendor@1100525000();
+    VAR
+      OperatingSystemMgt@1100409000 : Codeunit 11012364;
+      Command@1100525000 : Text[1024];
+    BEGIN
+      IF NOT CONFIRM(Text001) THEN EXIT;
+
+      IF TempVendorRec.FIND('-') THEN BEGIN
+        REPEAT
+          IF TempVendorRec."ICK Batch" <> '' THEN BEGIN
+            Command := STRSUBSTNO('"%1"', TempVendorRec."ICK Batch");
+            OperatingSystemMgt.ClientShell(Command, '', FALSE);
+          END;
+        UNTIL TempVendorRec.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE DetermineFileName@1100485003();
+    BEGIN
+      FileName := PathName + PurchOrder + '.ick';
+    END;
+
+    PROCEDURE OpenFile@1210190014();
+    VAR
+      lvText001@1100525000 : TextConst 'ENU="File %1 already exists; replace ?"';
+      lvFileExist@1100525002 : Boolean;
+    BEGIN
+      REPEAT
+        DetermineFileName;
+        lvFileExist := FileMgt.ClientFileExists(FileName);
+        IF lvFileExist THEN BEGIN
+          IF CONFIRM(lvText001) THEN BEGIN
+            FileMgt.DeleteClientFile4PS(FileName, TRUE);
+            lvFileExist := FALSE;
+          END;
+        END;
+      UNTIL (lvFileExist = FALSE);
+
+      ServerTempFileName := FileMgt.ServerTempFileName('ick');
+      gvFile.CREATE(ServerTempFileName);
+      gvFile.TEXTMODE(TRUE);
+      gvFile.CREATEOUTSTREAM(OutStreamStrm);
+    END;
+
+    PROCEDURE CloseFile@1210190030();
+    BEGIN
+      gvFile.CLOSE();
+
+      FileMgt.DownloadToFile(
+        ServerTempFileName, FileName);
+      ERASE(ServerTempFileName);
+    END;
+
+    PROCEDURE WriteLine@1210190051(CountRec@1100525000 : Boolean);
+    BEGIN
+      //update line to file
+      OutStreamStrm.WRITETEXT(LineTxt);
+
+      //Carriage Return / Line Feed
+      OutStreamStrm.WRITETEXT();
+
+      gvCounter := gvCounter + 1;
+    END;
+
+    PROCEDURE FillHeader@1100525005();
+    BEGIN
+      LineTxt := InlogCode;
+      WriteLine(FALSE);
+
+      LineTxt := PurchOrder;
+      WriteLine(FALSE);
+
+      LineTxt := ExtraRefTxt;
+      WriteLine(FALSE);
+
+      LineTxt := RefOrder;
+      WriteLine(FALSE);
+
+      LineTxt := CustCode;
+      WriteLine(FALSE);
+
+      LineTxt := IcmProcedureTxt;
+      WriteLine(FALSE);
+
+      LineTxt := AddressCode;
+      WriteLine(FALSE);
+
+      LineTxt := VarName1Txt;
+      WriteLine(FALSE);
+
+      LineTxt := VarName1Txt;
+      WriteLine(FALSE);
+
+      LineTxt := VarStreetTxt;
+      WriteLine(FALSE);
+
+      LineTxt := VarCityTxt;
+      WriteLine(FALSE);
+
+      LineTxt := VarPostCode;
+      WriteLine(FALSE);
+
+      LineTxt := VarHouseNumber;
+      WriteLine(FALSE);
+
+      LineTxt := VarPhoneTxt;
+      WriteLine(FALSE);
+
+      LineTxt := ShipmentDateTxt;
+      WriteLine(FALSE);
+
+      LineTxt := ShipmMethodCde;
+      WriteLine(FALSE);
+
+      LineTxt := ShipmInstruct1Txt;
+      WriteLine(FALSE);
+
+      LineTxt := ShipmInstruct2Txt;
+      WriteLine(FALSE);
+
+      LineTxt := OrderLinesTxt;
+      WriteLine(FALSE);
+    END;
+
+    PROCEDURE FillLine@1100525009();
+    BEGIN
+      LineTxt := ItemQuanTxt;
+      WriteLine(FALSE);
+
+      LineTxt := ItemCode;
+      WriteLine(FALSE);
+
+      LineTxt := ItemDescTxt;
+      WriteLine(FALSE);
+
+      LineTxt := SalesPriceTxt;
+      WriteLine(FALSE);
+    END;
+
+    PROCEDURE SetTruncateAddress@1210190002(TruncateAddress@1210190000 : Boolean);
+    BEGIN
+      //kzwerver, 110520, n, #27454
+      gTruncateAddress := TruncateAddress;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

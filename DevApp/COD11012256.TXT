@@ -1,0 +1,1772 @@
+OBJECT Codeunit 11012256 Project Forecast Management
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 11012034=im,
+                TableData 11012035=im;
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Project@1100525002 : Record 11072003;
+      ProjectForecastHeader@1100525001 : Record 11020630;
+      ProjForecastInPeriod@1100528500 : Record 11020632;
+      CostContMgt@1100525000 : Codeunit 11012006;
+      Text001@1100525004 : TextConst 'ENU=Fill Forecast with Available ?';
+      Text002@1100525005 : TextConst 'ENU=Fill Forecast with Allowed ?';
+      Text003@1100525006 : TextConst 'ENU=Fill Forecast with Prognosis ?';
+      Text004@1100525007 : TextConst 'ENU=Copy Previous Forecast ?';
+      Text005@1100525008 : TextConst 'ENU=Distribute Forecast Linear ?';
+      Text006@1100525009 : TextConst 'ENU=Create prognosis ?';
+      Text007@1100525010 : TextConst 'ENU=%1 %2 is not supported in Prognosis.';
+      Text008@1100525011 : TextConst 'ENU=Prognosis already exists, overwrite ?';
+      Text009@1210190000 : TextConst 'ENU=Project %1 -  Element %2 does not exist (from surcharges)';
+      Text010@1100528800 : TextConst 'ENU=It is not possible to create a Prognosis. Not all lines have a deviation of 0.';
+
+    PROCEDURE CreateForecastLines@1100525000(Rec@1100525000 : Record 11020630);
+    VAR
+      DetermineProgressDate@1100525003 : Codeunit 11012014;
+      DeterminePrognosisDate@1100525001 : Codeunit 11012029;
+    BEGIN
+      ProjectForecastHeader.COPY(Rec);
+      Project.GET(ProjectForecastHeader."Project No.");
+      Project.SETRANGE("Period Filter",0D, ProjectForecastHeader."Forecast Date");
+      DetermineProgressDate.DetermineDate(Project);
+      DeterminePrognosisDate.DetermineDate(Project);
+
+      //Build Cost Control
+      Project.BuildCostControl;
+      CODEUNIT.RUN(CODEUNIT::CreateControlLinesProjCostType, Project);
+      CASE Project."Forecast Level" OF
+        Project."Forecast Level"::"Element - Cost Object":
+          CODEUNIT.RUN(CODEUNIT::CreateControlLinesElemCostObj, Project);
+        Project."Forecast Level"::"Element - Cost Type":
+          BEGIN
+            CODEUNIT.RUN(CODEUNIT::CreateControlLinesElemCostObj, Project);
+            CreateControlLinesElemCostTyp;
+          END;
+        Project."Forecast Level"::"Cost Object":
+          CODEUNIT.RUN(CODEUNIT::CreateControlLinesProjCostObj,Project);
+        Project."Forecast Level"::"Cost Type":;
+      END;
+      COMMIT;
+
+      CASE Project."Forecast Level" OF
+        Project."Forecast Level"::"Element - Cost Object":
+          CreateForecastElemCostObject;
+        Project."Forecast Level"::"Element - Cost Type":
+          CreateForecastElemCostType;
+        Project."Forecast Level"::"Cost Object":
+          CreateForecastCostObject;
+        Project."Forecast Level"::"Cost Type":
+          CreateForecastCostType;
+      END;
+      CreateForecastRevenues;
+      CreateForecastTotals;
+    END;
+
+    PROCEDURE CreateControlLinesElemCostTyp@1100525017();
+    VAR
+      ControlProjElemCostObject@1100525000 : Record 11012050;
+    BEGIN
+      ControlProjElemCostObject.SETRANGE("Project No.", ProjectForecastHeader."Project No.");
+      ControlProjElemCostObject.SETRANGE("Cumulation Filter", 0D, ProjectForecastHeader."Forecast Date");
+      ControlProjElemCostObject.SETRANGE("Main Project No.", Project."Main Project");
+      IF Project."No." <> Project."Main Project" THEN
+        ControlProjElemCostObject.SETRANGE("Project Filter", Project."No.");
+      ControlProjElemCostObject.SETFILTER(Element, '<>%1', '');
+      IF ControlProjElemCostObject.FINDSET THEN
+        REPEAT
+          Project.SETRANGE("Multipurpose Filter", ControlProjElemCostObject.Element);
+          CODEUNIT.RUN(CODEUNIT::CreateControlLinesProjCostType,Project);
+        UNTIL ControlProjElemCostObject.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE CreateForecastElemCostObject@1100525005() : Decimal;
+    VAR
+      ControlProjElemCostObject@1100525003 : Record 11012050;
+      ProjectForecastLine@1100525000 : Record 11020631;
+      Dummy@1100525001 : Decimal;
+    BEGIN
+      Project.COPYFILTER("Progress Filter", ControlProjElemCostObject."Progress Filter");
+      Project.COPYFILTER("Prognosis Filter", ControlProjElemCostObject."Prognosis Filter");
+      ControlProjElemCostObject.SETRANGE("Project No.", ProjectForecastHeader."Project No.");
+      ControlProjElemCostObject.SETRANGE("Cumulation Filter", 0D, ProjectForecastHeader."Forecast Date");
+      ControlProjElemCostObject.SETRANGE("Main Project No.", Project."Main Project");
+      ControlProjElemCostObject.SETRANGE("Cost Type",
+        ControlProjElemCostObject."Cost Type"::Labor, ControlProjElemCostObject."Cost Type"::Sundry);
+      IF Project."No." <> Project."Main Project" THEN
+        ControlProjElemCostObject.SETRANGE("Project Filter", Project."No.");
+      IF ControlProjElemCostObject.FINDSET THEN
+        REPEAT
+          IF NOT ProjectForecastLine.GET(
+            ProjectForecastHeader."Project No.",
+            ProjectForecastHeader."Forecast Date",
+            ControlProjElemCostObject."Cost Type",
+            ControlProjElemCostObject.Element,
+            ControlProjElemCostObject."Cost Object") THEN
+          BEGIN
+            ControlProjElemCostObject.CALCFIELDS(
+              Budget, "Actual Costs", Prognosis,
+              "Open (Inventory)","Open Ovh. Surch. (Inventory)"); //C003394
+
+            CLEAR(ProjectForecastLine);
+            ProjectForecastLine."Project No." := ProjectForecastHeader."Project No.";
+            ProjectForecastLine."Forecast Date" := ProjectForecastHeader."Forecast Date";
+            ProjectForecastLine."Cost Type" := ControlProjElemCostObject."Cost Type";
+            ProjectForecastLine.Element := ControlProjElemCostObject.Element;
+            ProjectForecastLine.VALIDATE("Cost Object",ControlProjElemCostObject."Cost Object");
+            ProjectForecastLine.Budget := ControlProjElemCostObject.Budget;
+            ProjectForecastLine."Actual Costs" := ControlProjElemCostObject."Actual Costs";
+            ProjectForecastLine.Prognosis := ControlProjElemCostObject.Prognosis;
+            ProjectForecastLine."Prognosis Hours" := DeterminePrognosisHours(ProjectForecastLine);
+
+            CostContMgt.AllowedAndPurchElemCostObj(
+              ControlProjElemCostObject,
+              ProjectForecastLine.Allowed,
+              ProjectForecastLine."Allowed Hours",
+              Dummy, Dummy, Dummy, Dummy, Dummy, Dummy, Dummy, TRUE);
+
+            ProjectForecastLine."Open (Purchase)" := CostContMgt.OutstandingElemCostObj(ControlProjElemCostObject,TRUE);
+            ProjectForecastLine."Received/Not Invoiced" := CostContMgt.ReceivedNotInvoicedElemCostObj(ControlProjElemCostObject,TRUE);
+            ProjectForecastLine."Open Ovh. Surch. (Purchase)" := CostContMgt.OpenOvhPurchElemCostObj(ControlProjElemCostObject,TRUE);
+            //C003394.sn
+            ProjectForecastLine."Open (Inventory)" := ControlProjElemCostObject."Open (Inventory)";
+            ProjectForecastLine."Open Ovh. Surch. (Inventory)" := ControlProjElemCostObject."Open Ovh. Surch. (Inventory)";
+            ProjectForecastLine.CalcTotalOpenPurch;
+            //C003394.en
+            ProjectForecastLine.VALIDATE("Total Cost", CostContMgt.TotCostElemCostObj(ControlProjElemCostObject,TRUE));
+
+            IF ControlProjElemCostObject."Cost Type" = ControlProjElemCostObject."Cost Type"::Labor THEN BEGIN
+              ControlProjElemCostObject.CALCFIELDS("Budget Hours", "Actual Hours", "Open Hours");
+              ProjectForecastLine."Budget Hours" := ControlProjElemCostObject."Budget Hours";
+              ProjectForecastLine."Actual Hours" := ControlProjElemCostObject."Actual Hours";
+              ProjectForecastLine."Open Hours" := ControlProjElemCostObject."Open Hours";
+              ProjectForecastLine."Total Hours" := CostContMgt.TotHoursElemCostObj(ControlProjElemCostObject,TRUE);
+            END;
+
+            ProjectForecastLine.INSERT(TRUE);
+            CreateForecastInPeriodFromPurc(ProjectForecastLine);
+            CreateForecastInPeriodFromHrs(ProjectForecastLine);
+            CreateForecastInPeriodFromInv(ProjectForecastLine); //C003394
+          END;
+        UNTIL ControlProjElemCostObject.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE CreateForecastElemCostType@1100525006();
+    VAR
+      ControlProjElemCostType@1100525002 : Record 11012049;
+      ProjectForecastLine@1100525001 : Record 11020631;
+      Dummy@1100525000 : Decimal;
+    BEGIN
+      Project.COPYFILTER("Progress Filter", ControlProjElemCostType."Progress Filter");
+      Project.COPYFILTER("Prognosis Filter", ControlProjElemCostType."Prognosis Filter");
+      ControlProjElemCostType.SETRANGE("Project No.", ProjectForecastHeader."Project No.");
+      ControlProjElemCostType.SETRANGE("Cumulation Filter", 0D, ProjectForecastHeader."Forecast Date");
+      ControlProjElemCostType.SETRANGE("Main Project No.", Project."Main Project");
+      ControlProjElemCostType.SETRANGE("Cost Type",
+        ControlProjElemCostType."Cost Type"::Labor, ControlProjElemCostType."Cost Type"::Sundry);
+      IF Project."No." <> Project."Main Project" THEN
+        ControlProjElemCostType.SETRANGE("Project Filter", Project."No.");
+      IF ControlProjElemCostType.FINDSET THEN
+        REPEAT
+          IF NOT ProjectForecastLine.GET(
+            ProjectForecastHeader."Project No.",
+            ProjectForecastHeader."Forecast Date",
+            ControlProjElemCostType."Cost Type",
+            ControlProjElemCostType.Element,
+            '') THEN
+          BEGIN
+            ControlProjElemCostType.CALCFIELDS(
+              Budget, "Actual Costs", Prognosis,
+              "Open (Inventory)","Open Ovh. Surch. (Inventory)"); //C003394
+
+            CLEAR(ProjectForecastLine);
+            ProjectForecastLine."Project No." := ProjectForecastHeader."Project No.";
+            ProjectForecastLine."Forecast Date" := ProjectForecastHeader."Forecast Date";
+            ProjectForecastLine."Cost Type" := ControlProjElemCostType."Cost Type";
+            ProjectForecastLine.Element := ControlProjElemCostType.Element;
+            ProjectForecastLine.Budget := ControlProjElemCostType.Budget;
+            ProjectForecastLine."Actual Costs" := ControlProjElemCostType."Actual Costs";
+            ProjectForecastLine.Prognosis := ControlProjElemCostType.Prognosis;
+            ProjectForecastLine."Prognosis Hours" := DeterminePrognosisHours(ProjectForecastLine);
+
+            CostContMgt.AllowedAndPurchElemCostType(
+              ControlProjElemCostType,
+              ProjectForecastLine.Allowed,
+              ProjectForecastLine."Allowed Hours",
+              Dummy, Dummy, TRUE);
+
+            ProjectForecastLine."Open (Purchase)" := CostContMgt.OutstandingElemCostType(ControlProjElemCostType,TRUE);
+            ProjectForecastLine."Received/Not Invoiced" := CostContMgt.ReceivedNotInvoicedElemCostTyp(ControlProjElemCostType,TRUE);
+            ProjectForecastLine."Open Ovh. Surch. (Purchase)" := CostContMgt.OpenOvhPurchElemCostType(ControlProjElemCostType,TRUE);
+            //C003394.sn
+            ProjectForecastLine."Open (Inventory)" := ControlProjElemCostType."Open (Inventory)";
+            ProjectForecastLine."Open Ovh. Surch. (Inventory)" := ControlProjElemCostType."Open Ovh. Surch. (Inventory)";
+            ProjectForecastLine.CalcTotalOpenPurch;
+            //C003394.en
+            ProjectForecastLine.VALIDATE("Total Cost", CostContMgt.TotCostElemCostType(ControlProjElemCostType,TRUE));
+
+            IF ControlProjElemCostType."Cost Type" = ControlProjElemCostType."Cost Type"::Labor THEN BEGIN
+              ControlProjElemCostType.CALCFIELDS("Budget Hours", "Actual Hours", "Open Hours");
+              ProjectForecastLine."Budget Hours" := ControlProjElemCostType."Budget Hours";
+              ProjectForecastLine."Actual Hours" := ControlProjElemCostType."Actual Hours";
+              ProjectForecastLine."Open Hours" := ControlProjElemCostType."Open Hours";
+              ProjectForecastLine."Total Hours" := CostContMgt.TotHoursElemCostType(ControlProjElemCostType,TRUE);
+            END;
+            ProjectForecastLine.INSERT(TRUE);
+            CreateForecastInPeriodFromPurc(ProjectForecastLine);
+            CreateForecastInPeriodFromHrs(ProjectForecastLine);
+            CreateForecastInPeriodFromInv(ProjectForecastLine); //C003394
+          END;
+        UNTIL ControlProjElemCostType.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE CreateForecastCostObject@1100525007();
+    VAR
+      ControlProjectCostObject@1100525001 : Record 11012047;
+      ProjectForecastLine@1100525002 : Record 11020631;
+      Dummy@1100525000 : Decimal;
+    BEGIN
+      Project.COPYFILTER("Progress Filter", ControlProjectCostObject."Progress Filter");
+      Project.COPYFILTER("Prognosis Filter", ControlProjectCostObject."Prognosis Filter");
+      ControlProjectCostObject.SETRANGE("Project No.", ProjectForecastHeader."Project No.");
+      ControlProjectCostObject.SETRANGE("Cumulation Filter", 0D, ProjectForecastHeader."Forecast Date");
+      ControlProjectCostObject.SETRANGE("Main Project No.", Project."Main Project");
+      ControlProjectCostObject.SETRANGE("Cost Type",
+        ControlProjectCostObject."Cost Type"::Labor, ControlProjectCostObject."Cost Type"::Sundry);
+      IF Project."No." <> Project."Main Project" THEN
+        ControlProjectCostObject.SETRANGE("Project Filter", Project."No.");
+      IF ControlProjectCostObject.FINDSET THEN
+        REPEAT
+          IF NOT ProjectForecastLine.GET(
+            ProjectForecastHeader."Project No.",
+            ProjectForecastHeader."Forecast Date",
+            ControlProjectCostObject."Cost Type",
+            '',
+            ControlProjectCostObject."Cost Object") THEN
+          BEGIN
+            ControlProjectCostObject.CALCFIELDS(
+              Budget, "Actual Costs", Prognosis,
+              "Open (Inventory)","Open Ovh. Surch. (Inventory)"); //C003394
+
+
+            CLEAR(ProjectForecastLine);
+            ProjectForecastLine."Project No." := ProjectForecastHeader."Project No.";
+            ProjectForecastLine."Forecast Date" := ProjectForecastHeader."Forecast Date";
+            ProjectForecastLine."Cost Type" := ControlProjectCostObject."Cost Type";
+            ProjectForecastLine.VALIDATE("Cost Object",ControlProjectCostObject."Cost Object");
+            ProjectForecastLine.Budget := ControlProjectCostObject.Budget;
+            ProjectForecastLine."Actual Costs" := ControlProjectCostObject."Actual Costs";
+            ProjectForecastLine.Prognosis := ControlProjectCostObject.Prognosis;
+            ProjectForecastLine."Prognosis Hours" := DeterminePrognosisHours(ProjectForecastLine);
+
+            CostContMgt.AllowedAndPurchCostObj(
+              ControlProjectCostObject,
+              ProjectForecastLine.Allowed,
+              ProjectForecastLine."Allowed Hours",
+              Dummy, Dummy, Dummy, Dummy, Dummy, Dummy, Dummy, TRUE);
+
+            ProjectForecastLine."Open (Purchase)" := CostContMgt.OutstandingCostObj(ControlProjectCostObject,TRUE);
+            ProjectForecastLine."Received/Not Invoiced" := CostContMgt.ReceivedNotInvoicedCostObj(ControlProjectCostObject,TRUE);
+            ProjectForecastLine."Open Ovh. Surch. (Purchase)" := CostContMgt.OpenOvhPurchCostObj(ControlProjectCostObject,TRUE);
+            //C003394.sn
+            ProjectForecastLine."Open (Inventory)" := ControlProjectCostObject."Open (Inventory)";
+            ProjectForecastLine."Open Ovh. Surch. (Inventory)" := ControlProjectCostObject."Open Ovh. Surch. (Inventory)";
+            ProjectForecastLine.CalcTotalOpenPurch;
+            //C003394.en
+            ProjectForecastLine.VALIDATE("Total Cost", CostContMgt.TotCostCostObj(ControlProjectCostObject,TRUE));
+
+            IF ControlProjectCostObject."Cost Type" = ControlProjectCostObject."Cost Type"::Labor THEN BEGIN
+              ControlProjectCostObject.CALCFIELDS("Budget Hours", "Actual Hours", "Open Hours");
+              ProjectForecastLine."Budget Hours" := ControlProjectCostObject."Budget Hours";
+              ProjectForecastLine."Actual Hours" := ControlProjectCostObject."Actual Hours";
+              ProjectForecastLine."Open Hours" := ControlProjectCostObject."Open Hours";
+              ProjectForecastLine."Total Hours" := CostContMgt.TotHoursCostObj(ControlProjectCostObject,TRUE);
+            END;
+            ProjectForecastLine.INSERT(TRUE);
+            CreateForecastInPeriodFromPurc(ProjectForecastLine);
+            CreateForecastInPeriodFromHrs(ProjectForecastLine);
+            CreateForecastInPeriodFromInv(ProjectForecastLine); //C003394
+          END;
+        UNTIL ControlProjectCostObject.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE CreateForecastCostType@1100525008();
+    VAR
+      ControlProjectCostType@1100525000 : Record 11012046;
+      ProjectForecastLine@1100525002 : Record 11020631;
+      Dummy@1100525001 : Decimal;
+    BEGIN
+      Project.COPYFILTER("Progress Filter", ControlProjectCostType."Progress Filter");
+      Project.COPYFILTER("Prognosis Filter", ControlProjectCostType."Prognosis Filter");
+      ControlProjectCostType.SETRANGE("Project No.", ProjectForecastHeader."Project No.");
+      ControlProjectCostType.SETRANGE("Cumulation Filter", 0D, ProjectForecastHeader."Forecast Date");
+      ControlProjectCostType.SETRANGE("Main Project No.", Project."Main Project");
+      IF Project."No." <> Project."Main Project" THEN
+        ControlProjectCostType.SETRANGE("Project Filter", Project."No.");
+      ControlProjectCostType.SETRANGE("Cost Type",
+        ControlProjectCostType."Cost Type"::Labor, ControlProjectCostType."Cost Type"::Sundry);
+      IF ControlProjectCostType.FINDSET THEN
+        REPEAT
+          IF NOT ProjectForecastLine.GET(
+            ProjectForecastHeader."Project No.",
+            ProjectForecastHeader."Forecast Date",
+            ControlProjectCostType."Cost Type",
+            '',
+            '') THEN
+          BEGIN
+            ControlProjectCostType.CALCFIELDS(
+              Budget, "Actual Costs", Prognosis,
+              "Open (Inventory)","Open Ovh. Surch. (Inventory)"); //C003394
+
+            CLEAR(ProjectForecastLine);
+            ProjectForecastLine."Project No." := ProjectForecastHeader."Project No.";
+            ProjectForecastLine."Forecast Date" := ProjectForecastHeader."Forecast Date";
+            ProjectForecastLine."Cost Type" := ControlProjectCostType."Cost Type";
+            ProjectForecastLine.Budget := ControlProjectCostType.Budget;
+            ProjectForecastLine."Actual Costs" := ControlProjectCostType."Actual Costs";
+            ProjectForecastLine.Prognosis := ControlProjectCostType.Prognosis;
+            ProjectForecastLine."Prognosis Hours" := DeterminePrognosisHours(ProjectForecastLine);
+
+            CostContMgt.AllowedAndPurchCostType(
+              ControlProjectCostType,
+              ProjectForecastLine.Allowed,
+              ProjectForecastLine."Allowed Hours",
+              Dummy, Dummy, Dummy, Dummy, Dummy, Dummy, Dummy, TRUE);
+
+            ProjectForecastLine."Open (Purchase)" := CostContMgt.OutstandingCostType(ControlProjectCostType,TRUE);
+            ProjectForecastLine."Received/Not Invoiced" := CostContMgt.ReceivedNotInvoicedCostType(ControlProjectCostType,TRUE);
+            ProjectForecastLine."Open Ovh. Surch. (Purchase)" := CostContMgt.OpenOvhPurchCostType(ControlProjectCostType,TRUE);
+            //C003394.sn
+            ProjectForecastLine."Open (Inventory)" := ControlProjectCostType."Open (Inventory)";
+            ProjectForecastLine."Open Ovh. Surch. (Inventory)" := ControlProjectCostType."Open Ovh. Surch. (Inventory)";
+            ProjectForecastLine.CalcTotalOpenPurch;
+            //C003394.en
+            ProjectForecastLine.VALIDATE("Total Cost", CostContMgt.TotCostCostType(ControlProjectCostType,TRUE));
+
+            IF ControlProjectCostType."Cost Type" = ControlProjectCostType."Cost Type"::Labor THEN BEGIN
+              ControlProjectCostType.CALCFIELDS("Budget Hours", "Actual Hours", "Open Hours");
+              ProjectForecastLine."Budget Hours" := ControlProjectCostType."Budget Hours";
+              ProjectForecastLine."Actual Hours" := ControlProjectCostType."Actual Hours";
+              ProjectForecastLine."Open Hours" := ControlProjectCostType."Open Hours";
+              ProjectForecastLine."Total Hours" := CostContMgt.TotHoursCostType(ControlProjectCostType,TRUE);
+            END;
+            ProjectForecastLine.INSERT(TRUE);
+            CreateForecastInPeriodFromPurc(ProjectForecastLine);
+            CreateForecastInPeriodFromHrs(ProjectForecastLine);
+            CreateForecastInPeriodFromInv(ProjectForecastLine); //C003394
+          END;
+        UNTIL ControlProjectCostType.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE CreateForecastRevenues@1100525016();
+    VAR
+      SubProject@1100525000 : Record 11072003;
+      ProjectInstallment@1100525001 : Record 11012018;
+      ProjLedgEntry@1100526200 : Record 11072005;
+      ProjectForecastLine@1100525002 : Record 11020631;
+      StartDate@1100525003 : Date;
+      AmountToApplyInPeriod@1100525004 : Decimal;
+    BEGIN
+      ProjectForecastLine.SETRANGE("Project No.", ProjectForecastHeader."Project No.");
+      ProjectForecastLine.SETRANGE("Forecast Date", ProjectForecastHeader."Forecast Date");
+      ProjectForecastLine.SETRANGE("Cost Type", ProjectForecastLine."Cost Type"::Revenue);
+      IF NOT ProjectForecastLine.ISEMPTY THEN
+        EXIT;
+
+      SubProject.SETCURRENTKEY("Main Project");
+      SubProject.SETRANGE("Main Project", Project."Main Project");
+      IF Project."Single/Main/Sub Project" <> Project."Single/Main/Sub Project"::"Main Project" THEN
+        SubProject.SETRANGE("No.", ProjectForecastHeader."Project No.");
+      IF SubProject.FINDSET THEN
+        REPEAT
+          //*C005733.sn
+          ProjLedgEntry.RESET;
+          ProjLedgEntry.SETCURRENTKEY("Job No.", "Cost Type", "Entry Type", "Posting Date");
+          ProjLedgEntry.SETRANGE("Job No.", SubProject."No.");
+          ProjLedgEntry.SETRANGE("Cost Type", ProjLedgEntry."Cost Type"::Revenues);
+          ProjLedgEntry.SETRANGE("Entry Type", ProjLedgEntry."Entry Type"::Sale);
+          ProjLedgEntry.SETRANGE("Posting Date", 0D, ProjectForecastHeader."Forecast Date");  //*C005725.n
+          IF ProjLedgEntry.FINDSET THEN BEGIN
+            REPEAT
+              CLEAR(ProjectForecastLine);
+              ProjectForecastLine."Project No." := ProjectForecastHeader."Project No.";
+              ProjectForecastLine."Forecast Date" := ProjectForecastHeader."Forecast Date";
+              ProjectForecastLine."Cost Type" := ProjectForecastLine."Cost Type"::Revenue;
+              CASE Project."Forecast Level" OF
+                Project."Forecast Level"::"Element - Cost Object":
+                  BEGIN
+                    ProjectForecastLine."Cost Object" := ProjLedgEntry."Global Dimension 2 Code";
+                    ProjectForecastLine.Element := ProjLedgEntry.Element;
+                  END;
+                Project."Forecast Level"::"Element - Cost Type":
+                  ProjectForecastLine.Element := ProjLedgEntry.Element;
+                Project."Forecast Level"::"Cost Object":
+                  ProjectForecastLine."Cost Object" := ProjLedgEntry."Global Dimension 2 Code";
+                Project."Forecast Level"::"Cost Type":;
+              END;
+              IF NOT ProjectForecastLine.GET(
+                ProjectForecastHeader."Project No.",
+                ProjectForecastHeader."Forecast Date",
+                ProjectForecastLine."Cost Type"::Revenue,
+                ProjectForecastLine.Element,
+                ProjectForecastLine."Cost Object") THEN
+              BEGIN
+                ProjectForecastLine.Invoiced := - ProjLedgEntry."Total Price (LCY)";  //Note: Total Price neg. in Proj. Ledger Entry
+                ProjectForecastLine.INSERT(TRUE);
+              END ELSE BEGIN
+                ProjectForecastLine.Invoiced := ProjectForecastLine.Invoiced - ProjLedgEntry."Total Price (LCY)";
+                ProjectForecastLine.MODIFY(TRUE);
+              END;
+            UNTIL ProjLedgEntry.NEXT = 0;
+          END;
+          //*C005733.en
+
+          ProjectInstallment.RESET;
+          ProjectInstallment.SETRANGE("Project No.", SubProject."No.");
+          IF ProjectInstallment.FINDSET THEN
+            REPEAT
+              IF NOT SkipInstallment(ProjectInstallment) THEN BEGIN  //*C005931.n
+                CLEAR(ProjectForecastLine);
+                ProjectForecastLine."Project No." := ProjectForecastHeader."Project No.";
+                ProjectForecastLine."Forecast Date" := ProjectForecastHeader."Forecast Date";
+                ProjectForecastLine."Cost Type" := ProjectForecastLine."Cost Type"::Revenue;
+                CASE Project."Forecast Level" OF
+                  Project."Forecast Level"::"Element - Cost Object":
+                    BEGIN
+                      ProjectForecastLine."Cost Object" := ProjectInstallment."Cost Object";
+                      ProjectForecastLine.Element := ProjectInstallment.Element;
+                    END;
+                  Project."Forecast Level"::"Element - Cost Type":
+                    ProjectForecastLine.Element := ProjectInstallment.Element;
+                  Project."Forecast Level"::"Cost Object":
+                    ProjectForecastLine."Cost Object" := ProjectInstallment."Cost Object";
+                  Project."Forecast Level"::"Cost Type":;
+                END;
+                //ProjectInstallment.CALCFIELDS("Invoiced Price (LCY)");  //*C005725.o
+                CalcInstallmentInvoicedPrice(ProjectInstallment);  //*C005725.n
+                IF NOT ProjectForecastLine.GET(
+                  ProjectForecastHeader."Project No.",
+                  ProjectForecastHeader."Forecast Date",
+                  ProjectForecastLine."Cost Type"::Revenue,
+                  ProjectForecastLine.Element,
+                  ProjectForecastLine."Cost Object") THEN
+                BEGIN
+                  ProjectForecastLine.VALIDATE(Amount,
+                    ProjectInstallment."Installment Amount (LCY)" - ProjectInstallment."Invoiced Price (LCY)");
+                  //ProjectForecastLine.Invoiced := ProjectInstallment."Invoiced Price (LCY)"; //*C005733.o
+                  IF ProjectForecastLine.Amount <> 0 THEN
+                    ProjectForecastLine.INSERT(TRUE);
+                END ELSE BEGIN
+                  ProjectForecastLine.VALIDATE(Amount,
+                    ProjectForecastLine.Amount + ProjectInstallment."Installment Amount (LCY)" -
+                    ProjectInstallment."Invoiced Price (LCY)");
+                  //ProjectForecastLine.Invoiced := ProjectForecastLine.Invoiced+ProjectInstallment."Invoiced Price (LCY)";//*C005733.o
+                  ProjectForecastLine.MODIFY(TRUE);
+                END;
+
+                AmountToApplyInPeriod := ProjectInstallment."Installment Amount (LCY)" - ProjectInstallment."Invoiced Price (LCY)";
+                StartDate := ProjectInstallment."Expected Invoice Date";
+                IF StartDate = 0D THEN
+                  StartDate := ProjectInstallment."Due Date Actual";
+                IF StartDate = 0D THEN
+                  StartDate := ProjectInstallment."Due Date Base";
+                IF StartDate <> 0D THEN BEGIN //Call 25931
+                  //IF StartDate < ProjectForecastHeader."Forecast Date" THEN //*C005733.o
+                  //  StartDate := ProjectForecastHeader."Forecast Date";     //*C005733.o
+                  IF StartDate <= ProjectForecastHeader."Forecast Date" THEN  //*C005733.n
+                    StartDate := ProjectForecastHeader."Forecast Date" + 1;   //*C005733.n
+                  CreateForecastInPeriod(
+                    ProjectForecastLine, StartDate, AmountToApplyInPeriod);
+                END;
+              END;  //*C005931.n
+            UNTIL ProjectInstallment.NEXT = 0;
+        UNTIL SubProject.NEXT = 0;
+    END;
+
+    PROCEDURE SkipInstallment@1100526202(ProjectInstallment@1100526200 : Record 11012018) : Boolean;
+    VAR
+      ExtensionContract@1100526201 : Record 11012004;
+      Option@1100526202 : Record 11012502;
+    BEGIN
+      //*C005931
+      IF ProjectInstallment."Extension Contract" <> '' THEN BEGIN
+        IF ExtensionContract.GET(ProjectInstallment."Project No.", ProjectInstallment."Extension Contract") THEN
+          IF ExtensionContract."Version Date" > ProjectForecastHeader."Forecast Date" THEN
+            EXIT(TRUE);
+      END;
+      IF (ProjectInstallment."Plot No." <> '') AND (ProjectInstallment.Option <> '') THEN BEGIN
+        ProjectInstallment.CALCFIELDS("House Model");
+        IF Option.GET(
+          ProjectInstallment."Project No.", ProjectInstallment."Plot No.", ProjectInstallment."House Model",
+          ProjectInstallment."Main Group", ProjectInstallment.Group, ProjectInstallment."Sub Group", ProjectInstallment.Option)
+        THEN
+          IF Option."Version Date" > ProjectForecastHeader."Forecast Date" THEN
+            EXIT(TRUE);
+      END;
+    END;
+
+    PROCEDURE CalcInstallmentInvoicedPrice@1100526203(VAR ProjectInstallment@1100526200 : Record 11012018);
+    VAR
+      ProjLedgEntry@1100526201 : Record 11072005;
+    BEGIN
+      //*C005725
+      ProjectInstallment.CALCFIELDS("Invoiced Price (LCY)");
+
+      //* Minus invoiced after forecast date, use same filters as in flowfield but extra filter on posting date
+      ProjLedgEntry.SETCURRENTKEY("Job No.", "Posting Date");
+      ProjLedgEntry.SETRANGE("Job No.", ProjectInstallment."Project No.");
+      ProjLedgEntry.SETRANGE("Project Invoice", TRUE);
+      ProjLedgEntry.SETRANGE("Installment Invoice", TRUE);
+      ProjLedgEntry.SETRANGE(Principal, ProjectInstallment.Principal);
+      ProjLedgEntry.SETRANGE("Installment No.", ProjectInstallment."Installment No.");
+      ProjLedgEntry.SETRANGE("Plot No.", ProjectInstallment."Plot No.");
+      ProjLedgEntry.SETFILTER("Posting Date", '>%1', ProjectForecastHeader."Forecast Date");
+      IF ProjLedgEntry.FINDSET THEN BEGIN
+        REPEAT
+          //Note: Total Price neg. in Proj. Ledger Entry so use plus (+) then it will be minus (-)
+          ProjectInstallment."Invoiced Price (LCY)" += ProjLedgEntry."Total Price (LCY)";
+        UNTIL ProjLedgEntry.NEXT =0;
+      END;
+    END;
+
+    PROCEDURE CreateForecastTotals@1100525018();
+    VAR
+      ProjectForecastTotalLine@1100525000 : Record 11020633;
+    BEGIN
+      ProjectForecastTotalLine."Project No." := ProjectForecastHeader."Project No.";
+      ProjectForecastTotalLine."Forecast Date" := ProjectForecastHeader."Forecast Date";
+      FOR ProjectForecastTotalLine."Line No." := 1 TO 7 DO BEGIN
+        IF ProjectForecastTotalLine."Line No." <= 5 THEN BEGIN
+          ProjectForecastTotalLine."Cost Type" := ProjectForecastTotalLine."Line No." - 1;
+          ProjectForecastTotalLine."Cost Type Filter" := STRSUBSTNO('%1', ProjectForecastTotalLine."Line No." - 1);
+        END ELSE
+          IF ProjectForecastTotalLine."Line No." = 6 THEN BEGIN
+            ProjectForecastTotalLine."Cost Type" := 6;
+            ProjectForecastTotalLine."Cost Type Filter" := '0..4';
+          END ELSE BEGIN
+            ProjectForecastTotalLine."Cost Type" := 5;
+            ProjectForecastTotalLine."Cost Type Filter" := '5';
+          END;
+        IF ProjectForecastTotalLine.INSERT(TRUE) THEN;
+      END;
+    END;
+
+    LOCAL PROCEDURE CreateForecastInPeriodFromPurc@1100525001(ProjectForecastLine@1100525000 : Record 11020631);
+    VAR
+      PurchLine@1100525001 : Record 39;
+      PurchOrderControlLine@1100525003 : Record 11020221;
+      ProjectForecastSurchLine@1210190000 : Record 11020631;
+      ExpectedReceiptDate@1100525007 : Date;
+      OutstandingAmount@1100525004 : Decimal;
+      ReceivedNotInvoicedAmount@1100525005 : Decimal;
+      OutstandingAmountSurch@1100528501 : Decimal;
+      ReceivedNotInvoicedAmountSurch@1100528500 : Decimal;
+    BEGIN
+      IF ProjectForecastLine."Cost Type" = ProjectForecastLine."Cost Type"::Labor THEN
+        EXIT;
+
+      PurchLine.SETRANGE("Document Type", PurchLine."Document Type"::Order);
+      PurchLine.SETRANGE("Main Project No.", Project."Main Project");
+      IF Project."No." <> Project."Main Project" THEN
+        PurchLine.SETRANGE("Job No.", ProjectForecastLine."Project No.");
+
+      CASE Project."Forecast Level" OF
+        Project."Forecast Level"::"Element - Cost Object":
+          BEGIN
+            PurchLine.SETCURRENTKEY(
+              "Document Type","Main Project No.","Job No.",Element,"Shortcut Dimension 2 Code");
+            PurchLine.SETRANGE(Element, ProjectForecastLine.Element);
+            PurchLine.SETRANGE("Shortcut Dimension 2 Code", ProjectForecastLine."Cost Object");
+          END;
+        Project."Forecast Level"::"Element - Cost Type":
+          BEGIN
+            PurchLine.SETCURRENTKEY(
+              "Document Type","Main Project No.","Job No.",Element,"Cost Type");
+            PurchLine.SETRANGE(Element, ProjectForecastLine.Element);
+            PurchLine.SETRANGE("Cost Type", ProjectForecastLine."Cost Type" + 1);
+          END;
+        Project."Forecast Level"::"Cost Object":
+          BEGIN
+            PurchLine.SETCURRENTKEY(
+              "Document Type","Main Project No.","Job No.","Cost Type", "Shortcut Dimension 2 Code");
+            PurchLine.SETRANGE("Shortcut Dimension 2 Code", ProjectForecastLine."Cost Object");
+          END;
+        Project."Forecast Level"::"Cost Type":
+          BEGIN
+            PurchLine.SETCURRENTKEY(
+              "Document Type","Main Project No.","Job No.","Cost Type");
+            PurchLine.SETRANGE("Cost Type", ProjectForecastLine."Cost Type" + 1);
+          END;
+      END;
+      PurchLine.SETRANGE("Order Date", 0D, ProjectForecastLine."Forecast Date"); //C003388
+
+      IF PurchLine.FINDSET THEN
+        REPEAT
+          //C003388.sn
+          OutstandingAmount := 0;
+          ReceivedNotInvoicedAmount := 0;
+          OutstandingAmountSurch := 0;
+          ReceivedNotInvoicedAmountSurch := 0;
+          //C003388.en
+          PurchOrderControlLine.SETRANGE("Order No.", PurchLine."Document No.");
+          PurchOrderControlLine.SETRANGE("Order Line No.", PurchLine."Line No.");
+          PurchOrderControlLine.SETRANGE(Date, 0D, ProjectForecastLine."Forecast Date"); //C003388
+          IF PurchOrderControlLine.FINDSET THEN
+            REPEAT
+              OutstandingAmount += PurchOrderControlLine."Outstanding Amount";
+              ReceivedNotInvoicedAmount += PurchOrderControlLine."Amt. Rcd. Not Invoiced";
+              OutstandingAmountSurch += PurchOrderControlLine."Overhead Surcharge Soft";
+              ReceivedNotInvoicedAmountSurch += PurchOrderControlLine."Overhead Surcharge Firm";
+            UNTIL PurchOrderControlLine.NEXT = 0;
+
+          IF (OutstandingAmount <> 0) THEN BEGIN
+            IF PurchLine."Expected Receipt Date" <= ProjectForecastLine."Forecast Date" THEN
+              ExpectedReceiptDate := CALCDATE('<1D>', ProjectForecastLine."Forecast Date")
+            ELSE
+              ExpectedReceiptDate := PurchLine."Expected Receipt Date";
+
+            InsertForecastInPeriod(
+              ProjectForecastLine, PurchLine."Document No.", ExpectedReceiptDate, 0, OutstandingAmount,
+              ProjForecastInPeriod.Source::"Outstanding Purchase");
+          END;
+          IF (ReceivedNotInvoicedAmount <> 0) THEN BEGIN
+            ExpectedReceiptDate := CALCDATE('<1D>', ProjectForecastLine."Forecast Date");
+
+            InsertForecastInPeriod(
+              ProjectForecastLine, PurchLine."Document No.", ExpectedReceiptDate, 0, ReceivedNotInvoicedAmount,
+              ProjForecastInPeriod.Source::"Received Not Invoiced");
+          END;
+
+          //Handle Surcharges
+          IF (OutstandingAmountSurch <> 0) OR (ReceivedNotInvoicedAmountSurch <> 0) THEN BEGIN
+            IF PurchOrderControlLine.FINDSET THEN
+              REPEAT
+                ProjectForecastSurchLine."Project No." := ProjectForecastLine."Project No.";
+                ProjectForecastSurchLine."Forecast Date" := ProjectForecastLine."Forecast Date";
+                CASE Project."Forecast Level" OF
+                  Project."Forecast Level"::"Element - Cost Object":
+                    BEGIN
+                      ProjectForecastSurchLine.Element := PurchOrderControlLine.Element;
+                      ProjectForecastSurchLine."Cost Object" := PurchOrderControlLine."Shortcut Dimension 2 Code";
+                    END;
+                  Project."Forecast Level"::"Element - Cost Type":
+                    BEGIN
+                      ProjectForecastSurchLine.Element := PurchOrderControlLine.Element;
+                      ProjectForecastSurchLine."Cost Object" := '';
+                    END;
+                  Project."Forecast Level"::"Cost Object":
+                    BEGIN
+                      ProjectForecastSurchLine.Element := '';
+                      ProjectForecastSurchLine."Cost Object" := PurchOrderControlLine."Shortcut Dimension 2 Code";
+                    END;
+                  Project."Forecast Level"::"Cost Type":
+                    BEGIN
+                      ProjectForecastSurchLine.Element := '';
+                      ProjectForecastSurchLine."Cost Object" := '';
+                    END;
+                END;
+                ProjectForecastSurchLine."Cost Type" := PurchOrderControlLine."Cost Type" - 1;
+
+                IF (PurchOrderControlLine."Overhead Surcharge Soft" <> 0) THEN BEGIN
+                  IF PurchLine."Expected Receipt Date" <= ProjectForecastSurchLine."Forecast Date" THEN
+                    ExpectedReceiptDate := CALCDATE('<1D>', ProjectForecastSurchLine."Forecast Date")
+                  ELSE
+                    ExpectedReceiptDate := PurchLine."Expected Receipt Date";
+
+                  InsertForecastInPeriod(
+                    ProjectForecastSurchLine, PurchLine."Document No.",
+                    ExpectedReceiptDate, 0, PurchOrderControlLine."Overhead Surcharge Soft",
+                    ProjForecastInPeriod.Source::"Outstanding Purchase");
+
+                END;
+                IF (PurchOrderControlLine."Overhead Surcharge Firm" <> 0) THEN BEGIN
+                  ExpectedReceiptDate := CALCDATE('<1D>', ProjectForecastSurchLine."Forecast Date");
+
+                  InsertForecastInPeriod(
+                    ProjectForecastSurchLine, PurchLine."Document No.",
+                    ExpectedReceiptDate, 0, PurchOrderControlLine."Overhead Surcharge Firm",
+                    ProjForecastInPeriod.Source::"Received Not Invoiced");
+
+                END;
+
+              UNTIL PurchOrderControlLine.NEXT = 0;
+          END;
+          //
+        UNTIL PurchLine.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE CreateForecastInPeriodFromHrs@1210190000(ProjectForecastLine@1100525000 : Record 11020631);
+    VAR
+      HourAccountingLine@1100525001 : Record 11012039;
+      HourAccountingSurcharge@1100528500 : Record 11020308;
+      ProjectForecastSurchLine@1100528501 : Record 11020631;
+      PostingDate@1100528502 : Date;
+    BEGIN
+      IF ProjectForecastLine."Cost Type" <> ProjectForecastLine."Cost Type"::Labor THEN
+        EXIT;
+
+      HourAccountingLine.SETRANGE("Main Project No.", Project."Main Project");
+      IF Project."No." <> Project."Main Project" THEN
+        HourAccountingLine.SETRANGE("Project No.", ProjectForecastLine."Project No.");
+      //HourAccountingLine.SETFILTER("Posting Date", '>%1', ProjectForecastLine."Forecast Date"); //C003394
+      CASE Project."Forecast Level" OF
+        Project."Forecast Level"::"Element - Cost Object":
+          BEGIN
+            HourAccountingLine.SETCURRENTKEY(
+              "Main Project No.","Project No.",Element);
+            HourAccountingLine.SETRANGE(Element, ProjectForecastLine.Element);
+            HourAccountingLine.SETRANGE("Cost Object", ProjectForecastLine."Cost Object");
+          END;
+        Project."Forecast Level"::"Element - Cost Type":
+          BEGIN
+            HourAccountingLine.SETCURRENTKEY(
+              "Main Project No.","Project No.",Element);
+            HourAccountingLine.SETRANGE(Element, ProjectForecastLine.Element);
+            HourAccountingLine.SETRANGE("Cost Type", ProjectForecastLine."Cost Type");
+          END;
+        Project."Forecast Level"::"Cost Object":
+          BEGIN
+            HourAccountingLine.SETCURRENTKEY(
+              "Main Project No.","Cost Type", "Cost Object");
+            HourAccountingLine.SETRANGE("Cost Object", ProjectForecastLine."Cost Object");
+          END;
+        Project."Forecast Level"::"Cost Type":
+          BEGIN
+            HourAccountingLine.SETCURRENTKEY(
+              "Main Project No.","Cost Type");
+            HourAccountingLine.SETRANGE("Cost Type", ProjectForecastLine."Cost Type");
+          END;
+      END;
+      HourAccountingLine.SETRANGE("Posting Date", 0D, ProjectForecastLine."Forecast Date");  //*C003388.n
+
+      IF HourAccountingLine.FINDSET THEN
+        REPEAT
+          //C003394 Posting Date in the past is moved to tomorrow
+          IF HourAccountingLine."Posting Date" <= ProjectForecastLine."Forecast Date" THEN
+            PostingDate := CALCDATE('<1D>', ProjectForecastLine."Forecast Date")
+          ELSE
+            PostingDate := HourAccountingLine."Posting Date";
+
+          InsertForecastInPeriod(
+            ProjectForecastLine, HourAccountingLine."Document No.",
+            PostingDate, HourAccountingLine."Total Line", HourAccountingLine."Amount (LCY)",
+            ProjForecastInPeriod.Source::"Outstanding Hours");
+          //call C003387.sn
+          HourAccountingSurcharge.SETRANGE(Year, HourAccountingLine.Year);
+          HourAccountingSurcharge.SETRANGE(Week, HourAccountingLine.Week);
+          HourAccountingSurcharge.SETRANGE("Employee No.", HourAccountingLine."Employee No.");
+          HourAccountingSurcharge.SETRANGE("Hour Line No.", HourAccountingLine."Line No.");
+          IF HourAccountingSurcharge.FINDSET THEN
+            REPEAT
+              ProjectForecastSurchLine := ProjectForecastLine;
+              ProjectForecastSurchLine."Cost Type" := HourAccountingSurcharge."Cost Type";
+              ProjectForecastSurchLine.Element := HourAccountingSurcharge.Element;
+              ProjectForecastSurchLine."Cost Object" := HourAccountingSurcharge."Cost Object";
+              InsertForecastInPeriod(
+                ProjectForecastSurchLine, HourAccountingLine."Document No.",
+                PostingDate, 0,
+                HourAccountingSurcharge."Overhead Surcharge Project",
+                ProjForecastInPeriod.Source::"Outstanding Hours");
+            UNTIL HourAccountingSurcharge.NEXT = 0;
+          //call C003387.en
+        UNTIL HourAccountingLine.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE CreateForecastInPeriodFromInv@1100528502(ProjectForecastLine@1100525000 : Record 11020631);
+    VAR
+      ItemJournalLine@1100525001 : Record 83;
+      ItemJournalSurcharge@1100528500 : Record 11020585;
+      ProjectForecastSurchLine@1100528501 : Record 11020631;
+      DeliveryDate@1100528502 : Date;
+    BEGIN
+      //C003394
+      IF ProjectForecastLine."Cost Type" = ProjectForecastLine."Cost Type"::Labor THEN
+        EXIT;
+
+      ItemJournalLine.SETCURRENTKEY("Main Project No.","Job No.");
+      ItemJournalLine.SETRANGE("Main Project No.", Project."Main Project");
+      IF Project."No." <> Project."Main Project" THEN
+        ItemJournalLine.SETRANGE("Job No.", ProjectForecastLine."Project No.");
+      ItemJournalLine.SETRANGE("Posting Date", 0D, ProjectForecastLine."Forecast Date");
+      CASE Project."Forecast Level" OF
+        Project."Forecast Level"::"Element - Cost Object":
+          BEGIN
+            ItemJournalLine.SETRANGE(Element, ProjectForecastLine.Element);
+            ItemJournalLine.SETRANGE("Shortcut Dimension 2 Code", ProjectForecastLine."Cost Object");
+          END;
+        Project."Forecast Level"::"Element - Cost Type":
+          BEGIN
+            ItemJournalLine.SETRANGE(Element, ProjectForecastLine.Element);
+            ItemJournalLine.SETRANGE("Cost Type", ProjectForecastLine."Cost Type" + 1);
+          END;
+        Project."Forecast Level"::"Cost Object":
+          ItemJournalLine.SETRANGE("Shortcut Dimension 2 Code", ProjectForecastLine."Cost Object");
+        Project."Forecast Level"::"Cost Type":
+          ItemJournalLine.SETRANGE("Cost Type", ProjectForecastLine."Cost Type" + 1);
+      END;
+
+      IF ItemJournalLine.FINDSET THEN
+        REPEAT
+          IF ItemJournalLine."Delivery Date" <= ProjectForecastLine."Forecast Date" THEN
+            DeliveryDate := CALCDATE('<1D>', ProjectForecastLine."Forecast Date")
+          ELSE
+            DeliveryDate := ItemJournalLine."Delivery Date";
+
+          InsertForecastInPeriod(
+            ProjectForecastLine, ItemJournalLine."Document No.",
+            DeliveryDate, 0, ItemJournalLine.Amount,
+            ProjForecastInPeriod.Source::"Outstanding Inventory");
+
+          ItemJournalSurcharge.SETRANGE("Journal Template Name", ItemJournalLine."Journal Template Name");
+          ItemJournalSurcharge.SETRANGE("Journal Batch Name", ItemJournalLine."Journal Batch Name");
+          ItemJournalSurcharge.SETRANGE("Journal Line No.", ItemJournalLine."Line No.");
+          IF ItemJournalSurcharge.FINDSET THEN
+            REPEAT
+              ProjectForecastSurchLine := ProjectForecastLine;
+              ProjectForecastSurchLine."Cost Type" := ItemJournalSurcharge."Cost Type" - 1;
+              ProjectForecastSurchLine.Element := ItemJournalSurcharge.Element;
+              ProjectForecastSurchLine."Cost Object" := ItemJournalSurcharge."Shortcut Dimension 2 Code";
+              InsertForecastInPeriod(
+                ProjectForecastSurchLine, ItemJournalLine."Document No.",
+                DeliveryDate, 0,
+                ItemJournalSurcharge."Overhead Surcharge Project",
+                ProjForecastInPeriod.Source::"Outstanding Inventory");
+            UNTIL ItemJournalSurcharge.NEXT = 0;
+        UNTIL ItemJournalLine.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE InsertForecastInPeriod@1100525020(ProjectForecastLine@1100525000 : Record 11020631;DocumentNo@1100525005 : Code[20];ExpectedDate@1100525001 : Date;QuantityToInsert@1100525004 : Decimal;AmountToInsert@1210190000 : Decimal;Source@1100525002 : Option);
+    VAR
+      ProjectForecastInPeriod@1100525003 : Record 11020632;
+    BEGIN
+      //IF AmountToInsert = 0 THEN  //C005685.o
+      //  EXIT;
+      //C005685.sn
+      IF (ProjectForecastLine."Cost Type" = ProjectForecastLine."Cost Type"::Labor) THEN BEGIN
+        IF (AmountToInsert = 0) AND (QuantityToInsert = 0) THEN
+          EXIT;
+      END ELSE BEGIN
+        IF AmountToInsert = 0 THEN
+          EXIT;
+      END;
+      //C005685.en
+
+      ProjectForecastInPeriod.SETRANGE("Project No.", ProjectForecastLine."Project No.");
+      ProjectForecastInPeriod.SETRANGE("Forecast Date", ProjectForecastLine."Forecast Date");
+      ProjectForecastInPeriod.SETRANGE("Cost Type", ProjectForecastLine."Cost Type");
+      ProjectForecastInPeriod.SETRANGE(Element, ProjectForecastLine.Element);
+      ProjectForecastInPeriod.SETRANGE("Cost Object", ProjectForecastLine."Cost Object");
+      ProjectForecastInPeriod.SETRANGE(Date, ExpectedDate);
+      ProjectForecastInPeriod.SETRANGE(Source, Source);
+      ProjectForecastInPeriod.SETRANGE("Document No.", DocumentNo);
+      IF NOT ProjectForecastInPeriod.FINDFIRST THEN BEGIN
+        ProjectForecastInPeriod.INIT;
+        ProjectForecastInPeriod."Project No." := ProjectForecastLine."Project No.";
+        ProjectForecastInPeriod."Forecast Date" := ProjectForecastLine."Forecast Date";
+        ProjectForecastInPeriod."Cost Type" := ProjectForecastLine."Cost Type";
+        ProjectForecastInPeriod.Element := ProjectForecastLine.Element;
+        ProjectForecastInPeriod."Cost Object" := ProjectForecastLine."Cost Object";
+        ProjectForecastInPeriod.Date := ExpectedDate;
+        ProjectForecastInPeriod."Line No." :=
+          GetForecastInPeriodNewLineNo(ProjectForecastInPeriod);
+        ProjectForecastInPeriod.Quantity := QuantityToInsert;
+        ProjectForecastInPeriod.Amount := AmountToInsert;
+        ProjectForecastInPeriod.Source := Source;
+        ProjectForecastInPeriod."Document No." := DocumentNo;
+        ProjectForecastInPeriod.INSERT(TRUE);
+      END ELSE BEGIN
+        ProjectForecastInPeriod.Quantity := ProjectForecastInPeriod.Quantity + QuantityToInsert;  //C005685.n
+        ProjectForecastInPeriod.Amount := ProjectForecastInPeriod.Amount + AmountToInsert;
+        ProjectForecastInPeriod.MODIFY(TRUE);
+      END;
+    END;
+
+    PROCEDURE CreateForecastInPeriod@1100525003(ProjectForecastLine@1100525000 : Record 11020631;StartDate@1100525003 : Date;VAR Forecast@1100525001 : Decimal);
+    VAR
+      ProjectForecastInPeriod@1100525002 : Record 11020632;
+      Currency@1100525005 : Record 4;
+    BEGIN
+      IF ProjectForecastLine."Cost Type" <> ProjectForecastLine."Cost Type"::Labor THEN BEGIN
+        Currency.InitRoundingPrecision;
+        Forecast := ROUND(Forecast, Currency."Amount Rounding Precision");
+      END;
+      IF Forecast = 0 THEN
+        EXIT;
+
+      ProjectForecastInPeriod.INIT;
+      ProjectForecastInPeriod."Project No." := ProjectForecastLine."Project No.";
+      ProjectForecastInPeriod."Forecast Date" := ProjectForecastLine."Forecast Date";
+      ProjectForecastInPeriod."Cost Type" := ProjectForecastLine."Cost Type";
+      ProjectForecastInPeriod.Element := ProjectForecastLine.Element;
+      ProjectForecastInPeriod.VALIDATE("Cost Object", ProjectForecastLine."Cost Object");
+      ProjectForecastInPeriod.Date := StartDate;
+      ProjectForecastInPeriod."Line No." := GetForecastInPeriodNewLineNo(ProjectForecastInPeriod);
+      IF ProjectForecastLine."Cost Type" = ProjectForecastLine."Cost Type"::Labor THEN BEGIN
+        ProjectForecastInPeriod.InitLaborRate;
+        ProjectForecastInPeriod.VALIDATE(Quantity, Forecast);
+      END ELSE
+        ProjectForecastInPeriod.Amount := Forecast;
+      ProjectForecastInPeriod.Source := ProjectForecastInPeriod.Source::Forecast;
+
+      ProjectForecastInPeriod.INSERT(TRUE);
+    END;
+
+    PROCEDURE GetForecastInPeriodNewLineNo@1100525019(ProjectForecastInPeriod@1100525000 : Record 11020632) NewLineNo : Integer;
+    BEGIN
+      ProjectForecastInPeriod.SETRANGE("Project No.", ProjectForecastInPeriod."Project No.");
+      ProjectForecastInPeriod.SETRANGE("Forecast Date", ProjectForecastInPeriod."Forecast Date");
+      ProjectForecastInPeriod.SETRANGE("Cost Type", ProjectForecastInPeriod."Cost Type");
+      ProjectForecastInPeriod.SETRANGE(Element, ProjectForecastInPeriod.Element);
+      ProjectForecastInPeriod.SETRANGE("Cost Object", ProjectForecastInPeriod."Cost Object");
+      ProjectForecastInPeriod.SETRANGE(Date, ProjectForecastInPeriod.Date);
+      IF ProjectForecastInPeriod.FINDLAST THEN
+        NewLineNo := ProjectForecastInPeriod."Line No.";
+      NewLineNo := NewLineNo + 10000;
+    END;
+
+    PROCEDURE FillForecastWithAvailable@1100525012(ProjectForecastHeader@1100525000 : Record 11020630);
+    VAR
+      ProjectSetup@1100525004 : Record 315;
+      ProjectForecastLine@1100525003 : Record 11020631;
+      AvailableQuan@1100525002 : Decimal;
+      AvailableAmount@1100525001 : Decimal;
+    BEGIN
+      IF NOT CONFIRM(Text001, TRUE) THEN
+        EXIT;
+
+      ProjectSetup.GET;
+
+      ProjectForecastLine.SETRANGE("Project No.", ProjectForecastHeader."Project No.");
+      ProjectForecastLine.SETRANGE("Forecast Date", ProjectForecastHeader."Forecast Date");
+      ProjectForecastLine.SETRANGE("Cost Type", ProjectForecastLine."Cost Type"::Labor, ProjectForecastLine."Cost Type"::Sundry);
+      IF ProjectForecastLine.FINDSET(TRUE) THEN
+        REPEAT
+          IF ProjectForecastLine."Cost Type" = ProjectForecastLine."Cost Type"::Labor THEN BEGIN
+            IF ProjectSetup."Calculate Available" = ProjectSetup."Calculate Available"::"Budget - Allowed Cost" THEN
+              AvailableQuan := ProjectForecastLine."Budget Hours" - ProjectForecastLine."Allowed Hours"
+            ELSE
+              AvailableQuan := ProjectForecastLine."Budget Hours" - ProjectForecastLine."Total Hours";
+            IF (AvailableQuan < 0) AND (ProjectSetup."Fill Forecast with Available" =
+               ProjectSetup."Fill Forecast with Available"::"Forecast may not be Negative") THEN
+              AvailableQuan := 0;
+            ProjectForecastLine.VALIDATE(Quantity, AvailableQuan);
+          END ELSE BEGIN
+            IF ProjectSetup."Calculate Available" = ProjectSetup."Calculate Available"::"Budget - Allowed Cost" THEN
+              AvailableAmount := ProjectForecastLine.Budget - ProjectForecastLine.Allowed - ProjectForecastLine."Open (Purchase)"
+            ELSE
+              AvailableAmount := ProjectForecastLine.Budget - ProjectForecastLine."Total Cost";
+            IF (AvailableAmount < 0) AND (ProjectSetup."Fill Forecast with Available" =
+               ProjectSetup."Fill Forecast with Available"::"Forecast may not be Negative") THEN
+              AvailableAmount := 0;
+            ProjectForecastLine.VALIDATE(Amount, AvailableAmount);
+          END;
+          ProjectForecastLine.MODIFY(TRUE);
+        UNTIL ProjectForecastLine.NEXT = 0;
+    END;
+
+    PROCEDURE FillForecastWithAllowed@1100525013(ProjectForecastHeader@1100525000 : Record 11020630);
+    VAR
+      ProjectForecastLine@1100525001 : Record 11020631;
+    BEGIN
+      IF NOT CONFIRM(Text002, TRUE) THEN
+        EXIT;
+
+      ProjectForecastLine.SETRANGE("Project No.", ProjectForecastHeader."Project No.");
+      ProjectForecastLine.SETRANGE("Forecast Date", ProjectForecastHeader."Forecast Date");
+      ProjectForecastLine.SETRANGE("Cost Type", ProjectForecastLine."Cost Type"::Labor, ProjectForecastLine."Cost Type"::Sundry);
+      IF ProjectForecastLine.FINDSET(TRUE) THEN
+        REPEAT
+          IF ProjectForecastLine."Cost Type" = ProjectForecastLine."Cost Type"::Labor THEN
+            ProjectForecastLine.VALIDATE(Quantity, ProjectForecastLine."Allowed Hours")
+          ELSE
+            ProjectForecastLine.VALIDATE(Amount, ProjectForecastLine.Allowed);
+          ProjectForecastLine.MODIFY(TRUE);
+        UNTIL ProjectForecastLine.NEXT = 0;
+    END;
+
+    PROCEDURE FillForecastWithPrognosis@1100525014(ProjectForecastHeader@1100525000 : Record 11020630);
+    VAR
+      ProjectForecastLine@1100525001 : Record 11020631;
+    BEGIN
+      IF NOT CONFIRM(Text003, TRUE) THEN
+        EXIT;
+
+      ProjectForecastLine.SETRANGE("Project No.", ProjectForecastHeader."Project No.");
+      ProjectForecastLine.SETRANGE("Forecast Date", ProjectForecastHeader."Forecast Date");
+      ProjectForecastLine.SETRANGE("Cost Type", ProjectForecastLine."Cost Type"::Labor, ProjectForecastLine."Cost Type"::Sundry);
+      IF ProjectForecastLine.FINDSET(TRUE) THEN
+        REPEAT
+          IF ProjectForecastLine."Cost Type" = ProjectForecastLine."Cost Type"::Labor THEN
+            ProjectForecastLine.VALIDATE(Quantity, ProjectForecastLine."Prognosis Hours")
+          ELSE
+            ProjectForecastLine.VALIDATE(Amount, ProjectForecastLine.Prognosis);
+          ProjectForecastLine.MODIFY(TRUE);
+        UNTIL ProjectForecastLine.NEXT = 0;
+    END;
+
+    PROCEDURE CopyPreviousForecast@1100525015(ProjectForecastHeader@1100525000 : Record 11020630;MinusActuals@1100409000 : Boolean);
+    VAR
+      ProjectForecastLine@1100525004 : Record 11020631;
+      ProjectForecastLine2@1100525001 : Record 11020631;
+      ProjectForecastInPeriod@1100525002 : Record 11020632;
+      ProjectForecastInPeriod2@1100525003 : Record 11020632;
+    BEGIN
+      IF NOT CONFIRM(Text004, TRUE) THEN
+        EXIT;
+
+      ProjectForecastLine.SETRANGE("Project No.", ProjectForecastHeader."Project No.");
+      ProjectForecastLine.SETRANGE("Forecast Date", ProjectForecastHeader."Forecast Date");
+      IF ProjectForecastLine.FINDSET(TRUE) THEN BEGIN
+        //Delete Forecast in Period
+        ProjectForecastInPeriod.SETRANGE("Project No.", ProjectForecastLine."Project No.");
+        ProjectForecastInPeriod.SETRANGE("Forecast Date", ProjectForecastLine."Forecast Date");
+        ProjectForecastInPeriod.SETFILTER("Cost Type", '<%1', ProjectForecastInPeriod."Cost Type"::Revenue);
+        ProjectForecastInPeriod.SETRANGE(Source, ProjectForecastInPeriod.Source::Forecast);
+        ProjectForecastInPeriod.DELETEALL(TRUE);
+        REPEAT
+          ProjectForecastLine2 := ProjectForecastLine;
+          ProjectForecastLine2.SETRECFILTER;
+          ProjectForecastLine2.SETFILTER("Forecast Date", '<%1', ProjectForecastLine."Forecast Date");
+          IF ProjectForecastLine2.FINDLAST THEN BEGIN
+            IF ProjectForecastLine."Cost Type" = ProjectForecastLine."Cost Type"::Labor THEN BEGIN
+              ProjectForecastLine."Rate Code" := ProjectForecastLine2."Rate Code";
+              ProjectForecastLine.Rate := ProjectForecastLine2.Rate;
+              //C003392.sn
+              IF MinusActuals THEN BEGIN
+                ProjectForecastLine.VALIDATE(Quantity,
+                    ProjectForecastLine2.Quantity +
+                    (ProjectForecastLine."Budget Hours" - ProjectForecastLine2."Budget Hours") -
+                    (ProjectForecastLine."Total Hours" - ProjectForecastLine2."Total Hours"));
+              END ELSE
+              //C003392.en
+                ProjectForecastLine.VALIDATE(Quantity, ProjectForecastLine2.Quantity);
+            END ELSE
+              //C003392.sn
+              IF MinusActuals THEN BEGIN
+                ProjectForecastLine.VALIDATE(Amount,
+                    ProjectForecastLine2.Amount +
+                    (ProjectForecastLine.Budget - ProjectForecastLine2.Budget) -
+                    (ProjectForecastLine."Total Cost" - ProjectForecastLine2."Total Cost"));
+              END ELSE
+              //C003392.en
+                ProjectForecastLine.VALIDATE(Amount, ProjectForecastLine2.Amount);
+            ProjectForecastLine."Best Case" := ProjectForecastLine2."Best Case";
+            ProjectForecastLine."Worst Case" := ProjectForecastLine2."Worst Case";
+            ProjectForecastLine.MODIFY(TRUE);
+
+            IF ProjectForecastLine2."Cost Type" < ProjectForecastLine2."Cost Type"::Revenue THEN BEGIN
+              ProjectForecastInPeriod.SETRANGE("Project No.", ProjectForecastLine2."Project No.");
+              ProjectForecastInPeriod.SETRANGE("Forecast Date", ProjectForecastLine2."Forecast Date");
+              ProjectForecastInPeriod.SETRANGE("Cost Type", ProjectForecastLine2."Cost Type");
+              ProjectForecastInPeriod.SETRANGE(Element, ProjectForecastLine2.Element);
+              ProjectForecastInPeriod.SETRANGE("Cost Object", ProjectForecastLine2."Cost Object");
+              ProjectForecastInPeriod.SETFILTER(Date, '%1..', ProjectForecastLine."Forecast Date");
+              ProjectForecastInPeriod.SETRANGE(Source, ProjectForecastInPeriod.Source::Forecast);
+              IF ProjectForecastInPeriod.FINDSET THEN
+                REPEAT
+                  ProjectForecastInPeriod2 := ProjectForecastInPeriod;
+                  ProjectForecastInPeriod2."Forecast Date" := ProjectForecastLine."Forecast Date";
+                  ProjectForecastInPeriod2."Line No." := 0;
+                  ProjectForecastInPeriod2.INSERT(TRUE);
+                UNTIL ProjectForecastInPeriod.NEXT = 0;
+            END;
+          END;
+        UNTIL ProjectForecastLine.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE DistributeLinear@1100525002(ProjectForecastHeader@1100525000 : Record 11020630;VAR ProjectForecastLine@1100525014 : Record 11020631;PeriodType@1100525001 : Integer);
+    VAR
+      ProjectForecastInPeriod@1100525013 : Record 11020632;
+      ProjectForecastInPeriod2@1100525012 : Record 11020632;
+      Date@1100525011 : Record 2000000007;
+      AccountingPeriod@1100525015 : Record 50;
+      AccountingPeriod2@1100525016 : Record 50;
+      StartDate@1100525010 : Date;
+      EndDate@1100525009 : Date;
+      StartDatePeriod@1210190000 : Date;
+      EndDatePeriod@1210190001 : Date;
+      DeleteUntilDate@1100525008 : Date;
+      DeleteFromDate@1100525007 : Date;
+      NumberOfPeriods@1100525006 : Integer;
+      ForecastToDistributeInPeriod@1100525005 : Decimal;
+      ForecastDistributedInPeriod@1100525004 : Decimal;
+      ForecastToApplyInPeriod@1100525003 : Decimal;
+      TotalForecastDistributed@1100525002 : Decimal;
+    BEGIN
+      IF NOT CONFIRM(Text005, TRUE) THEN
+        EXIT;
+
+      ProjectForecastLine.SETRANGE("Project No.", ProjectForecastHeader."Project No.");
+      ProjectForecastLine.SETRANGE("Forecast Date", ProjectForecastHeader."Forecast Date");
+      ProjectForecastLine.FILTERGROUP(9);
+      ProjectForecastLine.SETRANGE("Cost Type", ProjectForecastLine."Cost Type"::Labor, ProjectForecastLine."Cost Type"::Sundry);
+      ProjectForecastLine.FILTERGROUP(0);
+      ProjectForecastLine.MARKEDONLY(TRUE);
+      IF ProjectForecastLine.ISEMPTY THEN
+        ProjectForecastLine.MARKEDONLY(FALSE);
+      IF ProjectForecastLine.FINDSET THEN
+        REPEAT
+          DetermineStartAndEndDate(ProjectForecastLine, StartDate, EndDate);
+          NumberOfPeriods := DetermineNumberOfPeriods(StartDate, EndDate, PeriodType);
+
+          ProjectForecastInPeriod.RESET;
+          ProjectForecastInPeriod.SETCURRENTKEY(
+            "Project No.","Forecast Date","Cost Type",Element,"Cost Object",Source,Date);
+          ProjectForecastInPeriod.SETRANGE("Project No.", ProjectForecastLine."Project No.");
+          ProjectForecastInPeriod.SETRANGE("Forecast Date", ProjectForecastLine."Forecast Date");
+          ProjectForecastInPeriod.SETRANGE("Cost Type", ProjectForecastLine."Cost Type");
+          ProjectForecastInPeriod.SETRANGE(Element, ProjectForecastLine.Element);
+          ProjectForecastInPeriod.SETRANGE("Cost Object", ProjectForecastLine."Cost Object");
+          ProjectForecastInPeriod.SETRANGE(Source, ProjectForecastInPeriod.Source::Forecast);
+
+          IF (PeriodType <> Date."Period Type"::Year + 1) THEN BEGIN  // <> Accounting Period
+            Date.SETRANGE("Period Type", PeriodType);
+            IF PeriodType = Date."Period Type"::Date THEN
+            Date.SETRANGE("Period Start", StartDate, EndDate)
+            ELSE BEGIN
+              Date.SETFILTER("Period Start", '..%1', EndDate);
+              Date.SETFILTER("Period End", '%1..', StartDate);
+            END;
+            IF Date.FINDSET THEN BEGIN
+              IF Date."Period Start" < StartDate THEN
+                DeleteUntilDate := CALCDATE('<-1D>', StartDate)
+              ELSE
+                DeleteUntilDate := CALCDATE('<-1D>', Date."Period Start");
+              TotalForecastDistributed := 0;
+              REPEAT
+                IF Date."Period Start" < StartDate THEN
+                  StartDatePeriod := StartDate
+                ELSE
+                  StartDatePeriod := Date."Period Start";
+                IF Date."Period End" > EndDate THEN
+                  EndDatePeriod := EndDate
+                ELSE
+                  EndDatePeriod := Date."Period End";
+
+                ProjectForecastInPeriod.SETRANGE(Date, StartDatePeriod, EndDatePeriod);
+                IF ProjectForecastLine."Cost Type" = ProjectForecastLine."Cost Type"::Labor THEN BEGIN
+                  ProjectForecastInPeriod.CALCSUMS(Quantity);
+                  ForecastDistributedInPeriod := ProjectForecastInPeriod.Quantity;
+                  ForecastToDistributeInPeriod := (ProjectForecastLine.Quantity - TotalForecastDistributed)/NumberOfPeriods;
+                END ELSE BEGIN
+                  ProjectForecastInPeriod.CALCSUMS(Amount);
+                  ForecastDistributedInPeriod := ProjectForecastInPeriod.Amount;
+                  ForecastToDistributeInPeriod := (ProjectForecastLine.Amount - TotalForecastDistributed)/NumberOfPeriods;
+                END;
+                ForecastToApplyInPeriod := ForecastToDistributeInPeriod - ForecastDistributedInPeriod;
+                CreateForecastInPeriod(
+                  ProjectForecastLine, StartDatePeriod, ForecastToApplyInPeriod); //ForecastToApplyInPeriod is Rounded here
+                ForecastToDistributeInPeriod := ForecastToApplyInPeriod + ForecastDistributedInPeriod;
+
+                TotalForecastDistributed := TotalForecastDistributed + ForecastToDistributeInPeriod;
+                NumberOfPeriods := NumberOfPeriods - 1;
+                DeleteFromDate := CALCDATE('<+1D>', EndDatePeriod);
+              UNTIL Date.NEXT = 0;
+            END;
+          END ELSE BEGIN
+            AccountingPeriod.SETFILTER("Starting Date", '<=%1', StartDate);
+            IF AccountingPeriod.FINDLAST THEN BEGIN
+              AccountingPeriod.SETFILTER("Starting Date", '>=%1', AccountingPeriod."Starting Date");
+              AccountingPeriod.FINDSET;
+              IF AccountingPeriod."Starting Date" < StartDate THEN
+                DeleteUntilDate := CALCDATE('<-1D>', StartDate)
+              ELSE
+                DeleteUntilDate := CALCDATE('<-1D>', AccountingPeriod."Starting Date");
+              TotalForecastDistributed := 0;
+              REPEAT
+                AccountingPeriod2.SETFILTER("Starting Date", '>%1', AccountingPeriod."Starting Date");
+                AccountingPeriod2.FINDFIRST;  //Read next period -> End date curr period is start date next period - 1
+                IF AccountingPeriod."Starting Date" < StartDate THEN
+                  StartDatePeriod := StartDate
+                ELSE
+                  StartDatePeriod := AccountingPeriod."Starting Date";
+                IF (AccountingPeriod2."Starting Date" - 1) > EndDate THEN
+                  EndDatePeriod := EndDate
+                ELSE
+                  EndDatePeriod := AccountingPeriod2."Starting Date" - 1;
+
+                ProjectForecastInPeriod.SETRANGE(Date, StartDatePeriod, EndDatePeriod);
+                IF ProjectForecastLine."Cost Type" = ProjectForecastLine."Cost Type"::Labor THEN BEGIN
+                  ProjectForecastInPeriod.CALCSUMS(Quantity);
+                  ForecastDistributedInPeriod := ProjectForecastInPeriod.Quantity;
+                  ForecastToDistributeInPeriod := (ProjectForecastLine.Quantity - TotalForecastDistributed)/NumberOfPeriods;
+                END ELSE BEGIN
+                  ProjectForecastInPeriod.CALCSUMS(Amount);
+                  ForecastDistributedInPeriod := ProjectForecastInPeriod.Amount;
+                  ForecastToDistributeInPeriod := (ProjectForecastLine.Amount - TotalForecastDistributed)/NumberOfPeriods;
+                END;
+                ForecastToApplyInPeriod := ForecastToDistributeInPeriod - ForecastDistributedInPeriod;
+                CreateForecastInPeriod(
+                  ProjectForecastLine, StartDatePeriod, ForecastToApplyInPeriod); //ForecastToApplyInPeriod is Rounded here
+                ForecastToDistributeInPeriod := ForecastToApplyInPeriod + ForecastDistributedInPeriod;
+                TotalForecastDistributed := TotalForecastDistributed + ForecastToDistributeInPeriod;
+                NumberOfPeriods := NumberOfPeriods - 1;
+                DeleteFromDate := CALCDATE('<+1D>', EndDatePeriod);
+              UNTIL (AccountingPeriod.NEXT = 0) OR (AccountingPeriod2."Starting Date" > EndDate);
+            END;
+          END;
+
+          //Apply Forecast outside date boundaries
+          ProjectForecastInPeriod.SETFILTER(Date, '..%1|%2..', DeleteUntilDate, DeleteFromDate);
+          IF ProjectForecastInPeriod.FINDSET THEN
+            REPEAT
+              ProjectForecastInPeriod2.COPY(ProjectForecastInPeriod);
+              ProjectForecastInPeriod2.SETRANGE(Date, ProjectForecastInPeriod.Date);
+              IF ProjectForecastLine."Cost Type" = ProjectForecastLine."Cost Type"::Labor THEN BEGIN
+                ProjectForecastInPeriod2.CALCSUMS(Quantity);
+                ForecastToApplyInPeriod := -ProjectForecastInPeriod2.Quantity;
+              END ELSE BEGIN
+                ProjectForecastInPeriod2.CALCSUMS(Amount); //hier ook
+                ForecastToApplyInPeriod := -ProjectForecastInPeriod2.Amount;
+              END;
+              CreateForecastInPeriod(
+                ProjectForecastLine, ProjectForecastInPeriod.Date,
+                ForecastToApplyInPeriod);
+            UNTIL ProjectForecastInPeriod.NEXT = 0;
+
+        UNTIL ProjectForecastLine.NEXT = 0;
+    END;
+
+    PROCEDURE DetermineStartAndEndDate@1100525010(ProjectForecastLine@1100525002 : Record 11020631;VAR StartDate@1100525004 : Date;VAR EndDate@1100525003 : Date);
+    VAR
+      ProjectElement@1100525001 : Record 11012010;
+      Project@1100525000 : Record 11072003;
+    BEGIN
+      StartDate := 0D;
+      EndDate := 0D;
+
+      IF ProjectForecastLine.Element <> '' THEN BEGIN
+        IF ProjectElement.GET(ProjectForecastLine."Project No.", ProjectForecastLine.Element) THEN BEGIN
+          //IF needed in case of elements Main Project differ from Sub Projects
+          StartDate := ProjectElement."Starting Date";
+          EndDate := ProjectElement."Ending Date";
+        END;
+      END;
+
+      IF (StartDate = 0D) OR (EndDate = 0D) THEN BEGIN
+        Project.GET(ProjectForecastLine."Project No.");
+        IF (StartDate = 0D) THEN
+          StartDate := Project."Starting Date";
+        IF (EndDate = 0D) THEN BEGIN
+          Project.TESTFIELD("Ending Date");
+          EndDate := Project."Ending Date";
+        END;
+      END;
+      IF StartDate <= ProjectForecastLine."Forecast Date" THEN
+        StartDate := CALCDATE('<+1D>', ProjectForecastLine."Forecast Date");
+      IF EndDate < StartDate THEN
+        EndDate := StartDate;
+    END;
+
+    PROCEDURE DetermineNumberOfPeriods@1100525011(StartDate@1100525001 : Date;EndDate@1100525000 : Date;PeriodType@1100525003 : Integer) : Integer;
+    VAR
+      Date@1100525002 : Record 2000000007;
+      AccountingPeriod@1100525004 : Record 50;
+      StartDateFirst@1100525005 : Date;
+      StartDateLast@1100525006 : Date;
+    BEGIN
+      IF (PeriodType <> Date."Period Type"::Year + 1) THEN BEGIN  // <> Accounting Period
+        Date.SETRANGE("Period Type", PeriodType);
+        IF PeriodType = Date."Period Type"::Date THEN
+          Date.SETRANGE("Period Start", StartDate, EndDate)
+        ELSE BEGIN
+          Date.SETFILTER("Period Start", '..%1', EndDate);
+          Date.SETFILTER("Period End", '%1..', StartDate);
+        END;
+        EXIT(Date.COUNT);
+      END ELSE BEGIN
+        AccountingPeriod.SETFILTER("Starting Date", '<=%1', StartDate);
+        AccountingPeriod.FINDLAST;
+        StartDateFirst := AccountingPeriod."Starting Date";
+        AccountingPeriod.SETFILTER("Starting Date", '<=%1', EndDate);
+        AccountingPeriod.FINDLAST;
+        StartDateLast := AccountingPeriod."Starting Date";
+        AccountingPeriod.SETRANGE("Starting Date", StartDateFirst, StartDateLast);
+        EXIT(AccountingPeriod.COUNT);
+      END;
+    END;
+
+    LOCAL PROCEDURE DeterminePrognosisHours@1100525009(ProjectForecastLine@1100525000 : Record 11020631) : Decimal;
+    VAR
+      PrognosisLine@1100525001 : Record 11012035;
+    BEGIN
+      IF ProjectForecastLine."Cost Type" <> ProjectForecastLine."Cost Type"::Labor THEN
+        EXIT(0);
+
+      PrognosisLine.SETCURRENTKEY("Main Project No.");
+      PrognosisLine.SETRANGE("Main Project No.", Project."Main Project");
+      IF Project."No." <> Project."Main Project" THEN
+        PrognosisLine.SETRANGE("Project No.", Project."No.");
+
+      CASE Project."Forecast Level" OF
+        Project."Forecast Level"::"Element - Cost Object":
+          BEGIN
+            PrognosisLine.SETRANGE(Element, ProjectForecastLine.Element);
+            PrognosisLine.SETRANGE("Cost Object", ProjectForecastLine."Cost Object");
+          END;
+        Project."Forecast Level"::"Element - Cost Type":
+          BEGIN
+            PrognosisLine.SETRANGE(Element, ProjectForecastLine.Element);
+            PrognosisLine.SETRANGE("Cost Type", ProjectForecastLine."Cost Type");
+          END;
+        Project."Forecast Level"::"Cost Object":
+          PrognosisLine.SETRANGE("Cost Object", ProjectForecastLine."Cost Object");
+        Project."Forecast Level"::"Cost Type":
+          PrognosisLine.SETRANGE("Cost Type", ProjectForecastLine."Cost Type");
+      END;
+      Project.COPYFILTER("Prognosis Filter", PrognosisLine."Prognosis Date");
+
+      PrognosisLine.CALCSUMS(Quantity);
+      EXIT(PrognosisLine.Quantity);
+    END;
+
+    PROCEDURE CreatePrognosis@1100525004(ProjectForecastHeader@1100525000 : Record 11020630);
+    VAR
+      ProjectSetup@1210190001 : Record 315;
+      Prognosis@1100525001 : Record 11012034;
+      PrognosisLine@1100525004 : Record 11012035;
+      ProjectForecastLine@1100525003 : Record 11020631;
+      ProjectForecastTotalLine@1210190000 : Record 11020633;
+      PrognosisForm@1100409001 : Page 11012085;
+      OvhSurchargesCalculated@1210190002 : Boolean;
+      PrognosisManagement@1100409000 : Codeunit 11020217;
+      ProjectForecastMgt@1100528816 : Codeunit 11012256;
+      GenPrognosisFromForecast@1100528815 : Report 11020304;
+      StartProcess@1100528814 : Boolean;
+      PrognosisDate@1100528813 : Date;
+      CopyPrevCostPrognosis@1100528812 : Boolean;
+      CopyPrevPrognosisEndResult@1100528811 : Boolean;
+      CopyPrevRevenuePrognosis@1100528810 : Boolean;
+      CopyPrevPrognosisTotalRev@1100528809 : Boolean;
+      CopyCommentsPrevPrognosis@1100528808 : Boolean;
+      FillProgWithAvailableCost@1100528807 : Boolean;
+      FillProgWithExtrapolatedCosts@1100528806 : Boolean;
+      FillProgFromProjPlanningAct@1100528805 : Boolean;
+      FillProgFromRequestedActCap@1100528804 : Boolean;
+      FillProgFromAssignedActCap@1100528803 : Boolean;
+      FillProgRevenues@1100528802 : Boolean;
+      CalcSurcharges@1100528801 : Boolean;
+      CalcRiscCoverage@1100528800 : Boolean;
+    BEGIN
+      //DP00699.sn.mve 2015-02-09
+      TestNoProjectForecastLineDeviation(ProjectForecastHeader);
+
+      GenPrognosisFromForecast.SetSelections(ProjectForecastHeader."Forecast Date");
+      GenPrognosisFromForecast.RUNMODAL;
+      GenPrognosisFromForecast.GetSelections(StartProcess,PrognosisDate,
+        CopyPrevCostPrognosis,CopyPrevPrognosisEndResult,CopyPrevRevenuePrognosis,CopyPrevPrognosisTotalRev,
+        CopyCommentsPrevPrognosis,FillProgWithAvailableCost,FillProgWithExtrapolatedCosts,FillProgFromProjPlanningAct,
+        FillProgFromRequestedActCap,FillProgFromAssignedActCap,FillProgRevenues,CalcSurcharges,CalcRiscCoverage);
+      IF NOT StartProcess THEN
+        ERROR('');
+
+        ProjectForecastHeader."Ovh. Surcharges Calculated" := TRUE;
+        ProjectForecastHeader."Altered After Calculation" := FALSE;
+        ProjectForecastHeader.MODIFY;
+
+        ProjectForecastMgt.CalculateSurcharges(ProjectForecastHeader);
+
+        ProjectForecastHeader."Ovh. Surcharges Calculated" := TRUE; //M28187
+        ProjectForecastHeader."Altered After Calculation" := FALSE; //M28187
+        ProjectForecastHeader.MODIFY;                               //M28187
+
+      //IF NOT CONFIRM(Text006, TRUE) THEN
+      //  EXIT;
+      //DP00699.en.mve 2015-02-09
+
+      ProjectSetup.GET;
+
+      Project.GET(ProjectForecastHeader."Project No.");
+      CASE Project."Forecast Level" OF
+        Project."Forecast Level"::"Element - Cost Object":
+          Project.TESTFIELD("Prognosis per Element", TRUE);
+        Project."Forecast Level"::"Cost Object":
+          Project.TESTFIELD("Prognosis per Element", FALSE);
+        Project."Forecast Level"::"Element - Cost Type",
+        Project."Forecast Level"::"Cost Type":
+          ERROR(Text007, Project.FIELDCAPTION("Forecast Level"), Project."Forecast Level");
+      END;
+
+      IF Prognosis.GET(ProjectForecastHeader."Project No.", ProjectForecastHeader."Forecast Date") THEN BEGIN
+        Prognosis.TESTFIELD(Fixed, FALSE);
+        IF NOT CONFIRM(Text008) THEN
+          EXIT;
+      END ELSE BEGIN
+        Prognosis.INIT;
+        Prognosis.VALIDATE("Project No.", ProjectForecastHeader."Project No.");
+        Prognosis.VALIDATE("Prognosis Date", ProjectForecastHeader."Forecast Date");
+        Prognosis."Fix Prognosis Line" := ProjectSetup."Fix Prognosis Line";
+        Prognosis.INSERT(TRUE);
+      END;
+      Prognosis."Prognosis Level" := Prognosis."Prognosis Level"::Detailed;
+
+      ProjectForecastTotalLine.SETRANGE("Project No.", ProjectForecastHeader."Project No.");
+      ProjectForecastTotalLine.SETRANGE("Forecast Date", ProjectForecastHeader."Forecast Date");
+      ProjectForecastTotalLine.SETRANGE("Cost Type", ProjectForecastTotalLine."Cost Type"::"Total Cost");
+      IF ProjectForecastTotalLine.FINDFIRST THEN BEGIN
+        ProjectForecastTotalLine.CALCFIELDS("Best Case", "Worst Case");
+        Prognosis."Best Case Cost Forecast" := ProjectForecastTotalLine."Best Case";
+        Prognosis."Worst Case Cost Forecast" := ProjectForecastTotalLine."Worst Case";
+      END;
+      ProjectForecastTotalLine.SETRANGE("Cost Type", ProjectForecastTotalLine."Cost Type"::Revenue);
+      IF ProjectForecastTotalLine.FINDFIRST THEN BEGIN
+        ProjectForecastTotalLine.CALCFIELDS("Best Case", "Worst Case");
+        Prognosis."Best Case Revenue Forecast" := ProjectForecastTotalLine."Best Case";
+        Prognosis."Worst Case Revenue Forecast" := ProjectForecastTotalLine."Worst Case";
+      END;
+
+      Prognosis."Last Date Modified" := TODAY;
+      Prognosis."Modified by" := USERID;
+      Prognosis.MODIFY;
+      PrognosisForm.SETRECORD(Prognosis);
+      PrognosisManagement.CreatePrognosis(Prognosis,2);
+
+      ProjectForecastLine.SETRANGE("Project No.", ProjectForecastHeader."Project No.");
+      ProjectForecastLine.SETRANGE("Forecast Date", ProjectForecastHeader."Forecast Date");
+      IF ProjectForecastLine.FINDSET THEN
+        REPEAT
+          PrognosisLine.SETRANGE("Project No.", ProjectForecastLine."Project No.");
+          PrognosisLine.SETRANGE("Prognosis Date", ProjectForecastLine."Forecast Date");
+          PrognosisLine.SETRANGE("Cost Type", ProjectForecastLine."Cost Type");
+          PrognosisLine.SETRANGE(Element, ProjectForecastLine.Element);
+          PrognosisLine.SETRANGE("Cost Object", ProjectForecastLine."Cost Object");
+          IF NOT PrognosisLine.FINDFIRST THEN BEGIN
+            PrognosisLine.INIT;
+            PrognosisLine."Project No." := ProjectForecastLine."Project No.";
+            PrognosisLine."Prognosis Date" := ProjectForecastLine."Forecast Date";
+            PrognosisLine."Cost Type" := ProjectForecastLine."Cost Type";
+            PrognosisLine.Element := ProjectForecastLine.Element;
+            PrognosisLine."Cost Object" := ProjectForecastLine."Cost Object";
+            PrognosisLine.INSERT(TRUE);
+          END;
+
+          PrognosisLine."Ovh. Surcharge" := ProjectForecastLine."Overhead Surcharge Forecast";
+          CASE ProjectForecastLine."Cost Type" OF
+            ProjectForecastLine."Cost Type"::Labor:
+              BEGIN
+                PrognosisLine."Rate Code" := ProjectForecastLine."Rate Code";
+                PrognosisLine.Rate := ProjectForecastLine.Rate;
+                //PrognosisLine.Quantity := ProjectForecastLine.Quantity; //C003259.o
+                PrognosisLine.Quantity := ProjectForecastLine.TotalDistributedForecast; //C003259.n
+                ProjectForecastLine.CALCFIELDS("Total Distributed Forecast Amt");
+                PrognosisLine.VALIDATE(Amount, ProjectForecastLine."Total Distributed Forecast Amt");
+              END;
+            ProjectForecastLine."Cost Type"::Revenue:
+              PrognosisLine.VALIDATE("Amount Revenue", ProjectForecastLine.Amount);
+            ELSE
+              PrognosisLine.VALIDATE(Amount, ProjectForecastLine.Amount);
+          END;
+          PrognosisLine.MODIFY(TRUE);
+
+          IF ProjectForecastLine."Overhead Surcharge Forecast" <> 0 THEN
+            OvhSurchargesCalculated := TRUE;
+
+        UNTIL ProjectForecastLine.NEXT = 0;
+
+      IF OvhSurchargesCalculated <> Prognosis."Ovh. Surcharges Calculated" THEN BEGIN
+        Prognosis.FIND;
+        Prognosis."Ovh. Surcharges Calculated" := OvhSurchargesCalculated;
+        Prognosis.MODIFY;
+      END;
+    END;
+
+    PROCEDURE RemoveSurcharges@1210190003(ProjectForecastHeader@1210190000 : Record 11020630);
+    VAR
+      ProjectForecastLine@1100525000 : Record 11020631;
+      ProjectForecastInPeriod@1210190001 : Record 11020632;
+    BEGIN
+      ProjectForecastLine.SETRANGE("Project No.", ProjectForecastHeader."Project No.");
+      ProjectForecastLine.SETRANGE("Forecast Date", ProjectForecastHeader."Forecast Date");
+      ProjectForecastLine.SETRANGE("Cost Type", ProjectForecastLine."Cost Type"::Labor, ProjectForecastLine."Cost Type"::Sundry);
+      IF ProjectForecastLine.FINDSET(TRUE, FALSE) THEN
+        REPEAT
+          ProjectForecastLine."Overhead Surcharge Forecast" := 0;
+          ProjectForecastLine.VALIDATE("Amount incl. Surcharge", ProjectForecastLine.Amount);
+          ProjectForecastLine.MODIFY(TRUE);
+        UNTIL ProjectForecastLine.NEXT = 0;
+
+      ProjectForecastInPeriod.SETRANGE("Project No.", ProjectForecastHeader."Project No.");
+      ProjectForecastInPeriod.SETRANGE("Forecast Date", ProjectForecastHeader."Forecast Date");
+      ProjectForecastInPeriod.SETRANGE(Source, ProjectForecastInPeriod.Source::"Overhead Surcharge Forecast");
+      ProjectForecastInPeriod.DELETEALL;
+    END;
+
+    PROCEDURE CalculateSurcharges@1210190002(ProjectForecastHeader@1210190000 : Record 11020630);
+    VAR
+      ProjectSetup@1210190002 : Record 315;
+      ProjectForecastLine@1210190001 : Record 11020631;
+      DimVal@1210190004 : Record 349;
+      DimMgt@1210190003 : Codeunit 408;
+    BEGIN
+      //Copied from Prognosis
+      ProjectSetup.GET;
+
+      RemoveSurcharges(ProjectForecastHeader);
+
+      Project.GET(ProjectForecastHeader."Project No.");
+      Project.TESTFIELD("Project Type");
+
+      ProjectForecastLine.SETRANGE("Project No.", ProjectForecastHeader."Project No.");
+      ProjectForecastLine.SETRANGE("Forecast Date", ProjectForecastHeader."Forecast Date");
+      IF ProjectSetup."Prognosis Ovh Surcharge Labor" THEN
+        ProjectForecastLine.SETRANGE("Cost Type", ProjectForecastLine."Cost Type"::Labor, ProjectForecastLine."Cost Type"::Sundry)
+      ELSE
+        ProjectForecastLine.SETRANGE("Cost Type", ProjectForecastLine."Cost Type"::Material, ProjectForecastLine."Cost Type"::Sundry);
+      IF ProjectForecastLine.FINDSET(TRUE, FALSE) THEN
+        REPEAT
+          DimMgt.GetDimValueRec(2, ProjectForecastLine."Cost Object", DimVal, FALSE, '');
+
+          CalcSurcharge(ProjectForecastLine, DimVal);
+          CalcSurchargeInPeriod(ProjectForecastLine, DimVal);
+        UNTIL ProjectForecastLine.NEXT = 0;
+    END;
+
+    PROCEDURE CalcSurcharge@1210190009(ProjectForecastLine@1210190000 : Record 11020631;DimVal@1210190001 : Record 349);
+    VAR
+      OverheadSurcharge@1100525003 : Record 11020208;
+      SurchDimVal@1100525004 : Record 349;
+      ProjectForecastLine2@1100525005 : Record 11020631;
+      ProjectForecastSurchLine@1210190003 : Record 11020631;
+      ProjectElement@1100525008 : Record 11012010;
+      Origin@1100525002 : 'Project,Service';
+      TotSurchAmount@1100525006 : Decimal;
+    BEGIN
+      //Copied from Prognosis
+      CLEAR(ProjectForecastSurchLine);
+      IF OverheadSurcharge.GetSurcharges(
+           Origin::Project, Project."Project Type", ProjectForecastLine."Project No.",
+           (DimVal."Cost Type" <> DimVal."Cost Type"::Revenue),
+           DimVal."Cost Type", DimVal.Code, '',
+           Project."Global Dimension 1 Code", '',
+           '', ProjectForecastLine."Forecast Date",
+           OverheadSurcharge) THEN
+        REPEAT
+          OverheadSurcharge.GetSurchargeDimVal(DimVal, SurchDimVal);
+          ProjectForecastLine2 := ProjectForecastLine;
+          ProjectForecastLine2."Overhead Surcharge Forecast" := 0;
+
+          InitSurcharge(
+            ProjectForecastLine2, SurchDimVal,
+            OverheadSurcharge, TotSurchAmount);
+
+          ProjectForecastSurchLine.INIT;
+          IF ProjectForecastSurchLine.GET(
+               ProjectForecastLine2."Project No.",
+               ProjectForecastLine2."Forecast Date",
+               ProjectForecastLine2."Cost Type",
+               ProjectForecastLine2.Element,
+               ProjectForecastLine2."Cost Object") THEN
+          BEGIN
+            ProjectForecastSurchLine."Overhead Surcharge Forecast" :=
+              ProjectForecastSurchLine."Overhead Surcharge Forecast" + ProjectForecastLine2."Overhead Surcharge Forecast";
+            ProjectForecastSurchLine.VALIDATE(Amount);
+            ProjectForecastSurchLine.MODIFY;
+          END ELSE BEGIN
+            IF ProjectForecastLine2.Element <> '' THEN BEGIN
+              IF NOT ProjectElement.GET(ProjectForecastLine2."Project No.", ProjectForecastLine2.Element) THEN
+                ERROR(STRSUBSTNO(Text009, ProjectForecastLine2."Project No.", ProjectForecastLine2.Element));
+            END;
+            ProjectForecastSurchLine."Project No." := ProjectForecastLine2."Project No.";
+            ProjectForecastSurchLine."Forecast Date" := ProjectForecastLine2."Forecast Date";
+            ProjectForecastSurchLine."Cost Type" := ProjectForecastLine2."Cost Type";
+            ProjectForecastSurchLine.Element := ProjectForecastLine2.Element;
+            ProjectForecastSurchLine."Cost Object" := ProjectForecastLine2."Cost Object";
+            ProjectForecastSurchLine."Overhead Surcharge Forecast" :=
+              ProjectForecastLine2."Overhead Surcharge Forecast";
+            ProjectForecastSurchLine.VALIDATE(Amount);
+            ProjectForecastSurchLine.INSERT(TRUE);
+          END;
+
+        UNTIL OverheadSurcharge.NEXT = 0;
+    END;
+
+    PROCEDURE InitSurcharge@1210190001(VAR ProjectForecastLine@1210190000 : Record 11020631;SurchDimVal@1210190009 : Record 349;OverheadSurcharge@1210190004 : Record 11020208;VAR TotSurchAmount@1100485002 : Decimal);
+    VAR
+      BaseAmount@1210190002 : Decimal;
+    BEGIN
+      IF OverheadSurcharge.Percentage <> 0 THEN BEGIN
+        IF ProjectForecastLine."Cost Type" = ProjectForecastLine."Cost Type"::Labor THEN BEGIN
+          ProjectForecastLine.CALCFIELDS("Total Distributed Forecast Amt");
+          BaseAmount := ProjectForecastLine."Total Distributed Forecast Amt";
+        END ELSE
+          BaseAmount := ProjectForecastLine.Amount;
+
+        IF OverheadSurcharge."Surcharge over Surcharge" THEN
+          ProjectForecastLine."Overhead Surcharge Forecast" :=
+            ROUND((BaseAmount + TotSurchAmount) * OverheadSurcharge.Percentage/100)
+        ELSE
+          ProjectForecastLine."Overhead Surcharge Forecast" :=
+            ROUND(BaseAmount * OverheadSurcharge.Percentage/100)
+      END ELSE
+        ProjectForecastLine."Overhead Surcharge Forecast" := ROUND(OverheadSurcharge.Amount * ProjectForecastLine.Quantity);
+
+      CASE Project."Forecast Level" OF
+        Project."Forecast Level"::"Element - Cost Object":
+          BEGIN
+            IF OverheadSurcharge."Element Surcharge" <> '' THEN
+              ProjectForecastLine.Element := OverheadSurcharge."Element Surcharge";
+            ProjectForecastLine."Cost Object" := SurchDimVal.Code;
+          END;
+        Project."Forecast Level"::"Element - Cost Type":
+          BEGIN
+            IF OverheadSurcharge."Element Surcharge" <> '' THEN
+              ProjectForecastLine.Element := OverheadSurcharge."Element Surcharge";
+            ProjectForecastLine."Cost Object" := '';
+          END;
+        Project."Forecast Level"::"Cost Object":
+          BEGIN
+            ProjectForecastLine.Element := '';
+            ProjectForecastLine."Cost Object" := SurchDimVal.Code;
+          END;
+        Project."Forecast Level"::"Cost Type":
+          BEGIN
+            ProjectForecastLine.Element := '';
+            ProjectForecastLine."Cost Object" := '';
+          END;
+      END;
+      ProjectForecastLine."Cost Type" := SurchDimVal."Cost Type";
+
+      TotSurchAmount := TotSurchAmount + ProjectForecastLine."Overhead Surcharge Forecast";
+    END;
+
+    PROCEDURE CalcSurchargeInPeriod@1210190011(ProjectForecastLine@1210190000 : Record 11020631;DimVal@1210190001 : Record 349);
+    VAR
+      OverheadSurcharge@1100525003 : Record 11020208;
+      SurchDimVal@1100525004 : Record 349;
+      ProjectForecastInPeriod@1210190003 : Record 11020632;
+      ProjectForecastInPeriod2@1210190002 : Record 11020632;
+      ProjectForecastInPeriodSurch@1210190004 : Record 11020632;
+      Origin@1100525002 : 'Project,Service';
+      SurchAmount@1210190005 : Decimal;
+      TotSurchAmount@1100525006 : Decimal;
+    BEGIN
+      ProjectForecastInPeriod.SETRANGE("Project No.", ProjectForecastLine."Project No.");
+      ProjectForecastInPeriod.SETRANGE("Forecast Date", ProjectForecastLine."Forecast Date");
+      ProjectForecastInPeriod.SETRANGE("Cost Type", ProjectForecastLine."Cost Type");
+      ProjectForecastInPeriod.SETRANGE(Element, ProjectForecastLine.Element);
+      ProjectForecastInPeriod.SETRANGE("Cost Object", ProjectForecastLine."Cost Object");
+      ProjectForecastInPeriod.SETRANGE(Source, ProjectForecastInPeriod.Source::Forecast);
+      IF ProjectForecastInPeriod.FINDSET(TRUE, FALSE) THEN
+        REPEAT
+          TotSurchAmount := 0;
+          IF OverheadSurcharge.GetSurcharges(
+               Origin::Project, Project."Project Type", ProjectForecastInPeriod."Project No.",
+               (DimVal."Cost Type" <> DimVal."Cost Type"::Revenue),
+               DimVal."Cost Type", DimVal.Code, '',
+               Project."Global Dimension 1 Code", '',
+               '', ProjectForecastInPeriod.Date,
+               OverheadSurcharge) THEN
+            REPEAT
+              OverheadSurcharge.GetSurchargeDimVal(DimVal, SurchDimVal);
+
+              ProjectForecastInPeriod2 := ProjectForecastInPeriod;
+
+              InitSurchargeInPeriod(
+                ProjectForecastInPeriod2, SurchDimVal,
+                OverheadSurcharge, SurchAmount, TotSurchAmount);
+
+              IF SurchAmount <> 0 THEN BEGIN
+                ProjectForecastInPeriodSurch.SETRANGE("Project No.", ProjectForecastInPeriod2."Project No.");
+                ProjectForecastInPeriodSurch.SETRANGE("Forecast Date", ProjectForecastInPeriod2."Forecast Date");
+                ProjectForecastInPeriodSurch.SETRANGE("Cost Type", ProjectForecastInPeriod2."Cost Type");
+                ProjectForecastInPeriodSurch.SETRANGE(Element, ProjectForecastInPeriod2.Element);
+                ProjectForecastInPeriodSurch.SETRANGE("Cost Object", ProjectForecastInPeriod2."Cost Object");
+                ProjectForecastInPeriodSurch.SETRANGE(Date, ProjectForecastInPeriod2.Date);
+                ProjectForecastInPeriodSurch.SETRANGE(Source, ProjectForecastInPeriodSurch.Source::"Overhead Surcharge Forecast");
+                IF ProjectForecastInPeriodSurch.FINDFIRST THEN BEGIN
+                  ProjectForecastInPeriodSurch.Amount := ProjectForecastInPeriodSurch.Amount + SurchAmount;
+                  ProjectForecastInPeriodSurch.VALIDATE(Amount);
+                  ProjectForecastInPeriodSurch.MODIFY;
+                END ELSE BEGIN
+                  ProjectForecastInPeriodSurch.INIT;
+                  ProjectForecastInPeriodSurch."Project No." := ProjectForecastInPeriod2."Project No.";
+                  ProjectForecastInPeriodSurch."Forecast Date" := ProjectForecastInPeriod2."Forecast Date";
+                  ProjectForecastInPeriodSurch."Cost Type" := ProjectForecastInPeriod2."Cost Type";
+                  ProjectForecastInPeriodSurch.Element := ProjectForecastInPeriod2.Element;
+                  ProjectForecastInPeriodSurch."Cost Object" := ProjectForecastInPeriod2."Cost Object";
+                  ProjectForecastInPeriodSurch.Date := ProjectForecastInPeriod2.Date;
+                  ProjectForecastInPeriodSurch."Line No." :=
+                    GetForecastInPeriodNewLineNo(ProjectForecastInPeriodSurch);
+                  ProjectForecastInPeriodSurch.Source := ProjectForecastInPeriod2.Source::"Overhead Surcharge Forecast";
+                  ProjectForecastInPeriodSurch.Amount := SurchAmount;
+                  ProjectForecastInPeriodSurch.VALIDATE(Amount);
+                  ProjectForecastInPeriodSurch.INSERT(TRUE);
+                END;
+              END;
+
+            UNTIL OverheadSurcharge.NEXT = 0;
+
+        UNTIL ProjectForecastInPeriod.NEXT = 0;
+    END;
+
+    PROCEDURE InitSurchargeInPeriod@1210190015(VAR ProjectForecastInPeriod@1210190000 : Record 11020632;SurchDimVal@1210190009 : Record 349;OverheadSurcharge@1210190004 : Record 11020208;VAR SurchAmount@1210190002 : Decimal;VAR TotSurchAmount@1100485002 : Decimal);
+    BEGIN
+      IF OverheadSurcharge.Percentage <> 0 THEN BEGIN
+        IF OverheadSurcharge."Surcharge over Surcharge" THEN
+          SurchAmount :=
+            ROUND((ProjectForecastInPeriod.Amount + TotSurchAmount) * OverheadSurcharge.Percentage/100)
+        ELSE
+          SurchAmount :=
+            ROUND(ProjectForecastInPeriod.Amount * OverheadSurcharge.Percentage/100)
+      END ELSE
+        SurchAmount := ROUND(OverheadSurcharge.Amount * ProjectForecastInPeriod.Quantity);
+
+      CASE Project."Forecast Level" OF
+        Project."Forecast Level"::"Element - Cost Object":
+          BEGIN
+            IF OverheadSurcharge."Element Surcharge" <> '' THEN
+              ProjectForecastInPeriod.Element := OverheadSurcharge."Element Surcharge";
+            ProjectForecastInPeriod."Cost Object" := SurchDimVal.Code;
+          END;
+        Project."Forecast Level"::"Element - Cost Type":
+          BEGIN
+            IF OverheadSurcharge."Element Surcharge" <> '' THEN
+              ProjectForecastInPeriod.Element := OverheadSurcharge."Element Surcharge";
+            ProjectForecastInPeriod."Cost Object" := '';
+          END;
+        Project."Forecast Level"::"Cost Object":
+          BEGIN
+            ProjectForecastInPeriod.Element := '';
+            ProjectForecastInPeriod."Cost Object" := SurchDimVal.Code;
+          END;
+        Project."Forecast Level"::"Cost Type":
+          BEGIN
+            ProjectForecastInPeriod.Element := '';
+            ProjectForecastInPeriod."Cost Object" := '';
+          END;
+      END;
+      ProjectForecastInPeriod."Cost Type" := SurchDimVal."Cost Type";
+
+      TotSurchAmount := TotSurchAmount + SurchAmount;
+    END;
+
+    PROCEDURE TestNoProjectForecastLineDeviation@1100528800(ProjectForecastHeader@1100528800 : Record 11020630);
+    VAR
+      ProjectForecastLine@1100528801 : Record 11020631;
+    BEGIN
+      ProjectForecastLine.SETRANGE("Project No.", ProjectForecastHeader."Project No.");
+      ProjectForecastLine.SETRANGE("Forecast Date", ProjectForecastHeader."Forecast Date");
+      IF ProjectForecastLine.FINDSET THEN
+        REPEAT
+          IF ProjectForecastLine.Deviation <> 0 THEN
+            ERROR(Text010);
+        UNTIL ProjectForecastLine.NEXT = 0;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

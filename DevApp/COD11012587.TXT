@@ -1,0 +1,1109 @@
+OBJECT Codeunit 11012587 Plant Request Mgt.
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      PlantSetupRec@1100409000 : Record 11012550;
+      ReqRec@1100409001 : Record 11020520;
+      ReqLineRec@1100409002 : Record 11020521;
+      NextLineNoPlant@1100409003 : Integer;
+
+    PROCEDURE RunSetRequestedPlantRequest@1100485018(VAR Rec@1100485000 : Record 11020520);
+    VAR
+      lvUserAccess@1100485001 : Option;
+      lvText001@1100485002 : TextConst 'ENU=No Plant Request Lines present.\ \Request, are you sure?';
+    BEGIN
+      ReqRec.COPY(Rec);
+
+      WITH ReqRec DO BEGIN
+        PlantSetupRec.GET;
+
+        PlantRequestAccess(11,ReqRec,lvUserAccess);  //* Aanvragen
+        TESTFIELD("No.");
+        TESTFIELD(Posted, FALSE);
+        TESTFIELD(Status, Status::Open);
+        TESTFIELD("Transfer Date");
+        IF Type <> Type::Arrival THEN
+          TESTFIELD("From Location");
+        IF Type <> Type::Removal THEN
+          TESTFIELD("To Location");
+        IF ("Transport Cost for (Advice)" = "Transport Cost for (Advice)"::Project) AND (PlantSetupRec."Transport Orders") THEN
+          TESTFIELD("Project No. (TP-Cost)");
+        CheckElementMandatory(ReqRec, Status::Requested);  //DP00241.n (26939)
+
+        ReqLineRec.RESET;
+        ReqLineRec.SETRANGE("Plant Request No.","No.");
+        IF (NOT ReqLineRec.FIND('-')) AND GUIALLOWED THEN BEGIN
+          IF NOT CONFIRM(lvText001, FALSE) THEN
+            ERROR('');
+        END;
+
+        "Requested on" := CURRENTDATETIME;
+        VALIDATE(Status, Status::Requested);
+        MODIFY(TRUE);
+      END;
+
+      Rec := ReqRec;
+    END;
+
+    PROCEDURE RunOpenPlantRequest@1100485021(VAR Rec@1100485000 : Record 11020520);
+    VAR
+      lvUserAccess@1100485001 : Option;
+    BEGIN
+      ReqRec.COPY(Rec);
+
+      WITH ReqRec DO BEGIN
+        PlantRequestAccess(10,ReqRec,lvUserAccess);  //* Openen
+        TESTFIELD("No.");
+        TESTFIELD(Posted, FALSE);
+        TESTFIELD(Status, Status::Requested);
+        TESTFIELD("Internet Order", FALSE);
+
+        VALIDATE(Status, Status::Open);
+        MODIFY(TRUE);
+      END;
+
+      Rec := ReqRec;
+    END;
+
+    PROCEDURE RunCancelPlantRequest@1100485030(VAR Rec@1100485000 : Record 11020520;INewStatus@1100485001 : Option);
+    VAR
+      lvText001@1100485002 : TextConst 'ENU=Disapprove/Cancal not allowed, no Plant Request Lines present.';
+      lvUserAccess@1100485003 : Option;
+    BEGIN
+      //* Materieelaanvragen op afgekeurd of vervallen zetten. Deze worden dan ook meteen op 'Geboekt' gezet.
+      //* Hierbij wordt natuurlijk geen materieelorder aangemaakt, dus alleen overzetten naar de geboekte materieelaanvragen.
+
+      ReqRec.COPY(Rec);
+      IF NOT (INewStatus IN [ReqRec.Status::Disapproved, ReqRec.Status::Cancelled]) THEN
+        EXIT;
+
+      WITH ReqRec DO BEGIN
+        IF INewStatus = ReqRec.Status::Disapproved THEN
+          PlantRequestAccess(13,ReqRec,lvUserAccess)   //* Afkeuren
+        ELSE
+          PlantRequestAccess(14,ReqRec,lvUserAccess);  //* Vervallen
+        TESTFIELD(Posted, FALSE);
+        TESTFIELD(Status, Status::Requested);
+
+        ReqLineRec.RESET;
+        ReqLineRec.SETRANGE("Plant Request No.","No.");
+        IF NOT ReqLineRec.FIND('-') THEN
+          ERROR(lvText001);  //* Dan moet aanvraag maar gewoon verwijderd worden.
+
+        ReqRec.Status := INewStatus;
+        Posted := TRUE;
+        "Posted on" := CURRENTDATETIME;
+
+        MODIFY(TRUE);
+      END;
+
+      Rec := ReqRec;
+    END;
+
+    PROCEDURE RunPostPlantRequest@1100485031(VAR Rec@1100485000 : Record 11020520);
+    BEGIN
+      ReqRec.COPY(Rec);
+      PostPlantRequest();
+      Rec := ReqRec;
+    END;
+
+    LOCAL PROCEDURE PostPlantRequest@1100485033();
+    VAR
+      lvPlantOrderRec@1100485007 : Record 11012556;
+      lvRequestOrderContRec@1100485002 : Record 11012536;
+      lvPlantOrderContRec@1100485004 : Record 11012536;
+      lvText001@1100485005 : TextConst 'ENU=No Plant Request Lines present.\ \An empty Plant Order will be created, are you sure?';
+      ReqCostLine@1100525000 : Record 11020554;
+      POCostLine@1100525001 : Record 11012558;
+      lvPrevLineType@1100485000 : Option;
+      lvUserAccess@1100485006 : Option;
+      NextLineNoCost@1100525002 : Integer;
+    BEGIN
+      WITH ReqRec DO BEGIN
+        PlantSetupRec.GET;
+
+        PlantRequestAccess(12,ReqRec,lvUserAccess);  //* Goedkeuren
+        TESTFIELD("No.");
+        TESTFIELD("Transfer Date");
+        TESTFIELD("From Location");
+        TESTFIELD("To Location");
+        TESTFIELD(Posted, FALSE);
+        TESTFIELD(Status, Status::Requested);
+        IF ("Plant Order No." <> '') THEN BEGIN
+          lvPlantOrderRec.GET("Plant Order No.");
+          lvPlantOrderRec.TESTFIELD(Posted, FALSE);
+          IF NOT (lvPlantOrderRec.Status IN [lvPlantOrderRec.Status::Open, lvPlantOrderRec.Status::Printed]) THEN
+            lvPlantOrderRec.FIELDERROR(Status);
+          IF NOT (lvPlantOrderRec.Type IN
+            [lvPlantOrderRec.Type::Arrival, lvPlantOrderRec.Type::Removal,lvPlantOrderRec.Type::"Other Transfers"])
+          THEN
+            lvPlantOrderRec.FIELDERROR(Type);
+          lvPlantOrderRec.TESTFIELD("Purchase Order No.", '');
+          lvPlantOrderRec.TESTFIELD("Exit Order No.", '');
+        END;
+        IF ("Transport Cost for (Advice)" = "Transport Cost for (Advice)"::Project) AND (PlantSetupRec."Transport Orders") THEN
+          TESTFIELD("Project No. (TP-Cost)");
+        CheckElementMandatory(ReqRec, Status::Approved);  //DP00241.n (26939)
+        //* Verder worden de meeste zaken verder wel getest bij vullen van velden met 'Validate'
+
+        ReqLineRec.RESET;
+        ReqLineRec.SETRANGE("Plant Request No.","No.");
+        IF (NOT ReqLineRec.FINDFIRST) AND GUIALLOWED THEN BEGIN
+          IF NOT CONFIRM(lvText001, FALSE) THEN
+            ERROR('');
+        END;
+
+        InsertPlantOrderFromRequest();
+        //* Als nieuwe materieelorder wordt toegevoegd, dan wordt daar ook direct het veld "Plant Order No." gevuld.
+        //* Veld moet hier al gevuld zijn want wordt verder gebruik bij het toevoegen van regels, etc.
+
+        NextLineNoPlant := 10000;
+        lvPrevLineType := ReqLineRec.Type::Plant; //* Alleen vullen met 'Plant' of 'Item', om te bepalen waar tekst bij hoort
+        ReqLineRec.RESET;
+        ReqLineRec.SETRANGE("Plant Request No.","No.");
+        IF ReqLineRec.FINDSET THEN BEGIN
+          REPEAT
+            CASE ReqLineRec.Type OF
+              ReqLineRec.Type::Plant:
+                BEGIN
+                  ProcessRequestLinePlant();
+                  lvPrevLineType := ReqLineRec.Type::Plant;
+                END;
+              ReqLineRec.Type::Item:
+                BEGIN
+                  ProcessRequestLineItem();
+                  lvPrevLineType := ReqLineRec.Type::Item;
+                END;
+              ReqLineRec.Type::Text:
+                BEGIN
+                  IF lvPrevLineType <> ReqLineRec.Type::Item THEN
+                    ProcessRequestLinePlant()
+                  ELSE
+                    ProcessRequestLineItem();
+                END;
+            END;
+          UNTIL ReqLineRec.NEXT = 0
+        END;
+
+        //* 22453
+        ReqCostLine.RESET;
+        ReqCostLine.SETRANGE("Plant Request No.","No.");
+        IF ReqCostLine.FINDSET THEN BEGIN
+          NextLineNoCost := 10000;
+          REPEAT
+            IF ReqCostLine.Type <> ReqCostLine.Type::Text THEN BEGIN
+              ReqCostLine.TESTFIELD("No.");
+              ReqCostLine.TESTFIELD(Quantity);
+            END;
+            POCostLine.INIT;
+            POCostLine.InitRecord;
+            POCostLine."Plant Order No." := ReqRec."Plant Order No.";
+            POCostLine."Line No." := NextLineNoCost;
+            POCostLine.InitRecord();
+            POCostLine.Type := ReqCostLine.Type;
+            POCostLine."No." := ReqCostLine."No.";
+            POCostLine.Description := ReqCostLine.Description;
+            IF ReqCostLine.Type <> ReqCostLine.Type::Text THEN BEGIN
+              POCostLine."Unit of Measure" := ReqCostLine."Unit of Measure";
+              POCostLine.Quantity := ReqCostLine.Quantity;
+              POCostLine.Price := ReqCostLine.Price;
+              POCostLine.Amount := ReqCostLine.Amount;
+              POCostLine.Element := ReqCostLine.Element;
+            END;
+            POCostLine.INSERT(TRUE);
+            NextLineNoCost := NextLineNoCost + 10000;
+          UNTIL ReqCostLine.NEXT = 0
+        END;
+
+        lvRequestOrderContRec.SETRANGE(Type, lvRequestOrderContRec.Type::"Req From", lvRequestOrderContRec.Type::"Req To");
+        lvRequestOrderContRec.SETRANGE("Order No.", "No.");
+        IF lvRequestOrderContRec.FINDSET THEN BEGIN
+          REPEAT
+            lvPlantOrderContRec := lvRequestOrderContRec;
+            IF lvRequestOrderContRec.Type = lvRequestOrderContRec.Type::"Req From" THEN
+              lvPlantOrderContRec.Type := lvPlantOrderContRec.Type::"PO From"
+            ELSE
+              lvPlantOrderContRec.Type := lvPlantOrderContRec.Type::"PO To";
+            lvPlantOrderContRec."Order No." := "Plant Order No.";
+            lvPlantOrderContRec.INSERT(TRUE);
+          UNTIL lvRequestOrderContRec.NEXT = 0;
+        END;
+
+        //DP00183.sc
+        IF "Plant Order No." <> '' THEN BEGIN
+          IF lvPlantOrderRec.GET("Plant Order No.") THEN
+            CopyCommentRequestToPlantOrder(ReqRec, lvPlantOrderRec);
+        END;
+        //DP00183.ec
+
+        Status := Status::Approved;
+        Posted := TRUE;
+        "Posted on" := CURRENTDATETIME;
+
+        MODIFY(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertPlantOrderFromRequest@1100485035();
+    VAR
+      lvPlantOrderRec@1100485000 : Record 11012556;
+      lvPlantOrderLineRec@1100485001 : Record 11012557;
+      lvCostOrderLineRec@1100485002 : Record 11012558;
+      lvOrderContRec@1100485004 : Record 11012536;
+    BEGIN
+      //* Als het materieelordernummer is gevuld in de materieelaanvraag dan niet toevoegen, maar die MO volledig overschrijven.
+
+      WITH ReqRec DO BEGIN
+        IF ("Plant Order No." = '') THEN BEGIN
+          lvPlantOrderRec.INIT;
+          lvPlantOrderRec."No." := '';
+          lvPlantOrderRec.INSERT(TRUE);
+          lvPlantOrderRec.TESTFIELD("No.");
+          "Plant Order No." := lvPlantOrderRec."No.";
+        END ELSE BEGIN
+          lvPlantOrderLineRec.SETRANGE("Plant Order No.", "Plant Order No.");
+          lvPlantOrderLineRec.DELETEALL(TRUE);
+          //
+          lvCostOrderLineRec.SETRANGE("Plant Order No.", "Plant Order No.");
+          lvCostOrderLineRec.DELETEALL;
+          //
+          //lvItemOrderLineRec.SETRANGE("Plant Order No.", "Plant Order No.");
+          //lvItemOrderLineRec.DELETEALL;
+          //
+          lvOrderContRec.SETRANGE(Type, lvOrderContRec.Type::"PO From", lvOrderContRec.Type::"PO To");
+          lvOrderContRec.SETRANGE("Order No.", "Plant Order No.");
+          lvOrderContRec.DELETEALL;
+          //
+          lvPlantOrderRec.GET("Plant Order No.");
+          lvPlantOrderRec.INIT;
+          lvPlantOrderRec.Status := lvPlantOrderRec.Status::Open;
+          lvPlantOrderRec.DeleteCommentLines();  //DP00183.c
+        END;
+
+        lvPlantOrderRec.VALIDATE(Type, Type);
+        lvPlantOrderRec.VALIDATE("From Location", "From Location");
+        lvPlantOrderRec.VALIDATE("To Location", "To Location");
+        lvPlantOrderRec.VALIDATE("Transfer Date", "Transfer Date");
+        lvPlantOrderRec.VALIDATE("From Location Address Code", "From Location Address Code");
+        lvPlantOrderRec."Collect Order" := "Collect Order";
+        lvPlantOrderRec."From Location Address" := "From Location Address";
+        lvPlantOrderRec."From Location Address 2" := "From Location Address 2";
+        lvPlantOrderRec."From Location Post Code" := "From Location Post Code";
+        lvPlantOrderRec."From Location City" := "From Location City";
+        lvPlantOrderRec."From Location Contact" := "From Location Contact";
+        lvPlantOrderRec."From Location Contact Phone No" := "From Location Contact Phone No";
+        lvPlantOrderRec.VALIDATE("To Location Address Code", "To Location Address Code");
+        lvPlantOrderRec."To Location Address" := "To Location Address";
+        lvPlantOrderRec."To Location Address 2" := "To Location Address 2";
+        lvPlantOrderRec."To Location Post Code" := "To Location Post Code";
+        lvPlantOrderRec."To Location City" := "To Location City";
+        lvPlantOrderRec."To Location Contact" := "To Location Contact";
+        lvPlantOrderRec."To Location Contact Phone No" := "To Location Contact Phone No";
+        IF (PlantSetupRec."Transport Orders") THEN BEGIN
+          lvPlantOrderRec.VALIDATE("Transport Cost for (Advice)", "Transport Cost for (Advice)");
+          IF lvPlantOrderRec."Transport Cost for (Advice)" = lvPlantOrderRec."Transport Cost for (Advice)"::Project THEN
+            lvPlantOrderRec.VALIDATE("Project No. (TP-Cost)", "Project No. (TP-Cost)");
+        END;
+        lvPlantOrderRec."Appointment Fixed Date" := "Appointment Fixed Date";
+        lvPlantOrderRec."Appointment Time" := "Appointment Time";
+        lvPlantOrderRec."Appointment Code" := "Appointment Code";
+        lvPlantOrderRec."Appointment Comment" := "Appointment Comment";
+        lvPlantOrderRec."Requested on" :=DT2DATE("Requested on");
+        lvPlantOrderRec."Requested by" := "Requested by";
+        lvPlantOrderRec."Department Code" := ReqRec."Department Code"; //**4PS.n DPA Plant
+        lvPlantOrderRec."Your Reference" := "Your Reference";
+
+        lvPlantOrderRec.MODIFY(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE ProcessRequestLinePlant@1100485029();
+    VAR
+      lvPlantOrderLineRec@1100485000 : Record 11012557;
+      lvPlantNeedRec@1100525000 : Record 11012579;
+    BEGIN
+      WITH ReqLineRec DO BEGIN
+        lvPlantOrderLineRec.SetCreateFromPlantRequest(TRUE);
+        lvPlantOrderLineRec.INIT;
+        lvPlantOrderLineRec."Plant Order No." := ReqRec."Plant Order No.";
+        lvPlantOrderLineRec."Line No." := NextLineNoPlant;
+        lvPlantOrderLineRec.InitRecord();
+
+        IF Type = Type::Text THEN BEGIN
+          IF Description = '' THEN
+            EXIT;
+          lvPlantOrderLineRec.VALIDATE(Type, lvPlantOrderLineRec.Type::Text);
+          IF "Plant No." <> '' THEN
+            lvPlantOrderLineRec."No." := "Plant No.";  //DP00241.n (28876)
+          lvPlantOrderLineRec.Description := Description;
+        END ELSE BEGIN
+          IF "Plant Type" <> '' THEN
+            TESTFIELD("Set Code", '');
+          IF "Set Code" = '' THEN
+            TESTFIELD("Plant Type");
+          TESTFIELD(Quantity);
+          CALCFIELDS(Bulk);
+          IF (NOT Bulk) AND ("Plant Type" <> '') AND ("Plant No." <> '') THEN
+            TESTFIELD(Quantity, 1);
+          IF ("Plant Type" = '') AND ("Set Code" <> '') THEN BEGIN
+            IF UniquePlantWithNoFilledOnSet() THEN
+              TESTFIELD(Quantity, 1);
+          END;
+
+          lvPlantOrderLineRec.VALIDATE(Type, lvPlantOrderLineRec.Type::Plant);
+          IF ("Plant Type" = '') AND ("Set Code" <> '') THEN
+            lvPlantOrderLineRec.VALIDATE("Set Code", "Set Code")
+          ELSE BEGIN
+            lvPlantOrderLineRec.VALIDATE("Plant Type", "Plant Type");
+            IF "Plant No." <> '' THEN
+              lvPlantOrderLineRec.VALIDATE("No.", "Plant No.");
+          END;
+          IF Description <> '' THEN
+            lvPlantOrderLineRec.Description := Description;
+          //IF PlantSetupRec."Rate Codes" AND ("Rate Code" <> '') THEN BEGIN  //C003366.o
+          IF PlantSetupRec."Rate Codes" THEN BEGIN  //C003366.n
+            IF ("Rate Code" <> '') THEN BEGIN  //C003366.n
+              IF (ReqRec.Type = ReqRec.Type::Removal) THEN
+                lvPlantOrderLineRec."From Rate Code" := "Rate Code"
+              ELSE
+                lvPlantOrderLineRec."To Rate Code" := "Rate Code";
+            END;
+            IF ("From Rate Code (Other Transf.)" <> '') AND (ReqRec.Type = ReqRec.Type::"Other Transfers") THEN
+              lvPlantOrderLineRec."From Rate Code" := "From Rate Code (Other Transf.)";  //C003366.n
+          END;
+          lvPlantOrderLineRec.Element := Element;
+          IF ("Expected return on" <> 0D) AND ("Expected return on" >= ReqRec."Transfer Date") THEN
+            lvPlantOrderLineRec."Expected return on" := "Expected return on";
+          IF PlantSetupRec."Extended Picking Procedure" AND (ReqRec.Type = ReqRec.Type::Arrival) THEN
+            lvPlantOrderLineRec."Asked Quantity" := Quantity
+          ELSE BEGIN
+            IF (NOT (PlantSetupRec."Removal with Qty. to Receive" AND (ReqRec.Type = ReqRec.Type::Removal))) OR
+               (PlantSetupRec."Removal with Qty. to Receive" AND (ReqRec.Type = ReqRec.Type::Removal) AND
+                PlantSetupRec."Fill Qty. with Qty. to Receive")
+            THEN
+              lvPlantOrderLineRec.VALIDATE(Quantity, Quantity);
+          END;
+          IF PlantSetupRec."Removal with Qty. to Receive" AND (ReqRec.Type = ReqRec.Type::Removal) THEN
+            lvPlantOrderLineRec."Qty. to Receive" := Quantity;
+        END;
+
+        lvPlantOrderLineRec."Comment CP Order" := "Comment CP Order";
+        lvPlantOrderLineRec."Plant Request No." := "Plant Request No.";
+        lvPlantOrderLineRec."Plant Request Line No." := "Line No.";
+        IF ("Location Copied Need" <> '') AND ("Line No. Copied Need" <> 0) THEN BEGIN
+          IF lvPlantNeedRec.GET("Location Copied Need", "Line No. Copied Need") THEN BEGIN
+            lvPlantOrderLineRec."Location Copied Need" := "Location Copied Need";
+            lvPlantOrderLineRec."Line No. Copied Need" := "Line No. Copied Need";
+            IF (lvPlantNeedRec."Quantity To Copy" <= 0) AND (NOT lvPlantNeedRec.Finished) THEN BEGIN
+              lvPlantNeedRec.Finished := TRUE;
+              lvPlantNeedRec.MODIFY;
+            END;
+          END;
+        END;
+
+        lvPlantOrderLineRec.INSERT(TRUE);
+        NextLineNoPlant := NextLineNoPlant + 10000;
+      END;
+    END;
+
+    LOCAL PROCEDURE ProcessRequestLineItem@1100485038();
+    VAR
+      lvPlantOrderLineRec@1100485000 : Record 11012557;
+    BEGIN
+      WITH ReqLineRec DO BEGIN
+        IF (Type = Type::Item) AND (PlantSetupRec."CP Item Transport" <> '') AND (PlantSetupRec."CP Item Transport" = "Item No.") THEN
+          EXIT;  //* BNBM: Betreft aanvraag voor transport, dit artikel niet overzetten naar de materieelorder
+
+        lvPlantOrderLineRec.SetCreateFromPlantRequest(TRUE);
+        lvPlantOrderLineRec.INIT;
+        lvPlantOrderLineRec."Plant Order No." := ReqRec."Plant Order No.";
+        lvPlantOrderLineRec."Line No." := NextLineNoPlant;
+        lvPlantOrderLineRec.InitRecord();
+
+        IF Type = Type::Text THEN BEGIN
+          IF Description = '' THEN
+            EXIT;
+          lvPlantOrderLineRec.VALIDATE(Type, lvPlantOrderLineRec.Type::Text);
+          IF "Plant No." <> '' THEN  // Stnd. Text No.
+            lvPlantOrderLineRec."Item No." := "Plant No.";  //DP00241.n (28876)
+          lvPlantOrderLineRec.Description := Description;
+        END ELSE BEGIN
+          TESTFIELD("Item No.");
+          TESTFIELD(Quantity);
+
+          lvPlantOrderLineRec.VALIDATE(Type, lvPlantOrderLineRec.Type::Item);
+          lvPlantOrderLineRec.VALIDATE("Item No.", "Item No.");
+          IF Description <> '' THEN
+            lvPlantOrderLineRec.Description := Description;
+          IF "Location Code" <> '' THEN
+            lvPlantOrderLineRec."Location Code" := "Location Code";  //*22501
+          lvPlantOrderLineRec.Element := Element;
+          IF PlantSetupRec."Extended Picking Procedure" AND (ReqRec.Type = ReqRec.Type::Arrival) THEN
+            lvPlantOrderLineRec.VALIDATE("Asked Quantity", Quantity)
+          ELSE BEGIN
+            IF (NOT (PlantSetupRec."Removal with Qty. to Receive" AND (ReqRec.Type = ReqRec.Type::Removal))) OR
+               (PlantSetupRec."Removal with Qty. to Receive" AND (ReqRec.Type = ReqRec.Type::Removal) AND
+                PlantSetupRec."Fill Qty. with Qty. to Receive")
+            THEN
+              lvPlantOrderLineRec.VALIDATE(Quantity, Quantity);
+          END;
+        END;
+        IF PlantSetupRec."Removal with Qty. to Receive" AND (ReqRec.Type = ReqRec.Type::Removal) THEN
+          lvPlantOrderLineRec."Qty. to Receive" := Quantity;
+
+        lvPlantOrderLineRec."Comment CP Order" := "Comment CP Order";
+        lvPlantOrderLineRec."Plant Request No." := "Plant Request No.";
+        lvPlantOrderLineRec."Plant Request Line No." := "Line No.";
+
+        lvPlantOrderLineRec.INSERT(TRUE);
+        NextLineNoPlant := NextLineNoPlant + 10000;
+      END;
+    END;
+
+    PROCEDURE RunAddPresentPlantOnRequest@1100485025(ReqRec@1100485001 : Record 11020520);
+    VAR
+      lvReqLineRec@1100485000 : Record 11020521;
+      lvInventoryRec@1100485002 : Record 11012555;
+      lvNextLineNo@1100485003 : Integer;
+      lvPlantNo@1100485004 : Code[20];
+      lvText001@1100485005 : TextConst 'ENU=Do you want to insert the plant present on location ''%1'' per %2 ?';
+    BEGIN
+      WITH ReqRec DO BEGIN
+        TESTFIELD(Status, Status::Open);
+        TESTFIELD(Posted, FALSE);
+        IF Type = Type::Arrival THEN
+          FIELDERROR(Type);
+        TESTFIELD("From Location");
+        TESTFIELD("To Location");
+        TESTFIELD("Transfer Date");
+
+        IF GUIALLOWED THEN
+          IF NOT CONFIRM(lvText001, FALSE, "From Location", "Transfer Date") THEN
+            EXIT;
+
+        lvReqLineRec.RESET;
+        lvReqLineRec.SETRANGE("Plant Request No.", "No.");
+        lvReqLineRec.SETRANGE(Type, lvReqLineRec.Type::Plant);
+        lvReqLineRec.DELETEALL(TRUE);
+
+        lvReqLineRec.RESET;
+        lvReqLineRec.SETRANGE("Plant Request No.", "No.");
+        IF lvReqLineRec.FINDLAST THEN
+          lvNextLineNo := lvReqLineRec."Line No.";
+        lvNextLineNo := lvNextLineNo + 10000;
+
+        lvInventoryRec.RESET;
+        lvInventoryRec.SETRANGE(Removed, FALSE);
+        lvInventoryRec.SETRANGE(Location, "From Location");
+        lvInventoryRec.SETFILTER("Present from", '<= %1', "Transfer Date");
+        lvInventoryRec.SETFILTER(Quantity,'>0');
+        IF lvInventoryRec.FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            lvPlantNo := lvInventoryRec."Plant No.";
+            IF lvPlantNo = '0' THEN
+              lvPlantNo := '';
+
+            lvReqLineRec.RESET;
+            lvReqLineRec.SETRANGE("Plant Request No.", "No.");
+            lvReqLineRec.SETRANGE(Type, lvReqLineRec.Type::Plant);
+            lvReqLineRec.SETRANGE("Plant Type", lvInventoryRec."Plant Type");
+            lvReqLineRec.SETRANGE("Plant No.", lvPlantNo);
+            IF NOT lvReqLineRec.FINDFIRST THEN BEGIN
+              lvReqLineRec.INIT;
+              lvReqLineRec."Plant Request No." := "No.";
+              lvReqLineRec."Line No." := lvNextLineNo;
+              lvReqLineRec.Type := lvReqLineRec.Type::Plant;
+              lvReqLineRec."Plant Type" := lvInventoryRec."Plant Type";
+              lvReqLineRec."Plant No." := lvPlantNo;
+              lvReqLineRec.GetPlantDescription();
+              lvReqLineRec.Quantity := lvInventoryRec.Quantity;
+              lvReqLineRec.INSERT(TRUE);
+              lvNextLineNo := lvNextLineNo + 10000;
+            END ELSE BEGIN
+              lvReqLineRec.Quantity := lvReqLineRec.Quantity + lvInventoryRec.Quantity;
+              lvReqLineRec.MODIFY(TRUE);
+            END;
+          UNTIL lvInventoryRec.NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE RunAddPresentPlantSelectOnReq@1100525002(ReqRec@1100525000 : Record 11020520);
+    VAR
+      ReqLineRec@1100525004 : Record 11020521;
+      FromLocRec@1100409001 : Record 11012554;
+      ToLocRec@1100409002 : Record 11012554;
+      InventoryRec@1100525006 : Record 11012555;
+      TmpPlantInventRec@1100525002 : TEMPORARY Record 11012555;
+      PlantRequestLine2@1100525009 : Record 11020521;
+      AddLinkedPlantTypeStndItemMgt@1100525008 : Codeunit 11012583;
+      PlantInventPag@1100525001 : Page 11012559;
+      SoldAllowed@1100525003 : Boolean;
+      LineNo@1100525005 : Integer;
+      PlantNo@1100525007 : Code[20];
+    BEGIN
+      WITH ReqRec DO BEGIN
+        TESTFIELD(Status, Status::Open);
+        TESTFIELD(Posted, FALSE);
+        IF Type = Type::Arrival THEN
+          FIELDERROR(Type);
+        TESTFIELD("From Location");
+        TESTFIELD("To Location");
+        TESTFIELD("Transfer Date");
+
+        FromLocRec.GET("To Location");
+        ToLocRec.GET("To Location");
+        SoldAllowed :=
+          (Type = Type::Removal) OR
+          ((Type = Type::"Other Transfers") AND
+           (NOT FromLocRec.Depot) AND (NOT ToLocRec.Depot) AND ("From Location" <> "To Location"));
+
+        InventoryRec.RESET;
+        InventoryRec.FILTERGROUP(9);
+        InventoryRec.SETRANGE(Removed, FALSE);
+        InventoryRec.SETRANGE(Location, "From Location");
+        InventoryRec.SETFILTER("Present from", '<=%1', "Transfer Date");
+        InventoryRec.SETFILTER("Date Filter", '<=%1', "Transfer Date");
+        IF NOT SoldAllowed THEN BEGIN
+          InventoryRec.SETRANGE(Sold, FALSE);
+          InventoryRec.SETRANGE("Sold Filter", FALSE);
+        END;
+        InventoryRec.SETFILTER(Quantity, '>%1', 0);
+        InventoryRec.SETFILTER("Quantity Filter", '>%1', 0);
+        InventoryRec.FILTERGROUP(0);
+        PlantInventPag.SetDetailSelection(2);  //* Detail Level: 2=Plant No.
+        PlantInventPag.SetMultiSelection();  //* Then Detail Level not editable in form, so in returned in the level that is set
+        PlantInventPag.SETTABLEVIEW(InventoryRec);
+        PlantInventPag.LOOKUPMODE(TRUE);
+        IF PlantInventPag.RUNMODAL <> ACTION::LookupOK THEN
+          EXIT;
+        IF NOT PlantInventPag.GetMarkedRecords(TmpPlantInventRec) THEN //* In tmprec compressed quantity is returned
+          EXIT;
+        //C003363.en
+
+        TmpPlantInventRec.RESET;
+        IF TmpPlantInventRec.FINDSET THEN BEGIN
+          ReqLineRec.RESET;
+          ReqLineRec.SETRANGE("Plant Request No.", "No.");
+          IF ReqLineRec.FINDLAST THEN
+            LineNo := ReqLineRec."Line No."
+          ELSE
+            LineNo := 0;
+          AddLinkedPlantTypeStndItemMgt.SetGeneralConfirm();
+          REPEAT
+            PlantNo := TmpPlantInventRec."Plant No.";
+            IF PlantNo = '0' THEN
+              PlantNo := '';
+            TmpPlantInventRec.CALCFIELDS(Bulk);
+            ReqLineRec.RESET;
+            ReqLineRec.SETRANGE("Plant Request No.", "No.");
+            ReqLineRec.SETRANGE("Plant Type", TmpPlantInventRec."Plant Type");
+            ReqLineRec.SETRANGE("Plant No.", PlantNo);
+            IF NOT TmpPlantInventRec.Bulk THEN BEGIN
+              IF NOT ReqLineRec.ISEMPTY THEN
+                TmpPlantInventRec.Quantity := 0;   //* Unique plant no. already on plant order
+            END ELSE BEGIN
+              IF ReqLineRec.FINDSET THEN BEGIN         //* Correction: minus qty already on PO
+                REPEAT
+                  TmpPlantInventRec.Quantity := TmpPlantInventRec.Quantity - ReqLineRec.Quantity;
+                UNTIL (ReqLineRec.NEXT = 0) OR (TmpPlantInventRec.Quantity <= 0)
+              END;
+            END;
+            IF TmpPlantInventRec.Quantity > 0 THEN BEGIN
+              LineNo := LineNo + 10000;
+              ReqLineRec.INIT;
+              ReqLineRec."Plant Request No." := "No.";
+              ReqLineRec."Line No." := LineNo;
+              ReqLineRec.Type := ReqLineRec.Type::Plant;
+              ReqLineRec."Plant Type" := TmpPlantInventRec."Plant Type";
+              ReqLineRec."Plant No." := PlantNo;
+              ReqLineRec.GetPlantDescription();
+              ReqLineRec.Quantity := TmpPlantInventRec.Quantity;
+              ReqLineRec.INSERT(TRUE);
+              IF AddLinkedPlantTypeStndItemMgt.InsertOnPlantRequest(ReqLineRec, 0) THEN BEGIN  // 0=Insert
+                PlantRequestLine2.SETRANGE("Plant Request No.", "No.");
+                PlantRequestLine2.FINDLAST;
+                LineNo := PlantRequestLine2."Line No."
+              END;
+            END;
+          UNTIL TmpPlantInventRec.NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE RunCopyPlantOrderToPlntRequest@1100485019(VAR Rec@1100485000 : Record 11020520;INewRequest@1100485015 : Boolean);
+    VAR
+      lvPlantOrderRec@1100485001 : Record 11012556;
+      lvText000@1100485016 : TextConst 'ENU=Already Request Line(s) present, are you sure you want to overwrite te Plant Request ''%1''?';
+      lvText001@1100485002 : TextConst 'ENU=No Plant Order selected.';
+      lvText002@1100485003 : TextConst 'ENU=Plant Order ''%1'' is already linked to the not posted Plant Request ''%2'' with Status ''%3''''.';
+      lvPlantOrderLineRec@1100485004 : Record 11012557;
+      lvRequestOrderContRec@1100485010 : Record 11012536;
+      lvPlantOrderContRec@1100485009 : Record 11012536;
+      lvPlantReqRec2@1100485012 : Record 11020520;
+      lvUserAccess@1100485013 : Option;
+      lvNextLineNo@1100485005 : Integer;
+      lvText003@1100485011 : TextConst 'ENU=For Plant Order ''%1'' is already a Purchase Order (''%2'') created.';
+      lvText004@1100485014 : TextConst 'ENU=For Plant Order ''%1'' is already an Exit Order (''%2'') created.';
+    BEGIN
+      //* Copy and/or link Plant Order to a new Plant Request
+      ReqRec.COPY(Rec);
+
+      PlantSetupRec.GET;
+      PlantSetupRec.TESTFIELD("Copy/Link PO to Plant Request", TRUE);
+      PlantRequestAccess(91,ReqRec,lvUserAccess);  //* Kopieren/koppelen MO en toevoegen MA
+
+      WITH ReqRec DO BEGIN
+        IF NOT INewRequest THEN BEGIN
+          TESTFIELD("No.");
+          TESTFIELD(Status, Status::Open);
+          TESTFIELD("Plant Order No.", '');  //* Evt . moet men zelf dan eerst bewust ontkoppelen
+          ReqLineRec.RESET;
+          ReqLineRec.SETRANGE("Plant Request No.", "No.");
+          IF ReqLineRec.FINDFIRST AND GUIALLOWED THEN BEGIN
+            IF NOT CONFIRM(lvText000, FALSE, "No.") THEN
+              ERROR('');
+          END;
+        END;
+      END;
+
+      lvPlantOrderRec.FILTERGROUP(9);
+      lvPlantOrderRec.SETRANGE(Posted, FALSE);
+      lvPlantOrderRec.SETRANGE(Status, lvPlantOrderRec.Status::Open, lvPlantOrderRec.Status::Printed);
+      lvPlantOrderRec.SETRANGE(Type, lvPlantOrderRec.Type::Arrival, lvPlantOrderRec.Type::"Other Transfers");
+      lvPlantOrderRec.FILTERGROUP(0);
+      IF PAGE.RUNMODAL(0, lvPlantOrderRec) <> ACTION::LookupOK THEN
+        ERROR(lvText001)
+      ELSE BEGIN
+        IF lvPlantOrderRec."No." = '' THEN
+          ERROR(lvText001);
+        lvPlantOrderRec.CALCFIELDS("Linked Plant Requests","From Location Description","To Location Description");
+        lvPlantOrderRec.TESTFIELD(Posted, FALSE);
+        IF NOT (lvPlantOrderRec.Status IN [lvPlantOrderRec.Status::Open, lvPlantOrderRec.Status::Printed]) THEN
+          lvPlantOrderRec.FIELDERROR(Status);
+        IF NOT (lvPlantOrderRec.Type IN
+          [lvPlantOrderRec.Type::Arrival, lvPlantOrderRec.Type::Removal,lvPlantOrderRec.Type::"Other Transfers"])
+        THEN
+          lvPlantOrderRec.FIELDERROR(Type);
+        IF lvPlantOrderRec."Linked Plant Requests" > 0 THEN BEGIN
+          lvPlantReqRec2.RESET;
+          lvPlantReqRec2.SETCURRENTKEY("Plant Order No.");
+          lvPlantReqRec2.SETRANGE("Plant Order No.", lvPlantOrderRec."No.");
+          lvPlantReqRec2.SETRANGE(Posted, FALSE);
+          IF lvPlantReqRec2.FINDFIRST THEN
+            ERROR(lvText002, lvPlantOrderRec."No.", lvPlantReqRec2."No.", lvPlantReqRec2.Status);
+        END;
+        IF lvPlantOrderRec."Purchase Order No." <> '' THEN
+          ERROR(lvText003, lvPlantOrderRec."No.", lvPlantOrderRec."Purchase Order No." );
+        IF lvPlantOrderRec."Exit Order No." <> '' THEN
+          ERROR(lvText004, lvPlantOrderRec."No.", lvPlantOrderRec."Exit Order No." );
+      END;
+
+      WITH ReqRec DO BEGIN
+        INIT;
+        IF INewRequest THEN BEGIN
+          "No." := '';
+          INSERT(TRUE);
+          TESTFIELD("No.");
+        END ELSE BEGIN
+          //* Als bij bestaande (alleen koppelen) dan MA volldedig overschrijven (is dus eigenlijk een nieuwe aanvraag)
+          "Created by" := USERID;
+          "Created on" := CREATEDATETIME(TODAY, TIME);
+
+          ReqLineRec.RESET;
+          ReqLineRec.SETRANGE("Plant Request No.", "No.");
+          ReqLineRec.DELETEALL;
+          //
+          lvRequestOrderContRec.RESET;
+          lvRequestOrderContRec.SETRANGE(Type, lvRequestOrderContRec.Type::"Req From", lvRequestOrderContRec.Type::"Req To");
+          lvRequestOrderContRec.SETRANGE("Order No.", "No.");
+          lvRequestOrderContRec.DELETEALL;
+          //
+          DeleteCommentLines();  //DP00183.c
+        END;
+        Type := lvPlantOrderRec.Type;
+        "Transfer Date" := lvPlantOrderRec."Transfer Date";
+        "From Location" := lvPlantOrderRec."From Location";
+        "To Location" := lvPlantOrderRec."To Location";
+        "Plant Order No." := lvPlantOrderRec."No.";
+        "Transport Cost for (Advice)" := lvPlantOrderRec."Transport Cost for (Advice)";
+        "Project No. (TP-Cost)" := lvPlantOrderRec."Project No. (TP-Cost)";
+        "From Location Address Code" := lvPlantOrderRec."From Location Address Code";
+        "From Location Name" := lvPlantOrderRec."From Location Description";
+        "From Location Address" := lvPlantOrderRec."From Location Address";
+        "From Location Address 2" := lvPlantOrderRec."From Location Address 2";
+        "From Location Post Code" := lvPlantOrderRec."From Location Post Code";
+        "From Location City" := lvPlantOrderRec."From Location City";
+        "From Location Contact" := lvPlantOrderRec."From Location Contact";
+        "From Location Contact Phone No" := lvPlantOrderRec."From Location Contact Phone No";
+        "To Location Address Code" := lvPlantOrderRec."To Location Address Code";
+        "To Location Name" := lvPlantOrderRec."To Location Description";
+        "To Location Address" := lvPlantOrderRec."To Location Address";
+        "To Location Address 2" := lvPlantOrderRec."To Location Address 2";
+        "To Location Post Code" := lvPlantOrderRec."To Location Post Code";
+        "To Location City" := lvPlantOrderRec."To Location City";
+        "To Location Contact" := lvPlantOrderRec."To Location Contact";
+        "To Location Contact Phone No" := lvPlantOrderRec."To Location Contact Phone No";
+        "Appointment Fixed Date" := lvPlantOrderRec."Appointment Fixed Date";
+        "Appointment Time" := lvPlantOrderRec."Appointment Time";
+        "Appointment Code" := lvPlantOrderRec."Appointment Code";
+        "Appointment Comment" := lvPlantOrderRec."Appointment Comment";
+        "Department Code" := lvPlantOrderRec."Department Code"; //**4PS.n DPA Plant
+        "Your Reference" := lvPlantOrderRec."Your Reference";
+        MODIFY(TRUE);
+      END;
+
+      WITH ReqLineRec DO BEGIN
+        lvNextLineNo := 10000;
+
+        lvPlantOrderLineRec.RESET;
+        lvPlantOrderLineRec.SETRANGE("Plant Order No.", lvPlantOrderRec."No.");
+        IF lvPlantOrderLineRec.FINDSET(TRUE, FALSE) THEN BEGIN
+          REPEAT
+            IF lvPlantOrderLineRec."Exit Order No." <> '' THEN
+              ERROR(lvText004, lvPlantOrderRec."No.", lvPlantOrderLineRec."Exit Order No." );
+            INIT;
+            "Plant Request No." := ReqRec."No.";
+            "Line No." := lvNextLineNo;
+            CASE lvPlantOrderLineRec.Type OF
+              lvPlantOrderLineRec.Type::Text:
+                Type := Type::Text;
+              lvPlantOrderLineRec.Type::Plant:
+                BEGIN
+                  Type := Type::Plant;
+                  "Plant Type" := lvPlantOrderLineRec."Plant Type";
+                  IF lvPlantOrderLineRec."No." <> '0' THEN
+                    "Plant No." := lvPlantOrderLineRec."No.";
+                  IF (lvPlantOrderLineRec."Plant Type" = '') AND (lvPlantOrderLineRec."Set Code" <> '') THEN
+                    "Set Code" := lvPlantOrderLineRec."Set Code";
+                  IF PlantSetupRec."Rate Codes" THEN BEGIN
+                    IF (lvPlantOrderRec.Type = lvPlantOrderRec.Type::Removal) THEN
+                      "Rate Code" := lvPlantOrderLineRec."From Rate Code"
+                    ELSE
+                      "Rate Code" := lvPlantOrderLineRec."To Rate Code";
+                    IF lvPlantOrderRec.Type = lvPlantOrderRec.Type::"Other Transfers" THEN
+                      "From Rate Code (Other Transf.)" := lvPlantOrderLineRec."From Rate Code";  //C003366.n
+                  END;
+                  "Expected return on" := lvPlantOrderLineRec."Expected return on";
+                END;
+              lvPlantOrderLineRec.Type::Item:
+                BEGIN
+                  Type := Type::Item;
+                  "Item No." := lvPlantOrderLineRec."Item No.";
+                  "Location Code" := lvPlantOrderLineRec."Location Code";  //*22501
+                END;
+            END;
+
+            Description := lvPlantOrderLineRec.Description;
+            IF PlantSetupRec."Extended Picking Procedure" AND (lvPlantOrderRec.Type = ReqRec.Type::Arrival) THEN BEGIN
+              Quantity := lvPlantOrderLineRec."Asked Quantity";
+              IF Quantity = 0 THEN
+                Quantity := lvPlantOrderLineRec.Quantity;
+            END ELSE BEGIN
+              Quantity := lvPlantOrderLineRec.Quantity;
+            END;
+            Element := lvPlantOrderLineRec.Element;
+            "Comment CP Order" := lvPlantOrderLineRec."Comment CP Order";
+            INSERT(TRUE);
+            lvNextLineNo := lvNextLineNo + 10000;
+            lvPlantOrderLineRec."Plant Request No." := "Plant Request No.";
+            lvPlantOrderLineRec."Plant Request Line No." := "Line No.";
+            lvPlantOrderLineRec.MODIFY;
+          UNTIL lvPlantOrderLineRec.NEXT = 0;
+        END;
+
+        //lvItemOrderLineRec.RESET;
+        //lvItemOrderLineRec.SETRANGE("Plant Order No.", lvPlantOrderRec."No.");
+        //IF lvItemOrderLineRec.FINDSET(TRUE, FALSE) THEN BEGIN
+        //  REPEAT
+        //    INIT;
+        //    "Plant Request No." := ReqRec."No.";
+        //    "Line No." := lvNextLineNo;
+        //    IF lvItemOrderLineRec.Type <> lvItemOrderLineRec.Type::Item THEN
+        //      Type := Type::Text
+        //    ELSE BEGIN
+        //      Type := Type::Item;
+        //      "Item No." := lvItemOrderLineRec."Item No.";
+        //      "Location Code" := lvItemOrderLineRec."Location Code";  //*22501
+        //    END;
+        //    Description := lvItemOrderLineRec.Description;
+        //    IF PlantSetupRec."Extended Picking Procedure" AND (lvPlantOrderRec.Type = ReqRec.Type::Arrival) THEN BEGIN
+        //      Quantity := lvItemOrderLineRec."Asked Quantity";
+        //      IF Quantity = 0 THEN
+        //        Quantity := lvItemOrderLineRec.Quantity;
+        //    END ELSE BEGIN
+        //      Quantity := lvItemOrderLineRec.Quantity;
+        //    END;
+        //    Element := lvItemOrderLineRec.Element;
+        //    "Comment CP Order" := lvItemOrderLineRec."Comment CP Order";
+        //    INSERT(TRUE);
+        //    lvNextLineNo := lvNextLineNo + 10000;
+        //    lvItemOrderLineRec."Plant Request No." := "Plant Request No.";
+        //    lvItemOrderLineRec."Plant Request Line No." := "Line No.";
+        //    lvItemOrderLineRec.MODIFY;
+        //  UNTIL lvItemOrderLineRec.NEXT = 0;
+        //END;
+
+        lvPlantOrderContRec.SETRANGE(Type, lvPlantOrderContRec.Type::"PO From", lvPlantOrderContRec.Type::"PO To");
+        lvPlantOrderContRec.SETRANGE("Order No.", lvPlantOrderRec."No.");
+        IF lvPlantOrderContRec.FINDSET THEN BEGIN
+          REPEAT
+            lvRequestOrderContRec := lvPlantOrderContRec;
+            IF lvPlantOrderContRec.Type = lvPlantOrderContRec.Type::"PO From" THEN
+              lvRequestOrderContRec.Type := lvRequestOrderContRec.Type::"Req From"
+            ELSE
+              lvRequestOrderContRec.Type := lvRequestOrderContRec.Type::"Req To";
+            lvRequestOrderContRec."Order No." := ReqRec."No.";
+            lvRequestOrderContRec.INSERT(TRUE);
+          UNTIL lvPlantOrderContRec.NEXT = 0;
+        END;
+
+         CopyCommentPlantOrderToRequest(lvPlantOrderRec, ReqRec);  //DP00183.c
+
+        Rec := ReqRec;
+      END;
+    END;
+
+    PROCEDURE RunUnlinkPlantOrderOfPlRequest@1100485020(VAR Rec@1100485001 : Record 11020520);
+    VAR
+      lvUserAccess@1100485000 : Option;
+    BEGIN
+      ReqRec.COPY(Rec);
+
+      WITH ReqRec DO BEGIN
+        TESTFIELD("No.");
+        TESTFIELD(Posted, FALSE);
+        TESTFIELD("Plant Order No.");
+        PlantRequestAccess(92,ReqRec,lvUserAccess);  //* Ontkoppelen MO
+
+        "Plant Order No." := '';
+        MODIFY(TRUE);
+      END;
+
+      Rec := ReqRec;
+    END;
+
+    PROCEDURE PlantRequestAccess@1100485017(IAccessFor@1100485002 : Integer;IReqRec@1100485007 : Record 11020520;VAR OUserAccessReq@1100485003 : Option) : Boolean;
+    VAR
+      lvUserSetupRec@1100485000 : Record 91;
+      lvText000@1100485001 : TextConst 'ENU=You (User %1) don''t have permission for Plant Requests.';
+      lvText001@1100485004 : TextConst 'ENU=You (User %1) don''t have permission to insert a Plant Request.';
+      lvText002@1100485005 : TextConst 'ENU=You (User %1) don''t have permission to modify a Plant Request with status ''%2''.';
+      lvText003@1100485006 : TextConst 'ENU=You (User %1) don''t have permission to delete a Plant Request with status ''%2''.';
+      lvText004@1100485008 : TextConst 'ENU=You (User %1) don''t have permission to set the Status of the Plant Request on ''%2''.';
+      lvReqRec@1100485009 : Record 11020520;
+      lvText005@1100485010 : TextConst 'ENU=You (User %1) don''t have permission to copy/link a Plant Order to a Plant Request.';
+      lvText006@1100485011 : TextConst 'ENU=You (User %1) don''t have permission to unlink a Plant Order.';
+    BEGIN
+      //* Mogelijkwaarden van 'Access for':
+      //  1. Materieelaanvragen (algemeen)
+      //  2. Toevoegen
+      //  3. Wijzigen
+      //  4. Editable (wijzigen toegestaan), geen error maar return TRUE/FALSE
+      //  5. Verwijderen
+      //
+      // 10. Openen (status op 'Open' zetten)
+      // 11. Aanvragen (status op 'Aangevraagd' zetten)
+      // 12. Goedkeuren (status op 'Goedgekeurd' en 'Geboekt' zetten en MO aanmaken)
+      // 13. Afkeuren (status op 'Afgekeurd' en 'Geboekt' zetten, geen MO)
+      // 14. Vervallen (status op 'Vervallen' en 'Geboekt' zetten, geen MO)
+      //
+      // 91. Materieelorder kopieren naar/koppelen aan een nieuwe materieelaanvraag
+      // 92. Ontkoppelen MO
+
+      WITH lvUserSetupRec DO BEGIN
+        IF NOT GET(USERID) THEN
+          ERROR(lvText000, USERID);
+        OUserAccessReq := "Access Plant Requests";
+        IF "Access Plant Requests" = "Access Plant Requests"::No THEN
+          ERROR(lvText000, USERID);
+        IF "Access Plant Requests" = "Access Plant Requests"::Yes THEN
+          EXIT(TRUE);  //* Toegang voor alle materieelaanvraag functionaliteit
+
+        //* In de rol van aanvrager en verwerken beperkte toegang voor materieelaanvragen (MA)
+        //* Aanvrager:
+        //*  - Toevoegen van MA (nieuwe krijgen status 'Open')
+        //*  - Zichtbaar MA met status 'Open' en 'Aangevraagd' (dus niet geboekte) maar nooit 'Internet orders'
+        //*  - Wijzigen van MA met de status 'Open' (dus niet als status 'Aangevraagd')
+        //*  - Functies: Aanvragen, Openen, Vervallen, Koppelen MO, Ontkoppelen MO
+        //* Verwerken:
+        //*  - Toevoegen niet toegestaan
+        //*  - Zichtbaar/wijzigen MA met status 'Aangevraagd' (ook als het een 'Internet order' betreft)
+        //*  - Functies: Openen, Goedkeuren, Afkeuren, Vervallen
+        CASE "Access Plant Requests" OF
+          "Access Plant Requests"::Request:
+            BEGIN
+              CASE IAccessFor OF
+                3:
+                  BEGIN
+                    IF IReqRec.Status <> IReqRec.Status::Open THEN
+                      ERROR(lvText002, USERID, IReqRec.Status);
+                  END;
+                4:
+                  BEGIN
+                    IF IReqRec.Status <> IReqRec.Status::Open THEN
+                      EXIT(FALSE);
+                  END;
+                5:
+                  BEGIN
+                    IF IReqRec.Status <> IReqRec.Status::Open THEN
+                      ERROR(lvText003, USERID, IReqRec.Status);
+                  END;
+                12:
+                  BEGIN
+                    lvReqRec.Status := lvReqRec.Status::Approved;
+                    ERROR(lvText004, USERID, lvReqRec.Status);
+                  END;
+                13:
+                  BEGIN
+                    lvReqRec.Status := lvReqRec.Status::Disapproved;
+                    ERROR(lvText004, USERID, lvReqRec.Status);
+                  END;
+              END;
+            END;
+          "Access Plant Requests"::Process:
+            BEGIN
+              CASE IAccessFor OF
+                2:
+                  ERROR(lvText001, USERID);
+                3:
+                  BEGIN
+                    IF IReqRec.Status <> IReqRec.Status::Requested THEN
+                      ERROR(lvText002, USERID, IReqRec.Status);
+                  END;
+                4:
+                  BEGIN
+                    IF IReqRec.Status <> IReqRec.Status::Requested THEN
+                      EXIT(FALSE);
+                  END;
+                5:
+                  BEGIN
+                    IF IReqRec.Status <> IReqRec.Status::Requested THEN
+                      ERROR(lvText003, IReqRec.Status);
+                  END;
+                11:
+                  BEGIN
+                    lvReqRec.Status := lvReqRec.Status::Requested;
+                    ERROR(lvText004, USERID, lvReqRec.Status);
+                  END;
+                91:
+                  ERROR(lvText005, USERID);
+                92:
+                  ERROR(lvText006, USERID);
+              END;
+            END;
+        END;
+
+        EXIT(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE CopyCommentRequestToPlantOrder@1100529007(SourcePlantRequest@1100528400 : Record 11020520;TargetPlantOrder@1100528401 : Record 11012556);
+    VAR
+      PlantCommentLine@1100528402 : Record 11072666;
+    BEGIN
+      //DP00183
+      PlantCommentLine.CopyComments(
+        DATABASE::"Plant Request", SourcePlantRequest."No.", '', 0,
+        DATABASE::"Plant Order", TargetPlantOrder."No.", '', 0);  //C005461.c
+    END;
+
+    LOCAL PROCEDURE CopyCommentPlantOrderToRequest@1100529006(SourcePlantOrder@1100528400 : Record 11012556;TargetPlantRequest@1100528401 : Record 11020520);
+    VAR
+      PlantCommentLine@1100528402 : Record 11072666;
+    BEGIN
+      //DP00183
+      PlantCommentLine.CopyComments(
+        DATABASE::"Plant Order", SourcePlantOrder."No.", '', 0,
+        DATABASE::"Plant Request", TargetPlantRequest."No.", '', 0);  //C005461.c
+    END;
+
+    PROCEDURE CheckElementMandatory@1100525001(PlantRequest@1100525000 : Record 11020520;NewStatus@1100529001 : Option);
+    VAR
+      PlantSetup@1100529000 : Record 11012550;
+      PlantLoc@1100525001 : Record 11012554;
+      Proj@1100525002 : Record 11072003;
+      ReqPlantLine@1100525003 : Record 11020521;
+      ReqCostLine@1100525004 : Record 11020554;
+      ReqItemLine@1100525005 : Record 11020521;
+    BEGIN
+      //DP00241 (26939)
+      IF PlantRequest.Type = PlantRequest.Type::Removal THEN
+        EXIT;
+      PlantSetup.GET;
+      IF PlantSetup."Plant Request Element Mandat." = PlantSetup."Plant Request Element Mandat."::No THEN
+        EXIT;
+      CASE NewStatus OF
+        PlantRequest.Status::Requested:
+          IF (PlantSetup."Plant Request Element Mandat." <> PlantSetup."Plant Request Element Mandat."::Request) AND
+             (PlantSetup."Plant Request Element Mandat." <> PlantSetup."Plant Request Element Mandat."::Both)
+          THEN
+            EXIT;
+        PlantRequest.Status::Approved:
+          IF (PlantSetup."Plant Request Element Mandat." <> PlantSetup."Plant Request Element Mandat."::Approve) AND
+             (PlantSetup."Plant Request Element Mandat." <> PlantSetup."Plant Request Element Mandat."::Both)
+          THEN
+            EXIT;
+        ELSE
+          EXIT;
+      END;
+
+      IF PlantRequest.Type <> PlantRequest.Type::Removal THEN
+        PlantLoc.Code := PlantRequest."To Location"
+      ELSE
+        PlantLoc.Code := PlantRequest."From Location";
+      IF PlantLoc.Code = '' THEN
+        EXIT;
+      IF NOT PlantLoc.GET(PlantLoc.Code) THEN
+        EXIT;
+      IF PlantLoc."Project No." = '' THEN
+        EXIT;
+      IF PlantLoc."Company Name" <> '' THEN
+        Proj.CHANGECOMPANY(PlantLoc."Company Name");
+      IF NOT Proj.GET(PlantLoc."Project No.") THEN
+        EXIT;
+      IF NOT Proj."Posting Element Mandatory" THEN
+        EXIT;
+
+      IF PlantRequest.Type <> PlantRequest.Type::Removal THEN BEGIN
+        ReqPlantLine.SETRANGE("Plant Request No.", PlantRequest."No.");
+        ReqPlantLine.SETRANGE(Type, ReqPlantLine.Type::Plant);
+        ReqPlantLine.SETRANGE(Element, '');
+        IF ReqPlantLine.FINDFIRST THEN
+          ReqPlantLine.TESTFIELD(Element);
+      END;
+
+      ReqItemLine.SETRANGE("Plant Request No.", PlantRequest."No.");
+      ReqItemLine.SETRANGE(Type, ReqItemLine.Type::Item);
+      ReqItemLine.SETRANGE(Element, '');
+      IF ReqItemLine.FINDFIRST THEN
+        ReqItemLine.TESTFIELD(Element);
+
+      ReqCostLine.SETRANGE("Plant Request No.", PlantRequest."No.");
+      ReqCostLine.SETFILTER(Type, '<>%1', ReqCostLine.Type::Text);
+      ReqCostLine.SETRANGE(Element, '');
+      IF ReqCostLine.FINDFIRST THEN
+        ReqCostLine.TESTFIELD(Element);
+    END;
+
+    BEGIN
+    {
+      DP000267: Functions moved from granule 'Plant Extra' to basic granule 'Plant'.
+    }
+    END.
+  }
+}
+

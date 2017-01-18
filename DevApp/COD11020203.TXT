@@ -1,0 +1,464 @@
+OBJECT Codeunit 11020203 Excel Estimate Mgt.
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      TmpExcelBufferRec@1100485004 : TEMPORARY Record 370;
+      EstRec@1100525000 : Record 11012151;
+      EstimateSetupRec@1100485000 : Record 11012150;
+      EstimateSetupBln@1100485001 : Boolean;
+      Text001@1100485003 : TextConst 'ENU=Template file doesn''t exist.';
+      Text003@1100485006 : TextConst 'ENU=File %1 is already open.';
+      TmpXlMapRec@1100485007 : TEMPORARY Record 11020284;
+      TmpXlMapFilledBln@1100485008 : Boolean;
+      EstimateLineRec@1100485009 : Record 11012154;
+      FileMgt@1100525500 : Codeunit 419;
+      Text004@1100485011 : TextConst 'ENU="Column %1 not set up. "';
+
+    PROCEDURE OpenExcelFile@1100485000(iSubEstimatePartRec@1100485000 : Record 11012153);
+    VAR
+      lvEstimateLineBufRec@1100485004 : Record 11012154;
+      lvSubEstimatePartRec@1100485005 : Record 11012153;
+      ExcelAutomation@1100528700 : Codeunit 11012402;
+      lvFormatManagement@1100525000 : Codeunit 11012022;
+      lvPathFile@1100485001 : Text[250];
+      lvTemplPathFile@1100485002 : Text[250];
+      ServerFileName@1100525001 : Text;
+    BEGIN
+      GetEstimateSetup;
+
+      iSubEstimatePartRec.TESTFIELD("Excel Estimate Template");
+
+      lvPathFile := GetPathFileName(iSubEstimatePartRec);
+      lvTemplPathFile := GetTemplPathFile(iSubEstimatePartRec);
+
+      IF NOT iSubEstimatePartRec.ExcelFileExists THEN BEGIN
+        IF NOT FileMgt.ClientFileExists(lvTemplPathFile) THEN
+          ERROR(Text001,iSubEstimatePartRec."Excel Estimate Template");
+        CopyTemplateFile(lvTemplPathFile,lvPathFile);
+      END;
+
+      IF FileMgt.ClientFileIsInUse(lvPathFile) THEN
+        ERROR(Text003, CONVERTSTR(lvPathFile, '\', '/'));
+
+      TmpExcelBufferRec.RESET;
+      TmpExcelBufferRec.DELETEALL;
+
+      ExcelAutomation.InitExcel;
+      ExcelAutomation.OpenWorkbook(lvPathFile);
+      ExcelAutomation.SetDefaultFilePath(EstimateSetupRec."Pathname Excel Estimates");
+      ExcelAutomation.GiveUserControl;
+
+      //gebruiker past nu de file aan, wacht tot de file gesloten is, navision niet bereikbaar.
+      WHILE FileMgt.ClientFileIsInUse(lvPathFile) DO
+        SLEEP(500);  //db, 09-01-14: C010083
+
+      ServerFileName := FileMgt.UploadFileSilent(lvPathFile);
+      TmpExcelBufferRec.OpenBook(ServerFileName,EstimateSetupRec."Worksheet Excel Estimates");
+      TmpExcelBufferRec.ReadSheet;
+      TmpExcelBufferRec.CloseBook;
+      CLEAR(TmpExcelBufferRec); //object opgeruimd, tijdelijk tabel nog gevuld!
+      IF FILE.ERASE(ServerFileName) THEN;
+
+      FillTmpXlMap;
+
+      TmpExcelBufferRec.FILTERGROUP(10);
+      TmpExcelBufferRec.SETFILTER("Row No.",'%1..',EstimateSetupRec."First Worksheet Data Line");
+      TmpExcelBufferRec.FILTERGROUP(0);
+
+      //weggooien calc. regels dit en onderliggende niveau's
+      lvSubEstimatePartRec.RESET;
+      lvSubEstimatePartRec.SETRANGE("Estimate No.",iSubEstimatePartRec."Estimate No.");
+      lvSubEstimatePartRec.SETRANGE("Sub-Estimate No.",iSubEstimatePartRec."Sub-Estimate No.");
+      lvSubEstimatePartRec.SETRANGE("Part Group",iSubEstimatePartRec."Part Group");
+      CASE iSubEstimatePartRec.Level OF
+        //level 0: all records!!
+        1: lvSubEstimatePartRec.SETRANGE(Chapter,iSubEstimatePartRec.Chapter);
+        2: lvSubEstimatePartRec.SETRANGE(Paragraph,iSubEstimatePartRec.Paragraph);
+        3: lvSubEstimatePartRec.SETRANGE(Part,iSubEstimatePartRec.Part);
+      END;
+      IF lvSubEstimatePartRec.FINDSET THEN
+        REPEAT
+          EstimateLineRec.RESET;
+          EstimateLineRec.SETRANGE("Estimate No.",lvSubEstimatePartRec."Estimate No.");
+          EstimateLineRec.SETRANGE("Sub-Estimate No.",lvSubEstimatePartRec."Sub-Estimate No.");
+          EstimateLineRec.SETRANGE("Part Group",lvSubEstimatePartRec."Part Group");
+          EstimateLineRec.SETRANGE(Part,lvSubEstimatePartRec.Part);
+          EstimateLineRec.DELETEALL(TRUE);
+        UNTIL lvSubEstimatePartRec.NEXT = 0;
+
+      iSubEstimatePartRec."Updated form Excel" := FALSE;
+      iSubEstimatePartRec.MODIFY;
+      COMMIT;
+
+      EstRec.GET(iSubEstimatePartRec."Estimate No.");  //db, 17-03-10
+
+      IF TmpExcelBufferRec.FIND('-') THEN
+        REPEAT
+          TmpExcelBufferRec.SETRANGE("Row No.",TmpExcelBufferRec."Row No.");
+          InitEstimateLineRec(iSubEstimatePartRec,lvEstimateLineBufRec);
+          IF TmpExcelBufferRec.FIND('-') THEN
+            REPEAT
+              CellToField(TmpExcelBufferRec,lvEstimateLineBufRec);
+            UNTIL TmpExcelBufferRec.NEXT = 0;
+          lvFormatManagement.FormatElem(lvEstimateLineBufRec.Part, 1, ''); //mg, 06-10-10: M23275
+          CheckEstimateLineInSheet(lvEstimateLineBufRec,iSubEstimatePartRec);
+          InsertEstimateLineRec(lvEstimateLineBufRec);
+          TmpExcelBufferRec.SETRANGE("Row No.");
+        UNTIL TmpExcelBufferRec.NEXT = 0;
+
+      iSubEstimatePartRec."Updated form Excel" := TRUE;
+      iSubEstimatePartRec.MODIFY;
+    END;
+
+    PROCEDURE GetPathFileName@1100485001(iSubEstimatePartRec@1100485000 : Record 11012153) rFileName : Text[250];
+    BEGIN
+      GetEstimateSetup;
+
+      rFileName := EstimateSetupRec."Pathname Excel Estimates";
+
+      rFileName := rFileName +
+        STRSUBSTNO('%1_%2_%3_%4.xls',iSubEstimatePartRec."Estimate No.",iSubEstimatePartRec."Sub-Estimate No.",
+                                 iSubEstimatePartRec."Part Group",iSubEstimatePartRec.Part);
+    END;
+
+    PROCEDURE GetTemplPathFile@1100485002(iSubEstimatePartRec@1100485002 : Record 11012153) rFileName : Text[250];
+    BEGIN
+      GetEstimateSetup;
+
+      rFileName := EstimateSetupRec."Pathname Excel Est. Template";
+
+      rFileName := rFileName + iSubEstimatePartRec."Excel Estimate Template";
+    END;
+
+    PROCEDURE GetTemplPathFile2@1100485006(iPartByPartGroup@1100485002 : Record 11012169) rFileName : Text[250];
+    BEGIN
+      GetEstimateSetup;
+
+      rFileName := EstimateSetupRec."Pathname Excel Est. Template";
+
+      rFileName := rFileName + iPartByPartGroup."Excel Estimate Template";
+    END;
+
+    PROCEDURE GetEstimateSetup@1100485003();
+    BEGIN
+      IF EstimateSetupBln THEN
+        EXIT;
+
+      EstimateSetupRec.GET;
+      EstimateSetupBln := TRUE;
+    END;
+
+    PROCEDURE CellToField@1100485004(iExcelBufferRec@1100485000 : Record 370;VAR vEstimateLineBufRec@1100485001 : Record 11012154);
+    VAR
+      RecRef@1100485003 : RecordRef;
+      FieldRef@1100485002 : FieldRef;
+      OptionInt@1100485004 : Integer;
+      OptionTxt@1100485005 : Text[50];
+      NrOptions@1100485007 : Integer;
+      i@1100485006 : Integer;
+    BEGIN
+      IF NOT TmpXlMapRec.GET(TmpExcelBufferRec."Column No.") THEN
+        EXIT;
+
+      IF TmpXlMapRec."Field No. OLD" IN [10,30,45,80] THEN //primaraire indexvelden, door init gevuld.
+        EXIT;
+
+      RecRef.GETTABLE(vEstimateLineBufRec);
+
+      FieldRef := RecRef.FIELD(TmpXlMapRec."Field No. OLD");
+      IF FORMAT(FieldRef.TYPE) <> 'Option' THEN
+        EVALUATE(FieldRef,iExcelBufferRec."Cell Value as Text")
+      ELSE BEGIN
+        IF EVALUATE(OptionInt,iExcelBufferRec."Cell Value as Text") THEN
+          EVALUATE(FieldRef,iExcelBufferRec."Cell Value as Text")
+        ELSE BEGIN
+          OptionInt := 0;
+          NrOptions := 1;
+          FOR i := 1 TO STRLEN(FieldRef.OPTIONCAPTION) DO
+            IF COPYSTR(FieldRef.OPTIONCAPTION,i,1) = ',' THEN
+              NrOptions += 1;
+          REPEAT
+            OptionInt += 1;
+            OptionTxt := SELECTSTR(OptionInt,FieldRef.OPTIONCAPTION);
+          UNTIL (OptionInt >= NrOptions) OR (OptionTxt = iExcelBufferRec."Cell Value as Text");
+          OptionInt -= 1;
+          IF (OptionInt < (NrOptions)) THEN BEGIN
+            FieldRef.VALUE(OptionInt)
+          END ELSE BEGIN
+            FieldRef.VALUE(0);
+          END;
+        END;
+      END;
+
+      RecRef.SETTABLE(vEstimateLineBufRec);
+    END;
+
+    PROCEDURE DeleteOldEstimateLines@1100485008(iEstimateLineRec@1100485000 : Record 11012154);
+    BEGIN
+      //input: hoofdregel
+      //processing: alle calculatie-regels vanaf dit punt naar beneden moeten opgeschoond worden.
+      //onderliggende sub-estimate-parts moeten ontdaan worden van estimate lines.
+      //level 1: filter op hoofdstuk
+      //level 2: filter op paragraaf
+      //level 3: filter op zichzelf, dus alleen zichtzelf!!
+    END;
+
+    PROCEDURE InitEstimateLineRec@1100485010(iSubEstimatePartRec@1100485001 : Record 11012153;VAR vEstimateLineRec@1100485000 : Record 11012154);
+    BEGIN
+      vEstimateLineRec.INIT;
+      vEstimateLineRec."Estimate No." := iSubEstimatePartRec."Estimate No.";
+      vEstimateLineRec."Sub-Estimate No." := iSubEstimatePartRec."Sub-Estimate No.";
+      vEstimateLineRec."Part Group" := iSubEstimatePartRec."Part Group";
+      vEstimateLineRec.Part := iSubEstimatePartRec.Part; //kan overschreven worden door waardes uit de excelsheet.
+    END;
+
+    PROCEDURE InsertEstimateLineRec@1100485005(iEstimateLineBufRec@1100485000 : Record 11012154);
+    VAR
+      lvSubEstimatePartRec@1100485001 : Record 11012153;
+    BEGIN
+      lvSubEstimatePartRec.GET(
+        iEstimateLineBufRec."Estimate No.",
+        iEstimateLineBufRec."Sub-Estimate No.",
+        iEstimateLineBufRec."Part Group",
+        iEstimateLineBufRec.Part);
+
+      EstimateLineRec.SETRECFILTER;
+      EstimateLineRec.SETRANGE("Line No.");
+      IF EstimateLineRec.FINDLAST THEN
+        iEstimateLineBufRec."Line No." := EstimateLineRec."Line No." + 10000
+      ELSE
+        iEstimateLineBufRec."Line No." := 10000;
+
+      EstimateLineRec.RESET;  //db, 26-01-10: M17936 (validate recipe)
+      EstimateLineRec := iEstimateLineBufRec;
+      EstimateLineRec.INIT;
+      EstimateLineRec.INSERT(TRUE);  //db, 26-01-10: M17936
+
+      IF iEstimateLineBufRec."Recipe Group" <> '' THEN
+        EstimateLineRec.VALIDATE("Recipe Group",iEstimateLineBufRec."Recipe Group");
+      IF iEstimateLineBufRec.Recipe <> '' THEN BEGIN
+        IF EstimateLineRec."Recipe Group" = '' THEN  //db, 17-03-10
+          EstimateLineRec."Recipe Group" := EstRec."Recipe Group";
+        EstimateLineRec.VALIDATE(Recipe,iEstimateLineBufRec.Recipe);
+      END;
+      IF iEstimateLineBufRec."Item No." <> '' THEN
+        EstimateLineRec.VALIDATE("Item No.",iEstimateLineBufRec."Item No.");
+      IF iEstimateLineBufRec.Manufacturer <> '' THEN
+        EstimateLineRec.VALIDATE(Manufacturer,iEstimateLineBufRec.Manufacturer);
+      IF iEstimateLineBufRec."Basic Item" <> '' THEN
+        EstimateLineRec.VALIDATE("Basic Item",iEstimateLineBufRec."Basic Item");
+      IF iEstimateLineBufRec."Vendor (Trade Item)" <> '' THEN
+        EstimateLineRec.VALIDATE("Vendor (Trade Item)",iEstimateLineBufRec."Vendor (Trade Item)");
+      IF iEstimateLineBufRec."Trade Item" <> '' THEN
+        EstimateLineRec.VALIDATE("Trade Item",iEstimateLineBufRec."Trade Item");
+      IF iEstimateLineBufRec."Cost Object Labor" <> '' THEN
+        EstimateLineRec.VALIDATE("Cost Object Labor",iEstimateLineBufRec."Cost Object Labor");
+      IF iEstimateLineBufRec."Cost Object Material" <> '' THEN
+        EstimateLineRec.VALIDATE("Cost Object Material",iEstimateLineBufRec."Cost Object Material");
+      IF iEstimateLineBufRec."Cost Object Subcontracting" <> '' THEN
+        EstimateLineRec.VALIDATE("Cost Object Subcontracting",iEstimateLineBufRec."Cost Object Subcontracting");
+      IF iEstimateLineBufRec."Cost Object Plant" <> '' THEN
+        EstimateLineRec.VALIDATE("Cost Object Plant",iEstimateLineBufRec."Cost Object Plant");
+      IF iEstimateLineBufRec.Code <> '' THEN
+        EstimateLineRec.VALIDATE(Code,iEstimateLineBufRec.Code);
+      IF iEstimateLineBufRec.Description <> '' THEN
+        EstimateLineRec.VALIDATE(Description,iEstimateLineBufRec.Description);
+      IF iEstimateLineBufRec.Length <> 0 THEN
+        EstimateLineRec.VALIDATE(Length,iEstimateLineBufRec.Length);
+      IF iEstimateLineBufRec.Width <> 0 THEN
+        EstimateLineRec.VALIDATE(Width,iEstimateLineBufRec.Width);
+      IF iEstimateLineBufRec.Height <> 0 THEN
+        EstimateLineRec.VALIDATE(Height,iEstimateLineBufRec.Height);
+      IF iEstimateLineBufRec.Quantity <> 0 THEN
+        EstimateLineRec.VALIDATE(Quantity,iEstimateLineBufRec.Quantity);
+      IF iEstimateLineBufRec."Unit of Measure" <> '' THEN
+        EstimateLineRec.VALIDATE("Unit of Measure",iEstimateLineBufRec."Unit of Measure");
+      IF iEstimateLineBufRec."Time Quantity" <> 0 THEN
+        EstimateLineRec.VALIDATE("Time Quantity",iEstimateLineBufRec."Time Quantity");
+      IF iEstimateLineBufRec."Unit of Time" <> '' THEN
+        EstimateLineRec.VALIDATE("Unit of Time",iEstimateLineBufRec."Unit of Time");
+      IF iEstimateLineBufRec."Line Status" <> '' THEN
+        EstimateLineRec.VALIDATE("Line Status",iEstimateLineBufRec."Line Status");
+      IF iEstimateLineBufRec."Surcharge Type" <> 0 THEN
+        EstimateLineRec.VALIDATE("Surcharge Type",iEstimateLineBufRec."Surcharge Type");
+      IF iEstimateLineBufRec."Surcharge %" <> 0 THEN
+        EstimateLineRec.VALIDATE("Surcharge %",iEstimateLineBufRec."Surcharge %");
+      IF iEstimateLineBufRec."Norm Group" <> '' THEN
+        EstimateLineRec.VALIDATE("Norm Group",iEstimateLineBufRec."Norm Group");
+      IF iEstimateLineBufRec."Sub Operation Code" <> '' THEN
+        EstimateLineRec.VALIDATE("Sub Operation Code",iEstimateLineBufRec."Sub Operation Code");
+      IF iEstimateLineBufRec."Rate Code" <> '' THEN
+        EstimateLineRec.VALIDATE("Rate Code",iEstimateLineBufRec."Rate Code");
+      IF iEstimateLineBufRec.Norm <> 0 THEN
+        EstimateLineRec.VALIDATE(Norm,iEstimateLineBufRec.Norm);
+      IF iEstimateLineBufRec."Gross Price" <> 0 THEN
+        EstimateLineRec.VALIDATE("Gross Price",iEstimateLineBufRec."Gross Price");
+      IF iEstimateLineBufRec."Discount %" <> 0 THEN
+        EstimateLineRec.VALIDATE("Discount %",iEstimateLineBufRec."Discount %");
+      IF iEstimateLineBufRec."Material Price" <> 0 THEN
+        EstimateLineRec.VALIDATE("Material Price",iEstimateLineBufRec."Material Price");
+      IF iEstimateLineBufRec."Subcontracting Price" <> 0 THEN
+        EstimateLineRec.VALIDATE("Subcontracting Price",iEstimateLineBufRec."Subcontracting Price");
+      IF iEstimateLineBufRec."Plant Price" <> 0 THEN
+        EstimateLineRec.VALIDATE("Plant Price",iEstimateLineBufRec."Plant Price");
+      IF iEstimateLineBufRec.Vendor <> '' THEN
+        EstimateLineRec.VALIDATE(Vendor,iEstimateLineBufRec.Vendor);
+      IF iEstimateLineBufRec."Project No." <> '' THEN
+        EstimateLineRec.VALIDATE("Project No.",iEstimateLineBufRec."Project No.");
+      IF iEstimateLineBufRec.Element <> '' THEN
+        EstimateLineRec.VALIDATE(Element,iEstimateLineBufRec.Element);
+      IF iEstimateLineBufRec."Project Planning Activity Code" <> '' THEN
+        EstimateLineRec.VALIDATE("Project Planning Activity Code",iEstimateLineBufRec."Project Planning Activity Code");
+      IF iEstimateLineBufRec."Sales Discount %" <> 0 THEN
+        EstimateLineRec.VALIDATE("Sales Discount %",iEstimateLineBufRec."Sales Discount %");    //SR, 02-12-13: C006722
+
+      EstimateLineRec.MODIFY(TRUE);    //db, 26-01-10: M17936
+    END;
+
+    PROCEDURE FillTmpXlMap@1100485007();
+    VAR
+      lvXlMapRec@1100485000 : Record 11020284;
+    BEGIN
+      IF TmpXlMapFilledBln THEN
+        EXIT;
+
+      IF lvXlMapRec.FINDSET THEN
+        REPEAT
+          TmpXlMapRec := lvXlMapRec;
+          TmpXlMapRec.INSERT;
+        UNTIL lvXlMapRec.NEXT = 0;
+      TmpXlMapFilledBln := TRUE;
+    END;
+
+    PROCEDURE CopyTemplateFile@1100485009(TempPathFile@1100485000 : Text[250];PathFile@1100485001 : Text[250]);
+    VAR
+      ExcelAutomation@1100528705 : Codeunit 11012402;
+    BEGIN
+      ExcelAutomation.InitExcel;
+      ExcelAutomation.OpenWorkbook(TempPathFile);
+      ExcelAutomation.SaveWorkbookAs(PathFile);
+      ExcelAutomation.CloseWorkbook;
+      ExcelAutomation.TermExcel;
+    END;
+
+    PROCEDURE CopyExcelFile@1100485011(FromSubEstimatePartRec@1100485000 : Record 11012153;ToSubEstimatePartRec@1100485001 : Record 11012153);
+    VAR
+      lvEstimateSetup@1100485002 : Record 11012150;
+      lvFieldmappingExcelEstimate@1100485003 : Record 11020284;
+      sp1@1100485004 : Integer;
+      sp2@1100485005 : Integer;
+      ServerFileName@1100525000 : Text;
+    BEGIN
+      lvEstimateSetup.GET;
+      TmpExcelBufferRec.RESET;
+      IF TmpExcelBufferRec.FIND('-') THEN
+        TmpExcelBufferRec.DELETEALL;
+      IF NOT FileMgt.ClientFileExists(GetPathFileName(FromSubEstimatePartRec)) THEN
+        EXIT;
+
+      IF FileMgt.ClientFileExists(GetPathFileName(ToSubEstimatePartRec)) THEN
+        FileMgt.DeleteClientFile4PS(GetPathFileName(ToSubEstimatePartRec), TRUE);
+
+      IF FromSubEstimatePartRec.Level = 0 THEN
+        EXIT;
+
+      ServerFileName := FileMgt.UploadFileSilent(GetPathFileName(FromSubEstimatePartRec));
+      TmpExcelBufferRec.OpenBook(ServerFileName,lvEstimateSetup."Worksheet Excel Estimates");
+      TmpExcelBufferRec.ReadSheet;
+      TmpExcelBufferRec.CloseBook;
+      IF FILE.ERASE(ServerFileName) THEN;
+
+      lvFieldmappingExcelEstimate.SETRANGE("Field No. OLD",50);
+      IF NOT lvFieldmappingExcelEstimate.FINDFIRST THEN
+        ERROR(Text004,EstimateLineRec.FIELDCAPTION(Part));
+
+      FromSubEstimatePartRec.CheckFormat(sp1,sp2);
+      TmpExcelBufferRec.SETFILTER("Row No.",'%1..',EstimateSetupRec."First Worksheet Data Line");
+      TmpExcelBufferRec.SETRANGE("Column No.",lvFieldmappingExcelEstimate."Column No.");
+      IF TmpExcelBufferRec.FIND('-') THEN
+        REPEAT
+          CASE FromSubEstimatePartRec.Level OF
+            1: BEGIN
+                TmpExcelBufferRec."Cell Value as Text" := COPYSTR(ToSubEstimatePartRec.Part,1,sp1-1) +
+                                                          COPYSTR(TmpExcelBufferRec."Cell Value as Text",sp1);
+              END;
+            2: BEGIN
+                TmpExcelBufferRec."Cell Value as Text" := COPYSTR(ToSubEstimatePartRec.Part,1,sp2-1) +
+                                                          COPYSTR(TmpExcelBufferRec."Cell Value as Text",sp2);
+              END;
+            3: BEGIN
+                TmpExcelBufferRec."Cell Value as Text" := ToSubEstimatePartRec.Part;
+              END;
+          END;
+          TmpExcelBufferRec.MODIFY;
+        UNTIL TmpExcelBufferRec.NEXT = 0;
+
+      ServerFileName := FileMgt.UploadFileSilent(GetPathFileName(FromSubEstimatePartRec));
+      TmpExcelBufferRec.UpdateBook(ServerFileName,lvEstimateSetup."Worksheet Excel Estimates");
+      TmpExcelBufferRec.WriteSheet('', '', '');
+      TmpExcelBufferRec.CloseBook;
+      TmpExcelBufferRec.MoveFileToClient(GetPathFileName(ToSubEstimatePartRec));
+    END;
+
+    PROCEDURE CheckEstimateLineInSheet@1100485012(iEstimateLineRec@1100485000 : Record 11012154;iSubEstimatePartRec@1100485001 : Record 11012153);
+    VAR
+      lvSubEstimatePartRec@1100485002 : Record 11012153;
+      lvPartRec@1100525000 : Record 11012169;
+    BEGIN
+      lvSubEstimatePartRec.SETRANGE("Estimate No.",iSubEstimatePartRec."Estimate No.");
+      lvSubEstimatePartRec.SETRANGE("Sub-Estimate No.",iSubEstimatePartRec."Sub-Estimate No.");
+      lvSubEstimatePartRec.SETRANGE("Part Group",iSubEstimatePartRec."Part Group");
+
+      CASE iSubEstimatePartRec.Level OF
+        //0: No Filters
+        1: lvSubEstimatePartRec.SETRANGE(Chapter,iSubEstimatePartRec.Chapter);
+        2: lvSubEstimatePartRec.SETRANGE(Paragraph,iSubEstimatePartRec.Paragraph);
+        3: lvSubEstimatePartRec.SETRANGE(Part,iSubEstimatePartRec.Part);
+      END;
+
+      lvSubEstimatePartRec.SETFILTER(Level,'>=%1',iSubEstimatePartRec.Level);
+      lvSubEstimatePartRec.FILTERGROUP(10);
+      lvSubEstimatePartRec.SETRANGE(Part,iEstimateLineRec.Part);
+      lvSubEstimatePartRec.FILTERGROUP(0);
+
+      IF NOT lvSubEstimatePartRec.FINDFIRST THEN BEGIN
+        IF lvPartRec.GET(iEstimateLineRec."Part Group", iEstimateLineRec.Part) THEN BEGIN  //db, 08-02-10
+          lvSubEstimatePartRec."Estimate No." := iSubEstimatePartRec."Estimate No.";
+          lvSubEstimatePartRec."Sub-Estimate No." := iSubEstimatePartRec."Sub-Estimate No.";
+          lvSubEstimatePartRec."Part Group" := lvPartRec."Part Group";
+          lvSubEstimatePartRec.VALIDATE(Part, lvPartRec.Code);
+          lvSubEstimatePartRec.INSERT;
+        END ELSE BEGIN
+          //db, 17-03-10: M18136
+          //ERROR(Text005,iSubEstimatePartRec.TABLECAPTION,iEstimateLineRec.Part,iSubEstimatePartRec.Part);
+          lvSubEstimatePartRec."Estimate No." := iSubEstimatePartRec."Estimate No.";
+          lvSubEstimatePartRec."Sub-Estimate No." := iSubEstimatePartRec."Sub-Estimate No.";
+          lvSubEstimatePartRec."Part Group" := EstRec."Part Group";
+          lvSubEstimatePartRec.VALIDATE(Part, iEstimateLineRec.Part);
+          IF iEstimateLineRec."Part Description" <> '' THEN
+            lvSubEstimatePartRec.Description := iEstimateLineRec."Part Description"
+          ELSE
+            lvSubEstimatePartRec.Description := iEstimateLineRec.Description;
+          lvSubEstimatePartRec.INSERT;
+        END;
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

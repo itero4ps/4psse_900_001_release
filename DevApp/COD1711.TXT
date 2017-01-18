@@ -1,0 +1,310 @@
+OBJECT Codeunit 1711 Positive Pay Export Mgt
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00;
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 1220=rimd,
+                TableData 1221=rimd,
+                TableData 1240=rimd,
+                TableData 1242=rimd;
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      LineType@1013 : 'Detail,Header,Footer';
+      FormatNotDefinedErr@1014 : TextConst '@@@="%1 = Data Exch. Def. Code";ENU=You must choose a valid export format for the bank account. Format %1 is not correctly defined.';
+      DataExchLineDefNotFoundErr@1015 : TextConst '@@@="%1=Data Exch. Def. Name;%2=Data Exch. Line Def. Code";ENU=The %1 export format does not support the Payment Type %2.';
+      IncorrectLengthOfValuesErr@1016 : TextConst '@@@="%1=Data Exch.Def Type;%2=Data Exch. Def Code;%3=Field;%4=Expected length;%5=Actual length;%6=Actual Value";ENU=The payment that you are trying to export is different from the specified %1, %2.\\The value in the %3 field does not have the length that is required by the export format. \Expected: %4 \Actual: %5 \Field Value: %6.';
+
+    PROCEDURE ExportDataExchToFlatFile@2(DataExchNo@1000 : Integer;Filename@1002 : Text;LineFileType@1011 : Integer;HeaderCount@1012 : Integer);
+    VAR
+      DataExchField@1006 : Record 1221;
+      DataExch@1009 : Record 1220;
+      TempBlob@1001 : Record 99008535;
+      ExportGenericFixedWidth@1008 : XMLport 1231;
+      ExportFile@1003 : File;
+      OutStream@1005 : OutStream;
+      InStream@1004 : InStream;
+      CRLF@1010 : Text;
+      Filename2@1007 : Text[250];
+    BEGIN
+      DataExchField.SETRANGE("Data Exch. No.",DataExchNo);
+      IF DataExchField.COUNT > 0 THEN BEGIN
+        ExportFile.WRITEMODE := TRUE;
+        ExportFile.TEXTMODE := TRUE;
+        IF EXISTS(Filename) AND ((LineFileType <> LineType::Header) OR ((LineFileType = LineType::Header) AND (HeaderCount > 1))) THEN
+          ExportFile.OPEN(Filename)
+        ELSE
+          ExportFile.CREATE(Filename);
+
+        // Copy current file contents to TempBlob
+        ExportFile.CREATEINSTREAM(InStream);
+        TempBlob.Blob.CREATEOUTSTREAM(OutStream);
+        COPYSTREAM(OutStream,InStream);
+
+        ExportFile.CLOSE;
+        ExportFile.CREATE(Filename);
+        TempBlob.Blob.CREATEINSTREAM(InStream);
+
+        // Copy current tempblob to newly-instantiated file
+        ExportFile.CREATEOUTSTREAM(OutStream);
+        COPYSTREAM(OutStream,InStream);
+
+        IF (LineFileType <> LineType::Header) OR ((LineFileType = LineType::Header) AND (HeaderCount > 1)) THEN BEGIN
+          // Only the first line needs to not write a CRLF.
+          CRLF[1] := 13;
+          CRLF[2] := 10;
+          OutStream.WRITE(CRLF[1]);
+          OutStream.WRITE(CRLF[2]);
+        END;
+
+        IF LineFileType = LineType::Footer THEN BEGIN
+          Filename2 := COPYSTR(Filename,1,250);
+
+          DataExch.GET(DataExchNo);
+          DataExch."File Name" := Filename2;
+          DataExch."File Content" := TempBlob.Blob;
+          DataExch.MODIFY;
+        END;
+
+        // Now copy current file contents to table, also.
+        ExportGenericFixedWidth.SETDESTINATION(OutStream);
+        ExportGenericFixedWidth.SETTABLEVIEW(DataExchField);
+        ExportGenericFixedWidth.EXPORT;
+        ExportFile.CLOSE;
+
+        DataExchField.DELETEALL(TRUE);
+      END;
+    END;
+
+    PROCEDURE InsertDataExchLineForFlatFile@9(VAR DataExch@1000 : Record 1220;LineNo@1005 : Integer;RecRef@1006 : RecordRef);
+    VAR
+      DataExchMapping@1001 : Record 1224;
+      TableID@1008 : Integer;
+    BEGIN
+      DataExchMapping.INIT;
+      DataExchMapping.SETRANGE("Data Exch. Def Code",DataExch."Data Exch. Def Code");
+      DataExchMapping.SETRANGE("Data Exch. Line Def Code",DataExch."Data Exch. Line Def Code");
+      IF DataExchMapping.FINDFIRST THEN BEGIN
+        TableID := DataExchMapping."Table ID";
+        ProcessColumnMapping(DataExch,RecRef,LineNo,TableID);
+      END;
+    END;
+
+    LOCAL PROCEDURE ProcessColumnMapping@11(VAR DataExch@1004 : Record 1220;RecRef@1006 : RecordRef;LineNo@1017 : Integer;TableID@1005 : Integer);
+    VAR
+      DataExchDef@1023 : Record 1222;
+      DataExchColumnDef@1001 : Record 1223;
+      DataExchField@1009 : Record 1221;
+      DataExchFieldMapping@1010 : Record 1225;
+      ValueAsDestType@1007 : Variant;
+      FieldRef@1002 : FieldRef;
+      ValueAsString@1000 : Text[250];
+    BEGIN
+      IF NOT DataExchDef.GET(DataExch."Data Exch. Def Code") THEN
+        ERROR(FormatNotDefinedErr,DataExch."Data Exch. Def Code");
+
+      PrepopulateColumns(DataExchDef,DataExch."Data Exch. Line Def Code",DataExch."Entry No.",LineNo);
+
+      DataExchFieldMapping.SETRANGE("Data Exch. Def Code",DataExchDef.Code);
+      DataExchFieldMapping.SETRANGE("Data Exch. Line Def Code",DataExch."Data Exch. Line Def Code");
+      DataExchFieldMapping.SETRANGE("Table ID",TableID);
+      DataExchFieldMapping.FINDSET;
+      REPEAT
+        DataExchColumnDef.GET(DataExchDef.Code,DataExch."Data Exch. Line Def Code",DataExchFieldMapping."Column No.");
+        IF DataExchFieldMapping."Use Default Value" THEN
+          ValueAsString := DataExchFieldMapping."Default Value"
+        ELSE BEGIN
+          FieldRef := RecRef.FIELD(DataExchFieldMapping."Field ID");
+
+          IF FORMAT(FieldRef.CLASS) = 'FlowField' THEN
+            FieldRef.CALCFIELD;
+          CheckOptional(DataExchFieldMapping.Optional,FieldRef);
+          CastToDestinationType(ValueAsDestType,FieldRef.VALUE,DataExchColumnDef,DataExchFieldMapping.Multiplier);
+          ValueAsString := FormatToText(ValueAsDestType,DataExchDef,DataExchColumnDef);
+        END;
+        IF DataExchColumnDef."Data Type" <> DataExchColumnDef."Data Type"::Decimal THEN
+          CheckLength(ValueAsString,RecRef.FIELD(DataExchFieldMapping."Field ID"),DataExchDef,DataExchColumnDef);
+
+        DataExchField.GET(DataExch."Entry No.",LineNo,DataExchFieldMapping."Column No.");
+        DataExchField.Value := ValueAsString;
+        DataExchField.MODIFY;
+      UNTIL DataExchFieldMapping.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE PrepopulateColumns@39(DataExchDef@1000 : Record 1222;DataExchLineDefCode@1001 : Code[20];DataExchEntryNo@1004 : Integer;DataExchLineNo@1005 : Integer);
+    VAR
+      DataExchField@1002 : Record 1221;
+      DataExchLineDef@1007 : Record 1227;
+      DataExchColumnDef@1003 : Record 1223;
+      ColumnIndex@1006 : Integer;
+    BEGIN
+      IF DataExchDef."File Type" IN [DataExchDef."File Type"::"Fixed Text",DataExchDef."File Type"::Xml] THEN BEGIN
+        DataExchColumnDef.SETRANGE("Data Exch. Def Code",DataExchDef.Code);
+        DataExchColumnDef.SETRANGE("Data Exch. Line Def Code",DataExchLineDefCode);
+        IF NOT DataExchColumnDef.FINDSET THEN
+          ERROR(DataExchLineDefNotFoundErr,DataExchDef.Name,DataExchLineDefCode);
+        REPEAT
+          DataExchField.InsertRec(
+            DataExchEntryNo,DataExchLineNo,DataExchColumnDef."Column No.",
+            PADSTR(DataExchColumnDef.Constant,DataExchColumnDef.Length),DataExchLineDefCode)
+        UNTIL DataExchColumnDef.NEXT = 0;
+      END ELSE BEGIN
+        IF NOT DataExchLineDef.GET(DataExchDef.Code,DataExchLineDefCode) THEN
+          ERROR(DataExchLineDefNotFoundErr,DataExchDef.Name,DataExchLineDefCode);
+        FOR ColumnIndex := 1 TO DataExchLineDef."Column Count" DO
+          IF DataExchColumnDef.GET(DataExchDef.Code,DataExchLineDef.Code,ColumnIndex) THEN
+            DataExchField.InsertRec(
+              DataExchEntryNo,DataExchLineNo,ColumnIndex,DataExchColumnDef.Constant,DataExchLineDefCode)
+          ELSE
+            DataExchField.InsertRec(DataExchEntryNo,DataExchLineNo,ColumnIndex,'',DataExchLineDefCode);
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckOptional@6(Optional@1000 : Boolean;FieldRef@1001 : FieldRef);
+    VAR
+      Value@1002 : Variant;
+      StringValue@1003 : Text;
+    BEGIN
+      IF Optional THEN
+        EXIT;
+
+      Value := FieldRef.VALUE;
+      StringValue := FORMAT(Value);
+
+      IF ((Value.ISDECIMAL OR Value.ISINTEGER OR Value.ISBIGINTEGER) AND (StringValue = '0')) OR
+         (StringValue = '')
+      THEN
+        FieldRef.TESTFIELD
+    END;
+
+    LOCAL PROCEDURE CastToDestinationType@44(VAR DestinationValue@1004 : Variant;SourceValue@1005 : Variant;DataExchColumnDef@1003 : Record 1223;Multiplier@1001 : Decimal);
+    VAR
+      ValueAsDecimal@1002 : Decimal;
+      ValueAsDate@1000 : Date;
+      ValueAsDateTime@1006 : DateTime;
+    BEGIN
+      WITH DataExchColumnDef DO
+        CASE "Data Type" OF
+          "Data Type"::Decimal:
+            BEGIN
+              IF FORMAT(SourceValue) = '' THEN
+                ValueAsDecimal := 0
+              ELSE
+                EVALUATE(ValueAsDecimal,FORMAT(SourceValue));
+              DestinationValue := Multiplier * ValueAsDecimal;
+            END;
+          "Data Type"::Text:
+            DestinationValue := FORMAT(SourceValue);
+          "Data Type"::Date:
+            BEGIN
+              EVALUATE(ValueAsDate,FORMAT(SourceValue));
+              DestinationValue := ValueAsDate;
+            END;
+          "Data Type"::DateTime:
+            BEGIN
+              EVALUATE(ValueAsDateTime,FORMAT(SourceValue,0,9),9);
+              DestinationValue := ValueAsDateTime;
+            END;
+        END;
+    END;
+
+    LOCAL PROCEDURE FormatToText@7(ValueToFormat@1003 : Variant;DataExchDef@1001 : Record 1222;DataExchColumnDef@1000 : Record 1223) : Text[250];
+    VAR
+      StringConversionManagement@1004 : Codeunit 47;
+      NewString@1002 : Text[250];
+    BEGIN
+      IF DataExchColumnDef."Data Format" <> '' THEN
+        EXIT(FORMAT(ValueToFormat,0,DataExchColumnDef."Data Format"));
+
+      IF DataExchDef."File Type" = DataExchDef."File Type"::Xml THEN
+        EXIT(FORMAT(ValueToFormat,0,9));
+
+      IF (DataExchDef."File Type" = DataExchDef."File Type"::"Fixed Text") AND
+         (DataExchColumnDef."Data Type" = DataExchColumnDef."Data Type"::Text)
+      THEN BEGIN
+        IF DataExchColumnDef."Text Padding Required" AND (DataExchColumnDef."Pad Character" <> '') THEN BEGIN
+          NewString :=
+            StringConversionManagement.GetPaddedString(
+              ValueToFormat,
+              DataExchColumnDef.Length,
+              DataExchColumnDef."Pad Character");
+          EXIT(FORMAT(NewString,0,STRSUBSTNO('<Text,%1>',DataExchColumnDef.Length)));
+        END;
+        EXIT(FORMAT(ValueToFormat,0,STRSUBSTNO('<Text,%1>',DataExchColumnDef.Length)));
+      END;
+
+      IF (DataExchColumnDef."Data Type" = DataExchColumnDef."Data Type"::Decimal) AND
+         DataExchColumnDef."Text Padding Required" AND (DataExchColumnDef."Pad Character" <> '')
+      THEN BEGIN
+        NewString :=
+          StringConversionManagement.RemoveDecimalFromString(
+            FORMAT(ValueToFormat),
+            DataExchColumnDef.Length,
+            DataExchColumnDef."Pad Character");
+        EXIT(NewString);
+      END;
+      EXIT(FORMAT(ValueToFormat));
+    END;
+
+    LOCAL PROCEDURE CheckLength@49(Value@1001 : Text;FieldRef@1002 : FieldRef;DataExchDef@1003 : Record 1222;DataExchColumnDef@1000 : Record 1223);
+    VAR
+      DataExchDefCode@1004 : Code[20];
+    BEGIN
+      DataExchDefCode := DataExchColumnDef."Data Exch. Def Code";
+
+      IF (DataExchColumnDef.Length > 0) AND (STRLEN(Value) > DataExchColumnDef.Length) THEN
+        ERROR(IncorrectLengthOfValuesErr,GetType(DataExchDefCode),DataExchDefCode,
+          FieldRef.CAPTION,DataExchColumnDef.Length,STRLEN(Value),Value);
+
+      IF (DataExchDef."File Type" = DataExchDef."File Type"::"Fixed Text") AND
+         (STRLEN(Value) <> DataExchColumnDef.Length)
+      THEN
+        ERROR(IncorrectLengthOfValuesErr,GetType(DataExchDefCode),DataExchDefCode,FieldRef.CAPTION,
+          DataExchColumnDef.Length,STRLEN(Value),Value);
+    END;
+
+    LOCAL PROCEDURE GetType@8(DataExchDefCode@1000 : Code[20]) : Text;
+    VAR
+      DataExchDef@1001 : Record 1222;
+    BEGIN
+      DataExchDef.GET(DataExchDefCode);
+      EXIT(FORMAT(DataExchDef.Type));
+    END;
+
+    PROCEDURE PreparePosPayHeader@3(DataExch@1000 : Record 1220;BankAccountNo@1001 : Text[30]);
+    VAR
+      PosPayHeader@1002 : Record 1240;
+    BEGIN
+      PosPayHeader.INIT;
+      PosPayHeader."Data Exch. Entry No." := DataExch."Entry No.";
+      PosPayHeader."Company Name" := COMPANYNAME;
+      PosPayHeader."Account Number" := BankAccountNo;
+      PosPayHeader."Date of File" := TODAY;
+      PosPayHeader.INSERT;
+    END;
+
+    PROCEDURE PreparePosPayFooter@4(DataExch@1000 : Record 1220;DataExchDetalEntryNo@1001 : Integer;BankAccountNo@1002 : Text[30]);
+    VAR
+      PosPayFooter@1003 : Record 1242;
+    BEGIN
+      PosPayFooter.INIT;
+      PosPayFooter."Data Exch. Entry No." := DataExch."Entry No.";
+      PosPayFooter."Data Exch. Detail Entry No." := DataExchDetalEntryNo;
+      PosPayFooter."Account Number" := BankAccountNo;
+      PosPayFooter.INSERT;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

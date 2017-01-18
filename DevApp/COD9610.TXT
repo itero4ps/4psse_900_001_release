@@ -1,0 +1,1178 @@
+OBJECT Codeunit 9610 XSD Parser
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      TempAllXMLSchemaElement@1012 : TEMPORARY Record 9610;
+      TempStackXMLSchemaElement@1009 : TEMPORARY Record 9610;
+      TempXMLSchemaRestriction@1006 : TEMPORARY Record 9611;
+      XMLDOMManagement@1008 : Codeunit 6224;
+      CouldNotFindAllSchemasMsg@1005 : TextConst 'ENU=Some required schemas are missing.\\Load the schemas one by one to include the required schemas.';
+      GenerateDefinitionAgainQst@1007 : TextConst 'ENU=Do you want to generate the XML schema elements again?';
+      OverrideExistingDataExchangeDefQst@1010 : TextConst 'ENU=A data exchange definition already exists. Do you want to replace the existing data exchange definition?';
+      SEPACAMTDataLineTagTok@1004 : TextConst '@@@={Locked};ENU=/Document/BkToCstmrStmt/Stmt/Ntry';
+      ReferenceElementTypeTok@1011 : TextConst '@@@={Locked};ENU=Reference';
+      ExtensionElementTypeTok@1000 : TextConst '@@@={Locked};ENU=Extension';
+      CouldNotFindRelatedSchema@1003 : Boolean;
+
+    PROCEDURE LoadSchema@1(VAR XMLSchema@1003 : Record 9600);
+    BEGIN
+      IF XMLSchema.Indentation = 0 THEN
+        GenerateMainSchemaDefinition(XMLSchema)
+      ELSE
+        LoadDependentSchemaSeparately(XMLSchema);
+    END;
+
+    LOCAL PROCEDURE GenerateMainSchemaDefinition@41(VAR XMLSchema@1000 : Record 9600);
+    VAR
+      XMLSchemaElement@1003 : Record 9610;
+      DefinitionXMLSchema@1008 : Record 9600;
+      NamespaceMgr@1002 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNamespaceManager";
+      Schema@1001 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      SchemaPrefix@1005 : Text;
+      CurrentID@1006 : Integer;
+    BEGIN
+      LoadSchemaXML(XMLSchema,NamespaceMgr,Schema,SchemaPrefix);
+
+      DefinitionXMLSchema.COPY(XMLSchema);
+      DefinitionXMLSchema.Code := STRSUBSTNO('%1:1000',XMLSchema.Code);
+      DefinitionXMLSchema.Indentation := 1;
+      DefinitionXMLSchema.INSERT;
+
+      ParseSchemaReferences(NamespaceMgr,XMLSchema,Schema,SchemaPrefix);
+
+      CurrentID := 1;
+      CLEAR(XMLSchemaElement);
+      ParseChildXMLNodes(Schema.DocumentElement,SchemaPrefix,XMLSchemaElement,DefinitionXMLSchema,NamespaceMgr,0,CurrentID);
+
+      InitializeTempBuffers(XMLSchema);
+      ExpandDefinitions(XMLSchema);
+      UpdateXMLSchemaElementProperties(XMLSchema);
+
+      IF CouldNotFindRelatedSchema THEN
+        MESSAGE(CouldNotFindAllSchemasMsg)
+    END;
+
+    LOCAL PROCEDURE LoadSchemaXML@43(VAR XMLSchema@1000 : Record 9600;VAR NamespaceMgr@1005 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNamespaceManager";VAR Schema@1004 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";VAR SchemaPrefix@1003 : Text);
+    VAR
+      InStr@1001 : InStream;
+    BEGIN
+      XMLSchema.TESTFIELD(Code);
+      XMLSchema.CALCFIELDS(XSD);
+      XMLSchema.TESTFIELD(XSD);
+      XMLSchema.XSD.CREATEINSTREAM(InStr);
+
+      Schema := Schema.XmlDocument;
+      Schema.Load(InStr);
+
+      NamespaceMgr := NamespaceMgr.XmlNamespaceManager(Schema.XmlDocument.NameTable);
+      PopulateNamespaceManager(NamespaceMgr,Schema.DocumentElement,XMLSchema."Target Namespace",SchemaPrefix);
+      UpdateTargetNamespaceAliases(XMLSchema,NamespaceMgr);
+    END;
+
+    PROCEDURE ExtendSelectedElement@55(VAR XMLSchemaElement@1000 : Record 9610);
+    VAR
+      ChildXMLSchemaElement@1005 : Record 9610;
+      TempCurrentXMLSchemaElement@1004 : TEMPORARY Record 9610;
+      LastXMLSchemaElement@1006 : Record 9610;
+      XMLSchema@1003 : Record 9600;
+      CurrentID@1001 : Integer;
+      SchemaPrefix@1002 : Text;
+    BEGIN
+      IF (XMLSchemaElement."Defintion XML Schema Code" = '') OR (XMLSchemaElement."Definition XML Schema ID" = 0) THEN
+        EXIT;
+
+      XMLSchema.GET(XMLSchemaElement."XML Schema Code");
+      InitializeTempBuffers(XMLSchema);
+      TempAllXMLSchemaElement.SETRANGE("XML Schema Code",XMLSchemaElement."Defintion XML Schema Code");
+      TempAllXMLSchemaElement.SETRANGE(ID,XMLSchemaElement."Definition XML Schema ID");
+      TempAllXMLSchemaElement.FINDFIRST;
+
+      TempCurrentXMLSchemaElement.COPY(TempAllXMLSchemaElement);
+      TempCurrentXMLSchemaElement.INSERT;
+
+      SchemaPrefix := '';
+
+      LastXMLSchemaElement.SETRANGE("XML Schema Code",XMLSchema.Code);
+      LastXMLSchemaElement.FINDLAST;
+      CurrentID := LastXMLSchemaElement.ID + 1;
+
+      ExtendElementDefinitionType(TempCurrentXMLSchemaElement,XMLSchemaElement,0,XMLSchema,CurrentID,SchemaPrefix);
+
+      ChildXMLSchemaElement.SETRANGE("XML Schema Code",XMLSchema.Code);
+      ChildXMLSchemaElement.SETRANGE("Parent ID",XMLSchemaElement.ID);
+      IF ChildXMLSchemaElement.FINDSET THEN
+        REPEAT
+          UpdateSelectedProperty(ChildXMLSchemaElement,XMLSchemaElement."Sort Key",XMLSchema);
+        UNTIL ChildXMLSchemaElement.NEXT = 0;
+
+      XMLSchemaElement."Defintion XML Schema Code" := '';
+      XMLSchemaElement."Definition XML Schema ID" := 0;
+      XMLSchemaElement.MODIFY;
+    END;
+
+    LOCAL PROCEDURE LoadDependentSchemaDefinition@40(VAR XMLSchema@1000 : Record 9600);
+    VAR
+      XMLSchemaElement@1005 : Record 9610;
+      NamespaceMgr@1004 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNamespaceManager";
+      Schema@1003 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      SchemaPrefix@1002 : Text;
+      CurrentID@1001 : Integer;
+    BEGIN
+      LoadSchemaXML(XMLSchema,NamespaceMgr,Schema,SchemaPrefix);
+      ParseSchemaReferences(NamespaceMgr,XMLSchema,Schema,SchemaPrefix);
+
+      CurrentID := 1;
+
+      CLEAR(XMLSchemaElement);
+      ParseChildXMLNodes(Schema.DocumentElement,SchemaPrefix,XMLSchemaElement,XMLSchema,NamespaceMgr,0,CurrentID);
+    END;
+
+    LOCAL PROCEDURE ExpandDefinitions@10(XMLSchema@1004 : Record 9600);
+    VAR
+      TempRootXMLSchemaElement@1000 : TEMPORARY Record 9610;
+      ParentXMLSchemaElement@1002 : Record 9610;
+      CurrentID@1001 : Integer;
+    BEGIN
+      TempRootXMLSchemaElement.COPY(TempAllXMLSchemaElement,TRUE);
+      TempRootXMLSchemaElement.SETRANGE("Parent ID",0);
+      TempRootXMLSchemaElement.SETRANGE("XML Schema Code",XMLSchema.Code);
+      TempRootXMLSchemaElement.SETRANGE("Node Type",TempRootXMLSchemaElement."Node Type"::Element);
+
+      CurrentID := 1;
+      IF NOT TempRootXMLSchemaElement.FINDSET THEN
+        EXIT;
+
+      REPEAT
+        CLEAR(ParentXMLSchemaElement);
+        ParentXMLSchemaElement.Indentation := -1;
+        ExtendElementDefinition(TempRootXMLSchemaElement,ParentXMLSchemaElement,0,XMLSchema,CurrentID,'');
+      UNTIL TempRootXMLSchemaElement.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE ImportFile@34(VAR CurrentXMLSchema@1000 : Record 9600;FilePath@1004 : Text) : Boolean;
+    VAR
+      OutStream@1003 : OutStream;
+      InStream@1002 : InStream;
+      File@1001 : File;
+    BEGIN
+      IF NOT File.OPEN(FilePath) THEN
+        EXIT(FALSE);
+
+      File.CREATEINSTREAM(InStream);
+      CurrentXMLSchema.XSD.CREATEOUTSTREAM(OutStream);
+      COPYSTREAM(OutStream,InStream);
+
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE PopulateNamespaceManager@20(VAR NamespaceMgr@1005 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNamespaceManager";XmlNode@1000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";VAR TargetNamespace@1006 : Text;VAR SchemaPrefix@1001 : Text);
+    VAR
+      Attribute@1002 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlAttribute";
+      Prefix@1004 : Text;
+    BEGIN
+      IF NOT ISNULL(XmlNode) THEN
+        FOREACH Attribute IN XmlNode.Attributes DO BEGIN
+          IF STRPOS(Attribute.Name,'xmlns') = 1 THEN
+            IF STRPOS(Attribute.Name,':') > 0 THEN BEGIN
+              Prefix := COPYSTR(Attribute.Name,STRPOS(Attribute.Name,':') + 1);
+              NamespaceMgr.AddNamespace(Prefix,Attribute.Value);
+              IF Attribute.Value = 'http://www.w3.org/2001/XMLSchema' THEN
+                SchemaPrefix := Prefix;
+            END ELSE
+              IF Attribute.Value = 'http://www.w3.org/2001/XMLSchema' THEN BEGIN
+                SchemaPrefix := 'unamedXSDSchemaNamespace';
+                NamespaceMgr.AddNamespace(SchemaPrefix,Attribute.Value);
+              END;
+
+          IF STRPOS(Attribute.Name,'targetNamespace') = 1 THEN
+            TargetNamespace := COPYSTR(Attribute.Value,1,MAXSTRLEN(TargetNamespace));
+        END;
+    END;
+
+    LOCAL PROCEDURE UpdateTargetNamespaceAliases@46(VAR XMLSchema@1000 : Record 9600;NamespaceMgr@1002 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNamespaceManager");
+    VAR
+      Prefix@1001 : Text;
+    BEGIN
+      FOREACH Prefix IN NamespaceMgr DO BEGIN
+        IF NamespaceMgr.LookupNamespace(Prefix) = XMLSchema."Target Namespace" THEN
+          IF XMLSchema."Target Namespace Aliases" = '' THEN
+            XMLSchema."Target Namespace Aliases" := COPYSTR(Prefix,1,MAXSTRLEN(XMLSchema."Target Namespace Aliases"))
+          ELSE
+            XMLSchema."Target Namespace Aliases" += COPYSTR(' ' + Prefix,1,MAXSTRLEN(XMLSchema."Target Namespace Aliases"));
+        XMLSchema.MODIFY;
+      END;
+    END;
+
+    LOCAL PROCEDURE ParseSchemaReferences@4(NamespaceMgr@1001 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNamespaceManager";XMLSchema@1002 : Record 9600;Schema@1003 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";SchemaPrefix@1004 : Text);
+    BEGIN
+      ParseSchemaReferenceDefinition(STRSUBSTNO('./%1:include',SchemaPrefix),NamespaceMgr,XMLSchema,Schema);
+      ParseSchemaReferenceDefinition(STRSUBSTNO('./%1:import',SchemaPrefix),NamespaceMgr,XMLSchema,Schema);
+    END;
+
+    LOCAL PROCEDURE ParseSchemaReferenceDefinition@24(XPath@1001 : Text;NamespaceMgr@1015 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNamespaceManager";XMLSchema@1016 : Record 9600;Schema@1017 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument");
+    VAR
+      ImportXMLSchema@1006 : Record 9600;
+      ExistingXMLSchema@1005 : Record 9600;
+      LastXMLSchema@1014 : Record 9600;
+      ReferencedXMLSchema@1013 : Record 9612;
+      FileManagement@1007 : Codeunit 419;
+      XmlNodeList@1000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+      XmlNode@1004 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      SchemaLocation@1003 : Text;
+      DefinitionFileFound@1010 : Boolean;
+      NameSpacePrefix@1011 : Text;
+      TopElementCode@1012 : Text;
+    BEGIN
+      IF NOT XMLDOMManagement.FindNodesWithNamespaceManager(Schema.DocumentElement,XPath,NamespaceMgr,XmlNodeList) THEN
+        EXIT;
+
+      FOREACH XmlNode IN XmlNodeList DO BEGIN
+        SchemaLocation := GetSchemaLocation(XmlNode,XMLSchema);
+        TopElementCode := XMLSchema.GetTopSchemaCode(XMLSchema);
+
+        ExistingXMLSchema.SETRANGE(Path,SchemaLocation);
+        ExistingXMLSchema.SETFILTER(Code,STRSUBSTNO('%1*',TopElementCode));
+
+        IF NOT ExistingXMLSchema.FINDFIRST THEN BEGIN
+          ImportXMLSchema.INIT;
+          ImportXMLSchema.Path := COPYSTR(SchemaLocation,1,MAXSTRLEN(ImportXMLSchema.Path));
+          ImportXMLSchema."Target Namespace" := GetAttribute('namespace',XmlNode);
+
+          // Include takes parents root namespace
+          IF (ImportXMLSchema."Target Namespace" = '') AND (STRPOS(XPath,'include') > 0) THEN
+            ImportXMLSchema."Target Namespace" := XMLSchema."Target Namespace";
+
+          LastXMLSchema.SETFILTER(Code,STRSUBSTNO('%1:*',TopElementCode));
+          LastXMLSchema.FINDLAST;
+          ImportXMLSchema.Code := INCSTR(LastXMLSchema.Code);
+
+          ImportXMLSchema.Indentation := 2;
+          ImportXMLSchema.Description := COPYSTR(FileManagement.GetFileName(SchemaLocation),1,MAXSTRLEN(ImportXMLSchema.Description));
+
+          DefinitionFileFound := ImportFile(ImportXMLSchema,SchemaLocation);
+          ImportXMLSchema.INSERT;
+          IF DefinitionFileFound THEN
+            LoadDependentSchemaDefinition(ImportXMLSchema)
+          ELSE
+            CouldNotFindRelatedSchema := TRUE;
+        END ELSE
+          ImportXMLSchema := ExistingXMLSchema;
+
+        NameSpacePrefix := NamespaceMgr.LookupPrefix(ImportXMLSchema."Target Namespace");
+        ReferencedXMLSchema.INIT;
+        ReferencedXMLSchema.Code := XMLSchema.Code;
+        ReferencedXMLSchema."Referenced Schema Code" := ImportXMLSchema.Code;
+        ReferencedXMLSchema."Referenced Schema Namespace" :=
+          COPYSTR(NameSpacePrefix,1,MAXSTRLEN(ReferencedXMLSchema."Referenced Schema Namespace"));
+        IF ReferencedXMLSchema.INSERT(TRUE) THEN;
+      END;
+    END;
+
+    LOCAL PROCEDURE ParseChildXMLNodes@68(CurrentXMLNode@1000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";SchemaPrefix@1003 : Text;VAR ParentXMLSchemaElement@1004 : Record 9610;XMLSchema@1006 : Record 9600;NamespaceMgr@1007 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNamespaceManager";NestingLevel@1008 : Integer;VAR CurrentID@1009 : Integer);
+    VAR
+      XMLNode@1001 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+    BEGIN
+      IF CurrentXMLNode.HasChildNodes THEN
+        FOREACH XMLNode IN CurrentXMLNode.ChildNodes DO
+          ParseXMLNode(XMLNode,SchemaPrefix,ParentXMLSchemaElement,XMLSchema,NamespaceMgr,NestingLevel,CurrentID);
+    END;
+
+    LOCAL PROCEDURE ParseXMLNode@39(CurrentXMLNode@1000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";SchemaPrefix@1003 : Text;VAR ParentXMLSchemaElement@1004 : Record 9610;XMLSchema@1006 : Record 9600;NamespaceMgr@1007 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNamespaceManager";NestingLevel@1008 : Integer;VAR CurrentID@1009 : Integer);
+    VAR
+      LastXMLSchemaElement@1001 : Record 9610;
+      XMLNodeType@1002 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeType";
+    BEGIN
+      IF CurrentXMLNode.NodeType.Equals(XMLNodeType.Element) THEN
+        CASE CurrentXMLNode.Name OF
+          STRSUBSTNO('%1:element',SchemaPrefix),
+          STRSUBSTNO('%1:group',SchemaPrefix),
+          STRSUBSTNO('%1:extension',SchemaPrefix):
+            BEGIN
+              InsertElementDefinition(
+                LastXMLSchemaElement,CurrentXMLNode,ParentXMLSchemaElement.ID,XMLSchema,SchemaPrefix,CurrentID);
+              ParseChildXMLNodes(CurrentXMLNode,SchemaPrefix,LastXMLSchemaElement,XMLSchema,NamespaceMgr,NestingLevel + 1,CurrentID);
+            END;
+          STRSUBSTNO('%1:attribute',SchemaPrefix):
+            BEGIN
+              InsertAttributeDefinition(
+                LastXMLSchemaElement,CurrentXMLNode,ParentXMLSchemaElement.ID,XMLSchema,CurrentID);
+              ParseChildXMLNodes(CurrentXMLNode,SchemaPrefix,LastXMLSchemaElement,XMLSchema,NamespaceMgr,NestingLevel + 1,CurrentID);
+            END;
+          STRSUBSTNO('%1:complexType',SchemaPrefix),
+          STRSUBSTNO('%1:simpleType',SchemaPrefix):
+            IF NestingLevel = 0 THEN BEGIN
+              InsertElementDefinition(
+                LastXMLSchemaElement,CurrentXMLNode,ParentXMLSchemaElement.ID,XMLSchema,SchemaPrefix,CurrentID);
+              ParseChildXMLNodes(CurrentXMLNode,SchemaPrefix,LastXMLSchemaElement,XMLSchema,NamespaceMgr,NestingLevel + 1,CurrentID);
+            END ELSE
+              ParseChildXMLNodes(CurrentXMLNode,SchemaPrefix,ParentXMLSchemaElement,XMLSchema,NamespaceMgr,NestingLevel + 1,CurrentID);
+          STRSUBSTNO('%1:restriction',SchemaPrefix):
+            ParseRestrictions(CurrentXMLNode,ParentXMLSchemaElement,NamespaceMgr,XMLSchema,SchemaPrefix);
+          STRSUBSTNO('%1:annotation',SchemaPrefix):
+            EXIT;
+          ELSE
+            ParseChildXMLNodes(CurrentXMLNode,SchemaPrefix,ParentXMLSchemaElement,XMLSchema,NamespaceMgr,NestingLevel + 1,CurrentID);
+        END;
+    END;
+
+    LOCAL PROCEDURE ParseRestrictions@26(CurrentXmlNode@1003 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";VAR TempXMLSchemaElement@1001 : TEMPORARY Record 9610;NamespaceMgr@1004 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNamespaceManager";XMLSchema@1007 : Record 9600;SchemaPrefix@1008 : Text);
+    VAR
+      XMLSchemaRestriction@1000 : Record 9611;
+      LastIndex@1002 : Integer;
+    BEGIN
+      XMLSchemaRestriction.SETRANGE("XML Schema Code",XMLSchema.Code);
+      XMLSchemaRestriction.SETRANGE("Element ID",TempXMLSchemaElement.ID);
+      IF XMLSchemaRestriction.FINDLAST THEN
+        LastIndex := XMLSchemaRestriction.ID + 1
+      ELSE
+        LastIndex := 1;
+
+      XMLSchemaRestriction.INIT;
+      XMLSchemaRestriction."XML Schema Code" := XMLSchema.Code;
+      XMLSchemaRestriction."Element ID" := TempXMLSchemaElement.ID;
+      XMLSchemaRestriction.ID := LastIndex;
+      LastIndex += 1;
+      XMLSchemaRestriction.Value := GetAttribute('base',CurrentXmlNode);
+      XMLSchemaRestriction.Type := XMLSchemaRestriction.Type::Base;
+      XMLSchemaRestriction.INSERT;
+
+      ParseRestrictionDefinitions(
+        TempXMLSchemaElement.ID,STRSUBSTNO('./%1:enumeration',SchemaPrefix),CurrentXmlNode,NamespaceMgr,XMLSchema,LastIndex);
+      ParseRestrictionDefinitions(
+        TempXMLSchemaElement.ID,STRSUBSTNO('./%1:pattern',SchemaPrefix),CurrentXmlNode,NamespaceMgr,XMLSchema,LastIndex);
+    END;
+
+    LOCAL PROCEDURE ParseRestrictionDefinitions@17(ID@1000 : Integer;XPath@1006 : Text;VAR CurrentXMLNode@1002 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";NamespaceMgr@1003 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNamespaceManager";XMLSchema@1008 : Record 9600;VAR LastIndex@1005 : Integer);
+    VAR
+      XMLSchemaRestriction@1009 : Record 9611;
+      XMLNode@1007 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      XMLNodeList@1004 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+      i@1001 : Integer;
+    BEGIN
+      IF NOT XMLDOMManagement.FindNodesWithNamespaceManager(CurrentXMLNode,XPath,NamespaceMgr,XMLNodeList) THEN
+        EXIT;
+
+      FOR i := 1 TO XMLNodeList.Count DO BEGIN
+        XMLNode := XMLNodeList.Item(i - 1);
+        IF NOT ISNULL(XMLNode) THEN BEGIN
+          XMLSchemaRestriction.INIT;
+          XMLSchemaRestriction."XML Schema Code" := XMLSchema.Code;
+          XMLSchemaRestriction."Element ID" := ID;
+          LastIndex += 1;
+          XMLSchemaRestriction.ID := LastIndex;
+          XMLSchemaRestriction.Type := XMLSchemaRestriction.Type::Value;
+          XMLSchemaRestriction.Value := GetAttribute('name',XMLNode);
+          IF XMLSchemaRestriction.Value = '' THEN
+            XMLSchemaRestriction.Value := GetAttribute('value',XMLNode);
+          XMLSchemaRestriction.INSERT;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE ExtendElementDefinition@14(VAR CurrentDefinitionXMLSchemaElement@1000 : Record 9610;VAR ParentXMLSchemaElement@1002 : Record 9610;NestingLevel@1004 : Integer;XMLSchema@1005 : Record 9600;VAR CurrentID@1006 : Integer;SchemaPrefix@1007 : Text);
+    VAR
+      LastXMLSchemaElement@1001 : Record 9610;
+    BEGIN
+      CASE CurrentDefinitionXMLSchemaElement."Node Type" OF
+        CurrentDefinitionXMLSchemaElement."Node Type"::Element,
+        CurrentDefinitionXMLSchemaElement."Node Type"::Attribute:
+          BEGIN
+            InsertXMLSchemaElementFromDefinition(
+              CurrentDefinitionXMLSchemaElement,ParentXMLSchemaElement,LastXMLSchemaElement,XMLSchema,CurrentID,SchemaPrefix);
+            InsertRestrictions(LastXMLSchemaElement,CurrentDefinitionXMLSchemaElement,XMLSchema);
+            ExtendElementDefinitionType(
+              CurrentDefinitionXMLSchemaElement,LastXMLSchemaElement,NestingLevel,XMLSchema,CurrentID,SchemaPrefix);
+          END;
+        CurrentDefinitionXMLSchemaElement."Node Type"::"Definition Node":
+          BEGIN
+            InsertRestrictions(ParentXMLSchemaElement,CurrentDefinitionXMLSchemaElement,XMLSchema);
+            ExtendElementDefinitionType(
+              CurrentDefinitionXMLSchemaElement,ParentXMLSchemaElement,NestingLevel,XMLSchema,CurrentID,SchemaPrefix);
+          END;
+      END;
+    END;
+
+    LOCAL PROCEDURE ExtendElementDefinitionType@44(VAR CurrentDefinitionXMLSchemaElement@1000 : Record 9610;VAR ParentXMLSchemaElement@1002 : Record 9610;NestingLevel@1004 : Integer;XMLSchema@1005 : Record 9600;VAR CurrentID@1006 : Integer;SchemaPrefix@1007 : Text);
+    BEGIN
+      IF NOT ParentXMLSchemaElement.Selected THEN
+        IF DetectDefinitionLoop(CurrentDefinitionXMLSchemaElement) OR (ParentXMLSchemaElement.MinOccurs = 0)
+        THEN BEGIN
+          ParentXMLSchemaElement."Defintion XML Schema Code" := CurrentDefinitionXMLSchemaElement."XML Schema Code";
+          ParentXMLSchemaElement."Definition XML Schema ID" := CurrentDefinitionXMLSchemaElement.ID;
+          ParentXMLSchemaElement.MODIFY;
+          EXIT;
+        END;
+
+      PushDefinitionOnStack(CurrentDefinitionXMLSchemaElement);
+
+      CASE CurrentDefinitionXMLSchemaElement."Data Type" OF
+        '':
+          ExtendNestedElementDefinition(
+            CurrentDefinitionXMLSchemaElement,ParentXMLSchemaElement,NestingLevel,XMLSchema,CurrentID,SchemaPrefix);
+        ReferenceElementTypeTok:
+          ExtendReferenceElementDefinition(
+            CurrentDefinitionXMLSchemaElement,ParentXMLSchemaElement,NestingLevel,XMLSchema,CurrentID,SchemaPrefix);
+        ExtensionElementTypeTok:
+          ExtendExtensionElementDefinition(
+            CurrentDefinitionXMLSchemaElement,ParentXMLSchemaElement,NestingLevel,XMLSchema,CurrentID,SchemaPrefix);
+        ELSE
+          ExtendTypeElementDefinition(
+            CurrentDefinitionXMLSchemaElement,ParentXMLSchemaElement,NestingLevel,XMLSchema,CurrentID,SchemaPrefix);
+      END;
+
+      PopDefinitionFromStack(CurrentDefinitionXMLSchemaElement);
+    END;
+
+    LOCAL PROCEDURE ExtendNestedElementDefinition@35(VAR CurrentDefinitionXMLSchemaElement@1000 : Record 9610;VAR ParentXMLSchemaElement@1002 : Record 9610;NestingLevel@1004 : Integer;XMLSchema@1005 : Record 9600;VAR CurrentID@1006 : Integer;SchemaPrefix@1007 : Text);
+    VAR
+      TempNextXMLSchemaElementDefintion@1001 : TEMPORARY Record 9610;
+    BEGIN
+      IF GetChildElementsForComplexType(CurrentDefinitionXMLSchemaElement,TempNextXMLSchemaElementDefintion) THEN
+        REPEAT
+          ExtendElementDefinition(
+            TempNextXMLSchemaElementDefintion,ParentXMLSchemaElement,NestingLevel + 1,XMLSchema,CurrentID,SchemaPrefix);
+        UNTIL TempNextXMLSchemaElementDefintion.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE ExtendReferenceElementDefinition@36(VAR CurrentDefinitionXMLSchemaElement@1000 : Record 9610;VAR ParentXMLSchemaElement@1002 : Record 9610;NestingLevel@1004 : Integer;XMLSchema@1005 : Record 9600;VAR CurrentID@1006 : Integer;SchemaPrefix@1007 : Text);
+    VAR
+      TempNextXMLSchemaElementDefintion@1001 : TEMPORARY Record 9610;
+    BEGIN
+      IF GetReferencedElementDefinition(CurrentDefinitionXMLSchemaElement,TempNextXMLSchemaElementDefintion,SchemaPrefix) THEN
+        ExtendElementDefinitionType(
+          TempNextXMLSchemaElementDefintion,ParentXMLSchemaElement,NestingLevel + 1,XMLSchema,CurrentID,SchemaPrefix);
+    END;
+
+    LOCAL PROCEDURE ExtendExtensionElementDefinition@37(VAR CurrentDefinitionXMLSchemaElement@1000 : Record 9610;VAR ParentXMLSchemaElement@1002 : Record 9610;NestingLevel@1004 : Integer;XMLSchema@1005 : Record 9600;VAR CurrentID@1006 : Integer;SchemaPrefix@1007 : Text);
+    VAR
+      TempNextXMLSchemaElementDefintion@1001 : TEMPORARY Record 9610;
+      NewSchemaPrefix@1008 : Text;
+    BEGIN
+      IF GetReferencedElementDefinition(CurrentDefinitionXMLSchemaElement,TempNextXMLSchemaElementDefintion,NewSchemaPrefix) THEN
+        ExtendElementDefinition(
+          TempNextXMLSchemaElementDefintion,ParentXMLSchemaElement,NestingLevel + 1,XMLSchema,CurrentID,NewSchemaPrefix)
+      ELSE
+        UpdateSimpleType(ParentXMLSchemaElement,CurrentDefinitionXMLSchemaElement."Node Name");
+
+      IF GetChildElementsForComplexType(CurrentDefinitionXMLSchemaElement,TempNextXMLSchemaElementDefintion) THEN
+        REPEAT
+          ExtendElementDefinition(
+            TempNextXMLSchemaElementDefintion,ParentXMLSchemaElement,NestingLevel + 1,XMLSchema,CurrentID,SchemaPrefix);
+        UNTIL TempNextXMLSchemaElementDefintion.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE ExtendTypeElementDefinition@38(VAR CurrentDefinitionXMLSchemaElement@1000 : Record 9610;VAR ParentXMLSchemaElement@1002 : Record 9610;NestingLevel@1004 : Integer;XMLSchema@1005 : Record 9600;VAR CurrentID@1006 : Integer;SchemaPrefix@1007 : Text);
+    VAR
+      TempNextXMLSchemaElementDefintion@1001 : TEMPORARY Record 9610;
+    BEGIN
+      IF GetTypeDefinition(CurrentDefinitionXMLSchemaElement,TempNextXMLSchemaElementDefintion) THEN
+        REPEAT
+          ExtendElementDefinition(
+            TempNextXMLSchemaElementDefintion,ParentXMLSchemaElement,NestingLevel + 1,XMLSchema,CurrentID,SchemaPrefix);
+        UNTIL TempNextXMLSchemaElementDefintion.NEXT = 0
+      ELSE
+        UpdateSimpleType(ParentXMLSchemaElement,ParentXMLSchemaElement."Data Type");
+    END;
+
+    LOCAL PROCEDURE UpdateSimpleType@15(VAR XMLSchemaElement@1000 : Record 9610;NewSimpleType@1001 : Text);
+    BEGIN
+      IF XMLSchemaElement."Simple Data Type" = '' THEN BEGIN
+        XMLSchemaElement.VALIDATE("Simple Data Type",COPYSTR(NewSimpleType,1,MAXSTRLEN(XMLSchemaElement."Simple Data Type")));
+        XMLSchemaElement.MODIFY(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertElementDefinition@21(VAR LastXMLSchemaElement@1001 : Record 9610;XmlNode@1000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";ParentID@1003 : Integer;XMLSchema@1008 : Record 9600;SchemaPrefix@1009 : Text;VAR CurrentID@1010 : Integer);
+    VAR
+      XMLSchemaElement@1004 : Record 9610;
+    BEGIN
+      XMLSchemaElement.INIT;
+      AssignKeyToXMLSchemaElement(XMLSchemaElement,XMLSchema,CurrentID);
+
+      XMLSchemaElement."Node Name" := GetElementName(XmlNode);
+
+      IF XmlNode.Name = STRSUBSTNO('%1:element',SchemaPrefix) THEN
+        XMLSchemaElement."Node Type" := XMLSchemaElement."Node Type"::Element
+      ELSE
+        XMLSchemaElement."Node Type" := XMLSchemaElement."Node Type"::"Definition Node";
+
+      XMLSchemaElement."Data Type" := GetElementType(XmlNode);
+      XMLSchemaElement."Parent ID" := ParentID;
+      XMLSchemaElement.Choice := STRPOS(XmlNode.Name,'choice') > 0;
+
+      SetMinAndMaxOccurs(XMLSchemaElement,XmlNode);
+      XMLSchemaElement.INSERT;
+      LastXMLSchemaElement := XMLSchemaElement;
+    END;
+
+    LOCAL PROCEDURE InsertAttributeDefinition@33(VAR LastXMLSchemaElement@1000 : Record 9610;XmlNode@1007 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";ParentID@1006 : Integer;XMLSchema@1004 : Record 9600;VAR CurrentID@1001 : Integer);
+    VAR
+      XMLSchemaElement@1002 : Record 9610;
+    BEGIN
+      XMLSchemaElement.INIT;
+      AssignKeyToXMLSchemaElement(XMLSchemaElement,XMLSchema,CurrentID);
+      XMLSchemaElement."Node Name" := GetElementName(XmlNode);
+      XMLSchemaElement."Node Type" := XMLSchemaElement."Node Type"::Attribute;
+      XMLSchemaElement."Data Type" := GetElementType(XmlNode);
+      XMLSchemaElement."Parent ID" := ParentID;
+
+      IF GetAttribute('use',XmlNode) = 'required' THEN
+        XMLSchemaElement.MinOccurs := 1;
+
+      XMLSchemaElement.MaxOccurs := 1;
+      XMLSchemaElement.INSERT;
+
+      LastXMLSchemaElement := XMLSchemaElement;
+    END;
+
+    LOCAL PROCEDURE GetAttribute@22(AttributeName@1001 : Text;VAR XMLNode@1000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode") : Text[250];
+    VAR
+      XMLAttributeNode@1003 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+    BEGIN
+      XMLAttributeNode := XMLNode.Attributes.GetNamedItem(AttributeName);
+      IF ISNULL(XMLAttributeNode) THEN
+        EXIT('');
+
+      EXIT(COPYSTR(FORMAT(XMLAttributeNode.InnerText),1,250));
+    END;
+
+    LOCAL PROCEDURE SetMinAndMaxOccurs@18(VAR XMLSchemaElement@1000 : Record 9610;XmlNode@1001 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode");
+    BEGIN
+      IF GetAttribute('minOccurs',XmlNode) <> '' THEN
+        EVALUATE(XMLSchemaElement.MinOccurs,GetAttribute('minOccurs',XmlNode))
+      ELSE
+        XMLSchemaElement.MinOccurs := 1;
+
+      CASE GetAttribute('maxOccurs',XmlNode) OF
+        '':
+          XMLSchemaElement.MaxOccurs := XMLSchemaElement.MinOccurs;
+        'unbounded':
+          XMLSchemaElement.MaxOccurs := 999999999;
+        ELSE
+          EVALUATE(XMLSchemaElement.MaxOccurs,GetAttribute('maxOccurs',XmlNode));
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdateXMLSchemaElementProperties@27(XMLSchema@1001 : Record 9600);
+    VAR
+      XMLSchemaElement@1000 : Record 9610;
+    BEGIN
+      XMLSchemaElement.SETRANGE("XML Schema Code",XMLSchema.Code);
+      XMLSchemaElement.SETRANGE("Parent ID",0);
+
+      IF XMLSchemaElement.FINDSET THEN
+        REPEAT
+          UpdateSelectedProperty(XMLSchemaElement,'',XMLSchema);
+        UNTIL XMLSchemaElement.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE UpdateSelectedProperty@19(VAR CurrentXMLSchemaElement@1001 : Record 9610;ParentSortKey@1002 : Text[250];XMLSchema@1003 : Record 9600);
+    VAR
+      ChildXMLSchemaElement@1000 : Record 9610;
+    BEGIN
+      CurrentXMLSchemaElement."Sort Key" := STRSUBSTNO('%1 %2',ParentSortKey,FORMAT(1000 + CurrentXMLSchemaElement.ID));
+      CurrentXMLSchemaElement.MODIFY;
+
+      IF (CurrentXMLSchemaElement.MinOccurs > 0) AND (CurrentXMLSchemaElement."Defintion XML Schema Code" = '') THEN BEGIN
+        CurrentXMLSchemaElement.Selected := TRUE;
+        CurrentXMLSchemaElement.MODIFY;
+
+        ChildXMLSchemaElement.SETRANGE("XML Schema Code",XMLSchema.Code);
+        ChildXMLSchemaElement.SETRANGE("Parent ID",CurrentXMLSchemaElement.ID);
+        IF ChildXMLSchemaElement.FINDSET THEN
+          REPEAT
+            UpdateSelectedProperty(ChildXMLSchemaElement,CurrentXMLSchemaElement."Sort Key",XMLSchema);
+          UNTIL ChildXMLSchemaElement.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE GetElementName@3(VAR XMLNode@1000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode") : Text[250];
+    VAR
+      ElementName@1002 : Text;
+    BEGIN
+      ElementName := GetAttribute('name',XMLNode);
+
+      IF ElementName = '' THEN
+        ElementName := GetAttribute('ref',XMLNode);
+
+      IF ElementName = '' THEN
+        ElementName := GetAttribute('base',XMLNode);
+
+      EXIT(ElementName);
+    END;
+
+    LOCAL PROCEDURE GetElementType@30(VAR XMLNode@1000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode") : Text[250];
+    VAR
+      ElementType@1002 : Text;
+    BEGIN
+      ElementType := GetAttribute('type',XMLNode);
+
+      IF (ElementType = '') AND (GetAttribute('ref',XMLNode) <> '') THEN
+        ElementType := ReferenceElementTypeTok;
+
+      IF (ElementType = '') AND (GetAttribute('base',XMLNode) <> '') THEN
+        ElementType := ExtensionElementTypeTok;
+
+      EXIT(ElementType);
+    END;
+
+    LOCAL PROCEDURE GetChildElementsForComplexType@105(DefinitionXMLSchemaElement@1001 : Record 9610;VAR ReferenceXMLSchemaElement@1000 : Record 9610) : Boolean;
+    BEGIN
+      TempAllXMLSchemaElement.RESET;
+
+      // Get root definition
+      TempAllXMLSchemaElement.SETRANGE("XML Schema Code",DefinitionXMLSchemaElement."XML Schema Code");
+      TempAllXMLSchemaElement.SETRANGE("Parent ID",DefinitionXMLSchemaElement.ID);
+
+      IF NOT TempAllXMLSchemaElement.FINDSET THEN
+        EXIT(FALSE);
+
+      REPEAT
+        ReferenceXMLSchemaElement.COPY(TempAllXMLSchemaElement);
+        ReferenceXMLSchemaElement.INSERT;
+      UNTIL TempAllXMLSchemaElement.NEXT = 0;
+
+      ReferenceXMLSchemaElement.FINDFIRST;
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE GetReferencedElementDefinition@81(DefinitionXMLSchemaElement@1000 : Record 9610;VAR ReferenceXMLSchemaElement@1001 : Record 9610;VAR SchemaPrefix@1006 : Text) : Boolean;
+    VAR
+      XMLSchema@1003 : Record 9600;
+      ReferencedXMLSchema@1002 : Record 9612;
+      NameWithoutNamespace@1005 : Text;
+      NamespaceLength@1004 : Integer;
+    BEGIN
+      NamespaceLength := STRPOS(DefinitionXMLSchemaElement."Node Name",':');
+
+      IF NamespaceLength > 0 THEN BEGIN
+        // Process Import Namespaces
+        SchemaPrefix := COPYSTR(DefinitionXMLSchemaElement."Node Name",1,NamespaceLength - 1);
+        NameWithoutNamespace := COPYSTR(DefinitionXMLSchemaElement."Node Name",NamespaceLength + 1);
+        XMLSchema.GET(DefinitionXMLSchemaElement."XML Schema Code");
+        IF XMLSchema."Target Namespace Aliases" <> SchemaPrefix THEN BEGIN
+          ReferencedXMLSchema.SETRANGE("Referenced Schema Namespace",SchemaPrefix);
+          ReferencedXMLSchema.SETRANGE(Code,DefinitionXMLSchemaElement."XML Schema Code");
+          IF NOT ReferencedXMLSchema.FINDSET THEN
+            EXIT(FALSE);
+        END ELSE BEGIN
+          IF NOT (SchemaPrefix = 'cac') THEN
+            EXIT(FALSE);
+          TempAllXMLSchemaElement.RESET;
+          TempAllXMLSchemaElement.SETRANGE("XML Schema Code",DefinitionXMLSchemaElement."XML Schema Code");
+          TempAllXMLSchemaElement.SETRANGE("Parent ID",0);
+          TempAllXMLSchemaElement.SETRANGE("Node Name",NameWithoutNamespace);
+
+          IF TempAllXMLSchemaElement.FINDFIRST THEN BEGIN
+            ReferenceXMLSchemaElement.COPY(TempAllXMLSchemaElement);
+            ReferenceXMLSchemaElement.INSERT;
+
+            EXIT(TRUE);
+          END;
+
+          EXIT(FALSE);
+        END;
+      END;
+
+      IF NamespaceLength = 0 THEN BEGIN
+        // Check part of the same schema
+        IF NameWithoutNamespace = '' THEN
+          NameWithoutNamespace := DefinitionXMLSchemaElement."Node Name";
+
+        TempAllXMLSchemaElement.RESET;
+        TempAllXMLSchemaElement.SETRANGE("XML Schema Code",DefinitionXMLSchemaElement."XML Schema Code");
+        TempAllXMLSchemaElement.SETRANGE("Parent ID",0);
+        TempAllXMLSchemaElement.SETRANGE("Node Name",NameWithoutNamespace);
+
+        IF TempAllXMLSchemaElement.FINDFIRST THEN BEGIN
+          ReferenceXMLSchemaElement.COPY(TempAllXMLSchemaElement);
+          ReferenceXMLSchemaElement.INSERT;
+
+          EXIT(TRUE);
+        END;
+
+        // Process Include Statement
+        ReferencedXMLSchema.SETRANGE(Code,DefinitionXMLSchemaElement."XML Schema Code");
+        ReferencedXMLSchema.SETRANGE("Referenced Schema Namespace",'');
+
+        IF NOT ReferencedXMLSchema.FINDSET THEN
+          EXIT(FALSE);
+      END;
+
+      REPEAT
+        TempAllXMLSchemaElement.RESET;
+        TempAllXMLSchemaElement.SETRANGE("XML Schema Code",ReferencedXMLSchema."Referenced Schema Code");
+        TempAllXMLSchemaElement.SETRANGE("Parent ID",0);
+        TempAllXMLSchemaElement.SETRANGE("Node Name",NameWithoutNamespace);
+
+        IF TempAllXMLSchemaElement.FINDFIRST THEN BEGIN
+          ReferenceXMLSchemaElement.COPY(TempAllXMLSchemaElement);
+          ReferenceXMLSchemaElement.INSERT;
+          EXIT(TRUE);
+        END;
+      UNTIL ReferencedXMLSchema.NEXT = 0;
+
+      EXIT(FALSE);
+    END;
+
+    LOCAL PROCEDURE GetTypeDefinition@111(DefinitionXMLSchemaElement@1000 : Record 9610;VAR ReferenceXMLSchemaElement@1001 : Record 9610) : Boolean;
+    BEGIN
+      TempAllXMLSchemaElement.RESET;
+
+      // Get Type Definition
+      TempAllXMLSchemaElement.SETRANGE("XML Schema Code",DefinitionXMLSchemaElement."XML Schema Code");
+      TempAllXMLSchemaElement.SETRANGE("Parent ID",0);
+      TempAllXMLSchemaElement.SETRANGE("Node Name",DefinitionXMLSchemaElement."Data Type");
+      TempAllXMLSchemaElement.SETRANGE("Node Type",DefinitionXMLSchemaElement."Node Type"::"Definition Node");
+
+      IF NOT TempAllXMLSchemaElement.FINDFIRST THEN
+        EXIT(FALSE);
+
+      ReferenceXMLSchemaElement.INIT;
+      ReferenceXMLSchemaElement.COPY(TempAllXMLSchemaElement);
+      ReferenceXMLSchemaElement.INSERT;
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE InsertRestrictions@25(VAR ActualXMLSchemaElement@1000 : Record 9610;DefinitionXMLSchemaElement@1001 : Record 9610;XMLSchema@1005 : Record 9600);
+    VAR
+      XMLSchemaRestriction@1002 : Record 9611;
+      XMLSchemaRestriction2@1003 : Record 9611;
+      LastRestrictionID@1004 : Integer;
+    BEGIN
+      TempXMLSchemaRestriction.SETRANGE("XML Schema Code",XMLSchema.Code);
+      TempXMLSchemaRestriction.SETRANGE("Element ID",DefinitionXMLSchemaElement.ID);
+      TempXMLSchemaRestriction.SETRANGE(Type,TempXMLSchemaRestriction.Type::Base);
+
+      IF NOT TempXMLSchemaRestriction.FINDFIRST THEN
+        EXIT;
+
+      ActualXMLSchemaElement.VALIDATE(
+        "Simple Data Type",COPYSTR(TempXMLSchemaRestriction.Value,1,MAXSTRLEN(ActualXMLSchemaElement."Simple Data Type")));
+      ActualXMLSchemaElement.MODIFY;
+
+      TempXMLSchemaRestriction.SETRANGE(Type,TempXMLSchemaRestriction.Type::Value);
+      IF NOT TempXMLSchemaRestriction.FINDSET THEN
+        EXIT;
+
+      XMLSchemaRestriction2.SETRANGE("XML Schema Code",XMLSchema.Code);
+      XMLSchemaRestriction2.SETRANGE("Element ID",ActualXMLSchemaElement.ID);
+      IF XMLSchemaRestriction2.FINDLAST THEN
+        LastRestrictionID := XMLSchemaRestriction2.ID + 1
+      ELSE
+        LastRestrictionID := 1;
+
+      REPEAT
+        XMLSchemaRestriction.INIT;
+        XMLSchemaRestriction.COPY(TempXMLSchemaRestriction);
+        XMLSchemaRestriction.ID := LastRestrictionID;
+        LastRestrictionID += 1;
+        XMLSchemaRestriction."Element ID" := ActualXMLSchemaElement.ID;
+        XMLSchemaRestriction.INSERT;
+      UNTIL TempXMLSchemaRestriction.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE InsertXMLSchemaElementFromDefinition@64(DefinitionXMLSchemaElement@1000 : Record 9610;ParentXMLSchemaElement@1003 : Record 9610;VAR XMLSchemaElement@1002 : Record 9610;XMLSchema@1001 : Record 9600;VAR CurrentID@1004 : Integer;SchemaPrefix@1005 : Text);
+    VAR
+      PrefixLength@1006 : Integer;
+    BEGIN
+      XMLSchemaElement.COPY(DefinitionXMLSchemaElement);
+      AssignKeyToXMLSchemaElement(XMLSchemaElement,XMLSchema,CurrentID);
+      XMLSchemaElement."Node Name" := DefinitionXMLSchemaElement."Node Name";
+
+      PrefixLength := STRPOS(XMLSchemaElement."Node Name",':');
+      CASE XMLSchemaElement."Node Type" OF
+        XMLSchemaElement."Node Type"::Element:
+          IF (SchemaPrefix <> '') AND (PrefixLength = 0) THEN
+            XMLSchemaElement."Node Name" := STRSUBSTNO('%1:%2',SchemaPrefix,XMLSchemaElement."Node Name");
+        XMLSchemaElement."Node Type"::Element:
+          IF PrefixLength > 0 THEN
+            XMLSchemaElement."Node Name" := COPYSTR(XMLSchemaElement."Node Name",PrefixLength + 1);
+      END;
+
+      XMLSchemaElement."Parent ID" := ParentXMLSchemaElement.ID;
+      XMLSchemaElement.Indentation := ParentXMLSchemaElement.Indentation + 1;
+      XMLSchemaElement.INSERT;
+    END;
+
+    LOCAL PROCEDURE AssignKeyToXMLSchemaElement@29(VAR XMLSchemaElement@1000 : Record 9610;XMLSchema@1003 : Record 9600;VAR CurrentID@1004 : Integer);
+    BEGIN
+      XMLSchemaElement."XML Schema Code" := XMLSchema.Code;
+      XMLSchemaElement.ID := CurrentID;
+      CurrentID += 1;
+    END;
+
+    PROCEDURE ShowAll@13(VAR XMLSchemaElement@1000 : Record 9610);
+    BEGIN
+      XMLSchemaElement.MODIFYALL(Visible,TRUE);
+      XMLSchemaElement.SETRANGE(Visible);
+      XMLSchemaElement.SETRANGE(Selected);
+    END;
+
+    LOCAL PROCEDURE GetSchemaLocation@23(CurrentXmlNode@1000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";XMLSchema@1004 : Record 9600) : Text;
+    VAR
+      FileManagement@1003 : Codeunit 419;
+      SchemaLocation@1001 : Text;
+      FilePath@1002 : Text;
+    BEGIN
+      SchemaLocation := CONVERTSTR(GetAttribute('schemaLocation',CurrentXmlNode),'/','\');
+      FilePath := FileManagement.CombinePath(FileManagement.GetDirectoryName(XMLSchema.Path),SchemaLocation);
+      EXIT(FilePath);
+    END;
+
+    PROCEDURE SelectMandatory@11(XMLSchemaElement@1000 : Record 9610);
+    BEGIN
+      XMLSchemaElement.SETRANGE("XML Schema Code",XMLSchemaElement."XML Schema Code");
+      XMLSchemaElement.SETRANGE("Parent ID",0);
+      IF XMLSchemaElement.FINDFIRST THEN BEGIN
+        XMLSchemaElement.VALIDATE(Selected,TRUE);
+        XMLSchemaElement.MODIFY;
+      END;
+    END;
+
+    PROCEDURE DeselectAll@7(VAR XMLSchemaElement@1000 : Record 9610);
+    BEGIN
+      XMLSchemaElement.MODIFYALL(Selected,FALSE);
+    END;
+
+    PROCEDURE HideNotMandatory@8(VAR XMLSchemaElement@1000 : Record 9610);
+    VAR
+      xXMLSchemaElementID@1003 : Integer;
+      LevelVisible@1002 : ARRAY [100] OF Boolean;
+    BEGIN
+      xXMLSchemaElementID := XMLSchemaElement.ID;
+      XMLSchemaElement.SETCURRENTKEY("Sort Key");
+      LevelVisible[1] := TRUE;
+      IF XMLSchemaElement.FINDSET THEN
+        REPEAT
+          XMLSchemaElement.Visible := (XMLSchemaElement.MinOccurs > 0);
+          IF XMLSchemaElement.Indentation > 0 THEN
+            IF NOT LevelVisible[XMLSchemaElement.Indentation] THEN
+              XMLSchemaElement.Visible := FALSE;
+          LevelVisible[XMLSchemaElement.Indentation + 1] := XMLSchemaElement.Visible;
+          XMLSchemaElement.MODIFY;
+        UNTIL XMLSchemaElement.NEXT = 0;
+
+      XMLSchemaElement.SETRANGE(Visible,TRUE);
+      IF XMLSchemaElement.GET(XMLSchemaElement."XML Schema Code",xXMLSchemaElementID) THEN;
+    END;
+
+    PROCEDURE HideNotSelected@9(VAR XMLSchemaElement@1000 : Record 9610);
+    BEGIN
+      XMLSchemaElement.SETRANGE(Selected,TRUE);
+    END;
+
+    LOCAL PROCEDURE LoadDependentSchemaSeparately@12(XMLSchema@1000 : Record 9600);
+    VAR
+      XMLSchemaElement@1007 : Record 9610;
+      MainDocumentXMLSchema@1001 : Record 9600;
+      NamespaceMgr@1005 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNamespaceManager";
+      Schema@1004 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      SchemaPrefix@1003 : Text;
+      CurrentID@1002 : Integer;
+    BEGIN
+      LoadSchemaXML(XMLSchema,NamespaceMgr,Schema,SchemaPrefix);
+      ParseSchemaReferences(NamespaceMgr,XMLSchema,Schema,SchemaPrefix);
+
+      CurrentID := 1;
+      CLEAR(XMLSchemaElement);
+      ParseChildXMLNodes(Schema.DocumentElement,SchemaPrefix,XMLSchemaElement,XMLSchema,NamespaceMgr,0,CurrentID);
+
+      IF NOT CONFIRM(GenerateDefinitionAgainQst) THEN
+        EXIT;
+
+      MainDocumentXMLSchema.GET(XMLSchema.GetTopSchemaCode(XMLSchema));
+      RemoveDefinitions(MainDocumentXMLSchema);
+
+      InitializeTempBuffers(MainDocumentXMLSchema);
+      ExpandDefinitions(MainDocumentXMLSchema);
+      UpdateXMLSchemaElementProperties(MainDocumentXMLSchema);
+
+      IF CouldNotFindRelatedSchema THEN
+        MESSAGE(CouldNotFindAllSchemasMsg)
+    END;
+
+    LOCAL PROCEDURE RemoveDefinitions@31(VAR XMLSchema@1000 : Record 9600);
+    VAR
+      XMLSchemaElement@1003 : Record 9610;
+      XMLSchemaRestriction@1002 : Record 9611;
+    BEGIN
+      XMLSchemaRestriction.SETRANGE("XML Schema Code",XMLSchema.Code);
+      XMLSchemaRestriction.DELETEALL(TRUE);
+
+      XMLSchemaElement.SETRANGE("XML Schema Code",XMLSchema.Code);
+      XMLSchemaElement.DELETEALL(TRUE);
+
+      CouldNotFindRelatedSchema := FALSE;
+
+      TempStackXMLSchemaElement.RESET;
+      TempStackXMLSchemaElement.DELETEALL;
+
+      TempAllXMLSchemaElement.RESET;
+      TempXMLSchemaRestriction.RESET;
+
+      TempAllXMLSchemaElement.DELETEALL;
+      TempXMLSchemaRestriction.DELETEALL;
+    END;
+
+    PROCEDURE CreateXMLPortFile@2(VAR XMLSchemaElement@1001 : Record 9610;NewObjectNo@1000 : Integer;NewName@1010 : Text[30];ShowFileDialog@1002 : Boolean;ForImport@1014 : Boolean) : Text;
+    VAR
+      XMLSchema@1012 : Record 9600;
+      xXMLSchemaElement@1013 : Record 9610;
+      TempBlob@1011 : Record 99008535;
+      FileManagement@1006 : Codeunit 419;
+      File@1003 : File;
+      FileName@1005 : Text;
+      NewFileName@1004 : Text;
+      ElementTypeText@1007 : Text;
+      IndentationText@1008 : Text[2];
+      NodeNameText@1009 : Text;
+    BEGIN
+      XMLSchema.GET(XMLSchemaElement."XML Schema Code");
+      xXMLSchemaElement := XMLSchemaElement;
+      XMLSchemaElement.SETRANGE("XML Schema Code",XMLSchemaElement."XML Schema Code");
+      XMLSchemaElement.FINDSET;
+      File.TEXTMODE := TRUE;
+
+      File.CREATETEMPFILE;
+      FileName := File.NAME;
+      // CLOSE + CREATE to avoid the file from being deleted before download.
+      File.CLOSE;
+      File.CREATE(FileName);
+
+      File.WRITE(STRSUBSTNO('OBJECT XMLport %1 %2',NewObjectNo,NewName));
+      File.WRITE('{');
+      File.WRITE('  OBJECT-PROPERTIES');
+      File.WRITE('  {');
+      File.WRITE('    Date=;');
+      File.WRITE('    Time=;');
+      File.WRITE('    Version List=;');
+      File.WRITE('  }');
+      File.WRITE('  PROPERTIES');
+      File.WRITE('  {');
+      IF ForImport THEN
+        File.WRITE('    Direction=Import;')
+      ELSE
+        File.WRITE('    Direction=Export;');
+      File.WRITE('    Encoding=UTF-8;');
+      File.WRITE('    Format/Evaluate=XML Format/Evaluate;');
+      IF XMLSchema."Target Namespace" <> '' THEN BEGIN
+        File.WRITE(STRSUBSTNO('    DefaultNamespace=%1;',XMLSchema."Target Namespace"));
+        File.WRITE('    UseDefaultNamespace=Yes;');
+      END;
+      File.WRITE('  }');
+      File.WRITE('  ELEMENTS');
+      File.WRITE('  {');
+      WITH XMLSchemaElement DO
+        REPEAT
+          IF "Node Type" = "Node Type"::Element THEN
+            ElementTypeText := 'Element '
+          ELSE
+            ElementTypeText := 'Attribute';
+          IF Indentation = 0 THEN
+            IndentationText := '  '
+          ELSE
+            IndentationText := STRSUBSTNO('#1',Indentation);
+          IF STRLEN("Node Name") > 20 THEN
+            NodeNameText := "Node Name"
+          ELSE
+            NodeNameText := PADSTR("Node Name",20);
+          File.WRITE(STRSUBSTNO('    { [%1];%2;%3;%4;Text     }',CREATEGUID,IndentationText,NodeNameText,ElementTypeText));
+          File.WRITE('');
+        UNTIL NEXT = 0;
+      File.WRITE('  }');
+      File.WRITE('  EVENTS');
+      File.WRITE('  {');
+      File.WRITE('  }');
+      File.WRITE('  REQUESTPAGE');
+      File.WRITE('  {');
+      File.WRITE('    PROPERTIES');
+      File.WRITE('    {');
+      File.WRITE('    }');
+      File.WRITE('    CONTROLS');
+      File.WRITE('    {');
+      File.WRITE('    }');
+      File.WRITE('  }');
+      File.WRITE('  CODE');
+      File.WRITE('  {');
+      File.WRITE('');
+      File.WRITE('    BEGIN');
+      File.WRITE('    END.');
+      File.WRITE('  }');
+      File.WRITE('}');
+      File.CLOSE;
+
+      FileManagement.BLOBImportFromServerFile(TempBlob,FileName);
+      ERASE(FileName);
+
+      XMLSchemaElement := xXMLSchemaElement;
+      IF XMLSchemaElement.FIND THEN;
+
+      NewFileName := STRSUBSTNO('XML%1.TXT',NewObjectNo);
+      EXIT(FileManagement.BLOBExport(TempBlob,NewFileName,ShowFileDialog));
+    END;
+
+    PROCEDURE CreateDataExchDefForCAMT@1060(VAR XMLSchemaElement@1001 : Record 9610);
+    VAR
+      XMLSchema@1012 : Record 9600;
+      DataExchDef@1017 : Record 1222;
+    BEGIN
+      XMLSchema.GET(XMLSchemaElement."XML Schema Code");
+
+      IF DataExchDef.GET(XMLSchema.Code) THEN BEGIN
+        IF NOT CONFIRM(OverrideExistingDataExchangeDefQst) THEN
+          EXIT;
+        DataExchDef.DELETE(TRUE);
+      END;
+
+      DataExchDef.InsertRec(XMLSchema.Code,XMLSchema.Description,
+        DataExchDef.Type::"Bank Statement Import",0,0,'','');
+      DataExchDef."File Type" := DataExchDef."File Type"::Xml;
+      DataExchDef."Reading/Writing Codeunit" := CODEUNIT::"Import Bank Statement";
+      DataExchDef.MODIFY;
+
+      CreateDataExchColumnDefinitions(XMLSchema,DataExchDef);
+
+      COMMIT;
+      PAGE.RUNMODAL(PAGE::"Data Exch Def Card",DataExchDef);
+    END;
+
+    PROCEDURE CreateDataExchColumnDefinitions@28(XMLSchema@1000 : Record 9600;DataExchDef@1001 : Record 1222);
+    VAR
+      DataExchColumnDef@1007 : Record 1223;
+      XMLSchemaElement@1003 : Record 9610;
+      DataExchLineDef@1008 : Record 1227;
+      SchemaContext@1002 : Text;
+      ColumnNo@1004 : Integer;
+      FullPath@1006 : Text;
+      ElementName@1005 : Text;
+    BEGIN
+      XMLSchemaElement.SETRANGE("XML Schema Code",XMLSchema.Code);
+      XMLSchemaElement.SETRANGE(Selected,TRUE);
+      XMLSchemaElement.FINDSET;
+
+      DataExchLineDef.SETRANGE("Data Exch. Def Code",DataExchDef.Code);
+      IF NOT DataExchLineDef.FINDFIRST THEN BEGIN
+        DataExchLineDef.InsertRec(DataExchDef.Code,DataExchDef.Code,DataExchDef.Name,0);
+        DataExchLineDef."Data Line Tag" := SEPACAMTDataLineTagTok;
+        DataExchLineDef.MODIFY;
+      END;
+
+      DataExchColumnDef.SETRANGE("Data Exch. Def Code",DataExchDef.Code);
+      DataExchColumnDef.SETRANGE("Data Exch. Line Def Code",DataExchLineDef.Code);
+      DataExchColumnDef.DELETEALL(TRUE);
+
+      SchemaContext := XMLSchema.GetSchemaContext;
+      WITH XMLSchemaElement DO
+        REPEAT
+          IF IsLeaf THEN BEGIN
+            ColumnNo += 1;
+            FullPath := GetFullPath;
+            ElementName := FullPath;
+            IF STRPOS(FullPath,SchemaContext) > 0 THEN
+              ElementName := DELSTR(FullPath,STRPOS(FullPath,SchemaContext),STRLEN(SchemaContext));
+            DataExchColumnDef.InsertRecForImport(DataExchDef.Code,DataExchLineDef.Code,
+              ColumnNo,COPYSTR(ElementName,1,MAXSTRLEN(DataExchColumnDef.Name)),
+              COPYSTR("Node Name",1,MAXSTRLEN(DataExchColumnDef.Description)),TRUE,
+              DataExchColumnDef."Data Type"::Text,'','');
+            DataExchColumnDef.SetXMLDataFormattingValues("Simple Data Type");
+            DataExchColumnDef.Path := COPYSTR(FullPath,1,MAXSTRLEN(DataExchColumnDef.Path));
+            DataExchColumnDef.MODIFY;
+          END;
+        UNTIL NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE PushDefinitionOnStack@47(VAR TempDefinitionXMLSchemaElement@1000 : TEMPORARY Record 9610);
+    VAR
+      LastID@1001 : Integer;
+    BEGIN
+      TempStackXMLSchemaElement.RESET;
+      TempStackXMLSchemaElement.SETCURRENTKEY(ID);
+      IF TempStackXMLSchemaElement.FINDLAST THEN
+        LastID := TempStackXMLSchemaElement.ID
+      ELSE
+        LastID := 1;
+
+      TempStackXMLSchemaElement.COPY(TempDefinitionXMLSchemaElement);
+      TempStackXMLSchemaElement.ID := LastID + 1;
+      TempStackXMLSchemaElement.INSERT;
+    END;
+
+    LOCAL PROCEDURE PopDefinitionFromStack@48(VAR TempCurrentDefinitionXMLSchemaElement@1000 : TEMPORARY Record 9610);
+    BEGIN
+      TempStackXMLSchemaElement.RESET;
+      TempStackXMLSchemaElement.SETRANGE("XML Schema Code",TempCurrentDefinitionXMLSchemaElement."XML Schema Code");
+      TempStackXMLSchemaElement.SETRANGE("Node Name",TempCurrentDefinitionXMLSchemaElement."Node Name");
+      TempStackXMLSchemaElement.SETRANGE("Node Type",TempCurrentDefinitionXMLSchemaElement."Node Type");
+      TempStackXMLSchemaElement.SETRANGE("Data Type",TempCurrentDefinitionXMLSchemaElement."Data Type");
+      TempStackXMLSchemaElement.SETCURRENTKEY(ID);
+      TempStackXMLSchemaElement.FINDLAST;
+      TempStackXMLSchemaElement.DELETE;
+    END;
+
+    LOCAL PROCEDURE DetectDefinitionLoop@49(VAR TempCurrentDefinitionXMLSchemaElement@1000 : TEMPORARY Record 9610) : Boolean;
+    BEGIN
+      TempStackXMLSchemaElement.RESET;
+      TempStackXMLSchemaElement.SETRANGE("XML Schema Code",TempCurrentDefinitionXMLSchemaElement."XML Schema Code");
+      TempStackXMLSchemaElement.SETRANGE("Node Name",TempCurrentDefinitionXMLSchemaElement."Node Name");
+      TempStackXMLSchemaElement.SETRANGE("Node Type",TempCurrentDefinitionXMLSchemaElement."Node Type");
+      TempStackXMLSchemaElement.SETRANGE("Data Type",TempCurrentDefinitionXMLSchemaElement."Data Type");
+      EXIT(TempStackXMLSchemaElement.FINDFIRST);
+    END;
+
+    LOCAL PROCEDURE InitializeTempBuffers@50(XMLSchema@1000 : Record 9600);
+    VAR
+      XMLSchemaElement@1001 : Record 9610;
+      XMLSchemaRestriction@1003 : Record 9611;
+      MainDefinitionSchemaCode@1002 : Code[20];
+    BEGIN
+      MainDefinitionSchemaCode := STRSUBSTNO('%1:1000',XMLSchema.Code);
+
+      TempAllXMLSchemaElement.RESET;
+      TempAllXMLSchemaElement.DELETEALL;
+
+      TempStackXMLSchemaElement.RESET;
+      TempStackXMLSchemaElement.DELETEALL;
+
+      XMLSchemaElement.SETFILTER("XML Schema Code",STRSUBSTNO('%1:*',XMLSchema.Code));
+
+      IF XMLSchemaElement.FINDSET THEN
+        REPEAT
+          TempAllXMLSchemaElement.COPY(XMLSchemaElement);
+          IF TempAllXMLSchemaElement."XML Schema Code" = MainDefinitionSchemaCode THEN
+            TempAllXMLSchemaElement."XML Schema Code" := XMLSchema.Code;
+          TempAllXMLSchemaElement.INSERT;
+        UNTIL XMLSchemaElement.NEXT = 0;
+
+      TempXMLSchemaRestriction.RESET;
+      TempXMLSchemaRestriction.DELETEALL;
+
+      XMLSchemaRestriction.SETFILTER("XML Schema Code",STRSUBSTNO('%1:*',XMLSchema.Code));
+
+      IF XMLSchemaRestriction.FINDSET THEN
+        REPEAT
+          TempXMLSchemaRestriction.COPY(XMLSchemaRestriction);
+          IF TempXMLSchemaRestriction."XML Schema Code" = MainDefinitionSchemaCode THEN
+            TempXMLSchemaRestriction."XML Schema Code" := XMLSchema.Code;
+          TempXMLSchemaRestriction.INSERT;
+        UNTIL XMLSchemaRestriction.NEXT = 0;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

@@ -1,0 +1,876 @@
+OBJECT Codeunit 950 Time Sheet Management
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 958=ri,
+                TableData 11020401=r,
+                TableData 5200=r;
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text001@1003 : TextConst 'ENU=Mon,Tue,Wed,Thu,Fri,Sat,Sun';
+      Text002@1001 : TextConst '@@@=User1 is already defined as Resources for Resource No. LIFT with type Machine.;ENU=%1 is already defined as Time Sheet Owner User ID for Resource No. %2 with type %3.';
+      Text003@1000 : TextConst '@@@=Time Sheet Header Archive 10 is not found.;ENU=Time Sheet Header %1 is not found.';
+      Text004@1002 : TextConst '@@@=%1 - Quantity, %2 - Unit of measure. Example: Quantity cannot be greater than 8 HOUR.;ENU=cannot be greater than %1 %2.';
+      Text005@1004 : TextConst '@@@=Time Sheet Header Archive 10 is not found.;ENU=Time Sheet Header Archive %1 is not found.';
+
+    PROCEDURE FilterTimeSheets@9(VAR TimeSheetHeader@1000 : Record 950;FieldNo@1001 : Integer);
+    VAR
+      UserSetup@1002 : Record 91;
+    BEGIN
+      IF UserSetup.GET(USERID) THEN;
+      IF NOT UserSetup."Time Sheet Admin." THEN BEGIN
+        TimeSheetHeader.FILTERGROUP(2);
+        CASE FieldNo OF
+          TimeSheetHeader.FIELDNO("Owner User ID"):
+            TimeSheetHeader.SETRANGE("Owner User ID",USERID);
+          TimeSheetHeader.FIELDNO("Approver User ID"):
+            TimeSheetHeader.SETRANGE("Approver User ID",USERID);
+        END;
+        TimeSheetHeader.FILTERGROUP(0);
+      END;
+    END;
+
+    PROCEDURE CheckTimeSheetNo@8(VAR TimeSheetHeader@1002 : Record 950;TimeSheetNo@1000 : Code[20]);
+    BEGIN
+      TimeSheetHeader.SETRANGE("No.",TimeSheetNo);
+      IF TimeSheetHeader.ISEMPTY THEN
+        ERROR(Text003,TimeSheetNo);
+    END;
+
+    PROCEDURE SetTimeSheetNo@3(TimeSheetNo@1000 : Code[20];VAR TimeSheetLine@1001 : Record 951);
+    BEGIN
+      TimeSheetLine.FILTERGROUP(2);
+      TimeSheetLine.SETRANGE("Time Sheet No.",TimeSheetNo);
+      TimeSheetLine.FILTERGROUP(0);
+      TimeSheetLine."Time Sheet No." := TimeSheetNo;
+    END;
+
+    PROCEDURE LookupOwnerTimeSheet@5(VAR TimeSheetNo@1001 : Code[20];VAR TimeSheetLine@1000 : Record 951;VAR TimeSheetHeader@1004 : Record 950);
+    VAR
+      TimeSheetList@1003 : Page 951;
+    BEGIN
+      COMMIT;
+      IF TimeSheetNo <> '' THEN BEGIN
+        TimeSheetHeader.GET(TimeSheetNo);
+        TimeSheetList.SETRECORD(TimeSheetHeader);
+      END;
+
+      TimeSheetList.LOOKUPMODE := TRUE;
+      IF TimeSheetList.RUNMODAL = ACTION::LookupOK THEN BEGIN
+        TimeSheetList.GETRECORD(TimeSheetHeader);
+        TimeSheetNo := TimeSheetHeader."No.";
+        SetTimeSheetNo(TimeSheetNo,TimeSheetLine);
+      END;
+    END;
+
+    PROCEDURE LookupApproverTimeSheet@2(VAR TimeSheetNo@1001 : Code[20];VAR TimeSheetLine@1000 : Record 951;VAR TimeSheetHeader@1004 : Record 950);
+    VAR
+      ManagerTimeSheetList@1003 : Page 953;
+    BEGIN
+      COMMIT;
+      IF TimeSheetNo <> '' THEN BEGIN
+        TimeSheetHeader.GET(TimeSheetNo);
+        ManagerTimeSheetList.SETRECORD(TimeSheetHeader);
+      END;
+
+      ManagerTimeSheetList.LOOKUPMODE := TRUE;
+      IF ManagerTimeSheetList.RUNMODAL = ACTION::LookupOK THEN BEGIN
+        ManagerTimeSheetList.GETRECORD(TimeSheetHeader);
+        TimeSheetNo := TimeSheetHeader."No.";
+        SetTimeSheetNo(TimeSheetNo,TimeSheetLine);
+      END;
+    END;
+
+    PROCEDURE FormatDate@10(Date@1000 : Date;DOWFormatType@1001 : 'Full,Short') : Text[30];
+    BEGIN
+      CASE DOWFormatType OF
+        DOWFormatType::Full:
+          EXIT(STRSUBSTNO('%1 %2',DATE2DMY(Date,1),FORMAT(Date,0,'<Weekday Text>')));
+        DOWFormatType::Short:
+          EXIT(STRSUBSTNO('%1 %2',DATE2DMY(Date,1),SELECTSTR(DATE2DWY(Date,1),Text001)));
+      END;
+    END;
+
+    PROCEDURE CheckAccPeriod@1(Date@1000 : Date);
+    VAR
+      AccountingPeriod@1001 : Record 50;
+    BEGIN
+      AccountingPeriod.SETFILTER("Starting Date",'..%1',Date);
+      AccountingPeriod.FINDLAST;
+      AccountingPeriod.TESTFIELD(Closed,FALSE);
+    END;
+
+    PROCEDURE CheckResourceTimeSheetOwner@13(TimeSheetOwnerUserID@1000 : Code[50];CurrResourceNo@1002 : Code[20]);
+    VAR
+      Resource@1001 : Record 156;
+    BEGIN
+      Resource.RESET;
+      Resource.SETFILTER("No.",'<>%1',CurrResourceNo);
+      Resource.SETRANGE(Type,Resource.Type::Person);
+      Resource.SETRANGE("Time Sheet Owner User ID",TimeSheetOwnerUserID);
+      IF Resource.FINDFIRST THEN
+        ERROR(
+          Text002,
+          TimeSheetOwnerUserID,
+          Resource."No.",
+          Resource.Type);
+    END;
+
+    PROCEDURE CalcStatusFactBoxData@12(VAR TimeSheetHeader@1000 : Record 950;VAR OpenQty@1008 : Decimal;VAR SubmittedQty@1007 : Decimal;VAR RejectedQty@1006 : Decimal;VAR ApprovedQty@1003 : Decimal;VAR PostedQty@1002 : Decimal;VAR TotalQuantity@1001 : Decimal);
+    VAR
+      Status@1004 : 'Open,Submitted,Rejected,Approved,Posted';
+    BEGIN
+      TotalQuantity := 0;
+      TimeSheetHeader.SETRANGE("Date Filter",TimeSheetHeader."Starting Date",TimeSheetHeader."Ending Date");
+      OpenQty := TimeSheetHeader.CalcQtyWithStatus(Status::Open);
+
+      SubmittedQty := TimeSheetHeader.CalcQtyWithStatus(Status::Submitted);
+
+      RejectedQty := TimeSheetHeader.CalcQtyWithStatus(Status::Rejected);
+
+      ApprovedQty := TimeSheetHeader.CalcQtyWithStatus(Status::Approved);
+
+      TimeSheetHeader.SETRANGE("Status Filter");
+      TimeSheetHeader.CALCFIELDS(Quantity);
+      TimeSheetHeader.CALCFIELDS("Posted Quantity");
+      TotalQuantity := TimeSheetHeader.Quantity;
+      PostedQty := TimeSheetHeader."Posted Quantity";
+    END;
+
+    PROCEDURE CalcActSchedFactBoxData@33(TimeSheetHeader@1000 : Record 950;VAR DateDescription@1003 : ARRAY [7] OF Text[30];VAR DateQuantity@1002 : ARRAY [7] OF Text[30];VAR TotalQtyText@1007 : Text[30];VAR TotalPresenceQty@1001 : Decimal;VAR AbsenceQty@1006 : Decimal);
+    VAR
+      Resource@1008 : Record 156;
+      Calendar@1005 : Record 2000000007;
+      TotalSchedQty@1009 : Decimal;
+      i@1004 : Integer;
+    BEGIN
+      TotalPresenceQty := 0;
+      IF Resource.GET(TimeSheetHeader."Resource No.") THEN BEGIN
+        Calendar.SETRANGE("Period Type",Calendar."Period Type"::Date);
+        Calendar.SETRANGE("Period Start",TimeSheetHeader."Starting Date",TimeSheetHeader."Ending Date");
+        IF Calendar.FINDSET THEN
+          REPEAT
+            i += 1;
+            DateDescription[i] := FormatDate(Calendar."Period Start",0);
+            TimeSheetHeader.SETRANGE("Date Filter",Calendar."Period Start");
+            TimeSheetHeader.CALCFIELDS(Quantity);
+            Resource.SETRANGE("Date Filter",Calendar."Period Start");
+            Resource.CALCFIELDS(Capacity);
+            DateQuantity[i] := FormatActualSched(TimeSheetHeader.Quantity,Resource.Capacity);
+            TotalPresenceQty += TimeSheetHeader.Quantity;
+            TotalSchedQty += Resource.Capacity;
+          UNTIL Calendar.NEXT = 0;
+        TotalQtyText := FormatActualSched(TotalPresenceQty,TotalSchedQty);
+        TimeSheetHeader.SETRANGE("Type Filter",TimeSheetHeader."Type Filter"::Absence);
+        TimeSheetHeader.SETRANGE("Date Filter",TimeSheetHeader."Starting Date",TimeSheetHeader."Ending Date");
+        TimeSheetHeader.CALCFIELDS(Quantity);
+        AbsenceQty := TimeSheetHeader.Quantity;
+      END;
+    END;
+
+    PROCEDURE FormatActualSched@34(ActualQty@1001 : Decimal;ScheduledQty@1000 : Decimal) : Text[30];
+    BEGIN
+      EXIT(
+        FORMAT(ActualQty,0,'<Precision,2:2><Standard Format,0>') + '/' + FORMAT(ScheduledQty,0,'<Precision,2:2><Standard Format,0>'));
+    END;
+
+    PROCEDURE FilterTimeSheetsArchive@4(VAR TimeSheetHeaderArchive@1000 : Record 954;FieldNo@1001 : Integer);
+    VAR
+      UserSetup@1002 : Record 91;
+    BEGIN
+      IF UserSetup.GET(USERID) THEN;
+      IF NOT UserSetup."Time Sheet Admin." THEN BEGIN
+        TimeSheetHeaderArchive.FILTERGROUP(2);
+        CASE FieldNo OF
+          TimeSheetHeaderArchive.FIELDNO("Owner User ID"):
+            TimeSheetHeaderArchive.SETRANGE("Owner User ID",USERID);
+          TimeSheetHeaderArchive.FIELDNO("Approver User ID"):
+            TimeSheetHeaderArchive.SETRANGE("Approver User ID",USERID);
+        END;
+        TimeSheetHeaderArchive.FILTERGROUP(0);
+      END;
+    END;
+
+    PROCEDURE CheckTimeSheetArchiveNo@14(VAR TimeSheetHeaderArchive@1002 : Record 954;TimeSheetNo@1000 : Code[20]);
+    BEGIN
+      TimeSheetHeaderArchive.SETRANGE("No.",TimeSheetNo);
+      IF TimeSheetHeaderArchive.ISEMPTY THEN
+        ERROR(Text005,TimeSheetNo);
+    END;
+
+    PROCEDURE SetTimeSheetArchiveNo@15(TimeSheetNo@1000 : Code[20];VAR TimeSheetLineArchive@1001 : Record 955);
+    BEGIN
+      TimeSheetLineArchive.FILTERGROUP(2);
+      TimeSheetLineArchive.SETRANGE("Time Sheet No.",TimeSheetNo);
+      TimeSheetLineArchive.FILTERGROUP(0);
+      TimeSheetLineArchive."Time Sheet No." := TimeSheetNo;
+    END;
+
+    PROCEDURE LookupOwnerTimeSheetArchive@18(VAR TimeSheetNo@1001 : Code[20];VAR TimeSheetLineArchive@1000 : Record 955;VAR TimeSheetHeaderArchive@1004 : Record 954);
+    VAR
+      TimeSheetArchiveList@1002 : Page 960;
+    BEGIN
+      COMMIT;
+      IF TimeSheetNo <> '' THEN BEGIN
+        TimeSheetHeaderArchive.GET(TimeSheetNo);
+        TimeSheetArchiveList.SETRECORD(TimeSheetHeaderArchive);
+      END;
+
+      TimeSheetArchiveList.LOOKUPMODE := TRUE;
+      IF TimeSheetArchiveList.RUNMODAL = ACTION::LookupOK THEN BEGIN
+        TimeSheetArchiveList.GETRECORD(TimeSheetHeaderArchive);
+        TimeSheetNo := TimeSheetHeaderArchive."No.";
+        SetTimeSheetArchiveNo(TimeSheetNo,TimeSheetLineArchive);
+      END;
+    END;
+
+    PROCEDURE LookupApproverTimeSheetArchive@16(VAR TimeSheetNo@1001 : Code[20];VAR TimeSheetLineArchive@1000 : Record 955;VAR TimeSheetHeaderArchive@1004 : Record 954);
+    VAR
+      ManagerTimeSheetArcList@1003 : Page 962;
+    BEGIN
+      COMMIT;
+      IF TimeSheetNo <> '' THEN BEGIN
+        TimeSheetHeaderArchive.GET(TimeSheetNo);
+        ManagerTimeSheetArcList.SETRECORD(TimeSheetHeaderArchive);
+      END;
+
+      ManagerTimeSheetArcList.LOOKUPMODE := TRUE;
+      IF ManagerTimeSheetArcList.RUNMODAL = ACTION::LookupOK THEN BEGIN
+        ManagerTimeSheetArcList.GETRECORD(TimeSheetHeaderArchive);
+        TimeSheetNo := TimeSheetHeaderArchive."No.";
+        SetTimeSheetArchiveNo(TimeSheetNo,TimeSheetLineArchive);
+      END;
+    END;
+
+    PROCEDURE CalcSummaryArcFactBoxData@11(TimeSheetHeaderArchive@1000 : Record 954;VAR DateDescription@1003 : ARRAY [7] OF Text[30];VAR DateQuantity@1002 : ARRAY [7] OF Decimal;VAR TotalQuantity@1001 : Decimal;VAR AbsenceQuantity@1006 : Decimal);
+    VAR
+      Calendar@1005 : Record 2000000007;
+      i@1004 : Integer;
+    BEGIN
+      TotalQuantity := 0;
+      Calendar.SETRANGE("Period Type",Calendar."Period Type"::Date);
+      Calendar.SETRANGE("Period Start",TimeSheetHeaderArchive."Starting Date",TimeSheetHeaderArchive."Ending Date");
+      IF Calendar.FINDSET THEN
+        REPEAT
+          i += 1;
+          DateDescription[i] := FormatDate(Calendar."Period Start",0);
+          TimeSheetHeaderArchive.SETRANGE("Date Filter",Calendar."Period Start");
+          TimeSheetHeaderArchive.CALCFIELDS(Quantity);
+          DateQuantity[i] := TimeSheetHeaderArchive.Quantity;
+          TotalQuantity += TimeSheetHeaderArchive.Quantity;
+        UNTIL Calendar.NEXT = 0;
+
+      TimeSheetHeaderArchive.SETRANGE("Type Filter",TimeSheetHeaderArchive."Type Filter"::Absence);
+      TimeSheetHeaderArchive.SETRANGE("Date Filter",TimeSheetHeaderArchive."Starting Date",TimeSheetHeaderArchive."Ending Date");
+      TimeSheetHeaderArchive.CALCFIELDS(Quantity);
+      AbsenceQuantity := TimeSheetHeaderArchive.Quantity;
+    END;
+
+    PROCEDURE MoveTimeSheetToArchive@17(TimeSheetHeader@1000 : Record 950);
+    VAR
+      TimeSheetLine@1007 : Record 951;
+      TimeSheetDetail@1006 : Record 952;
+      TimeSheetCommentLine@1005 : Record 953;
+      TimeSheetHeaderArchive@1004 : Record 954;
+      TimeSheetLineArchive@1003 : Record 955;
+      TimeSheetDetailArchive@1002 : Record 956;
+      TimeSheetCmtLineArchive@1001 : Record 957;
+    BEGIN
+      WITH TimeSheetHeader DO BEGIN
+        Check;
+
+        TimeSheetHeaderArchive.TRANSFERFIELDS(TimeSheetHeader);
+        TimeSheetHeaderArchive.INSERT;
+
+        TimeSheetLine.SETRANGE("Time Sheet No.","No.");
+        IF TimeSheetLine.FINDSET THEN BEGIN
+          REPEAT
+            TimeSheetLineArchive.TRANSFERFIELDS(TimeSheetLine);
+            TimeSheetLineArchive.INSERT;
+          UNTIL TimeSheetLine.NEXT = 0;
+          TimeSheetLine.DELETEALL;
+        END;
+
+        TimeSheetDetail.SETRANGE("Time Sheet No.","No.");
+        IF TimeSheetDetail.FINDSET THEN BEGIN
+          REPEAT
+            TimeSheetDetailArchive.TRANSFERFIELDS(TimeSheetDetail);
+            TimeSheetDetailArchive.INSERT
+          UNTIL TimeSheetDetail.NEXT = 0;
+          TimeSheetDetail.DELETEALL;
+        END;
+
+        TimeSheetCommentLine.SETRANGE("No.","No.");
+        IF TimeSheetCommentLine.FINDSET THEN BEGIN
+          REPEAT
+            TimeSheetCmtLineArchive.TRANSFERFIELDS(TimeSheetCommentLine);
+            TimeSheetCmtLineArchive.INSERT;
+          UNTIL TimeSheetCommentLine.NEXT = 0;
+          TimeSheetCommentLine.DELETEALL;
+        END;
+
+        DELETE;
+      END;
+    END;
+
+    PROCEDURE CopyPrevTimeSheetLines@19(ToTimeSheetHeader@1000 : Record 950);
+    VAR
+      FromTimeSheetHeader@1002 : Record 950;
+      FromTimeSheetLine@1003 : Record 951;
+      ToTimeSheetLine@1001 : Record 951;
+      LineNo@1004 : Integer;
+    BEGIN
+      LineNo := ToTimeSheetHeader.GetLastLineNo;
+
+      FromTimeSheetHeader.GET(ToTimeSheetHeader."No.");
+      FromTimeSheetHeader.SETCURRENTKEY("Resource No.","Starting Date");
+      FromTimeSheetHeader.SETRANGE("Resource No.",ToTimeSheetHeader."Resource No.");
+      IF FromTimeSheetHeader.NEXT(-1) <> 0 THEN BEGIN
+        FromTimeSheetLine.SETRANGE("Time Sheet No.",FromTimeSheetHeader."No.");
+        FromTimeSheetLine.SETFILTER(Type,'<>%1&<>%2',FromTimeSheetLine.Type::Service,FromTimeSheetLine.Type::"Assembly Order");
+        IF FromTimeSheetLine.FINDSET THEN
+          REPEAT
+            LineNo := LineNo + 10000;
+            ToTimeSheetLine.INIT;
+            ToTimeSheetLine."Time Sheet No." := ToTimeSheetHeader."No.";
+            ToTimeSheetLine."Line No." := LineNo;
+            ToTimeSheetLine."Time Sheet Starting Date" := ToTimeSheetHeader."Starting Date";
+            ToTimeSheetLine.Type := FromTimeSheetLine.Type;
+            CASE ToTimeSheetLine.Type OF
+              ToTimeSheetLine.Type::Job:
+                BEGIN
+                  ToTimeSheetLine.VALIDATE("Job No.",FromTimeSheetLine."Job No.");
+                  ToTimeSheetLine.VALIDATE("Job Task No.",FromTimeSheetLine."Job Task No.");
+                END;
+              ToTimeSheetLine.Type::Absence:
+                ToTimeSheetLine.VALIDATE("Cause of Absence Code",FromTimeSheetLine."Cause of Absence Code");
+            END;
+            ToTimeSheetLine.Description := FromTimeSheetLine.Description;
+            ToTimeSheetLine.Chargeable := FromTimeSheetLine.Chargeable;
+            ToTimeSheetLine."Work Type Code" := FromTimeSheetLine."Work Type Code";
+            ToTimeSheetLine.INSERT;
+          UNTIL FromTimeSheetLine.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE CalcPrevTimeSheetLines@39(ToTimeSheetHeader@1000 : Record 950) LinesQty : Integer;
+    VAR
+      TimeSheetHeader@1002 : Record 950;
+      TimeSheetLine@1003 : Record 951;
+    BEGIN
+      TimeSheetHeader.GET(ToTimeSheetHeader."No.");
+      TimeSheetHeader.SETCURRENTKEY("Resource No.","Starting Date");
+      TimeSheetHeader.SETRANGE("Resource No.",ToTimeSheetHeader."Resource No.");
+      IF TimeSheetHeader.NEXT(-1) <> 0 THEN BEGIN
+        TimeSheetLine.SETRANGE("Time Sheet No.",TimeSheetHeader."No.");
+        TimeSheetLine.SETFILTER(Type,'<>%1&<>%2',TimeSheetLine.Type::Service,TimeSheetLine.Type::"Assembly Order");
+        LinesQty := TimeSheetLine.COUNT;
+      END;
+    END;
+
+    PROCEDURE CreateLinesFromJobPlanning@20(TimeSheetHeader@1000 : Record 950) CreatedLinesQty : Integer;
+    VAR
+      TimeSheetLine@1001 : Record 951;
+      TempJobPlanningLine@1004 : TEMPORARY Record 11020401;
+      LineNo@1002 : Integer;
+    BEGIN
+      LineNo := TimeSheetHeader.GetLastLineNo;
+
+      FillJobPlanningBuffer(TimeSheetHeader,TempJobPlanningLine);
+
+      TempJobPlanningLine.RESET;
+      IF TempJobPlanningLine.FINDSET THEN
+        REPEAT
+          LineNo := LineNo + 10000;
+          CreatedLinesQty := CreatedLinesQty + 1;
+          TimeSheetLine.INIT;
+          TimeSheetLine."Time Sheet No." := TimeSheetHeader."No.";
+          TimeSheetLine."Line No." := LineNo;
+          TimeSheetLine."Time Sheet Starting Date" := TimeSheetHeader."Starting Date";
+          TimeSheetLine.VALIDATE(Type,TimeSheetLine.Type::Job);
+          TimeSheetLine.VALIDATE("Job No.",TempJobPlanningLine."Job No.");
+          TimeSheetLine.VALIDATE("Job Task No.",TempJobPlanningLine."Job Task No.");
+          TimeSheetLine.INSERT;
+        UNTIL TempJobPlanningLine.NEXT = 0;
+    END;
+
+    PROCEDURE CalcLinesFromJobPlanning@41(TimeSheetHeader@1000 : Record 950) : Integer;
+    VAR
+      TempJobPlanningLine@1004 : TEMPORARY Record 11020401;
+    BEGIN
+      FillJobPlanningBuffer(TimeSheetHeader,TempJobPlanningLine);
+      EXIT(TempJobPlanningLine.COUNT);
+    END;
+
+    LOCAL PROCEDURE FillJobPlanningBuffer@40(TimeSheetHeader@1000 : Record 950;VAR JobPlanningLineBuffer@1004 : Record 11020401);
+    VAR
+      JobPlanningLine@1003 : Record 11020401;
+    BEGIN
+      JobPlanningLine.SETRANGE(Type,JobPlanningLine.Type::Resource);
+      JobPlanningLine.SETRANGE("No.",TimeSheetHeader."Resource No.");
+      JobPlanningLine.SETRANGE("Planning Date",TimeSheetHeader."Starting Date",TimeSheetHeader."Ending Date");
+      IF JobPlanningLine.FINDSET THEN
+        REPEAT
+          JobPlanningLineBuffer.SETRANGE("Job No.",JobPlanningLine."Job No.");
+          JobPlanningLineBuffer.SETRANGE("Job Task No.",JobPlanningLine."Job Task No.");
+          IF JobPlanningLineBuffer.ISEMPTY THEN BEGIN
+            JobPlanningLineBuffer."Job No." := JobPlanningLine."Job No.";
+            JobPlanningLineBuffer."Job Task No." := JobPlanningLine."Job Task No.";
+            JobPlanningLineBuffer.INSERT;
+          END;
+        UNTIL JobPlanningLine.NEXT = 0;
+      JobPlanningLineBuffer.RESET;
+    END;
+
+    PROCEDURE FindTimeSheet@23(VAR TimeSheetHeader@1000 : Record 950;Which@1001 : 'Prev,Next') : Code[20];
+    BEGIN
+      TimeSheetHeader.RESET;
+      TimeSheetHeader.SETCURRENTKEY("Resource No.","Starting Date");
+      TimeSheetHeader.SETRANGE("Resource No.",TimeSheetHeader."Resource No.");
+      CASE Which OF
+        Which::Prev:
+          TimeSheetHeader.NEXT(-1);
+        Which::Next:
+          TimeSheetHeader.NEXT(1);
+      END;
+      EXIT(TimeSheetHeader."No.");
+    END;
+
+    PROCEDURE FindTimeSheetArchive@26(VAR TimeSheetHeaderArchive@1000 : Record 954;Which@1001 : 'Prev,Next') : Code[20];
+    BEGIN
+      TimeSheetHeaderArchive.RESET;
+      TimeSheetHeaderArchive.SETCURRENTKEY("Resource No.","Starting Date");
+      TimeSheetHeaderArchive.SETRANGE("Resource No.",TimeSheetHeaderArchive."Resource No.");
+      CASE Which OF
+        Which::Prev:
+          TimeSheetHeaderArchive.NEXT(-1);
+        Which::Next:
+          TimeSheetHeaderArchive.NEXT(1);
+      END;
+      EXIT(TimeSheetHeaderArchive."No.");
+    END;
+
+    PROCEDURE GetDateFilter@24(StartingDate@1001 : Date;EndingDate@1002 : Date) DateFilter : Text[30];
+    BEGIN
+      CASE TRUE OF
+        (StartingDate <> 0D) AND (EndingDate <> 0D):
+          DateFilter := STRSUBSTNO('%1..%2',StartingDate,EndingDate);
+        (StartingDate = 0D) AND (EndingDate <> 0D):
+          DateFilter := STRSUBSTNO('..%1',EndingDate);
+        (StartingDate <> 0D) AND (EndingDate = 0D):
+          DateFilter := STRSUBSTNO('%1..',StartingDate);
+      END;
+    END;
+
+    PROCEDURE CreateServDocLinesFromTS@27(ServiceHeader@1000 : Record 5900);
+    VAR
+      TimeSheetLine@1001 : Record 951;
+    BEGIN
+      CreateServLinesFromTS(ServiceHeader,TimeSheetLine,FALSE);
+    END;
+
+    PROCEDURE CreateServDocLinesFromTSLine@54(ServiceHeader@1000 : Record 5900;VAR TimeSheetLine@1001 : Record 951);
+    BEGIN
+      CreateServLinesFromTS(ServiceHeader,TimeSheetLine,TRUE);
+    END;
+
+    LOCAL PROCEDURE GetFirstServiceItemNo@28(ServiceHeader@1000 : Record 5900) : Code[20];
+    VAR
+      ServiceItemLine@1001 : Record 5901;
+    BEGIN
+      ServiceItemLine.SETRANGE("Document Type",ServiceHeader."Document Type");
+      ServiceItemLine.SETRANGE("Document No.",ServiceHeader."No.");
+      ServiceItemLine.FINDFIRST;
+      EXIT(ServiceItemLine."Service Item No.");
+    END;
+
+    PROCEDURE CreateTSLineFromServiceLine@29(ServiceLine@1000 : Record 5902;DocumentNo@1001 : Code[20];Chargeable@1002 : Boolean);
+    BEGIN
+      WITH ServiceLine DO
+        IF "Time Sheet No." = '' THEN
+          CreateTSLineFromDocLine(
+            DATABASE::"Service Line",
+            "No.",
+            "Posting Date",
+            DocumentNo,
+            "Document No.",
+            "Line No.",
+            "Work Type Code",
+            Chargeable,
+            Description,
+            -"Qty. to Ship");
+    END;
+
+    PROCEDURE CreateTSLineFromServiceShptLine@30(ServiceShipmentLine@1000 : Record 5991);
+    BEGIN
+      WITH ServiceShipmentLine DO
+        IF "Time Sheet No." = '' THEN
+          CreateTSLineFromDocLine(
+            DATABASE::"Service Shipment Line",
+            "No.",
+            "Posting Date",
+            "Document No.",
+            "Order No.",
+            "Order Line No.",
+            "Work Type Code",
+            TRUE,
+            Description,
+            -"Qty. Shipped Not Invoiced");
+    END;
+
+    LOCAL PROCEDURE CreateTSLineFromDocLine@25(TableID@1016 : Integer;ResourceNo@1000 : Code[20];PostingDate@1001 : Date;DocumentNo@1002 : Code[20];OrderNo@1008 : Code[20];OrderLineNo@1003 : Integer;WorkTypeCode@1004 : Code[10];Chargbl@1013 : Boolean;Desc@1005 : Text[50];Quantity@1006 : Decimal);
+    VAR
+      Resource@1012 : Record 156;
+      TimeSheetHeader@1011 : Record 950;
+      TimeSheetLine@1010 : Record 951;
+      TimeSheetDetail@1009 : Record 952;
+      LineNo@1007 : Integer;
+    BEGIN
+      Resource.GET(ResourceNo);
+      IF NOT Resource."Use Time Sheet" THEN
+        EXIT;
+
+      TimeSheetHeader.SETRANGE("Resource No.",Resource."No.");
+      TimeSheetHeader.SETFILTER("Starting Date",'..%1',PostingDate);
+      TimeSheetHeader.SETFILTER("Ending Date",'%1..',PostingDate);
+      TimeSheetHeader.FINDFIRST;
+
+      WITH TimeSheetLine DO BEGIN
+        SETRANGE("Time Sheet No.",TimeSheetHeader."No.");
+        IF FINDLAST THEN;
+        LineNo := "Line No." + 10000;
+
+        INIT;
+        "Time Sheet No." := TimeSheetHeader."No.";
+        "Line No." := LineNo;
+        "Time Sheet Starting Date" := TimeSheetHeader."Starting Date";
+        CASE TableID OF
+          DATABASE::"Service Line",
+          DATABASE::"Service Shipment Line":
+            BEGIN
+              Type := Type::Service;
+              "Service Order No." := OrderNo;
+              "Service Order Line No." := OrderLineNo;
+            END;
+          DATABASE::"Assembly Line":
+            BEGIN
+              Type := Type::"Assembly Order";
+              "Assembly Order No." := OrderNo;
+              "Assembly Order Line No." := OrderLineNo;
+            END;
+        END;
+        Description := Desc;
+        "Work Type Code" := WorkTypeCode;
+        Chargeable := Chargbl;
+        "Approver ID" := TimeSheetHeader."Approver User ID";
+        "Approved By" := USERID;
+        "Approval Date" := TODAY;
+        Status := Status::Approved;
+        Posted := TRUE;
+        INSERT;
+
+        TimeSheetDetail.INIT;
+        TimeSheetDetail.CopyFromTimeSheetLine(TimeSheetLine);
+        TimeSheetDetail.Date := PostingDate;
+        TimeSheetDetail.Quantity := Quantity;
+        TimeSheetDetail."Posted Quantity" := Quantity;
+        TimeSheetDetail.Posted := TRUE;
+        TimeSheetDetail.INSERT;
+
+        CreateTSPostingEntry(TimeSheetDetail,Quantity,PostingDate,DocumentNo,Description);
+      END;
+    END;
+
+    PROCEDURE CreateTSLineFromAssemblyLine@32(AssemblyHeader@1000 : Record 900;AssemblyLine@1004 : Record 901;Qty@1001 : Decimal);
+    BEGIN
+      AssemblyLine.TESTFIELD(Type,AssemblyLine.Type::Resource);
+
+      WITH AssemblyLine DO
+        CreateTSLineFromDocLine(
+          DATABASE::"Assembly Line",
+          "No.",
+          AssemblyHeader."Posting Date",
+          AssemblyHeader."Posting No.",
+          "Document No.",
+          "Line No.",
+          '',
+          TRUE,
+          Description,
+          Qty);
+    END;
+
+    PROCEDURE CreateTSPostingEntry@7(TimeSheetDetail@1000 : Record 952;Qty@1001 : Decimal;PostingDate@1002 : Date;DocumentNo@1003 : Code[20];Desc@1005 : Text[50]);
+    VAR
+      TimeSheetPostingEntry@1004 : Record 958;
+    BEGIN
+      WITH TimeSheetPostingEntry DO BEGIN
+        INIT;
+        "Time Sheet No." := TimeSheetDetail."Time Sheet No.";
+        "Time Sheet Line No." := TimeSheetDetail."Time Sheet Line No.";
+        "Time Sheet Date" := TimeSheetDetail.Date;
+        Quantity := Qty;
+        "Document No." := DocumentNo;
+        "Posting Date" := PostingDate;
+        Description := Desc;
+        INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckTSLineDetailPosting@38(TimeSheetNo@1000 : Code[20];TimeSheetLineNo@1001 : Integer;TimeSheetDate@1002 : Date;QtyToPost@1005 : Decimal;QtyPerUnitOfMeasure@1006 : Decimal;VAR MaxAvailableQty@1003 : Decimal) : Boolean;
+    VAR
+      TimeSheetDetail@1004 : Record 952;
+      MaxAvailableQtyBase@1007 : Decimal;
+    BEGIN
+      TimeSheetDetail.GET(TimeSheetNo,TimeSheetLineNo,TimeSheetDate);
+      TimeSheetDetail.TESTFIELD(Status,TimeSheetDetail.Status::Approved);
+      TimeSheetDetail.TESTFIELD(Posted,FALSE);
+
+      MaxAvailableQtyBase := TimeSheetDetail.GetMaxQtyToPost;
+      MaxAvailableQty := MaxAvailableQtyBase * QtyPerUnitOfMeasure;
+      EXIT(QtyToPost <= MaxAvailableQty);
+    END;
+
+    PROCEDURE CheckResJnlLine@31(ResJnlLine@1000 : Record 207);
+    VAR
+      MaxAvailableQty@1001 : Decimal;
+    BEGIN
+      WITH ResJnlLine DO BEGIN
+        TESTFIELD("Qty. per Unit of Measure");
+        IF NOT CheckTSLineDetailPosting(
+             "Time Sheet No.",
+             "Time Sheet Line No.",
+             "Time Sheet Date",
+             Quantity,
+             "Qty. per Unit of Measure",
+             MaxAvailableQty)
+        THEN
+          FIELDERROR(Quantity,STRSUBSTNO(Text004,MaxAvailableQty,"Unit of Measure Code"));
+      END;
+    END;
+
+    PROCEDURE CheckJobJnlLine@35(JobJnlLine@1000 : Record 11072008);
+    VAR
+      MaxAvailableQty@1001 : Decimal;
+    BEGIN
+      WITH JobJnlLine DO BEGIN
+        TESTFIELD("Qty. per Unit of Measure");
+        IF NOT CheckTSLineDetailPosting(
+             "Time Sheet No.",
+             "Time Sheet Line No.",
+             "Time Sheet Date",
+             Quantity,
+             "Qty. per Unit of Measure",
+             MaxAvailableQty)
+        THEN
+          FIELDERROR(Quantity,STRSUBSTNO(Text004,MaxAvailableQty,"Unit of Measure Code"));
+      END;
+    END;
+
+    PROCEDURE CheckServiceLine@37(ServiceLine@1000 : Record 5902);
+    VAR
+      MaxAvailableQty@1001 : Decimal;
+    BEGIN
+      WITH ServiceLine DO BEGIN
+        TESTFIELD("Qty. per Unit of Measure");
+        IF NOT CheckTSLineDetailPosting(
+             "Time Sheet No.",
+             "Time Sheet Line No.",
+             "Time Sheet Date",
+             "Qty. to Ship",
+             "Qty. per Unit of Measure",
+             MaxAvailableQty)
+        THEN
+          FIELDERROR(Quantity,STRSUBSTNO(Text004,MaxAvailableQty,"Unit of Measure Code"));
+      END;
+    END;
+
+    PROCEDURE UpdateTimeAllocation@36(TimeSheetLine@1001 : Record 951;AllocatedQty@1000 : ARRAY [7] OF Decimal);
+    VAR
+      TimeSheetHeader@1005 : Record 950;
+      TimeSheetDetail@1002 : Record 952;
+      TimeSheetDate@1004 : Date;
+      i@1003 : Integer;
+    BEGIN
+      WITH TimeSheetLine DO BEGIN
+        TimeSheetHeader.GET("Time Sheet No.");
+        FOR i := 1 TO 7 DO BEGIN
+          TimeSheetDate := TimeSheetHeader."Starting Date" + i - 1;
+          IF AllocatedQty[i] <> 0 THEN BEGIN
+            IF TimeSheetDetail.GET("Time Sheet No.","Line No.",TimeSheetDate) THEN BEGIN
+              TimeSheetDetail.Quantity := AllocatedQty[i];
+              TimeSheetDetail."Posted Quantity" := TimeSheetDetail.Quantity;
+              TimeSheetDetail.MODIFY;
+            END ELSE BEGIN
+              TimeSheetDetail.INIT;
+              TimeSheetDetail.CopyFromTimeSheetLine(TimeSheetLine);
+              TimeSheetDetail.Posted := TRUE;
+              TimeSheetDetail.Date := TimeSheetDate;
+              TimeSheetDetail.Quantity := AllocatedQty[i];
+              TimeSheetDetail."Posted Quantity" := TimeSheetDetail.Quantity;
+              TimeSheetDetail.INSERT;
+            END;
+          END ELSE BEGIN
+            IF TimeSheetDetail.GET("Time Sheet No.","Line No.",TimeSheetDate) THEN
+              TimeSheetDetail.DELETE;
+          END;
+        END;
+      END;
+    END;
+
+    PROCEDURE GetActivityInfo@42(TimeSheetLine@1000 : Record 951;VAR ActivityCaption@1001 : Text[30];VAR ActivityID@1002 : Code[20];VAR ActivitySubCaption@1004 : Text[30];VAR ActivitySubID@1003 : Code[20]);
+    BEGIN
+      ActivitySubCaption := '';
+      ActivitySubID := '';
+      ActivityCaption := '';
+      ActivityID := '';
+      WITH TimeSheetLine DO
+        CASE Type OF
+          Type::Job:
+            BEGIN
+              ActivityCaption := FIELDCAPTION("Job No.");
+              ActivityID := "Job No.";
+              ActivitySubCaption := FIELDCAPTION("Job Task No.");
+              ActivitySubID := "Job Task No.";
+            END;
+          Type::Absence:
+            BEGIN
+              ActivityCaption := FIELDCAPTION("Cause of Absence Code");
+              ActivityID := "Cause of Absence Code";
+            END;
+          Type::"Assembly Order":
+            BEGIN
+              ActivityCaption := FIELDCAPTION("Assembly Order No.");
+              ActivityID := "Assembly Order No.";
+            END;
+          Type::Service:
+            BEGIN
+              ActivityCaption := FIELDCAPTION("Service Order No.");
+              ActivityID := "Service Order No.";
+            END;
+        END;
+    END;
+
+    PROCEDURE ShowPostingEntries@43(TimeSheetNo@1002 : Code[20];TimeSheetLineNo@1003 : Integer);
+    VAR
+      TimeSheetPostingEntry@1000 : Record 958;
+      TimeSheetPostingEntries@1001 : Page 958;
+    BEGIN
+      TimeSheetPostingEntry.FILTERGROUP(2);
+      TimeSheetPostingEntry.SETRANGE("Time Sheet No.",TimeSheetNo);
+      TimeSheetPostingEntry.SETRANGE("Time Sheet Line No.",TimeSheetLineNo);
+      TimeSheetPostingEntry.FILTERGROUP(0);
+      CLEAR(TimeSheetPostingEntries);
+      TimeSheetPostingEntries.SETTABLEVIEW(TimeSheetPostingEntry);
+      TimeSheetPostingEntries.RUNMODAL;
+    END;
+
+    PROCEDURE FindNearestTimeSheetStartDate@44(Date@1000 : Date) : Date;
+    VAR
+      ResourcesSetup@1001 : Record 314;
+    BEGIN
+      ResourcesSetup.GET;
+      IF DATE2DWY(Date,1) = ResourcesSetup."Time Sheet First Weekday" + 1 THEN
+        EXIT(Date);
+
+      EXIT(CALCDATE(STRSUBSTNO('<WD%1>',ResourcesSetup."Time Sheet First Weekday" + 1),Date));
+    END;
+
+    LOCAL PROCEDURE CreateServLinesFromTS@6(ServiceHeader@1000 : Record 5900;VAR TimeSheetLine@1001 : Record 951;AddBySelectedTimesheetLine@1006 : Boolean);
+    VAR
+      TimeSheetDetail@1007 : Record 952;
+      TempTimeSheetDetail@1009 : TEMPORARY Record 952;
+      ServiceLine@1003 : Record 5902;
+      LineNo@1004 : Integer;
+    BEGIN
+      ServiceLine.SETRANGE("Document Type",ServiceHeader."Document Type");
+      ServiceLine.SETRANGE("Document No.",ServiceHeader."No.");
+      IF ServiceLine.FINDLAST THEN;
+      LineNo := ServiceLine."Line No." + 10000;
+
+      ServiceLine.SETFILTER("Time Sheet No.",'<>%1','');
+      IF ServiceLine.FINDSET THEN
+        REPEAT
+          IF NOT TempTimeSheetDetail.GET(
+               ServiceLine."Time Sheet No.",
+               ServiceLine."Time Sheet Line No.",
+               ServiceLine."Time Sheet Date")
+          THEN
+            IF TimeSheetDetail.GET(
+                 ServiceLine."Time Sheet No.",
+                 ServiceLine."Time Sheet Line No.",
+                 ServiceLine."Time Sheet Date")
+            THEN BEGIN
+              TempTimeSheetDetail := TimeSheetDetail;
+              TempTimeSheetDetail.INSERT;
+            END;
+        UNTIL ServiceLine.NEXT = 0;
+
+      TimeSheetDetail.SETRANGE("Service Order No.",ServiceHeader."No.");
+      TimeSheetDetail.SETRANGE(Status,TimeSheetDetail.Status::Approved);
+      IF AddBySelectedTimesheetLine = TRUE THEN BEGIN
+        TimeSheetDetail.SETRANGE("Time Sheet No.",TimeSheetLine."Time Sheet No.");
+        TimeSheetDetail.SETRANGE("Time Sheet Line No.",TimeSheetLine."Line No.");
+      END;
+      TimeSheetDetail.SETRANGE(Posted,FALSE);
+      IF TimeSheetDetail.FINDSET THEN
+        REPEAT
+          IF NOT TempTimeSheetDetail.GET(
+               TimeSheetDetail."Time Sheet No.",
+               TimeSheetDetail."Time Sheet Line No.",
+               TimeSheetDetail.Date)
+          THEN BEGIN
+            AddServLinesFromTSDetail(ServiceHeader,TimeSheetDetail,LineNo);
+            LineNo := LineNo + 10000;
+          END;
+        UNTIL TimeSheetDetail.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE AddServLinesFromTSDetail@46(ServiceHeader@1000 : Record 5900;VAR TimeSheetDetail@1001 : Record 952;LineNo@1006 : Integer);
+    VAR
+      TimeSheetHeader@1002 : Record 950;
+      TimeSheetLine@1004 : Record 951;
+      ServiceLine@1003 : Record 5902;
+      QtyToPost@1005 : Decimal;
+    BEGIN
+      QtyToPost := TimeSheetDetail.GetMaxQtyToPost;
+      IF QtyToPost <> 0 THEN BEGIN
+        ServiceLine.INIT;
+        ServiceLine."Document Type" := ServiceHeader."Document Type";
+        ServiceLine."Document No." := ServiceHeader."No.";
+        ServiceLine."Line No." := LineNo;
+        ServiceLine.VALIDATE("Service Item No.",GetFirstServiceItemNo(ServiceHeader));
+        ServiceLine."Time Sheet No." := TimeSheetDetail."Time Sheet No.";
+        ServiceLine."Time Sheet Line No." := TimeSheetDetail."Time Sheet Line No.";
+        ServiceLine."Time Sheet Date" := TimeSheetDetail.Date;
+        ServiceLine.Type := ServiceLine.Type::Resource;
+        TimeSheetHeader.GET(TimeSheetDetail."Time Sheet No.");
+        ServiceLine.VALIDATE("No.",TimeSheetHeader."Resource No.");
+        ServiceLine.VALIDATE(Quantity,TimeSheetDetail.Quantity);
+        TimeSheetLine.GET(TimeSheetDetail."Time Sheet No.",TimeSheetDetail."Time Sheet Line No.");
+        IF NOT TimeSheetLine.Chargeable THEN
+          ServiceLine.VALIDATE("Qty. to Consume",QtyToPost);
+        ServiceLine."Planned Delivery Date" := TimeSheetDetail.Date;
+        ServiceLine.VALIDATE("Work Type Code",TimeSheetLine."Work Type Code");
+        ServiceLine.INSERT;
+      END;
+    END;
+
+    BEGIN
+    {
+      4PS, Objects renumbered
+    }
+    END.
+  }
+}
+

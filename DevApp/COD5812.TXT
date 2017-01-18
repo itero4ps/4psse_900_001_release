@@ -1,0 +1,951 @@
+OBJECT Codeunit 5812 Calculate Standard Cost
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00.00.44365,4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1000 : TextConst 'ENU=Too many levels. Must be below %1.';
+      MfgSetup@1001 : Record 99000765;
+      GLSetup@1002 : Record 98;
+      TempItem@1003 : TEMPORARY Record 27;
+      TempWorkCenter@1016 : TEMPORARY Record 99000754;
+      TempMachineCenter@1017 : TEMPORARY Record 99000758;
+      TempResCost@1027 : TEMPORARY Record 202;
+      ProdBOMVersionErrBuf@1012 : TEMPORARY Record 99000779;
+      RtngVersionErrBuf@1014 : TEMPORARY Record 99000786;
+      CostCalcMgt@1004 : Codeunit 5836;
+      VersionMgt@1005 : Codeunit 99000756;
+      UOMMgt@1006 : Codeunit 5402;
+      Window@1019 : Dialog;
+      MaxLevel@1007 : Integer;
+      CalculationDate@1008 : Date;
+      CalcMultiLevel@1009 : Boolean;
+      UseAssemblyList@1010 : Boolean;
+      LogErrors@1011 : Boolean;
+      Text001@1013 : TextConst 'ENU=&Top level,&All levels';
+      ShowDialog@1020 : Boolean;
+      StdCostWkshName@1015 : Text[50];
+      Text002@1018 : TextConst 'ENU=@1@@@@@@@@@@@@@';
+      CalcMfgPrompt@1021 : TextConst 'ENU=One or more subassemblies on the assembly list for item %1 use replenishment system Prod. Order. Do you want to calculate standard cost for those subassemblies?';
+      TargetText@1026 : TextConst 'ENU=Standard Cost,Unit Price';
+      RecursionInstruction@1025 : TextConst '@@@="%1 = Item No., %2 = Description";ENU=Calculate the %3 of item %1 %2 by rolling up the assembly list components. Select All levels to include and update the %3 of any subassemblies.';
+      NonAssemblyItemError@1024 : TextConst '@@@="%1 = Item No., %2 = Description";ENU=Item %1 %2 does not use replenishment system Assembly. The %3 will not be calculated.';
+      NoAssemblyListError@1023 : TextConst '@@@="%1 = Item No., %2 = Description";ENU=Item %1 %2 has no assembly list. The %3 will not be calculated.';
+      NonAssemblyComponentWithList@1022 : TextConst 'ENU=One or more subassemblies on the assembly list for this item does not use replenishment system Assembly. The %1 for these subassemblies will not be calculated. Are you sure that you want to continue?';
+      ColIdx@1028 : ',StdCost,ExpCost,ActCost,Dev,Var';
+      RowIdx@1029 : ',MatCost,ResCost,ResOvhd,AsmOvhd,Total';
+      gvItemRec@1100485000 : Record 27;
+      gvErrorRec@1100485001 : Record 11012051;
+      gvBatch@1100485002 : Boolean;
+      Text11012000@1100485004 : TextConst 'ENU=Item %1: Status %2 %3 not certified';
+      gvErrorNum@1100485003 : Integer;
+
+    PROCEDURE SetProperties@1(NewCalculationDate@1000 : Date;NewCalcMultiLevel@1001 : Boolean;NewUseAssemblyList@1002 : Boolean;NewLogErrors@1003 : Boolean;NewStdCostWkshName@1004 : Text[50];NewShowDialog@1005 : Boolean);
+    BEGIN
+      TempItem.DELETEALL;
+      ProdBOMVersionErrBuf.DELETEALL;
+      RtngVersionErrBuf.DELETEALL;
+      CLEARALL;
+
+      CalculationDate := NewCalculationDate;
+      CalcMultiLevel := NewCalcMultiLevel;
+      UseAssemblyList := NewUseAssemblyList;
+      LogErrors := NewLogErrors;
+      StdCostWkshName := NewStdCostWkshName;
+      ShowDialog := NewShowDialog;
+
+      MaxLevel := 50;
+      MfgSetup.GET;
+      GLSetup.GET;
+    END;
+
+    PROCEDURE TestPreconditions@18(VAR Item@1000 : Record 27;VAR NewProdBOMVersionErrBuf@1002 : Record 99000779;VAR NewRtngVersionErrBuf@1001 : Record 99000786);
+    VAR
+      TempItem2@1003 : TEMPORARY Record 27;
+    BEGIN
+      CalcItems(Item,TempItem2);
+
+      ProdBOMVersionErrBuf.RESET;
+      IF ProdBOMVersionErrBuf.FIND('-') THEN
+        REPEAT
+          NewProdBOMVersionErrBuf := ProdBOMVersionErrBuf;
+          NewProdBOMVersionErrBuf.INSERT;
+        UNTIL ProdBOMVersionErrBuf.NEXT = 0;
+
+      RtngVersionErrBuf.RESET;
+      IF RtngVersionErrBuf.FIND('-') THEN
+        REPEAT
+          NewRtngVersionErrBuf := RtngVersionErrBuf;
+          NewRtngVersionErrBuf.INSERT;
+        UNTIL RtngVersionErrBuf.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE AnalyzeAssemblyList@12(VAR Item@1000 : Record 27;VAR Depth@1002 : Integer;VAR NonAssemblyItemWithList@1001 : Boolean;VAR ContainsProdBOM@1007 : Boolean);
+    VAR
+      BOMComponent@1003 : Record 90;
+      SubItem@1004 : Record 27;
+      BaseDepth@1005 : Integer;
+      MaxDepth@1006 : Integer;
+    BEGIN
+      IF Item.IsMfgItem AND ((Item."Production BOM No." <> '') OR (Item."Routing No." <> '')) THEN BEGIN
+        ContainsProdBOM := TRUE;
+        IF Item."Production BOM No." <> '' THEN
+          AnalyzeProdBOM(Item."Production BOM No.",Depth,NonAssemblyItemWithList,ContainsProdBOM)
+        ELSE
+          Depth += 1;
+        EXIT
+      END;
+      BOMComponent.SETRANGE("Parent Item No.",Item."No.");
+      IF BOMComponent.FINDSET THEN BEGIN
+        IF NOT Item.IsAssemblyItem THEN BEGIN
+          NonAssemblyItemWithList := TRUE;
+          EXIT
+        END;
+        Depth += 1;
+        BaseDepth := Depth;
+        REPEAT
+          IF BOMComponent.Type = BOMComponent.Type::Item THEN BEGIN
+            SubItem.GET(BOMComponent."No.");
+            MaxDepth := BaseDepth;
+            AnalyzeAssemblyList(SubItem,MaxDepth,NonAssemblyItemWithList,ContainsProdBOM);
+            IF MaxDepth > Depth THEN
+              Depth := MaxDepth
+          END
+        UNTIL BOMComponent.NEXT = 0
+      END;
+    END;
+
+    LOCAL PROCEDURE AnalyzeProdBOM@31(ProductionBOMNo@1001 : Code[20];VAR Depth@1000 : Integer;VAR NonAssemblyItemWithList@1008 : Boolean;VAR ContainsProdBOM@1007 : Boolean);
+    VAR
+      ProdBOMLine@1003 : Record 99000772;
+      SubItem@1006 : Record 27;
+      PBOMVersionCode@1002 : Code[20];
+      BaseDepth@1005 : Integer;
+      MaxDepth@1004 : Integer;
+    BEGIN
+      SetProdBOMFilters(ProdBOMLine,PBOMVersionCode,ProductionBOMNo);
+      IF ProdBOMLine.FINDSET THEN BEGIN
+        Depth += 1;
+        BaseDepth := Depth;
+        REPEAT
+          CASE ProdBOMLine.Type OF
+            ProdBOMLine.Type::Item:
+              BEGIN
+                SubItem.GET(ProdBOMLine."No.");
+                MaxDepth := BaseDepth;
+                AnalyzeAssemblyList(SubItem,MaxDepth,NonAssemblyItemWithList,ContainsProdBOM);
+                IF MaxDepth > Depth THEN
+                  Depth := MaxDepth
+              END;
+            ProdBOMLine.Type::"Production BOM":
+              BEGIN
+                MaxDepth := BaseDepth;
+                AnalyzeProdBOM(ProdBOMLine."No.",MaxDepth,NonAssemblyItemWithList,ContainsProdBOM);
+                MaxDepth -= 1;
+                IF MaxDepth > Depth THEN
+                  Depth := MaxDepth
+              END;
+          END;
+        UNTIL ProdBOMLine.NEXT = 0
+      END
+    END;
+
+    LOCAL PROCEDURE PrepareAssemblyCalculation@17(VAR Item@1000 : Record 27;VAR Depth@1001 : Integer;Target@1002 : 'Standard Cost,Unit Price';VAR ContainsProdBOM@1011 : Boolean) Instruction : Text[1024];
+    VAR
+      CalculationTarget@1008 : Text[80];
+      SubNonAssemblyItemWithList@1009 : Boolean;
+    BEGIN
+      CalculationTarget := SELECTSTR(Target,TargetText);
+      IF NOT Item.IsAssemblyItem THEN
+        ERROR(NonAssemblyItemError,Item."No.",Item.Description,CalculationTarget);
+      AnalyzeAssemblyList(Item,Depth,SubNonAssemblyItemWithList,ContainsProdBOM);
+      IF Depth = 0 THEN
+        ERROR(NoAssemblyListError,Item."No.",Item.Description,CalculationTarget);
+      Instruction := STRSUBSTNO(RecursionInstruction,Item."No.",Item.Description,CalculationTarget);
+      IF SubNonAssemblyItemWithList THEN
+        Instruction += STRSUBSTNO(NonAssemblyComponentWithList,CalculationTarget)
+    END;
+
+    PROCEDURE CalcItem@4(ItemNo@1001 : Code[20];NewUseAssemblyList@1000 : Boolean);
+    VAR
+      Item@1002 : Record 27;
+      ItemCostMgt@1004 : Codeunit 5804;
+      Instruction@1008 : Text[1024];
+      NewCalcMultiLevel@1003 : Boolean;
+      Depth@1009 : Integer;
+      AssemblyContainsProdBOM@1005 : Boolean;
+      CalcMfgItems@1006 : Boolean;
+    BEGIN
+      Item.GET(ItemNo);
+      IF NewUseAssemblyList THEN
+        Instruction := PrepareAssemblyCalculation(Item,Depth,1,AssemblyContainsProdBOM) // 1=StandardCost
+      ELSE
+        IF NOT Item.IsMfgItem THEN
+          EXIT;
+      IF NOT NewUseAssemblyList OR (Depth > 1) THEN
+        CASE STRMENU(Text001,1,Instruction) OF
+          0:
+            EXIT;
+          1:
+            NewCalcMultiLevel := FALSE;
+          2:
+            NewCalcMultiLevel := TRUE;
+        END;
+
+      SetProperties(WORKDATE,NewCalcMultiLevel,NewUseAssemblyList,FALSE,'',FALSE);
+
+      IF NewUseAssemblyList THEN BEGIN
+        IF NewCalcMultiLevel AND AssemblyContainsProdBOM THEN
+          CalcMfgItems := CONFIRM(CalcMfgPrompt,FALSE,Item."No.");
+        CalcAssemblyItem(ItemNo,Item,0,CalcMfgItems)
+      END ELSE
+        CalcMfgItem(ItemNo,Item,0);
+
+      IF TempItem.FIND('-') THEN
+        REPEAT
+          ItemCostMgt.UpdateStdCostShares(TempItem);
+        UNTIL TempItem.NEXT = 0;
+    END;
+
+    PROCEDURE CalcItems@7(VAR Item@1000 : Record 27;VAR NewTempItem@1001 : Record 27);
+    VAR
+      Item2@1002 : Record 27;
+      Item3@1003 : Record 27;
+      NoOfRecords@1004 : Integer;
+      LineCount@1005 : Integer;
+    BEGIN
+      NewTempItem.DELETEALL;
+
+      Item2.COPY(Item);
+
+      NoOfRecords := Item.COUNT;
+      IF ShowDialog THEN
+        Window.OPEN(Text002);
+
+      IF Item2.FIND('-') THEN
+        REPEAT
+          LineCount := LineCount + 1;
+          IF ShowDialog THEN
+            Window.UPDATE(1,ROUND(LineCount / NoOfRecords * 10000,1));
+          IF UseAssemblyList THEN
+            CalcAssemblyItem(Item2."No.",Item3,0,TRUE)
+          ELSE
+            CalcMfgItem(Item2."No.",Item3,0);
+        UNTIL Item2.NEXT = 0;
+
+      TempItem.RESET;
+      IF TempItem.FIND('-') THEN
+        REPEAT
+          NewTempItem := TempItem;
+          NewTempItem.INSERT;
+        UNTIL TempItem.NEXT = 0;
+
+      IF ShowDialog THEN
+        Window.CLOSE;
+    END;
+
+    LOCAL PROCEDURE CalcAssemblyItem@5(ItemNo@1000 : Code[20];VAR Item@1001 : Record 27;Level@1002 : Integer;CalcMfgItems@1007 : Boolean);
+    VAR
+      BOMComp@1004 : Record 90;
+      CompItem@1005 : Record 27;
+      Res@1003 : Record 156;
+      LotSize@1009 : Decimal;
+      ComponentQuantity@1011 : Decimal;
+    BEGIN
+      IF Level > MaxLevel THEN
+        ERROR(Text000,MaxLevel);
+
+      IF GetItem(ItemNo,Item) THEN
+        EXIT;
+
+      IF NOT Item.IsAssemblyItem THEN
+        EXIT;
+
+      IF NOT CalcMultiLevel AND (Level <> 0) THEN
+        EXIT;
+
+      BOMComp.SETRANGE("Parent Item No.",ItemNo);
+      BOMComp.SETFILTER(Type,'<>%1',BOMComp.Type::" ");
+      IF BOMComp.FINDSET THEN BEGIN
+        Item."Rolled-up Material Cost" := 0;
+        Item."Rolled-up Capacity Cost" := 0;
+        Item."Rolled-up Cap. Overhead Cost" := 0;
+        Item."Rolled-up Mfg. Ovhd Cost" := 0;
+        Item."Rolled-up Subcontracted Cost" := 0;
+        Item."Single-Level Material Cost" := 0;
+        Item."Single-Level Capacity Cost" := 0;
+        Item."Single-Level Cap. Ovhd Cost" := 0;
+        Item."Single-Level Subcontrd. Cost" := 0;
+
+        REPEAT
+          CASE BOMComp.Type OF
+            BOMComp.Type::Item:
+              BEGIN
+                GetItem(BOMComp."No.",CompItem);
+                ComponentQuantity :=
+                  BOMComp."Quantity per" *
+                  UOMMgt.GetQtyPerUnitOfMeasure(CompItem,BOMComp."Unit of Measure Code");
+                IF CompItem.IsAssemblyItem OR CompItem.IsMfgItem THEN BEGIN
+                  IF CompItem.IsAssemblyItem THEN
+                    CalcAssemblyItem(BOMComp."No.",CompItem,Level + 1,CalcMfgItems)
+                  ELSE
+                    IF CalcMfgItems THEN
+                      CalcMfgItem(BOMComp."No.",CompItem,Level + 1);
+                  Item."Rolled-up Material Cost" += ComponentQuantity * CompItem."Rolled-up Material Cost";
+                  Item."Rolled-up Capacity Cost" += ComponentQuantity * CompItem."Rolled-up Capacity Cost";
+                  Item."Rolled-up Cap. Overhead Cost" += ComponentQuantity * CompItem."Rolled-up Cap. Overhead Cost";
+                  Item."Rolled-up Mfg. Ovhd Cost" += ComponentQuantity * CompItem."Rolled-up Mfg. Ovhd Cost";
+                  Item."Rolled-up Subcontracted Cost" += ComponentQuantity * CompItem."Rolled-up Subcontracted Cost";
+                  Item."Single-Level Material Cost" += ComponentQuantity * CompItem."Standard Cost"
+                END ELSE BEGIN
+                  Item."Rolled-up Material Cost" += ComponentQuantity * CompItem."Unit Cost";
+                  Item."Single-Level Material Cost" += ComponentQuantity * CompItem."Unit Cost"
+                END
+              END;
+            BOMComp.Type::Resource:
+              BEGIN
+                LotSize := 1;
+                IF BOMComp."Resource Usage Type" = BOMComp."Resource Usage Type"::Fixed THEN
+                  IF Item."Lot Size" <> 0 THEN
+                    LotSize := Item."Lot Size";
+
+                GetResCost(BOMComp."No.",TempResCost);
+                Res.GET(BOMComp."No.");
+                ComponentQuantity :=
+                  BOMComp."Quantity per" *
+                  UOMMgt.GetResQtyPerUnitOfMeasure(Res,BOMComp."Unit of Measure Code") /
+                  LotSize;
+                Item."Single-Level Capacity Cost" += ComponentQuantity * TempResCost."Direct Unit Cost";
+                Item."Single-Level Cap. Ovhd Cost" += ComponentQuantity * (TempResCost."Unit Cost" - TempResCost."Direct Unit Cost");
+              END;
+          END;
+        UNTIL BOMComp.NEXT = 0;
+
+        Item."Single-Level Mfg. Ovhd Cost" :=
+          ROUND(
+            (Item."Single-Level Material Cost" +
+             Item."Single-Level Capacity Cost" +
+             Item."Single-Level Cap. Ovhd Cost") * Item."Indirect Cost %" / 100 +
+            Item."Overhead Rate",
+            GLSetup."Unit-Amount Rounding Precision");
+        Item."Rolled-up Material Cost" :=
+          ROUND(
+            Item."Rolled-up Material Cost",
+            GLSetup."Unit-Amount Rounding Precision");
+        Item."Rolled-up Capacity Cost" :=
+          ROUND(
+            Item."Rolled-up Capacity Cost" + Item."Single-Level Capacity Cost",
+            GLSetup."Unit-Amount Rounding Precision");
+        Item."Rolled-up Cap. Overhead Cost" :=
+          ROUND(
+            Item."Rolled-up Cap. Overhead Cost" + Item."Single-Level Cap. Ovhd Cost",
+            GLSetup."Unit-Amount Rounding Precision");
+        Item."Rolled-up Mfg. Ovhd Cost" :=
+          ROUND(
+            Item."Rolled-up Mfg. Ovhd Cost" + Item."Single-Level Mfg. Ovhd Cost",
+            GLSetup."Unit-Amount Rounding Precision");
+        Item."Rolled-up Subcontracted Cost" :=
+          ROUND(
+            Item."Rolled-up Subcontracted Cost",
+            GLSetup."Unit-Amount Rounding Precision");
+        Item."Standard Cost" :=
+          ROUND(
+            Item."Single-Level Material Cost" +
+            Item."Single-Level Capacity Cost" +
+            Item."Single-Level Cap. Ovhd Cost" +
+            Item."Single-Level Mfg. Ovhd Cost" +
+            Item."Single-Level Subcontrd. Cost",
+            GLSetup."Unit-Amount Rounding Precision");
+        Item."Single-Level Capacity Cost" :=
+          ROUND(
+            Item."Single-Level Capacity Cost",
+            GLSetup."Unit-Amount Rounding Precision");
+        Item."Single-Level Cap. Ovhd Cost" :=
+          ROUND(
+            Item."Single-Level Cap. Ovhd Cost",
+            GLSetup."Unit-Amount Rounding Precision");
+
+        Item."Last Unit Cost Calc. Date" := CalculationDate;
+
+        TempItem := Item;
+        TempItem.INSERT
+      END
+    END;
+
+    PROCEDURE CalcAssemblyItemPrice@15(ItemNo@1001 : Code[20]);
+    VAR
+      Item@1002 : Record 27;
+      Instruction@1000 : Text[1024];
+      Depth@1004 : Integer;
+      NewCalcMultiLevel@1003 : Boolean;
+      AssemblyContainsProdBOM@1005 : Boolean;
+    BEGIN
+      Item.GET(ItemNo);
+      Instruction := PrepareAssemblyCalculation(Item,Depth,2,AssemblyContainsProdBOM); // 2=UnitPrice
+      IF Depth > 1 THEN
+        CASE STRMENU(Text001,1,Instruction) OF
+          0:
+            EXIT;
+          1:
+            NewCalcMultiLevel := FALSE;
+          2:
+            NewCalcMultiLevel := TRUE;
+        END;
+
+      SetProperties(WORKDATE,NewCalcMultiLevel,TRUE,FALSE,'',FALSE);
+
+      Item.GET(ItemNo);
+      DoCalcAssemblyItemPrice(Item,0);
+    END;
+
+    LOCAL PROCEDURE DoCalcAssemblyItemPrice@16(VAR Item@1001 : Record 27;Level@1002 : Integer);
+    VAR
+      BOMComp@1004 : Record 90;
+      CompItem@1005 : Record 27;
+      CompResource@1000 : Record 156;
+      UnitPrice@1007 : Decimal;
+    BEGIN
+      IF Level > MaxLevel THEN
+        ERROR(Text000,MaxLevel);
+
+      IF NOT CalcMultiLevel AND (Level <> 0) THEN
+        EXIT;
+
+      IF NOT Item.IsAssemblyItem THEN
+        EXIT;
+
+      BOMComp.SETRANGE("Parent Item No.",Item."No.");
+      IF BOMComp.FIND('-') THEN BEGIN
+        REPEAT
+          CASE BOMComp.Type OF
+            BOMComp.Type::Item:
+              IF CompItem.GET(BOMComp."No.")THEN BEGIN
+                DoCalcAssemblyItemPrice(CompItem,Level + 1);
+                UnitPrice +=
+                  BOMComp."Quantity per" *
+                  UOMMgt.GetQtyPerUnitOfMeasure(CompItem,BOMComp."Unit of Measure Code") *
+                  CompItem."Unit Price";
+              END;
+            BOMComp.Type::Resource:
+              IF CompResource.GET(BOMComp."No.") THEN
+                UnitPrice +=
+                  BOMComp."Quantity per" *
+                  UOMMgt.GetResQtyPerUnitOfMeasure(CompResource,BOMComp."Unit of Measure Code") *
+                  CompResource."Unit Price";
+          END
+        UNTIL BOMComp.NEXT = 0;
+        UnitPrice := ROUND(UnitPrice,GLSetup."Unit-Amount Rounding Precision");
+        Item.VALIDATE("Unit Price",UnitPrice);
+        Item.MODIFY(TRUE)
+      END;
+    END;
+
+    LOCAL PROCEDURE CalcMfgItem@2(ItemNo@1000 : Code[20];VAR Item@1001 : Record 27;Level@1002 : Integer);
+    VAR
+      LotSize@1003 : Decimal;
+      MfgItemQtyBase@1004 : Decimal;
+      SLMat@1005 : Decimal;
+      SLCap@1006 : Decimal;
+      SLSub@1007 : Decimal;
+      SLCapOvhd@1008 : Decimal;
+      SLMfgOvhd@1009 : Decimal;
+      RUMat@1010 : Decimal;
+      RUCap@1011 : Decimal;
+      RUSub@1012 : Decimal;
+      RUCapOvhd@1013 : Decimal;
+      RUMfgOvhd@1014 : Decimal;
+    BEGIN
+      IF Level > MaxLevel THEN
+        ERROR(Text000,MaxLevel);
+
+      IF GetItem(ItemNo,Item) THEN
+        EXIT;
+
+      IF NOT CalcMultiLevel AND (Level <> 0) THEN
+        EXIT;
+
+      WITH Item DO BEGIN
+        LotSize := 1;
+
+        IF IsMfgItem THEN BEGIN
+          IF "Lot Size" <> 0 THEN
+            LotSize := "Lot Size";
+          gvItemRec := Item;  //**4PS.n
+          MfgItemQtyBase := CostCalcMgt.CalcQtyAdjdForBOMScrap(LotSize,"Scrap %");
+          CalcRtngCost("Routing No.",MfgItemQtyBase,SLCap,SLSub,SLCapOvhd);
+          CalcProdBOMCost(
+            Item,"Production BOM No.","Routing No.",
+            MfgItemQtyBase,TRUE,Level,SLMat,RUMat,RUCap,RUSub,RUCapOvhd,RUMfgOvhd);
+          SLMfgOvhd :=
+            CostCalcMgt.CalcOvhdCost(
+              SLMat + SLCap + SLSub + SLCapOvhd,
+              "Indirect Cost %","Overhead Rate",LotSize);
+          "Last Unit Cost Calc. Date" := CalculationDate;
+        END ELSE
+          IF IsAssemblyItem THEN BEGIN
+            CalcAssemblyItem(ItemNo,Item,Level,TRUE);
+            EXIT
+          END ELSE BEGIN
+            SLMat := "Unit Cost";
+            RUMat := "Unit Cost";
+          END;
+
+        "Single-Level Material Cost" := CalcCostPerUnit(SLMat,LotSize);
+        "Single-Level Capacity Cost" := CalcCostPerUnit(SLCap,LotSize);
+        "Single-Level Subcontrd. Cost" := CalcCostPerUnit(SLSub,LotSize);
+        "Single-Level Cap. Ovhd Cost" := CalcCostPerUnit(SLCapOvhd,LotSize);
+        "Single-Level Mfg. Ovhd Cost" := CalcCostPerUnit(SLMfgOvhd,LotSize);
+        "Rolled-up Material Cost" := CalcCostPerUnit(RUMat,LotSize);
+        "Rolled-up Capacity Cost" := CalcCostPerUnit(RUCap + SLCap,LotSize);
+        "Rolled-up Subcontracted Cost" := CalcCostPerUnit(RUSub + SLSub,LotSize);
+        "Rolled-up Cap. Overhead Cost" := CalcCostPerUnit(RUCapOvhd + SLCapOvhd,LotSize);
+        "Rolled-up Mfg. Ovhd Cost" := CalcCostPerUnit(RUMfgOvhd + SLMfgOvhd,LotSize);
+        "Standard Cost" :=
+          "Single-Level Material Cost" +
+          "Single-Level Capacity Cost" +
+          "Single-Level Subcontrd. Cost" +
+          "Single-Level Cap. Ovhd Cost" +
+          "Single-Level Mfg. Ovhd Cost";
+      END;
+
+      TempItem := Item;
+      TempItem.INSERT;
+    END;
+
+    LOCAL PROCEDURE SetProdBOMFilters@20(VAR ProdBOMLine@1014 : Record 99000772;VAR PBOMVersionCode@1002 : Code[20];ProdBOMNo@1001 : Code[20]);
+    VAR
+      ProdBOMHeader@1013 : Record 99000771;
+    BEGIN
+      PBOMVersionCode :=
+        VersionMgt.GetBOMVersion(ProdBOMNo,CalculationDate,TRUE);
+      IF PBOMVersionCode = '' THEN BEGIN
+        ProdBOMHeader.GET(ProdBOMNo);
+        TestBOMVersionIsCertified(PBOMVersionCode,ProdBOMHeader);
+      END;
+
+      WITH ProdBOMLine DO BEGIN
+        SETRANGE("Production BOM No.",ProdBOMNo);
+        SETRANGE("Version Code",PBOMVersionCode);
+        SETFILTER("Starting Date",'%1|..%2',0D,CalculationDate);
+        SETFILTER("Ending Date",'%1|%2..',0D,CalculationDate);
+        SETFILTER("No.",'<>%1','')
+      END
+    END;
+
+    LOCAL PROCEDURE CalcProdBOMCost@6(MfgItem@1000 : Record 27;ProdBOMNo@1001 : Code[20];RtngNo@1002 : Code[20];MfgItemQtyBase@1003 : Decimal;IsTypeItem@1004 : Boolean;Level@1005 : Integer;VAR SLMat@1006 : Decimal;VAR RUMat@1007 : Decimal;VAR RUCap@1008 : Decimal;VAR RUSub@1009 : Decimal;VAR RUCapOvhd@1010 : Decimal;VAR RUMfgOvhd@1011 : Decimal);
+    VAR
+      CompItem@1012 : Record 27;
+      ProdBOMLine@1014 : Record 99000772;
+      CompItemQtyBase@1015 : Decimal;
+      UOMFactor@1018 : Decimal;
+      PBOMVersionCode@1016 : Code[10];
+    BEGIN
+      IF ProdBOMNo = '' THEN
+        EXIT;
+
+      SetProdBOMFilters(ProdBOMLine,PBOMVersionCode,ProdBOMNo);
+
+      IF IsTypeItem THEN
+        UOMFactor := UOMMgt.GetQtyPerUnitOfMeasure(MfgItem,VersionMgt.GetBOMUnitOfMeasure(ProdBOMNo,PBOMVersionCode))
+      ELSE
+        UOMFactor := 1;
+
+      WITH ProdBOMLine DO BEGIN
+        IF FIND('-') THEN
+          REPEAT
+            CompItemQtyBase :=
+              CostCalcMgt.CalcCompItemQtyBase(ProdBOMLine,CalculationDate,MfgItemQtyBase,RtngNo,IsTypeItem) /
+              UOMFactor;
+            CASE Type OF
+              Type::Item:
+                BEGIN
+                  CalcMfgItem("No.",CompItem,Level + 1);
+                  IncrCost(SLMat,CompItem."Standard Cost",CompItemQtyBase);
+                  IncrCost(RUMat,CompItem."Rolled-up Material Cost",CompItemQtyBase);
+                  IncrCost(RUCap,CompItem."Rolled-up Capacity Cost",CompItemQtyBase);
+                  IncrCost(RUSub,CompItem."Rolled-up Subcontracted Cost",CompItemQtyBase);
+                  IncrCost(RUCapOvhd,CompItem."Rolled-up Cap. Overhead Cost",CompItemQtyBase);
+                  IncrCost(RUMfgOvhd,CompItem."Rolled-up Mfg. Ovhd Cost",CompItemQtyBase);
+                END;
+              Type::"Production BOM":
+                CalcProdBOMCost(
+                  MfgItem,"No.",RtngNo,CompItemQtyBase,FALSE,Level,SLMat,RUMat,RUCap,RUSub,RUCapOvhd,RUMfgOvhd);
+            END;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE CalcRtngCost@3(RtngHeaderNo@1000 : Code[20];MfgItemQtyBase@1001 : Decimal;VAR SLCap@1002 : Decimal;VAR SLSub@1003 : Decimal;VAR SLCapOvhd@1004 : Decimal);
+    VAR
+      RtngLine@1007 : Record 99000764;
+      RtngHeader@1005 : Record 99000763;
+    BEGIN
+      IF RtngLine.CertifiedRoutingVersionExists(RtngHeaderNo,CalculationDate) THEN BEGIN
+        IF RtngLine."Version Code" = '' THEN BEGIN
+          RtngHeader.GET(RtngHeaderNo);
+          TestRtngVersionIsCertified(RtngLine."Version Code",RtngHeader);
+        END;
+
+        REPEAT
+          CalcRtngLineCost(RtngLine,MfgItemQtyBase,SLCap,SLSub,SLCapOvhd);
+        UNTIL RtngLine.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE CalcRtngCostPerUnit@9(Type@1000 : 'Work Center,Machine Center, ';No@1001 : Code[20];VAR DirUnitCost@1002 : Decimal;VAR IndirCostPct@1003 : Decimal;VAR OvhdRate@1004 : Decimal;VAR UnitCost@1005 : Decimal;VAR UnitCostCalculation@1006 : 'Time,Unit');
+    VAR
+      WorkCenter@1007 : Record 99000754;
+      MachineCenter@1008 : Record 99000758;
+    BEGIN
+      CASE Type OF
+        Type::"Work Center":
+          GetWorkCenter(No,WorkCenter);
+        Type::"Machine Center":
+          GetMachineCenter(No,MachineCenter);
+      END;
+      CostCalcMgt.RoutingCostPerUnit2(Type,DirUnitCost,IndirCostPct,OvhdRate,UnitCost,UnitCostCalculation,WorkCenter,MachineCenter);
+    END;
+
+    LOCAL PROCEDURE CalcCostPerUnit@10(CostPerLot@1000 : Decimal;LotSize@1001 : Decimal) : Decimal;
+    BEGIN
+      EXIT(ROUND(CostPerLot / LotSize,GLSetup."Unit-Amount Rounding Precision"));
+    END;
+
+    LOCAL PROCEDURE TestBOMVersionIsCertified@14(BOMVersionCode@1002 : Code[20];ProdBOMHeader@1001 : Record 99000771) : Boolean;
+    BEGIN
+      IF BOMVersionCode = '' THEN BEGIN
+        IF ProdBOMHeader.Status <> ProdBOMHeader.Status::Certified THEN
+          IF LogErrors THEN
+            InsertInErrBuf(ProdBOMHeader."No.",'',FALSE)
+          ELSE
+            ProdBOMHeader.TESTFIELD(Status,ProdBOMHeader.Status::Certified);
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertInErrBuf@23(No@1000 : Code[20];Version@1001 : Code[10];IsRtng@1002 : Boolean);
+    BEGIN
+      IF NOT LogErrors THEN
+        EXIT;
+
+      IF IsRtng THEN BEGIN
+        RtngVersionErrBuf."Routing No." := No;
+        RtngVersionErrBuf."Version Code" := Version;
+        IF RtngVersionErrBuf.INSERT THEN;
+      END ELSE BEGIN
+        ProdBOMVersionErrBuf."Production BOM No." := No;
+        ProdBOMVersionErrBuf."Version Code" := Version;
+        IF ProdBOMVersionErrBuf.INSERT THEN;
+      END;
+
+      //**4PS.sn
+      IF gvBatch = TRUE THEN BEGIN
+        //db, 01-09-05: store error for report 11012306
+        WITH gvErrorRec DO BEGIN
+          SETRANGE("User ID", USERID);
+          SETRANGE("Source Type", "Source Type"::Item);
+          IF FIND('+') THEN
+            gvErrorNum := "Line No." + 1
+          ELSE
+            gvErrorNum := 1;
+
+          INIT;
+          "User ID" := USERID;
+          "Source Type" := "Source Type"::Item;
+          "Line No." := gvErrorNum;
+          IF IsRtng THEN
+            "Error message" := STRSUBSTNO(Text11012000, gvItemRec."No.", gvItemRec.FIELDCAPTION("Routing No."), No)
+          ELSE
+            "Error message" := STRSUBSTNO(Text11012000, gvItemRec."No.", gvItemRec.FIELDCAPTION("Production BOM No."), No);
+          INSERT;
+        END;
+      END;
+      //**4PS.en
+    END;
+
+    LOCAL PROCEDURE GetItem@22(ItemNo@1001 : Code[20];VAR Item@1002 : Record 27) IsInBuffer@1000 : Boolean;
+    VAR
+      StdCostWksh@1003 : Record 5841;
+    BEGIN
+      IF TempItem.GET(ItemNo) THEN BEGIN
+        Item := TempItem;
+        IsInBuffer := TRUE;
+      END ELSE BEGIN
+        Item.GET(ItemNo);
+        IF (StdCostWkshName <> '') AND
+           NOT (Item.IsMfgItem OR Item.IsAssemblyItem)
+        THEN BEGIN
+          IF StdCostWksh.GET(StdCostWkshName,StdCostWksh.Type::Item,ItemNo) THEN BEGIN
+            Item."Unit Cost" := StdCostWksh."New Standard Cost";
+            Item."Standard Cost" := StdCostWksh."New Standard Cost";
+            Item."Indirect Cost %" := StdCostWksh."New Indirect Cost %";
+            Item."Overhead Rate" := StdCostWksh."New Overhead Rate";
+          END;
+        END;
+        IsInBuffer := FALSE;
+      END;
+    END;
+
+    LOCAL PROCEDURE GetWorkCenter@11(No@1001 : Code[20];VAR WorkCenter@1002 : Record 99000754);
+    VAR
+      StdCostWksh@1003 : Record 5841;
+    BEGIN
+      IF TempWorkCenter.GET(No) THEN
+        WorkCenter := TempWorkCenter
+      ELSE BEGIN
+        WorkCenter.GET(No);
+        IF StdCostWkshName <> '' THEN BEGIN
+          IF StdCostWksh.GET(StdCostWkshName,StdCostWksh.Type::"Work Center",No) THEN BEGIN
+            WorkCenter."Unit Cost" := StdCostWksh."New Standard Cost";
+            WorkCenter."Indirect Cost %" := StdCostWksh."New Indirect Cost %";
+            WorkCenter."Overhead Rate" := StdCostWksh."New Overhead Rate";
+            WorkCenter."Direct Unit Cost" :=
+              CostCalcMgt.CalcDirUnitCost(
+                StdCostWksh."New Standard Cost",StdCostWksh."New Overhead Rate",StdCostWksh."New Indirect Cost %");
+          END;
+        END;
+        TempWorkCenter := WorkCenter;
+        TempWorkCenter.INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE GetMachineCenter@13(No@1001 : Code[20];VAR MachineCenter@1002 : Record 99000758);
+    VAR
+      StdCostWksh@1003 : Record 5841;
+    BEGIN
+      IF TempMachineCenter.GET(No) THEN
+        MachineCenter := TempMachineCenter
+      ELSE BEGIN
+        MachineCenter.GET(No);
+        IF StdCostWkshName <> '' THEN BEGIN
+          IF StdCostWksh.GET(StdCostWkshName,StdCostWksh.Type::"Machine Center",No) THEN BEGIN
+            MachineCenter."Unit Cost" := StdCostWksh."New Standard Cost";
+            MachineCenter."Indirect Cost %" := StdCostWksh."New Indirect Cost %";
+            MachineCenter."Overhead Rate" := StdCostWksh."New Overhead Rate";
+            MachineCenter."Direct Unit Cost" :=
+              CostCalcMgt.CalcDirUnitCost(
+                StdCostWksh."New Standard Cost",StdCostWksh."New Overhead Rate",StdCostWksh."New Indirect Cost %");
+          END;
+        END;
+        TempMachineCenter := MachineCenter;
+        TempMachineCenter.INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE GetResCost@25(No@1001 : Code[20];VAR ResCost@1002 : Record 202);
+    VAR
+      StdCostWksh@1003 : Record 5841;
+    BEGIN
+      IF TempResCost.GET(TempResCost.Type::Resource,No) THEN
+        ResCost := TempResCost
+      ELSE BEGIN
+        ResCost.INIT;
+        ResCost.Code := No;
+        ResCost."Work Type Code" := '';
+        CODEUNIT.RUN(CODEUNIT::"Resource-Find Cost",ResCost);
+
+        IF StdCostWkshName <> '' THEN BEGIN
+          IF StdCostWksh.GET(StdCostWkshName,StdCostWksh.Type::Resource,No) THEN BEGIN
+            ResCost."Unit Cost" := StdCostWksh."New Standard Cost";
+            ResCost."Direct Unit Cost" :=
+              CostCalcMgt.CalcDirUnitCost(
+                StdCostWksh."New Standard Cost",
+                StdCostWksh."New Overhead Rate",
+                StdCostWksh."New Indirect Cost %");
+          END;
+        END;
+        TempResCost := ResCost;
+        TempResCost.INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE IncrCost@8(VAR Cost@1000 : Decimal;UnitCost@1001 : Decimal;Qty@1002 : Decimal);
+    BEGIN
+      Cost := Cost + (Qty * UnitCost);
+    END;
+
+    PROCEDURE CalculateAssemblyCostExp@19(AssemblyHeader@1000 : Record 900;VAR ExpCost@1002 : ARRAY [5] OF Decimal);
+    BEGIN
+      GLSetup.GET;
+
+      ExpCost[RowIdx::AsmOvhd] :=
+        ROUND(
+          CalcOverHeadAmt(
+            AssemblyHeader.CalcTotalCost(ExpCost),
+            AssemblyHeader."Indirect Cost %",
+            AssemblyHeader."Overhead Rate" * AssemblyHeader.Quantity),
+          GLSetup."Unit-Amount Rounding Precision");
+    END;
+
+    LOCAL PROCEDURE CalculateAssemblyCostStd@21(ItemNo@1000 : Code[20];QtyBase@1001 : Decimal;VAR StdCost@1007 : ARRAY [5] OF Decimal);
+    VAR
+      Item@1002 : Record 27;
+      StdTotalCost@1006 : Decimal;
+    BEGIN
+      GLSetup.GET;
+
+      Item.GET(ItemNo);
+      StdCost[RowIdx::MatCost] :=
+        ROUND(
+          Item."Single-Level Material Cost" * QtyBase,
+          GLSetup."Unit-Amount Rounding Precision");
+      StdCost[RowIdx::ResCost] :=
+        ROUND(
+          Item."Single-Level Capacity Cost" * QtyBase,
+          GLSetup."Unit-Amount Rounding Precision");
+      StdCost[RowIdx::ResOvhd] :=
+        ROUND(
+          Item."Single-Level Cap. Ovhd Cost" * QtyBase,
+          GLSetup."Unit-Amount Rounding Precision");
+      StdTotalCost := StdCost[RowIdx::MatCost] + StdCost[RowIdx::ResCost] + StdCost[RowIdx::ResOvhd];
+      StdCost[RowIdx::AsmOvhd] :=
+        ROUND(
+          CalcOverHeadAmt(
+            StdTotalCost,
+            Item."Indirect Cost %",
+            Item."Overhead Rate" * QtyBase),
+          GLSetup."Unit-Amount Rounding Precision");
+    END;
+
+    PROCEDURE CalcOverHeadAmt@27(CostAmt@1000 : Decimal;IndirectCostPct@1001 : Decimal;OverheadRateAmt@1002 : Decimal) : Decimal;
+    BEGIN
+      EXIT(CostAmt * IndirectCostPct / 100 + OverheadRateAmt);
+    END;
+
+    LOCAL PROCEDURE CalculatePostedAssemblyCostExp@24(PostedAssemblyHeader@1000 : Record 910;VAR ExpCost@1002 : ARRAY [5] OF Decimal);
+    BEGIN
+      GLSetup.GET;
+
+      ExpCost[RowIdx::AsmOvhd] :=
+        ROUND(
+          CalcOverHeadAmt(
+            PostedAssemblyHeader.CalcTotalCost(ExpCost),
+            PostedAssemblyHeader."Indirect Cost %",
+            PostedAssemblyHeader."Overhead Rate" * PostedAssemblyHeader.Quantity),
+          GLSetup."Unit-Amount Rounding Precision");
+    END;
+
+    LOCAL PROCEDURE CalcTotalAndVar@30(VAR Value@1001 : ARRAY [5,5] OF Decimal);
+    BEGIN
+      CalcTotal(Value);
+      CalcVariance(Value);
+    END;
+
+    LOCAL PROCEDURE CalcTotal@29(VAR Value@1001 : ARRAY [5,5] OF Decimal);
+    VAR
+      RowId@1002 : Integer;
+      ColId@1000 : Integer;
+    BEGIN
+      FOR ColId := 1 TO 3 DO BEGIN
+        Value[ColId,5] := 0;
+        FOR RowId := 1 TO 4 DO
+          Value[ColId,5] += Value[ColId,RowId];
+      END;
+    END;
+
+    LOCAL PROCEDURE CalcVariance@28(VAR Value@1001 : ARRAY [5,5] OF Decimal);
+    VAR
+      i@1000 : Integer;
+    BEGIN
+      FOR i := 1 TO 5 DO BEGIN
+        Value[ColIdx::Dev,i] := CalcIndicatorPct(Value[ColIdx::StdCost,i],Value[ColIdx::ActCost,i]);
+        Value[ColIdx::"Var",i] := Value[ColIdx::ActCost,i] - Value[ColIdx::StdCost,i];
+      END;
+    END;
+
+    LOCAL PROCEDURE CalcIndicatorPct@26(Value@1000 : Decimal;Sum@1001 : Decimal) : Decimal;
+    BEGIN
+      IF Value = 0 THEN
+        EXIT(0);
+
+      EXIT(ROUND((Sum - Value) / Value * 100,1));
+    END;
+
+    PROCEDURE CalcAsmOrderStatistics@33(AssemblyHeader@1000 : Record 900;VAR Value@1001 : ARRAY [5,5] OF Decimal);
+    BEGIN
+      CalculateAssemblyCostStd(
+        AssemblyHeader."Item No.",
+        AssemblyHeader."Quantity (Base)",
+        Value[ColIdx::StdCost]);
+      CalculateAssemblyCostExp(AssemblyHeader,Value[ColIdx::ExpCost]);
+      AssemblyHeader.CalcActualCosts(Value[ColIdx::ActCost]);
+      CalcTotalAndVar(Value);
+    END;
+
+    PROCEDURE CalcPostedAsmOrderStatistics@34(PostedAssemblyHeader@1000 : Record 910;VAR Value@1001 : ARRAY [5,5] OF Decimal);
+    BEGIN
+      CalculateAssemblyCostStd(
+        PostedAssemblyHeader."Item No.",
+        PostedAssemblyHeader."Quantity (Base)",
+        Value[ColIdx::StdCost]);
+      CalculatePostedAssemblyCostExp(PostedAssemblyHeader,Value[ColIdx::ExpCost]);
+      PostedAssemblyHeader.CalcActualCosts(Value[ColIdx::ActCost]);
+      CalcTotalAndVar(Value);
+    END;
+
+    PROCEDURE CalcRtngLineCost@35(RtngLine@1000 : Record 99000764;MfgItemQtyBase@1009 : Decimal;VAR SLCap@1012 : Decimal;VAR SLSub@1011 : Decimal;VAR SLCapOvhd@1010 : Decimal);
+    VAR
+      WorkCenter@1002 : Record 99000754;
+      CostCalculationMgt@1013 : Codeunit 5836;
+      UnitCost@1008 : Decimal;
+      DirUnitCost@1007 : Decimal;
+      IndirCostPct@1006 : Decimal;
+      OvhdRate@1005 : Decimal;
+      CostTime@1004 : Decimal;
+      UnitCostCalculation@1003 : Option;
+    BEGIN
+      WITH RtngLine DO BEGIN
+        IF (Type = Type::"Work Center") AND ("No." <> '') THEN
+          WorkCenter.GET("No.");
+
+        UnitCost := "Unit Cost per";
+        CalcRtngCostPerUnit(Type,"No.",DirUnitCost,IndirCostPct,OvhdRate,UnitCost,UnitCostCalculation);
+        CostTime :=
+          CostCalculationMgt.CalcCostTime(
+            MfgItemQtyBase,
+            "Setup Time","Setup Time Unit of Meas. Code",
+            "Run Time","Run Time Unit of Meas. Code","Lot Size",
+            "Scrap Factor % (Accumulated)","Fixed Scrap Qty. (Accum.)",
+            "Work Center No.",UnitCostCalculation,MfgSetup."Cost Incl. Setup",
+            "Concurrent Capacities");
+
+        IF (Type = Type::"Work Center") AND (WorkCenter."Subcontractor No." <> '') THEN
+          IncrCost(SLSub,DirUnitCost,CostTime)
+        ELSE
+          IncrCost(SLCap,DirUnitCost,CostTime);
+        IncrCost(SLCapOvhd,CostCalcMgt.CalcOvhdCost(DirUnitCost,IndirCostPct,OvhdRate,1),CostTime);
+      END;
+    END;
+
+    LOCAL PROCEDURE TestRtngVersionIsCertified@32(RtngVersionCode@1002 : Code[20];RtngHeader@1001 : Record 99000763) : Boolean;
+    BEGIN
+      IF RtngVersionCode = '' THEN BEGIN
+        IF RtngHeader.Status <> RtngHeader.Status::Certified THEN
+          IF LogErrors THEN
+            InsertInErrBuf(RtngHeader."No.",'',TRUE)
+          ELSE
+            RtngHeader.TESTFIELD(Status,RtngHeader.Status::Certified);
+      END;
+    END;
+
+    PROCEDURE BatchProcess@1100485000();
+    BEGIN
+      //**4PS
+      gvBatch := TRUE;  //called from report 11012306
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

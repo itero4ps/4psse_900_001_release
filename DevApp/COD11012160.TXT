@@ -1,0 +1,425 @@
+OBJECT Codeunit 11012160 Interest Calculation IC-Acc.
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=11012118;
+    Permissions=TableData 17=rm;
+    OnRun=BEGIN
+            ICAccRec.COPY(Rec);
+            Code;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      InterestSetupRec@1210190002 : Record 11012117;
+      GLAccRec@1210190001 : Record 15;
+      ICAccRec@1210190000 : Record 11012118;
+      InterestPercRec@1210190006 : Record 11012119;
+      GLEntryRec@1210190028 : Record 17;
+      GenJnlLineRec@1210190019 : Record 81;
+      GenJnlTemplate@1210190027 : Record 80;
+      GenJnlBatch@1210190031 : Record 232;
+      InterestLineICAccRec@1100485000 : Record 11020307;
+      Window@1210190009 : Dialog;
+      gStartDate@1210190003 : Date;
+      gEndDate@1210190004 : Date;
+      gPostingDate@1210190022 : Date;
+      MinDate@1210190029 : Date;
+      NextYearDate@1210190025 : Date;
+      NextInterestDate@1210190008 : Date;
+      FirstInterestDate@1210190018 : Date;
+      FillInterestDateBln@1210190014 : Boolean;
+      NoDaysInYear@1210190024 : Integer;
+      NextLineNo@1210190017 : Integer;
+      InterestPercentage@1210190007 : Decimal;
+      InterestAmount@1210190005 : Decimal;
+      Text000@1210190010 : TextConst 'ENU=Account No. #1########\';
+      Text001@1210190011 : TextConst 'ENU=Date        #2########';
+      Text002@1210190012 : TextConst 'ENU=Starting Date (%1) and/or End Date (%2) not correct.';
+      Text003@1210190013 : TextConst 'ENU=No Interest Percentega present for %1.';
+      Text005@1210190015 : TextConst 'ENU=Interest of Account No. ''%1'' is already calculated upto %2.';
+      Text006@1210190016 : TextConst 'ENU=Interest of Account No. ''%1'' is not yet calculated from %2..%3.';
+      JnlTemplateName@1210190021 : Code[10];
+      JnlBatchName@1210190020 : Code[10];
+      FirstDocNo@1210190023 : Code[20];
+      DocNo@1210190030 : Code[20];
+      DescriptionJnlLine@1210190026 : Text[100];
+      Text007@1100485001 : TextConst 'ENU=Interest of Account No. ''%1'' is not yet posted, in  %2, %3 ''%4 - %5'', %6 ''%7''.';
+
+    PROCEDURE InitSelection@1210190002(IStartDate@1210190001 : Date;IEndDate@1210190000 : Date;IPostingDate@1210190002 : Date);
+    BEGIN
+      gStartDate := IStartDate;
+      gEndDate := IEndDate;
+      gPostingDate := IPostingDate;
+    END;
+
+    PROCEDURE Code@1210190000();
+    VAR
+      lvInterestCalcMgtCU@1210190000 : Codeunit 11012049;
+    BEGIN
+      WITH ICAccRec DO BEGIN
+        IF NOT FINDFIRST THEN
+          ERROR('');
+        ReadAndCheckSetup();
+        IF (gStartDate = 0D) OR (gEndDate = 0D) OR (gEndDate < gStartDate) THEN
+          ERROR(Text002, gStartDate, gEndDate);
+        Window.OPEN(Text000 + Text001);
+        MinDate := DMY2DATE(1, 1, 1);  //* 0D + 1
+        lvInterestCalcMgtCU.CheckGLEntryInterestKeyActive();
+
+        //* Update G/L Entries with empty Interest Date
+        FINDSET;
+        REPEAT
+          Window.UPDATE(1, "Account No.");
+          UpdateGLEntryEmptyInterestDate();
+        UNTIL NEXT = 0;
+        GLEntryRec.LOCKTABLE;
+
+        //* Check
+        FINDSET;
+        REPEAT
+          Window.UPDATE(1, "Account No.");
+          GLAccRec.GET("Account No.");
+          GLAccRec.TESTFIELD("Account Type", GLAccRec."Account Type"::Posting);
+          CheckLinesICAccPresent();
+          IF ("Interest Calculated to" <> 0D) THEN BEGIN
+            IF ((gStartDate - 1) <> "Interest Calculated to") THEN BEGIN
+              IF (gStartDate <= "Interest Calculated to") THEN
+                ERROR(Text005, "Account No.", "Interest Calculated to")
+              ELSE
+                ERROR(Text006, "Account No.", "Interest Calculated to" + 1, gStartDate - 1);
+            END;
+          END ELSE BEGIN
+            IF ReadFirstInterestDate((gStartDate - 1), FALSE) THEN
+              ERROR(Text006, "Account No.", FirstInterestDate, gStartDate - 1);
+          END;
+        UNTIL NEXT = 0;
+
+        // Post
+        FINDSET(TRUE,FALSE);
+        REPEAT
+          Window.UPDATE(1, "Account No.");
+          Window.UPDATE(2, 0D);
+
+          IF ("Interest Calculated to" <> 0D) THEN BEGIN
+            //* If the interest of the account is already calculated then check if there are G/L Entries with a posting date
+            //* equal to or less than "Interest Calculated to". If so then calculated the interest (only) for these entries.
+            //* NOTE: "Interest Calculated to" is "gStartDate - 1", see 'Check' above.
+            IF ReadFirstInterestDate((gStartDate - 1), TRUE) THEN BEGIN
+              DetermineDecription(FirstInterestDate, (gStartDate - 1));
+              PostInterest(FirstInterestDate, (gStartDate - 1), TRUE);
+            END;
+          END;
+
+          IF ReadFirstInterestDate(gEndDate, FALSE) THEN BEGIN
+            DetermineDecription(gStartDate, gEndDate);
+            IF (FirstInterestDate <= gStartDate) THEN
+              PostInterest(gStartDate, gEndDate, FALSE)
+            ELSE
+              PostInterest(FirstInterestDate, gEndDate, FALSE);
+          END;
+          "Interest Calculated to" := gEndDate;
+          MODIFY;
+        UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE ReadAndCheckSetup@1210190004();
+    VAR
+      lvICAccRec@1210190002 : Record 11012118;
+      lvGenJnlBatchRec@1210190000 : Record 232;
+      lvNoSeriesMgtCU@1210190001 : Codeunit 396;
+    BEGIN
+      WITH InterestSetupRec DO BEGIN
+        GET;
+        TESTFIELD("Journal Template");
+        TESTFIELD("Journal Batch");
+        TESTFIELD("Account No.");
+        TESTFIELD("Bal. Account No.");
+        TESTFIELD("Default Description");
+        JnlTemplateName := "Journal Template";
+        JnlBatchName := "Journal Batch";
+
+        IF lvICAccRec.GET("Account No.") OR lvICAccRec.GET("Bal. Account No.") THEN
+          FillInterestDateBln := TRUE;
+      END;
+
+      lvGenJnlBatchRec.GET(JnlTemplateName, JnlBatchName);
+      lvGenJnlBatchRec.TESTFIELD("No. Series");
+      FirstDocNo := lvNoSeriesMgtCU.TryGetNextNo(lvGenJnlBatchRec."No. Series", gPostingDate);
+    END;
+
+    PROCEDURE UpdateGLEntryEmptyInterestDate@1210190007();
+    VAR
+      lvGLEntryRec2@1210190000 : Record 17;
+    BEGIN
+      WITH GLEntryRec DO BEGIN
+        RESET;
+        SETCURRENTKEY("G/L Account No.", "Interest Date");
+        SETRANGE("G/L Account No.", ICAccRec."Account No.");
+        SETRANGE("Interest Date", 0D);
+        IF NOT FINDSET(TRUE,TRUE) THEN
+          EXIT;
+
+        REPEAT
+          lvGLEntryRec2.GET("Entry No.");
+          lvGLEntryRec2."Interest Date" := "Posting Date";
+          lvGLEntryRec2.MODIFY;
+        UNTIL NEXT = 0;
+        COMMIT;
+      END;
+    END;
+
+    PROCEDURE ReadFirstInterestDate@1210190012(IDateTo@1210190001 : Date;IOnlyNotCalculated@1210190002 : Boolean) : Boolean;
+    BEGIN
+      WITH GLEntryRec DO BEGIN
+        RESET;
+        SETCURRENTKEY("G/L Account No.", "Interest Date", "Interest Calculated");
+        SETRANGE("G/L Account No.", ICAccRec."Account No.");
+        SETRANGE("Interest Date", MinDate, IDateTo);
+        IF IOnlyNotCalculated THEN
+          SETRANGE("Interest Calculated", FALSE);
+
+        IF NOT FINDFIRST THEN
+          EXIT(FALSE);
+
+        FirstInterestDate := "Interest Date";
+        EXIT(TRUE);
+      END;
+    END;
+
+    PROCEDURE DetermineDecription@1210190009(IStartDate@1210190000 : Date;IEndDate@1210190001 : Date);
+    BEGIN
+      DescriptionJnlLine :=
+        COPYSTR(
+          STRSUBSTNO(InterestSetupRec."Default Description", ICAccRec."Account No.", IStartDate, IEndDate),
+          1, MAXSTRLEN(GenJnlLineRec.Description));
+    END;
+
+    PROCEDURE PostInterest@1210190010(IStartDate@1210190001 : Date;IEndDate@1210190000 : Date;IOnlyNotCalculated@1210190002 : Boolean);
+    VAR
+      lvGLEntryRec2@1100485000 : Record 17;
+      lvDate@1210190003 : Date;
+      lvDebitGenJnlLineNo@1100485001 : Integer;
+    BEGIN
+      WITH GLEntryRec DO BEGIN
+        RESET;
+        SETCURRENTKEY("G/L Account No.", "Interest Date", "Interest Calculated");
+        SETRANGE("G/L Account No.", ICAccRec."Account No.");
+        SETRANGE("Interest Date", MinDate, IEndDate);
+        IF IOnlyNotCalculated THEN
+          SETRANGE("Interest Calculated", FALSE);
+        IF NOT FINDFIRST THEN
+          EXIT;
+
+        InterestAmount := 0;
+        lvDate := IStartDate;
+        NextYearDate := lvDate;
+        NextInterestDate := lvDate;
+        REPEAT
+          Window.UPDATE(2, lvDate);
+          IF (lvDate = NextYearDate) THEN
+            CalculateNoDaysYear(lvDate);
+          IF (lvDate = NextInterestDate) THEN
+            ReadInterestPercentage(lvDate);
+
+          SETRANGE("Interest Date", MinDate, lvDate);
+          CALCSUMS(Amount);
+          InterestAmount := InterestAmount + (Amount * (InterestPercentage / 100) / NoDaysInYear);
+          lvDate := lvDate + 1;
+        UNTIL (lvDate > IEndDate);
+
+        lvDebitGenJnlLineNo := 0;
+        IF (ABS(InterestAmount) >= 0.005) THEN
+          PostInterestToGenJnl(lvDebitGenJnlLineNo);
+
+        RESET;
+        SETCURRENTKEY("G/L Account No.", "Interest Date", "Interest Calculated");
+        SETRANGE("G/L Account No.", ICAccRec."Account No.");
+        SETRANGE("Interest Date", MinDate, IEndDate);
+        SETRANGE("Interest Calculated", FALSE);
+        //MODIFYALL("Interest Calculated", TRUE);  //* Old
+        IF FINDSET(TRUE,TRUE) THEN BEGIN
+          REPEAT
+            lvGLEntryRec2.GET("Entry No.");
+            lvGLEntryRec2."Interest Calculated" := TRUE;
+            lvGLEntryRec2.MODIFY;
+            IF lvDebitGenJnlLineNo > 0 THEN
+              WriteLineICAcc(InterestLineICAccRec.Type::GLEntry, lvDebitGenJnlLineNo, "Entry No.");
+              //* Alleen die waar voor deze eerste keer rente over berekend is worden toegevoegd in de hulptabel.
+              //* Als een renteregel verwijderd wordt uit het memoriaaldagboek dan worden ook alleen de weer uit gezet.
+          UNTIL NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE CalculateNoDaysYear@1210190005(IDate@1210190000 : Date);
+    VAR
+      lvYear@1210190001 : Integer;
+    BEGIN
+      lvYear := DATE2DMY(IDate, 3);
+      IF ((lvYear MOD 4) <> 0) THEN
+        NoDaysInYear := 365
+      ELSE
+        NoDaysInYear := 366;
+
+      NextYearDate := DMY2DATE(1, 1, (lvYear + 1));
+    END;
+
+    PROCEDURE ReadInterestPercentage@1210190006(IDate@1210190000 : Date);
+    BEGIN
+      NextInterestDate := 0D;
+
+      InterestPercRec.SETRANGE("Starting Date", 0D, IDate);
+      IF NOT InterestPercRec.FINDLAST THEN
+        ERROR(Text003, IDate);
+
+      InterestPercentage := InterestPercRec."Interest Percentage";
+
+      InterestPercRec.SETRANGE("Starting Date");
+      IF (InterestPercRec.NEXT <> 0) THEN
+        NextInterestDate := InterestPercRec."Starting Date";
+    END;
+
+    PROCEDURE PostInterestToGenJnl@1210190001(VAR ODebitLineNo@1100485000 : Integer);
+    BEGIN
+      WITH GenJnlLineRec DO BEGIN
+        CLEAR(GenJnlLineRec);
+        IF NextLineNo = 0 THEN BEGIN
+          DetermineDocNo();
+          LOCKTABLE;
+
+          SETRANGE("Journal Template Name", JnlTemplateName);
+          SETRANGE("Journal Batch Name", JnlBatchName);
+          IF NOT FINDLAST THEN
+            "Line No." := 0;
+          NextLineNo := "Line No." + 1;
+        END;
+
+        //Post Line
+        GenJnlLineRec.INIT;
+        "Journal Template Name" := JnlTemplateName;
+        "Journal Batch Name" := JnlBatchName;
+        GenJnlTemplate.GET(JnlTemplateName);
+        GenJnlBatch.GET(JnlTemplateName,JnlBatchName);
+        "Source Code" := GenJnlTemplate."Source Code";
+        "Reason Code" := GenJnlBatch."Reason Code";
+        "Account Type" := "Account Type"::"G/L Account";
+        "Document No." := DocNo;
+        "Document Date" := WORKDATE;
+        "Posting Date" := gPostingDate;
+        IF FillInterestDateBln THEN
+          "Interest Date" := gPostingDate;
+        "System-Created Entry" := TRUE;
+
+        //Debit
+        "Line No." := NextLineNo;
+        VALIDATE("Account No.", InterestSetupRec."Account No.");
+        Description := DescriptionJnlLine;
+        VALIDATE(Amount, InterestAmount);
+        INSERT(TRUE);
+        WriteLineICAcc(InterestLineICAccRec.Type::GenJnlLine, "Line No.", 0);
+        ODebitLineNo := "Line No.";
+        NextLineNo := NextLineNo + 1;
+
+        //Credit
+        "Line No." := NextLineNo;
+        VALIDATE("Account No.", InterestSetupRec."Bal. Account No.");
+        Description := DescriptionJnlLine;
+        VALIDATE(Amount, -Amount);
+        INSERT(TRUE);
+        WriteLineICAcc(InterestLineICAccRec.Type::GenJnlLine, "Line No.", 0);
+        NextLineNo := NextLineNo + 1;
+      END;
+    END;
+
+    PROCEDURE DetermineDocNo@1210190003();
+    VAR
+      lvGenJnlLineRec@1210190000 : Record 81;
+      lvLen@1210190002 : Integer;
+      lvFirstPart@1210190001 : Code[20];
+      lvStr@1210190005 : Text[1];
+    BEGIN
+      WITH lvGenJnlLineRec DO BEGIN
+        DocNo := FirstDocNo;
+        lvFirstPart := DocNo;
+
+        lvLen := STRLEN(lvFirstPart);
+        WHILE (lvLen > 0) DO BEGIN
+          lvLen := STRLEN(lvFirstPart);
+          lvStr := COPYSTR(lvFirstPart, lvLen, 1);
+          IF (STRPOS('0123456789', lvStr) > 0) THEN BEGIN
+            IF lvLen > 1 THEN
+              lvFirstPart := COPYSTR(lvFirstPart, 1, lvLen - 1)
+            ELSE
+              lvFirstPart := '';
+            lvLen := lvLen - 1;
+          END ELSE BEGIN
+            lvLen := 0  //* End of While-Loop
+          END;
+        END;
+
+        SETRANGE("Journal Template Name", JnlTemplateName);
+        SETRANGE("Journal Batch Name", JnlBatchName);
+        SETRANGE("Document No.", PADSTR(lvFirstPart, STRLEN(DocNo), '0'), PADSTR(lvFirstPart, STRLEN(DocNo), '9'));
+        IF FINDLAST THEN
+          DocNo := INCSTR("Document No.");
+      END;
+    END;
+
+    PROCEDURE WriteLineICAcc@1100485000(IType@1100485000 : Option;ILineNo@1100485001 : Integer;IEntryNo@1100485002 : Integer);
+    BEGIN
+      //* Hulptabel om alles terug te kunnen draaien als als een 'GenJnlLine' met de berekende rente verwijderd wordt.
+      //* Dus als deze niet geboekt wordt. Daarom worden aan de 'GenJnlLine' de grootboekposten gekoppeld die van
+      //* 'Interest Calculated' is FALSE op TRUE zijn gezet. Ook worden de aangemaakte dagboekregels in deze tabel gezet.
+
+      WITH InterestLineICAccRec DO BEGIN
+        INIT;
+        Type := IType;
+        "IC Account No." := ICAccRec."Account No.";
+        "Gen. Journal Template Name" := JnlTemplateName;
+        "Gen. Journal Batch Name" := JnlBatchName;
+        "Gen. Journal Line No." := ILineNo;
+        "G/L Entry No." := IEntryNo;
+        IF Type = Type::GenJnlLine THEN   //* Vullen met de huidige 'Datum t/m', dus nog de oude (oorspronkelijk) waarde
+          "Prev. Interest Calculated to" := ICAccRec."Interest Calculated to";
+        INSERT;
+      END;
+    END;
+
+    PROCEDURE CheckLinesICAccPresent@1100485001();
+    BEGIN
+      //* Voor een rekening mag de renteberekening (voor een volgende periode) pas uitgevoerd worden als
+      //* de dagboekregels van de vorige run geboekt zijn. Dus als er geen record van de rekening meer aanwezig
+      //* zijn  in deze tabel.
+
+      WITH InterestLineICAccRec DO BEGIN
+        RESET;
+        SETRANGE(Type, Type::GenJnlLine);
+        SETRANGE("IC Account No.", ICAccRec."Account No.");
+        IF FINDFIRST THEN
+          ERROR(Text007,
+            ICAccRec."Account No.",
+            GenJnlLineRec.TABLECAPTION,
+            GenJnlLineRec.FIELDCAPTION("Journal Batch Name"),
+            "Gen. Journal Template Name", "Gen. Journal Batch Name",
+            GenJnlLineRec.FIELDCAPTION("Line No."), "Gen. Journal Line No.");
+
+        SETRANGE(Type, Type::GLEntry);  //* Evt. aanwezige van dit type op rekening verwijderen (dus dan geen error)
+        DELETEALL;
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

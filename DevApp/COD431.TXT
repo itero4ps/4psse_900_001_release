@@ -1,0 +1,202 @@
+OBJECT Codeunit 431 IC Outbox Export
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00;
+  }
+  PROPERTIES
+  {
+    TableNo=414;
+    OnRun=VAR
+            ICOutBoxTrans@1005 : Record 414;
+          BEGIN
+            IF NOT CONFIRM(Text003,FALSE) THEN
+              EXIT;
+            CompanyInfo.GET;
+            ICOutBoxTrans.COPY(Rec);
+            ICOutBoxTrans.SETRANGE("Line Action","Line Action"::"Send to IC Partner");
+            UpdateICStatus(ICOutBoxTrans);
+            SendToExternalPartner(ICOutBoxTrans);
+            SendToInternalPartner(ICOutBoxTrans);
+            ICOutBoxTrans.SETRANGE("Line Action","Line Action"::"Return to Inbox");
+            ReturnToInbox(ICOutBoxTrans);
+            CancelTrans(ICOutBoxTrans);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text001@1000 : TextConst 'ENU=Intercompany transactions from %1.';
+      Text002@1001 : TextConst 'ENU=Attached to this mail is an xml file containing one or more intercompany transactions from %1 (%2 %3).';
+      Text003@1002 : TextConst 'ENU=Do you want to complete line actions?';
+      CompanyInfo@1003 : Record 79;
+      ICInboxOutboxMgt@1004 : Codeunit 427;
+      FileMgt@1005 : Codeunit 419;
+
+    LOCAL PROCEDURE SendToExternalPartner@1(VAR ICOutboxTrans@1000 : Record 414);
+    VAR
+      ICPartner@1006 : Record 413;
+      MailHandler@1005 : Codeunit 397;
+      ICOutboxExportXML@1004 : XMLport 12;
+      OFile@1003 : File;
+      FileName@1002 : Text;
+      Ostr@1001 : OutStream;
+      ICPartnerFilter@1007 : Text[1024];
+      i@1008 : Integer;
+      ToName@1009 : Text[100];
+      CcName@1010 : Text[100];
+    BEGIN
+      ICPartner.SETFILTER("Inbox Type",'<>%1',ICPartner."Inbox Type"::Database);
+      ICPartnerFilter := ICOutboxTrans.GETFILTER("IC Partner Code");
+      IF ICPartnerFilter <> '' THEN
+        ICPartner.SETFILTER(Code,ICPartnerFilter);
+      IF ICPartner.FIND('-') THEN
+        REPEAT
+          ICOutboxTrans.SETRANGE("IC Partner Code",ICPartner.Code);
+          IF ICOutboxTrans.FIND('-') THEN BEGIN
+            IF ICPartner."Inbox Type" = ICPartner."Inbox Type"::"File Location" THEN BEGIN
+              ICPartner.TESTFIELD(Blocked,FALSE);
+              ICPartner.TESTFIELD("Inbox Details");
+              i := 1;
+              WHILE i <> 0 DO BEGIN
+                FileName :=
+                  STRSUBSTNO('%1\%2_%3_%4.xml',ICPartner."Inbox Details",ICPartner.Code,ICOutboxTrans."Transaction No.",i);
+                IF EXISTS(FileName) THEN
+                  i := i + 1
+                ELSE
+                  i := 0;
+              END;
+            END ELSE BEGIN
+              OFile.CREATETEMPFILE;
+              FileName := STRSUBSTNO('%1.%2.xml',OFile.NAME,ICPartner.Code);
+              OFile.CLOSE;
+            END;
+            OFile.CREATE(FileName);
+            OFile.CREATEOUTSTREAM(Ostr);
+            ICOutboxExportXML.SetICOutboxTrans(ICOutboxTrans);
+            ICOutboxExportXML.SETDESTINATION(Ostr);
+            ICOutboxExportXML.EXPORT;
+            OFile.CLOSE;
+            CLEAR(Ostr);
+            CLEAR(ICOutboxExportXML);
+            FileName := FileMgt.DownloadTempFile(FileName);
+            IF ICPartner."Inbox Type" = ICPartner."Inbox Type"::"E-Mail" THEN BEGIN
+              ICPartner.TESTFIELD(Blocked,FALSE);
+              ICPartner.TESTFIELD("Inbox Details");
+              ToName := ICPartner."Inbox Details";
+              IF STRPOS(ToName,';') > 0 THEN BEGIN
+                CcName := COPYSTR(ToName,STRPOS(ToName,';') + 1);
+                ToName := COPYSTR(ToName,1,STRPOS(ToName,';') - 1);
+                IF STRPOS(CcName,';') > 0 THEN
+                  CcName := COPYSTR(CcName,1,STRPOS(CcName,';') - 1);
+              END;
+              MailHandler.NewMessage(
+                ToName,CcName,'',
+                STRSUBSTNO(Text001,CompanyInfo.Name),
+                STRSUBSTNO(
+                  Text002,CompanyInfo.Name,CompanyInfo.FIELDCAPTION("IC Partner Code"),CompanyInfo."IC Partner Code"),
+                FileName,FALSE);
+            END;
+            ICOutboxTrans.FIND('-');
+            REPEAT
+              ICInboxOutboxMgt.MoveOutboxTransToHandledOutbox(ICOutboxTrans);
+            UNTIL ICOutboxTrans.NEXT = 0;
+          END;
+        UNTIL ICPartner.NEXT = 0;
+      ICOutboxTrans.SETRANGE("IC Partner Code");
+      IF ICPartnerFilter <> '' THEN
+        ICOutboxTrans.SETFILTER("IC Partner Code",ICPartnerFilter);
+    END;
+
+    LOCAL PROCEDURE SendToInternalPartner@2(VAR ICOutboxTrans@1000 : Record 414);
+    VAR
+      Company@1002 : Record 2000000006;
+      ICPartner@1001 : Record 413;
+      MoveICTransToPartnerCompany@1014 : Report 513;
+    BEGIN
+      IF ICOutboxTrans.FIND('-') THEN
+        REPEAT
+          ICPartner.GET(ICOutboxTrans."IC Partner Code");
+          ICPartner.TESTFIELD(Blocked,FALSE);
+          IF ICPartner."Inbox Type" = ICPartner."Inbox Type"::Database THEN BEGIN
+            ICPartner.TESTFIELD("Inbox Details");
+            Company.GET(ICPartner."Inbox Details");
+            ICOutboxTrans.SETRANGE("Transaction No.",ICOutboxTrans."Transaction No.");
+            MoveICTransToPartnerCompany.SETTABLEVIEW(ICOutboxTrans);
+            MoveICTransToPartnerCompany.USEREQUESTPAGE := FALSE;
+            MoveICTransToPartnerCompany.RUN;
+            ICOutboxTrans.SETRANGE("Transaction No.");
+            IF ICOutboxTrans."Line Action" = ICOutboxTrans."Line Action"::"Send to IC Partner" THEN
+              ICInboxOutboxMgt.MoveOutboxTransToHandledOutbox(ICOutboxTrans);
+          END;
+        UNTIL ICOutboxTrans.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE ReturnToInbox@4(VAR ICOutboxTrans@1000 : Record 414);
+    VAR
+      ICPartner@1001 : Record 413;
+      MoveICTransToPartnerCompany@1014 : Report 513;
+    BEGIN
+      IF ICOutboxTrans.FIND('-') THEN
+        REPEAT
+          IF ICPartner.GET(ICOutboxTrans."IC Partner Code") THEN
+            ICPartner.TESTFIELD(Blocked,FALSE);
+          MoveICTransToPartnerCompany.RecreateInboxTrans(ICOutboxTrans);
+          ICOutboxTrans.DELETE(TRUE);
+        UNTIL ICOutboxTrans.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE CancelTrans@3(VAR ICOutboxTrans@1000 : Record 414);
+    BEGIN
+      ICOutboxTrans.SETRANGE("Line Action",ICOutboxTrans."Line Action"::Cancel);
+      IF ICOutboxTrans.FIND('-') THEN
+        REPEAT
+          ICInboxOutboxMgt.MoveOutboxTransToHandledOutbox(ICOutboxTrans);
+        UNTIL ICOutboxTrans.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE UpdateICStatus@5(VAR ICOutboxTransaction@1000 : Record 414);
+    VAR
+      PurchHeader@1001 : Record 38;
+      SalesHeader@1002 : Record 36;
+    BEGIN
+      IF ICOutboxTransaction.FINDSET THEN
+        REPEAT
+          IF ICOutboxTransaction."Source Type" = ICOutboxTransaction."Source Type"::"Purchase Document" THEN
+            CASE ICOutboxTransaction."Document Type" OF
+              ICOutboxTransaction."Document Type"::Order:
+                IF PurchHeader.GET(PurchHeader."Document Type"::Order,ICOutboxTransaction."Document No.") THEN BEGIN
+                  PurchHeader.VALIDATE("IC Status",PurchHeader."IC Status"::Sent);
+                  PurchHeader.MODIFY;
+                END;
+              ICOutboxTransaction."Document Type"::"Return Order":
+                IF PurchHeader.GET(PurchHeader."Document Type"::"Return Order",ICOutboxTransaction."Document No.") THEN BEGIN
+                  PurchHeader.VALIDATE("IC Status",PurchHeader."IC Status"::Sent);
+                  PurchHeader.MODIFY;
+                END;
+            END
+          ELSE
+            IF ICOutboxTransaction."Source Type" = ICOutboxTransaction."Source Type"::"Sales Document" THEN
+              CASE ICOutboxTransaction."Document Type" OF
+                ICOutboxTransaction."Document Type"::Order:
+                  IF SalesHeader.GET(SalesHeader."Document Type"::Order,ICOutboxTransaction."Document No.") THEN BEGIN
+                    SalesHeader.VALIDATE("IC Status",SalesHeader."IC Status"::Sent);
+                    SalesHeader.MODIFY;
+                  END;
+                ICOutboxTransaction."Document Type"::"Return Order":
+                  IF SalesHeader.GET(SalesHeader."Document Type"::"Return Order",ICOutboxTransaction."Document No.") THEN BEGIN
+                    SalesHeader.VALIDATE("IC Status",SalesHeader."IC Status"::Sent);
+                    SalesHeader.MODIFY;
+                  END;
+              END;
+        UNTIL ICOutboxTransaction.NEXT = 0
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

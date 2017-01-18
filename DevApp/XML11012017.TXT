@@ -1,0 +1,336 @@
+OBJECT XMLport 11012017 Import MTC Invoice Spec.
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    CaptionML=ENU=Import MTC Invoice Specification;
+    Direction=Import;
+    DefaultFieldsValidation=No;
+    PreserveWhiteSpace=Yes;
+    OnPreXMLport=BEGIN
+                   PurchSetup.GET();
+                   PurchSetup.TESTFIELD("MTC Account No.");
+                 END;
+
+    Format=Variable Text;
+    FieldDelimiter=<None>;
+    FieldSeparator=<None>;
+    UseRequestPage=No;
+  }
+  ELEMENTS
+  {
+    { [{16430A21-1500-4215-B8C8-D686DA0D19C1}];  ;Root                ;Element ;Text     }
+
+    { [{CD868238-9071-41D0-A6FE-A5E0E9CA79F4}];1 ;Integer             ;Element ;Table   ;
+                                                  SourceTable=Table2000000026;
+                                                  SourceTableView=SORTING(Field1);
+                                                  Import::OnAfterInitRecord=BEGIN
+                                                                              CLEAR(TxtLine);
+                                                                            END;
+
+                                                  Import::OnBeforeInsertRecord=BEGIN
+                                                                                 CASE COPYSTR(TxtLine, 1, 3) OF
+                                                                                   'T00':
+                                                                                      IF ImportType = ImportType::PurchaseLine THEN
+                                                                                        ProcessT0Record();
+                                                                                   'T01':
+                                                                                     IF ImportType = ImportType::PurchaseLine THEN
+                                                                                       ProcessT1Record()
+                                                                                     ELSE
+                                                                                       ProcessT1RecordApproval;
+                                                                                 END;
+
+                                                                                 currXMLport.SKIP;
+                                                                               END;
+                                                                                }
+
+    { [{42035D74-4812-42E0-88E4-CF4B416D337B}];2 ;TxtLine             ;Element ;Text    ;
+                                                  MinOccurs=Zero }
+
+  }
+  EVENTS
+  {
+  }
+  REQUESTPAGE
+  {
+    PROPERTIES
+    {
+    }
+    CONTROLS
+    {
+    }
+  }
+  CODE
+  {
+    VAR
+      PurchSetup@1100525510 : Record 312;
+      PurchHeader@1100525509 : Record 38;
+      PurchLine@1100525508 : Record 39;
+      PurchInvHeader@1100525507 : Record 122;
+      PurchApprovalLine@1100525506 : Record 11012032;
+      CompanyRec@1100525505 : Record 2000000006;
+      XMLportStatusDialogMgt@1210190000 : Codeunit 11130006;
+      DimMgt@1100525000 : Codeunit 408;
+      JnlTemplCde@1100525503 : Code[10];
+      LineNo@1100525501 : Integer;
+      ImportType@1100525500 : 'PurchaseLine,ApprovalLine';
+
+    LOCAL PROCEDURE ProcessT0Record@1100485004();
+    BEGIN
+      PurchHeader."Vendor Invoice No." := COPYSTR(TxtLine, 10, 10);
+    END;
+
+    LOCAL PROCEDURE ProcessT1Record@1100485005();
+    VAR
+      RecRef@1100525500 : RecordRef;
+      lDecTemp@1100485000 : Decimal;
+    BEGIN
+      LineNo += 10000;
+      WITH PurchLine DO BEGIN
+        INIT();
+        "Document Type" := PurchHeader."Document Type";
+        "Document No." := PurchHeader."No.";
+        "Line No." := LineNo;
+        VALIDATE(Type, Type::"G/L Account");
+        VALIDATE("No.", PurchSetup."MTC Account No.");
+        Description := STRSUBSTNO('%1 %2', GetProductDescription(COPYSTR(TxtLine, 176, 2)),COPYSTR(TxtLine, 25, 8));
+
+        "Receiving Company" := DELCHR(COPYSTR(TxtLine, 68, 25), '<>', ' ');
+        IF "Receiving Company" <> '' THEN BEGIN
+          IF NOT CompanyRec.GET("Receiving Company") THEN BEGIN
+            CompanyRec.SETFILTER(Name, '%1', "Receiving Company" + '*');
+            CompanyRec.FIND('-'); //Should produce error when company is not found.
+            "Receiving Company" := CompanyRec.Name;
+          END;
+          IF "Receiving Company" = COMPANYNAME THEN
+            "Receiving Company" := ''
+          ELSE
+            VALIDATE("Receiving Company"); //Check IC-licence
+        END;
+
+        RecRef.GETTABLE(PurchLine);
+        XMLportStatusDialogMgt.ShowImportStatus(RecRef);
+        INSERT(TRUE);  //db, 23-06-06: Save receiving company for validation of dimension
+        VALIDATE("Shortcut Dimension 1 Code", DELCHR(COPYSTR(TxtLine, 43, 25), '<>', ' '));
+
+        EVALUATE(lDecTemp, COPYSTR(TxtLine, 169, 6));
+        lDecTemp := lDecTemp / 100;
+        IF COPYSTR(TxtLine, 175, 1) = '-' THEN
+          lDecTemp := -lDecTemp;
+        VALIDATE(Quantity, lDecTemp);
+
+        EVALUATE(lDecTemp, COPYSTR(TxtLine, 185, 6));
+        lDecTemp := lDecTemp / 100;
+        IF COPYSTR(TxtLine, 191, 1) = '-' THEN
+          lDecTemp := -lDecTemp;
+        VALIDATE("Line Amount", lDecTemp);
+
+        //{FIXED Dimension SET ID must be determined in stead of making docdim
+        IF (PurchSetup."MTC Registration in Dimension" <> '') AND (COPYSTR(TxtLine, 25, 6) <> '') THEN BEGIN
+          DimMgt.SetCompany("Receiving Company");  //DP00387 sn
+          "Dimension Set ID" := DimMgt.GetDimSetAddedDimVal(
+            "Dimension Set ID",
+            PurchSetup."MTC Registration in Dimension",
+            COPYSTR(TxtLine, 25, 6));
+          DimMgt.SetCompany(COMPANYNAME);
+                                                //DP00387 en
+          {
+          DocumentDimension."Table ID" := DATABASE::"Purchase Line";
+          DocumentDimension."Document Type" := "Document Type";
+          DocumentDimension."Document No." := "Document No.";
+          DocumentDimension."Line No." :=  "Line No.";
+          DocumentDimension."Dimension Code" := PurchSetup."MTC Registration in Dimension";
+          DocumentDimension.VALIDATE("Dimension Value Code", COPYSTR(TxtLine, 25, 6));
+          DocumentDimension.INSERT;
+          }
+        END;
+        MODIFY(TRUE);
+        //}
+      END;
+    END;
+
+    LOCAL PROCEDURE ProcessT1RecordApproval@1100485000();
+    VAR
+      RecRef@1100525501 : RecordRef;
+      XMLportStatusDialogMgt@1100525500 : Codeunit 11130006;
+      lDecTemp@1100485000 : Decimal;
+    BEGIN
+      LineNo += 10000;
+      WITH PurchApprovalLine DO BEGIN
+        INIT();
+        "Journal Template Name" := JnlTemplCde;
+        "Document Type" := "Document Type"::"Purchase Invoice";
+        "Document No." := PurchInvHeader."No.";
+        "Line No." := LineNo;
+        VALIDATE(Type, Type::"Account (G/L)");
+        VALIDATE("Account No.", PurchSetup."MTC Account No.");
+        Description := STRSUBSTNO('%1 %2', GetProductDescription(COPYSTR(TxtLine, 176, 2)),COPYSTR(TxtLine, 25, 8));
+
+        "Receiving Company" := DELCHR(COPYSTR(TxtLine, 68, 25), '<>', ' ');
+        IF "Receiving Company" <> '' THEN BEGIN
+          IF NOT CompanyRec.GET("Receiving Company") THEN BEGIN
+            CompanyRec.SETFILTER(Name, '%1', "Receiving Company" + '*');
+            CompanyRec.FIND('-'); //Should produce error when company is not found.
+            "Receiving Company" := CompanyRec.Name;
+          END;
+          IF "Receiving Company" = COMPANYNAME THEN
+            "Receiving Company" := ''
+          ELSE
+            VALIDATE("Receiving Company"); //Check IC-licence
+        END;
+
+        RecRef.GETTABLE(PurchApprovalLine);
+        XMLportStatusDialogMgt.ShowImportStatus(RecRef);
+        INSERT(TRUE);  //db, 23-06-06:Save receiving company for validation of dimension
+        VALIDATE("Shortcut Dimension 1 Code", DELCHR(COPYSTR(TxtLine, 43, 25), '<>', ' '));
+
+        EVALUATE(lDecTemp, COPYSTR(TxtLine, 169, 6));
+        lDecTemp := lDecTemp / 100;
+        IF COPYSTR(TxtLine, 175, 1) = '-' THEN
+          lDecTemp := -lDecTemp;
+        VALIDATE(Quantity, lDecTemp);
+
+        EVALUATE(lDecTemp, COPYSTR(TxtLine, 185, 6));
+        lDecTemp := lDecTemp / 100;
+        IF COPYSTR(TxtLine, 191, 1) = '-' THEN
+          lDecTemp := -lDecTemp;
+
+        VALIDATE(Amount, lDecTemp);
+
+
+
+        //{FIXED Dimension SET ID must be determined in stead of making docdim
+        IF (PurchSetup."MTC Registration in Dimension" <> '') AND (COPYSTR(TxtLine, 25, 6) <> '') THEN BEGIN
+
+          DimMgt.SetCompany("Receiving Company");  //DP00387 sn
+          "Dimension Set ID" := DimMgt.GetDimSetAddedDimVal(
+            "Dimension Set ID",
+            PurchSetup."MTC Registration in Dimension",
+            COPYSTR(TxtLine, 25, 6));
+          DimMgt.SetCompany(COMPANYNAME);
+                                                //DP00387 en
+          {
+          DocumentDimension."Table ID" := DATABASE::"Invoice Approval Line";
+          DocumentDimension."Document Type" := "Document Type";
+          DocumentDimension."Document No." := "Document No.";
+          DocumentDimension."Line No." :=  "Line No.";
+          DocumentDimension."Dimension Code" := PurchSetup."MTC Registration in Dimension";
+          DocumentDimension.VALIDATE("Dimension Value Code", COPYSTR(TxtLine, 25, 6));
+          DocumentDimension.INSERT;
+          }
+        END;
+
+        MODIFY(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE GetProductDescription@1100485008(iCodProduct@1100485000 : Code[2]) rTxtDescription : Text[50];
+    BEGIN
+      CASE iCodProduct OF
+        '15': rTxtDescription := 'LPG';
+        '20': rTxtDescription := 'Super';
+        '21': rTxtDescription := 'Super plus';
+        '24': rTxtDescription := 'Shell Pura';
+        '25': rTxtDescription := 'Euro 95';
+        '26': rTxtDescription := 'Speciale Benzine';
+        '28': rTxtDescription := 'Tweetakt';
+        '30': rTxtDescription := 'Diesel';
+        '31': rTxtDescription := 'Rode gasolie';
+        '32': rTxtDescription := 'Speciale Diesel';
+        '50': rTxtDescription := 'EasyPay';
+        '56': rTxtDescription := 'Ad Blue';
+        '57': rTxtDescription := 'Smeermiddelen';
+        '59': rTxtDescription := 'Wassen';
+        '60': rTxtDescription := 'Parkeren (Mobiliteit)';
+        '61': rTxtDescription := 'Auto accessoires (dkv)';
+        '62': rTxtDescription := 'Tunnel / tol (dkv)';
+        '63': rTxtDescription := 'Tolwegen (dkv)';
+        '64': rTxtDescription := 'Garage diensten (dkv)';
+        '65': rTxtDescription := 'Veerdiensten (dkv)';
+        '66': rTxtDescription := 'Berging- / Interventiekosten (dkv)';
+        '67': rTxtDescription := 'Consumptie-artikelen (dkv)';
+        '68': rTxtDescription := 'Eurovignet';
+        '89': rTxtDescription := 'ID-pas';
+        '90': rTxtDescription := 'Pasfee';
+        '91': rTxtDescription := 'ANWB pakket A';
+        '92': rTxtDescription := 'ANWB pakket B';
+        '93': rTxtDescription := 'ANWB pakket C';
+        '94': rTxtDescription := 'ANWB pakket D';
+        '95': rTxtDescription := 'Pasfee inclusief DKV';
+        '96': rTxtDescription := 'ANWB Pakket H';
+        '98': rTxtDescription := 'Merkgebonden Passen';
+        'A5': rTxtDescription := 'Pasfee Eneco';
+        'A6': rTxtDescription := 'Abonnement Love To Load Plus';
+        'A7': rTxtDescription := 'Normaal laden publiek';
+        'A8': rTxtDescription := 'Normaal laden thuis';
+        'A9': rTxtDescription := 'Abonnement snel laden';
+        'B1': rTxtDescription := 'Snel laden korte sessie';
+        'B2': rTxtDescription := 'Snel laden lange sessie';
+        'B4': rTxtDescription := 'Greenlease 2';
+        'B5': rTxtDescription := 'Snel laden';
+        'E8': rTxtDescription := 'P + R parkeren';
+        'E9': rTxtDescription := 'Vervangende kaart';
+        'F8': rTxtDescription := 'Bus, Tram en Metro correctie';
+        'F9': rTxtDescription := 'Trein correctie';
+        'G0': rTxtDescription := 'Verwerkingskosten per (brandstof)declaratie';
+        'G1': rTxtDescription := 'NS IC Direct abonnement';
+        'G2': rTxtDescription := 'NS Kantoorruimte';
+        'G3': rTxtDescription := 'Opslag per taxitransactie';
+        'G4': rTxtDescription := 'Verwerkingskosten per taxitransactie';
+        'G5': rTxtDescription := 'Verwerkingskosten per transactie per merkgeb. pas';
+        'G6': rTxtDescription := 'Uitgifte fee MTc/NS Business Card';
+        'G7': rTxtDescription := 'Parkeren doorlopende kosten BTW';
+      END;
+    END;
+
+    PROCEDURE SetPurchInvHeader@1100485001(lvPurchHeader@1100485000 : Record 38);
+    BEGIN
+      lvPurchHeader.TESTFIELD("Document Type", lvPurchHeader."Document Type"::Invoice);
+      PurchHeader.GET(lvPurchHeader."Document Type", lvPurchHeader."No.");
+      PurchHeader.TESTFIELD("Amounts only", FALSE);
+
+      PurchLine.SETRANGE("Document Type", lvPurchHeader."Document Type");
+      PurchLine.SETRANGE("Document No.", lvPurchHeader."No.");
+      IF PurchLine.FINDLAST THEN
+        LineNo := PurchLine."Line No."
+      ELSE
+        LineNo := 0;
+
+      ImportType := ImportType::PurchaseLine;
+    END;
+
+    PROCEDURE SetPurchInvHeaderApproval@1100485003(lvPurchInvHeader@1100485000 : Record 122;lvJnlTemplCde@1100485001 : Code[10]);
+    BEGIN
+      PurchInvHeader.GET(lvPurchInvHeader."No.");
+
+      // jhoek.070311.begin
+      IF PurchInvHeader."DMS Status" > PurchInvHeader."DMS Status"::"Awaiting Line Entry" THEN
+        PurchInvHeader.FIELDERROR("DMS Status");
+      // jhoek.070311.end
+
+      PurchApprovalLine.SETRANGE("Journal Template Name", lvJnlTemplCde);
+      PurchApprovalLine.SETRANGE("Document Type", PurchApprovalLine."Document Type"::"Purchase Invoice");
+      PurchApprovalLine.SETRANGE("Document No.", lvPurchInvHeader."No.");
+      IF PurchApprovalLine.FIND('+') THEN
+        LineNo := PurchApprovalLine."Line No."
+      ELSE
+        LineNo := 0;
+
+      JnlTemplCde := lvJnlTemplCde;
+
+      ImportType := ImportType::ApprovalLine;
+    END;
+
+    BEGIN
+    {
+      CC: Dataport 11012002
+    }
+    END.
+  }
+}
+

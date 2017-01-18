@@ -1,0 +1,1066 @@
+OBJECT Report 11020229 Invoice Sales Rental Order
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    CaptionML=ENU=Invoice Sales Rental Order;
+    ProcessingOnly=Yes;
+    OnPreReport=BEGIN
+                  PlantMgtCompRec."Plant Company" := PlantMgtCompRec.GetPlantCompanySalesRental(TRUE);
+                END;
+
+  }
+  DATASET
+  {
+    { 6640;    ;DataItem;                    ;
+               DataItemTable=Table36;
+               DataItemTableView=SORTING(Document Type,No.)
+                                 WHERE(Document Type=CONST(Order),
+                                       Sales Document Type=CONST(Sales Logistics Separated),
+                                       Status=CONST(Released));
+               ReqFilterHeadingML=ENU=Sales Rental Order;
+               OnPreDataItem=BEGIN
+                               GLSetup.GET;
+                               ProjSetup.GET;
+
+                               IF ReplacePostingDate AND (PostingDateReq = 0D) THEN
+                                 ERROR(Text000);
+                               CounterTotal := COUNT;
+                               Window.OPEN(Text001);
+                             END;
+
+               OnAfterGetRecord=VAR
+                                  lvPlantIsCompletelyInvoiced@1100485000 : Boolean;
+                                BEGIN
+                                  Counter := Counter + 1;
+                                  Window.UPDATE(1,"No.");
+                                  Window.UPDATE(2,ROUND(Counter / CounterTotal * 10000,1));
+
+                                  GetOrderInvoiceStatus;
+                                  IF NOT InvoicePaymentInAdvanceBln AND NOT InvoiceSalesLinesBln THEN
+                                    CurrReport.SKIP;
+
+                                  IF InvoiceSalesLinesBln THEN BEGIN
+                                    SalesLine.RESET;
+                                    SalesLine.SETRANGE("Document Type","Sales Header"."Document Type");
+                                    SalesLine.SETRANGE("Document No.","Sales Header"."No.");
+                                    SalesLine.SETFILTER("Plant Type", '<>%1', '');
+                                    IF SalesLine.FIND('-') THEN
+                                      TESTFIELD("Invoice Frequency Rental");
+                                    SalesLine.RESET;
+
+                                    IF CalcInvDisc THEN
+                                      CalculateInvoiceDiscount;
+                                  END;
+
+                                  "Sales Header".Ship := FALSE;
+                                  "Sales Header".Invoice := TRUE;
+                                  CLEAR(SalesPost);
+                                  SalesPost.SetPostingDate(ReplacePostingDate,ReplaceDocumentDate,PostingDateReq);
+                                  IF SalesPost.RUN("Sales Header") THEN BEGIN
+                                    SalesLineNo := 0;
+
+                                    IF InvoiceSalesLinesBln THEN BEGIN
+                                      CopyInventoryFromLogistics("Sales Header", FALSE, lvPlantIsCompletelyInvoiced);
+
+                                      SalesLine.LOCKTABLE;
+                                      //Invoice Item and Exit Lines first because Order line no. is used as invoice line no.
+                                      //When unposted invoice is removed corresponding order line no. is reset
+                                      //to be invoiced again.
+                                      InvoiceSalesItemLines;
+                                      InvoiceSalesExitLines;
+                                      InvoiceSalesExtrTransportLines;
+                                      InvoiceSalesItemRemovalLines;
+
+                                      //Now invoice Plant Lines. No connection between Order Line No. an Invoice Line No.
+                                      IF NOT lvPlantIsCompletelyInvoiced THEN
+                                        InvoiceSalesPlantLines;
+
+                                      IF SalesLineNo > 0 THEN
+                                        SalesCalcDisc.CalculateWithSalesHeader(SalesInvHeader, TempSalesInvLine);
+                                    END;
+
+                                    IF InvoicePaymentInAdvanceBln AND
+                                       ((PaymentInAdvanceAmount > 0) OR (SalesLineNo > 0))
+                                    THEN BEGIN
+                                      SalesLine.LOCKTABLE;
+                                      InvoiceSalesInAdvance;
+                                    END;
+
+                                    IF SalesLineNo > 0 THEN BEGIN
+                                      CopyTempInvToInv;
+                                      CounterOK := CounterOK + 1;
+                                    END;
+
+                                    COMMIT;
+                                    IF MARKEDONLY THEN
+                                      MARK(FALSE);
+                                  END;
+                                END;
+
+               OnPostDataItem=BEGIN
+                                Window.CLOSE;
+                                MESSAGE(Text002,CounterOK,CounterTotal);
+                              END;
+                               }
+
+  }
+  REQUESTPAGE
+  {
+    PROPERTIES
+    {
+      OnOpenPage=BEGIN
+                   SalesSetup.GET;
+                   CalcInvDisc := SalesSetup."Calc. Inv. Discount";
+                   ReplacePostingDate := FALSE;
+                   ReplaceDocumentDate := FALSE;
+                 END;
+
+    }
+    CONTROLS
+    {
+      { 1900000001;0;Container;
+                  ContainerType=ContentArea }
+
+      { 1900000002;1;Group  ;
+                  CaptionML=ENU=Options }
+
+      { 1100485000;2;Field  ;
+                  CaptionML=ENU=Inserted By;
+                  SourceExpr=varUserID;
+                  OnLookup=BEGIN
+                             LoginMgt.LookupUserID(varUserID);
+                           END;
+                            }
+
+      { 3   ;2   ;Field     ;
+                  CaptionML=ENU=Posting Date;
+                  SourceExpr=PostingDateReq }
+
+      { 4   ;2   ;Field     ;
+                  CaptionML=ENU=Replace Posting Date;
+                  SourceExpr=ReplacePostingDate;
+                  OnValidate=BEGIN
+                               IF ReplacePostingDate THEN
+                                 MESSAGE(Text003);
+                             END;
+                              }
+
+      { 5   ;2   ;Field     ;
+                  CaptionML=ENU=Replace Document Date;
+                  SourceExpr=ReplaceDocumentDate }
+
+      { 7   ;2   ;Field     ;
+                  CaptionML=ENU=Calc. Inv. Discount;
+                  SourceExpr=CalcInvDisc;
+                  OnValidate=BEGIN
+                               SalesSetup.GET;
+                               SalesSetup.TESTFIELD("Calc. Inv. Discount",FALSE);
+                             END;
+                              }
+
+    }
+  }
+  LABELS
+  {
+  }
+  CODE
+  {
+    VAR
+      Text000@1000 : TextConst 'ENU=Please enter the posting date.';
+      Text001@1001 : TextConst 'ENU=Posting orders  #1########## @2@@@@@@@@@@@@@';
+      Text002@1002 : TextConst 'ENU=%1 orders out of a total of %2 have now been posted.';
+      Text003@1003 : TextConst 'ENU=The exchange rate associated with the new posting date on the sales header will not apply to the sales lines.';
+      SalesLine@1005 : Record 37;
+      SalesSetup@1006 : Record 311;
+      SalesCalcDisc@1007 : Codeunit 60;
+      SalesPost@1008 : Codeunit 80;
+      Window@1009 : Dialog;
+      PostingDateReq@1012 : Date;
+      RentalPeriodToDate@1100485005 : Date;
+      LastInvDate@1100485019 : Date;
+      CounterTotal@1013 : Integer;
+      Counter@1014 : Integer;
+      CounterOK@1015 : Integer;
+      ReplacePostingDate@1016 : Boolean;
+      ReplaceDocumentDate@1017 : Boolean;
+      CalcInvDisc@1018 : Boolean;
+      varUserID@1100485001 : Code[50];
+      LoginMgt@1100485000 : Codeunit 418;
+      GLSetup@1100485025 : Record 98;
+      ProjSetup@1100485026 : Record 315;
+      SalesInvHeader@1100485023 : Record 36;
+      SalesInvHeader2@1100485016 : Record 36;
+      SalesInvLine@1100485022 : Record 37;
+      SalesRentInvLine@1100485021 : Record 11012788;
+      SalesRentInvLine2@1100485027 : Record 11012788;
+      SalesRemovalLine@1100485008 : Record 11012789;
+      TempSalesInvLine@1100485020 : TEMPORARY Record 37;
+      ExitOrderRec@1100485024 : Record 11012559;
+      PlantMgtCompRec@1100525000 : Record 11020586;
+      InvCounter@1100485018 : Integer;
+      SalesLineNo@1100485017 : Integer;
+      StartDate@1100485014 : Date;
+      EndDate@1100485013 : Date;
+      NumberRentalPeriods@1100485011 : Decimal;
+      Credit@1100485010 : Boolean;
+      RentalFirstInvoiced@1100485009 : Boolean;
+      Text004@1100485002 : TextConst 'ENU=Payment in Advance';
+      InvoicePaymentInAdvanceBln@1100485006 : Boolean;
+      InvoiceSalesLinesBln@1100485003 : Boolean;
+      PaymentInAdvanceAmount@1100485004 : Decimal;
+      Text005@1100485007 : TextConst 'ENU=Credit Payment in Advance';
+
+    PROCEDURE CalculateInvoiceDiscount@1();
+    BEGIN
+      SalesLine.RESET;
+      SalesLine.SETRANGE("Document Type","Sales Header"."Document Type");
+      SalesLine.SETRANGE("Document No.","Sales Header"."No.");
+      IF SalesLine.FIND('-') THEN
+        IF SalesCalcDisc.RUN(SalesLine) THEN BEGIN
+          "Sales Header".GET("Sales Header"."Document Type","Sales Header"."No.");
+          COMMIT;
+        END;
+    END;
+
+    PROCEDURE CopyInventoryFromLogistics@1100485010(ISalesHeader@1100485002 : Record 36;ICalledFromOutside@1100485003 : Boolean;VAR VLocationIsCompletelyInvoiced@1100485004 : Boolean);
+    VAR
+      PlantInvRec@1100485001 : Record 11012555;
+      SalesRentInvLine2@1100485000 : Record 11012788;
+    BEGIN
+      //This function is also called from Closing Projects. Be aware of that
+      LastInvDate := 0D;
+
+      IF ICalledFromOutside THEN BEGIN
+        ProjSetup.GET;
+        PlantMgtCompRec."Plant Company" := PlantMgtCompRec.GetPlantCompanySalesRental(TRUE);
+      END;
+
+      VLocationIsCompletelyInvoiced := TRUE;
+
+      WITH PlantInvRec DO BEGIN
+        CHANGECOMPANY(PlantMgtCompRec."Plant Company");
+        SETCURRENTKEY(Location);
+        SETRANGE(Location, ISalesHeader."Plant Location Code");
+        SETRANGE(Sold, FALSE);
+        IF FINDSET THEN
+          REPEAT
+            SalesRentInvLine.RESET;
+            SalesRentInvLine.INIT;
+            SalesRentInvLine.TRANSFERFIELDS(PlantInvRec);
+            CALCFIELDS("Unit of Measure");
+            SalesRentInvLine."Unit of Measure Code" := "Unit of Measure";
+            SalesRentInvLine.VALIDATE("Completely Invoiced");
+            IF SalesRentInvLine.INSERT THEN BEGIN
+              IF Removed THEN BEGIN
+                //Only for insert of removed get the invoice data from the not removed line.
+                SalesRentInvLine2 := SalesRentInvLine;
+                SalesRentInvLine2.Removed := FALSE;
+                SalesRentInvLine2."Line No." := "Original Stock Line No.";
+                IF SalesRentInvLine2.FIND('=') THEN BEGIN
+                  SalesRentInvLine."Invoiced until" := SalesRentInvLine2."Invoiced until";
+                  SalesRentInvLine."Last Invoice No." := SalesRentInvLine2."Last Invoice No.";
+                  SalesRentInvLine."Last Invoice Line No." := SalesRentInvLine2."Last Invoice Line No.";
+                  SalesRentInvLine."Invoice Status" := SalesRentInvLine2."Invoice Status";
+                  SalesRentInvLine."Total Time Units Invoiced" := SalesRentInvLine2."Total Time Units Invoiced";
+                  SalesRentInvLine."Previous Invoice No." := SalesRentInvLine2."Previous Invoice No.";
+                  SalesRentInvLine."Previous Invoice Line No." := SalesRentInvLine2."Previous Invoice Line No.";
+                  SalesRentInvLine."Previous Invoiced Until" := SalesRentInvLine2."Previous Invoiced Until";
+                  SalesRentInvLine."Previous No. of Time Units Inv" := SalesRentInvLine2."Previous No. of Time Units Inv";
+                  SalesRentInvLine.VALIDATE("Completely Invoiced");
+                  SalesRentInvLine.MODIFY;
+                  IF SalesRentInvLine."Invoiced until" > LastInvDate THEN
+                    LastInvDate := SalesRentInvLine."Invoiced until";
+                END;
+              END;
+            END ELSE BEGIN
+              SalesRentInvLine.FIND('=');
+              SalesRentInvLine.TRANSFERFIELDS(PlantInvRec);
+              SalesRentInvLine."Unit of Measure Code" := "Unit of Measure";
+              SalesRentInvLine.VALIDATE("Completely Invoiced");
+              SalesRentInvLine.MODIFY;
+              IF SalesRentInvLine."Invoiced until" > LastInvDate THEN
+                LastInvDate := SalesRentInvLine."Invoiced until";
+            END;
+            IF NOT SalesRentInvLine."Completely Invoiced" THEN
+              VLocationIsCompletelyInvoiced := FALSE;
+          UNTIL NEXT = 0;
+        RESET;
+      END;
+
+      //Delete removed inventory lines
+      WITH SalesRentInvLine DO BEGIN
+        RESET;
+        SETCURRENTKEY(Location);
+        SETRANGE(Location, ISalesHeader."Plant Location Code");
+        IF FINDSET(TRUE, FALSE) THEN
+          REPEAT
+            PlantInvRec.TRANSFERFIELDS(SalesRentInvLine);
+            IF NOT PlantInvRec.FIND('=') THEN
+              DELETE;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE InvoiceSalesItemLines@1100485008();
+    BEGIN
+      WITH SalesLine DO BEGIN
+        RESET;
+        SETRANGE("Document Type", "Sales Header"."Document Type");
+        SETRANGE("Document No.", "Sales Header"."No.");
+        SETFILTER("Plant Type", '%1', '');
+        SETFILTER("Arrival Order", '<>%1', '');
+        SETFILTER("Relate to", '<>%1', "Relate to"::Transport);
+        SETRANGE("Blocked for Invoicing", FALSE);
+        IF FINDSET(TRUE, FALSE) THEN
+          REPEAT
+            IF "Quantity Invoiced" <> "Quantity Shipped" THEN
+              IF ItemShipped THEN BEGIN
+                InsertSalesInvHeader;
+                InsertSalesInvLineItem(FALSE, FALSE);
+                "Quantity Invoiced" := "Quantity Shipped";
+                //14839
+                "Outstanding Amount" := 0;
+                "Outstanding Amount (LCY)" := 0;
+                //
+                MODIFY;
+              END;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE InvoiceSalesExtrTransportLines@1100485004();
+    BEGIN
+      WITH SalesLine DO BEGIN
+        RESET;
+        SETRANGE("Document Type", "Sales Header"."Document Type");
+        SETRANGE("Document No.", "Sales Header"."No.");
+        SETFILTER("Plant Type", '%1', '');
+        SETRANGE("Relate to", "Relate to"::Transport);
+        SETRANGE("Blocked for Invoicing", FALSE);
+        IF FINDSET(TRUE, FALSE) THEN
+          REPEAT
+            IF "Quantity Invoiced" <> Quantity THEN BEGIN
+              InsertSalesInvHeader;
+              InsertSalesInvLineItem(FALSE, TRUE);  //* This function but we use extra argument for indication 'Transport'
+              "Quantity Invoiced" := Quantity;
+              //14839
+              "Outstanding Amount" := 0;
+              "Outstanding Amount (LCY)" := 0;
+              //
+              MODIFY;
+            END;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE InvoiceSalesPlantLines@1100485003();
+    VAR
+      SalesRentInvLine2@1100485000 : Record 11012788;
+      lFirstDate@1100485001 : Date;
+    BEGIN
+      IF LastInvDate > 0D THEN
+        IF LastInvDate >= WORKDATE THEN
+          //Only Invoice added lines
+          RentalPeriodToDate := LastInvDate
+        ELSE
+          RentalPeriodToDate := CALCDATE("Sales Header"."Invoice Frequency Rental", LastInvDate)
+      ELSE
+        RentalPeriodToDate := 0D;
+
+      WITH SalesRentInvLine DO BEGIN
+        RESET;
+        SETCURRENTKEY("Completely Invoiced",Location,"Plant Type","Plant No.","Rate Code","Present from");
+        SETRANGE("Completely Invoiced", FALSE);
+        SETRANGE(Location, "Sales Header"."Plant Location Code");
+        SETFILTER(Quantity,'>0');
+        SETFILTER("Invoice Status", '0|%1', "Invoice Status"::Posted);
+        IF FINDSET(TRUE, TRUE) THEN
+          REPEAT
+            IF "Invoiced until" > 0D THEN
+              lFirstDate := CALCDATE('<1D>', "Invoiced until")
+            ELSE
+              IF "Rental Start Date" > 0D THEN
+                lFirstDate := "Rental Start Date"
+              ELSE
+                lFirstDate := "Present from";
+            IF (lFirstDate <= WORKDATE) OR (Removed AND ("Present from" <= WORKDATE)) THEN BEGIN
+              //Only invoice if First invoice day is today or in the past.
+              IF RentalPeriodToDate = 0D THEN BEGIN
+                RentalPeriodToDate := CALCDATE("Sales Header"."Invoice Frequency Rental", lFirstDate);
+                RentalPeriodToDate := CALCDATE('<-1D>', RentalPeriodToDate);
+              END;
+
+              SalesRentInvLine2 := SalesRentInvLine;
+              CountNumberRentalPeriods;
+              IF NumberRentalPeriods <> 0 THEN BEGIN
+                RentalFirstInvoiced := ("Invoiced until" = 0D);
+                InsertSalesInvHeader;
+                InsertSalesInvLineInventory;
+                SalesRentInvLine2."Previous Invoice No." := "Last Invoice No.";
+                SalesRentInvLine2."Previous Invoice Line No." := "Last Invoice Line No.";
+                SalesRentInvLine2."Previous Invoiced Until" := "Invoiced until";
+                SalesRentInvLine2."Previous No. of Time Units Inv" := "Total Time Units Invoiced";
+                SalesRentInvLine2."Last Invoice No." := SalesInvHeader."No.";
+                SalesRentInvLine2."Last Invoice Line No." := TempSalesInvLine."Line No.";
+                SalesRentInvLine2."Invoice Status" := "Invoice Status"::"Temporary";
+                SalesRentInvLine2."Total Time Units Invoiced" :=
+                  "Total Time Units Invoiced" + NumberRentalPeriods;
+              END;
+              IF Credit THEN
+                SalesRentInvLine2."Invoiced until" := StartDate - 1
+              ELSE
+                IF EndDate >= SalesRentInvLine2."Rental Start Date" THEN
+                  SalesRentInvLine2."Invoiced until" := EndDate;
+
+              IF (SalesRentInvLine2."Invoiced until" < "Present from") OR
+                 (SalesRentInvLine2."Invoiced until" < "Rental Start Date") THEN
+                SalesRentInvLine2."Invoiced until" := 0D;
+
+              SalesRentInvLine2.VALIDATE("Completely Invoiced");
+              SalesRentInvLine2.MODIFY;
+            END;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE InvoiceSalesExitLines@1100485002();
+    BEGIN
+      WITH SalesLine DO BEGIN
+        RESET;
+        SETRANGE("Document Type", "Sales Header"."Document Type");
+        SETRANGE("Document No.", "Sales Header"."No.");
+        SETFILTER("Plant Type", '<>%1', '');
+        SETFILTER("Removal Order Type", '%1|%2', "Removal Order Type"::"Plant Order",
+          "Removal Order Type"::"Exit-order");
+        SETRANGE("Arrival Date", 0D);
+        SETFILTER("Relate to", '<>%1', "Relate to"::Transport);
+        SETRANGE("Blocked for Invoicing", FALSE);
+        IF FINDSET(TRUE, FALSE) THEN
+          REPEAT
+            IF "Quantity Invoiced" <> Quantity THEN
+              IF PlantExitPosted THEN BEGIN
+                InsertSalesInvHeader;
+                InsertSalesInvLineItem(TRUE, FALSE);
+                "Quantity Invoiced" := Quantity;
+                //14839
+                "Outstanding Amount" := 0;
+                "Outstanding Amount (LCY)" := 0;
+                //
+                MODIFY;
+              END;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE InvoiceSalesItemRemovalLines@1100485015();
+    BEGIN
+      WITH SalesRemovalLine DO BEGIN
+        RESET;
+        SETRANGE("Document No.", "Sales Header"."No.");
+        SETFILTER("Item No.", '<>%1', '');
+        SETRANGE("Removed Item Invoiced", FALSE);
+        IF FINDSET(TRUE, FALSE) THEN
+          REPEAT
+            CALCFIELDS("Item No.");
+            IF RemovalItemPosted THEN BEGIN
+              SalesLine.GET("Sales Header"."Document Type", "Document No.", "Document Line No.");
+              IF NOT SalesLine."Blocked for Invoicing" THEN BEGIN
+                InsertSalesInvHeader;
+                InsertSalesInvRemovalLineItem;
+                SalesLine."Quantity Invoiced" := SalesLine."Quantity Invoiced" + SalesRemovalLine.Quantity;
+                SalesLine.MODIFY;
+                "Removed Item Invoiced" := TRUE;
+                MODIFY;
+              END;
+            END;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE InvoiceSalesInAdvance@1100485009();
+    BEGIN
+      ProjSetup.TESTFIELD("Cost Object Cost Plus");
+      InsertSalesInvHeader;
+
+      WITH TempSalesInvLine DO BEGIN
+        SuspendUpdateVATAmounts(TRUE);
+
+        INIT;
+        "Document Type" := SalesInvHeader."Document Type";
+        "Document No." := SalesInvHeader."No.";
+        "Line No." := SalesLineNo;
+        Type := Type::"G/L Account";
+        "System-Created Entry" := TRUE;
+        "Shortcut Dimension 2 Code" := ProjSetup."Cost Object Cost Plus";
+        VALIDATE("Job No.", "Sales Header"."Job No.");
+
+        VALIDATE(Quantity, 1);
+        VALIDATE("Unit Price", PaymentInAdvanceAmount);
+        UpdateUnitPrice(0);
+        IF PaymentInAdvanceAmount > 0 THEN
+          Description := Text004
+        ELSE
+          Description := Text005;
+
+        SuspendUpdateVATAmounts(FALSE);
+        UpdateAmounts;
+        INSERT;
+      END;
+
+      SalesLineNo := SalesLineNo + 10000;
+    END;
+
+    PROCEDURE InsertSalesInvHeader@3();
+    BEGIN
+      IF SalesLineNo > 0 THEN
+        EXIT;
+
+      WITH SalesInvHeader DO BEGIN
+        SalesInvHeader := "Sales Header";
+        "Document Type" := "Document Type"::Invoice;
+        "No." := '0';  //First use zero. Later check Total amount < 0 then create Invoice or Credit Memo No.
+        "Related Sales Order No." := "Sales Header"."No.";
+        "Shipment Date" := 0D;
+        Status := Status::Open;
+        FillDefaultInvoiceLayoutCode();
+        INSERT;
+      END;
+
+      InvCounter := InvCounter + 1;
+      SalesLineNo := 10000;
+    END;
+
+    PROCEDURE InsertSalesInvLineItem@1100485019(IExitPlant@1100485000 : Boolean;IExtraTransCost@1100485002 : Boolean);
+    VAR
+      PlantRec@1100485001 : Record 11012551;
+    BEGIN
+      WITH TempSalesInvLine DO BEGIN
+        TRANSFERFIELDS(SalesLine);
+        SuspendUpdateVATAmounts(TRUE);
+        "Document Type" := SalesInvHeader."Document Type";
+        "Document No." := SalesInvHeader."No.";
+        "Line No." := SalesLine."Line No.";
+        IF IExitPlant OR IExtraTransCost THEN
+          Quantity := SalesLine.Quantity - SalesLine."Quantity Invoiced"
+        ELSE
+          Quantity := SalesLine."Quantity Shipped" - SalesLine."Quantity Invoiced";
+        "Quantity Invoiced" := 0;
+        "Quantity Shipped" := 0;
+        InitOutstanding;
+        IF IExitPlant THEN BEGIN
+          PlantRec.GET(TempSalesInvLine."Plant Type");
+          PlantRec.TESTFIELD("Cost Object");
+          VALIDATE("Shortcut Dimension 2 Code", PlantRec."Cost Object");
+
+          "Rate Type" := 0;
+          CASE ExitOrderRec.Type OF
+            ExitOrderRec.Type::Missing: "Relate to" := "Relate to"::Missing;
+            ExitOrderRec.Type::Scrap: "Relate to" := "Relate to"::Scrap;
+          ELSE
+            "Relate to" := "Relate to"::Sales;
+          END;
+        END;
+        SalesInvLineFinish(FALSE);
+      END;
+    END;
+
+    PROCEDURE InsertSalesInvLineInventory@4();
+    VAR
+      PlantRec@1100485000 : Record 11012551;
+      TempSalesInvLine2@1100525000 : TEMPORARY Record 37;
+      SalesLineFound@1100485001 : Boolean;
+      CombineLines@1100525001 : Boolean;
+      ModifyExistingSalesLine@1100525002 : Boolean;
+      QuanPerSalesUnit@1210190000 : Decimal;
+      RoundPrecision@1210190001 : Decimal;
+    BEGIN
+      CombineLines := TRUE; //13-10-10
+
+      PlantRec.GET(SalesRentInvLine."Plant Type");
+      PlantRec.TESTFIELD("Cost Object");
+
+      WITH TempSalesInvLine2 DO BEGIN
+        INIT;
+        "Document Type" := SalesInvHeader."Document Type";
+        "Document No." := SalesInvHeader."No.";
+        "Line No." := SalesLineNo;
+        "System-Created Entry" := TRUE;
+        "Plant Invoice" := TRUE; //?
+        IF SalesInvHeader."Sell-to Customer No." <> '' THEN
+          VALIDATE("Sell-to Customer No.",SalesInvHeader."Sell-to Customer No.");
+        "Job No." := SalesInvHeader."Job No.";
+        SuspendUpdateVATAmounts(TRUE);
+
+        "Relate to" := "Relate to"::Rental;
+        Type := Type::"G/L Account";
+        "Shortcut Dimension 2 Code" := PlantRec."Cost Object";
+        VALIDATE("Job No.", "Sales Header"."Job No.");
+        "Number of Time Units" := NumberRentalPeriods;
+        VALIDATE(Quantity,SalesRentInvLine.Quantity);
+        "Plant Invoice Origin" := "Plant Invoice Origin"::"Plant Inventory";
+        "Plant Location" := SalesRentInvLine.Location;
+        VALIDATE("Plant Type", SalesRentInvLine."Plant Type");
+        "Plant No." := SalesRentInvLine."Plant No.";
+        "Plant Rate Code" := SalesRentInvLine."Rate Code";
+
+        CLEAR(SalesLine);
+        SalesLine.SETRANGE("Document Type", "Sales Header"."Document Type");
+        SalesLine.SETRANGE("Document No.", "Sales Header"."No.");
+        SalesLine.SETRANGE("Plant Type", SalesRentInvLine."Plant Type");
+        SalesLine.SETRANGE("Plant Type", SalesRentInvLine."Plant Type");
+        SalesLine.SETRANGE("Arrival Order Type", SalesRentInvLine."Arrival Order Type");
+        SalesLine.SETRANGE("Arrival Order", SalesRentInvLine."Arrival Order");
+        SalesLineFound := SalesLine.FINDFIRST;
+        IF NOT SalesLineFound THEN BEGIN
+          SalesLine.SETRANGE("Arrival Order Type");
+          SalesLine.SETRANGE("Arrival Order");
+          SalesLineFound := SalesLine.FINDFIRST;
+        END;
+        IF SalesLineFound THEN BEGIN
+          VALIDATE("Unit Price",SalesLine."Unit Price");
+          VALIDATE("Line Discount %",SalesLine."Line Discount %");
+          "Amount (LCY)" := Amount;
+          Description := SalesLine.Description;
+          VALIDATE("Unit of Measure Code",SalesLine."Unit of Measure Code");
+          "Plant Rate Unit of Measure" := SalesLine."Plant Rate Unit of Measure";
+          "Plant Qty. per Rate Unit" := SalesLine."Plant Qty. per Rate Unit";
+          //call 25815
+          //PlantQtyPerUnitOfMeasure(SalesRentInvLine."Unit of Measure Code");
+          //IF NOT ("Qty. per Unit of Measure" IN [0,1]) THEN
+          //  VALIDATE(Quantity,SalesRentInvLine.Quantity * ROUND(1/"Qty. per Unit of Measure", 0.00001));
+          "Qty. per Unit of Measure" := SalesLine."Qty. per Unit of Measure";
+          QuanPerSalesUnit := GetPlantQtyPerSalesUnit(
+            "Plant Type",
+            SalesRentInvLine."Unit of Measure Code",
+            SalesLine."Unit of Measure Code");
+          IF QuanPerSalesUnit <> 1 THEN BEGIN
+            SalesRentInvLine.CALCFIELDS(Bulk);
+            IF SalesRentInvLine.Bulk THEN
+              RoundPrecision := 0.00001
+            ELSE
+              RoundPrecision := 1;
+            VALIDATE(Quantity, ROUND(SalesRentInvLine.Quantity * 1/QuanPerSalesUnit, RoundPrecision));
+          END;
+
+          "Gen. Bus. Posting Group" := SalesLine."Gen. Bus. Posting Group";
+          VALIDATE("Gen. Prod. Posting Group",SalesLine."Gen. Prod. Posting Group");
+          VALIDATE("VAT Prod. Posting Group",SalesLine."VAT Prod. Posting Group");
+          VALIDATE("VAT Bus. Posting Group",SalesLine."VAT Bus. Posting Group");
+          "Posting Group" := SalesLine."Posting Group";
+          UpdateUnitPrice(0);
+        END;
+        "Arrival Order Type" := SalesRentInvLine."Arrival Order Type";
+        "Arrival Order" := SalesRentInvLine."Arrival Order";
+        "Removal Order Type" := SalesRentInvLine."Removal Order Type";
+        "Removal Order" := SalesRentInvLine."Removal Order";
+        "Rental Period" := STRSUBSTNO('%1..%2', StartDate, EndDate);
+        "Rate Type" := SalesLine."Rate Type";
+        "Plant Rental First Invoiced" := RentalFirstInvoiced;
+        RentalFirstInvoiced := FALSE;
+        "Allow Invoice Disc." := TRUE;
+
+        IF CombineLines THEN BEGIN
+          TempSalesInvLine.RESET;
+          TempSalesInvLine.SETRANGE("Document Type", TempSalesInvLine2."Document Type");
+          TempSalesInvLine.SETRANGE("Document No.", TempSalesInvLine2."Document No.");
+          TempSalesInvLine.SETRANGE("Relate to", TempSalesInvLine2."Relate to");
+          TempSalesInvLine.SETRANGE("Number of Time Units", TempSalesInvLine2."Number of Time Units");
+          TempSalesInvLine.SETRANGE("Plant Invoice Origin", TempSalesInvLine2."Plant Invoice Origin");
+          TempSalesInvLine.SETRANGE("Plant Type", TempSalesInvLine2."Plant Type");
+          TempSalesInvLine.SETRANGE("Plant No.", TempSalesInvLine2."Plant No.");
+          TempSalesInvLine.SETRANGE("Unit Price", TempSalesInvLine2."Unit Price");
+          TempSalesInvLine.SETRANGE("Line Discount %", TempSalesInvLine2."Line Discount %");
+          TempSalesInvLine.SETRANGE("Unit of Measure Code", TempSalesInvLine2."Unit of Measure Code");
+          TempSalesInvLine.SETRANGE("Plant Rate Unit of Measure", TempSalesInvLine2."Plant Rate Unit of Measure");
+          TempSalesInvLine.SETRANGE("Plant Qty. per Rate Unit", TempSalesInvLine2."Plant Qty. per Rate Unit");
+          TempSalesInvLine.SETRANGE("Rental Period", TempSalesInvLine2."Rental Period");
+          IF TempSalesInvLine.FINDFIRST THEN BEGIN
+            IF TempSalesInvLine."Arrival Order Type" <> TempSalesInvLine2."Arrival Order Type" THEN BEGIN
+              CLEAR(TempSalesInvLine."Arrival Order Type");
+              CLEAR(TempSalesInvLine."Arrival Order");
+            END;
+            IF TempSalesInvLine."Arrival Order" <> TempSalesInvLine2."Arrival Order" THEN
+              CLEAR(TempSalesInvLine."Arrival Order");
+            IF TempSalesInvLine."Removal Order Type" <> TempSalesInvLine2."Removal Order Type" THEN BEGIN
+              CLEAR(TempSalesInvLine."Removal Order Type");
+              CLEAR(TempSalesInvLine."Removal Order");
+            END;
+            IF TempSalesInvLine."Removal Order" <> TempSalesInvLine2."Removal Order" THEN
+              CLEAR(TempSalesInvLine."Removal Order");
+            TempSalesInvLine.VALIDATE(Quantity, TempSalesInvLine.Quantity + TempSalesInvLine2.Quantity);
+            ModifyExistingSalesLine := TRUE;
+          END;
+          TempSalesInvLine.RESET;
+        END;
+        IF NOT ModifyExistingSalesLine THEN
+          TempSalesInvLine := TempSalesInvLine2;
+        SalesInvLineFinish(ModifyExistingSalesLine);
+      END;
+    END;
+
+    PROCEDURE InsertSalesInvRemovalLineItem@1100485016();
+    BEGIN
+      WITH TempSalesInvLine DO BEGIN
+        TRANSFERFIELDS(SalesLine);
+        SuspendUpdateVATAmounts(TRUE);
+        "Document Type" := SalesInvHeader."Document Type";
+        "Document No." := SalesInvHeader."No.";
+        "Line No." := SalesLineNo;
+        VALIDATE("Qty. to Ship", SalesRemovalLine.Quantity);
+        VALIDATE(Quantity, SalesRemovalLine.Quantity);
+        "Quantity Invoiced" := 0;
+        "Quantity Shipped" := 0;
+        InitOutstanding;
+
+        SalesInvLineFinish(FALSE);
+      END;
+    END;
+
+    PROCEDURE SalesInvLineFinish@1100485007(ModifyExistingSalesLine@1100525000 : Boolean);
+    BEGIN
+      WITH TempSalesInvLine DO BEGIN
+        "Originally Ordered No." := "Sales Header"."No.";
+        InitQtyToShip;
+        SuspendUpdateVATAmounts(FALSE);
+        UpdateAmounts;
+        IF ModifyExistingSalesLine THEN
+          MODIFY
+        ELSE BEGIN
+          INSERT;
+
+          IF (SalesLineNo <= "Line No.") THEN
+            SalesLineNo := "Line No." + 10000;
+        END;
+      END;
+    END;
+
+    PROCEDURE CountNumberRentalPeriods@1100485013();
+    BEGIN
+      NumberRentalPeriods := 0;
+      Credit := FALSE;
+
+      WITH SalesRentInvLine DO BEGIN
+
+        IF NOT Removed AND ("Invoiced until" > RentalPeriodToDate) THEN BEGIN
+          //Plant is still present and already invoiced.
+          EndDate := "Invoiced until";
+          EXIT;
+        END;
+
+        //Determine Start Date
+        IF "Invoiced until" >= "Present from" THEN
+          StartDate := "Invoiced until" + 1
+        ELSE
+          StartDate := FirstRentalDay;
+
+        //Determine End Date
+        EndDate := RentalPeriodToDate;
+        IF Removed THEN
+          IF RentalPeriodToDate > LastRentalDay THEN
+            EndDate := LastRentalDay;
+
+        //Determine Credit
+        Credit := "Invoiced until" > EndDate;
+        IF Credit THEN BEGIN
+          StartDate := EndDate + 1;
+          IF StartDate < "Rental Start Date" THEN
+            StartDate := "Rental Start Date";
+          EndDate := "Invoiced until";
+        END;
+
+        IF EndDate < StartDate THEN
+          EXIT;
+
+        //Determine Rental Periods (Days, weeks, months)
+        IF Removed THEN BEGIN
+          //Final Invoice
+          NumberRentalPeriods := GetNumberRentalPeriods(FirstRentalDay, LastRentalDay) - "Total Time Units Invoiced";
+        END ELSE BEGIN
+          NumberRentalPeriods := GetNumberRentalPeriods(StartDate, EndDate);
+          IF Credit THEN
+            NumberRentalPeriods := -NumberRentalPeriods;
+        END;
+      END;
+    END;
+
+    PROCEDURE GetNumberRentalPeriods@1100485012(IStartDate@1100485006 : Date;IEndDate@1100485007 : Date) : Decimal;
+    VAR
+      lvPlantLocRec@1100485001 : Record 11012554;
+      lvCalcRentalPeriodsCU@1100485000 : Codeunit 11012568;
+      lvRateType@1100485002 : Option;
+      lvRentalPeriods@1100485003 : Decimal;
+      lvWholeWeeks@1100485004 : Integer;
+      lvRemainingDays@1100485005 : Integer;
+    BEGIN
+      IF (IStartDate = 0D) OR (IEndDate = 0D) OR (IEndDate < IStartDate) THEN
+        EXIT(0);
+
+      lvRentalPeriods := lvCalcRentalPeriodsCU.NumberRentalPeriods(
+        lvPlantLocRec, IStartDate, IEndDate, SalesRentInvLine."Plant Type", SalesRentInvLine."Plant No.",lvRateType);
+
+      IF (SalesSetup."Min. Days To Invoice one Week" > 0) AND
+         (lvRateType = lvPlantLocRec."Rate Type"::Week) THEN
+      BEGIN
+        lvWholeWeeks := (7 * lvRentalPeriods) DIV 7;
+        lvRemainingDays := ROUND((7 * lvRentalPeriods) MOD 7, 1);
+        IF lvRemainingDays >= SalesSetup."Min. Days To Invoice one Week" THEN
+          lvRentalPeriods := lvWholeWeeks + 1
+        ELSE
+          lvRentalPeriods := lvWholeWeeks;
+      END;
+
+      EXIT(lvRentalPeriods);
+    END;
+
+    PROCEDURE ItemShipped@1100485000() : Boolean;
+    VAR
+      PlantOrderLine@1100485000 : Record 11012557;
+      ExtPlantOrderFuncs@1100485001 : Codeunit 11020503;
+    BEGIN
+      WITH PlantOrderLine DO BEGIN
+        CHANGECOMPANY(PlantMgtCompRec."Plant Company");
+        SETRANGE(Type, Type::Item);
+        SETRANGE("Item No.", SalesLine."Item No.");
+        SETRANGE("Arrival Location", "Sales Header"."Plant Location Code");
+        SETFILTER("Plant Order No.", '%1|%2',
+          SalesLine."Arrival Order",
+          SalesLine."Arrival Order" + ExtPlantOrderFuncs.GetBackorderSign + '*');
+        SETRANGE(Posted, TRUE);
+        EXIT(NOT ISEMPTY);
+      END;
+    END;
+
+    PROCEDURE RemovalItemPosted@1100485005() : Boolean;
+    VAR
+      PlantOrderLine@1100485000 : Record 11012557;
+      ExtPlantOrderFuncs@1100525000 : Codeunit 11020503;
+    BEGIN
+      WITH PlantOrderLine DO BEGIN
+        CHANGECOMPANY(PlantMgtCompRec."Plant Company");
+        SETRANGE(Type, Type::Item);
+        SETRANGE("Item No.", SalesRemovalLine."Item No.");
+        SETFILTER("Plant Order No.", '%1|%2',
+          SalesRemovalLine."Removal Order No.",
+          SalesRemovalLine."Removal Order No." + ExtPlantOrderFuncs.GetBackorderSign + '*');
+        SETRANGE(Posted, TRUE);
+        EXIT(NOT ISEMPTY);
+      END;
+    END;
+
+    PROCEDURE PlantExitPosted@1100485011() : Boolean;
+    VAR
+      lvSalesRentalRemovalLine@1100485000 : Record 11012789;
+      lvPlantOrderRec@1100485002 : Record 11012556;
+    BEGIN
+      CLEAR(ExitOrderRec);
+
+      lvSalesRentalRemovalLine.SETCURRENTKEY("Document No.", "Generated Sales Line No.");
+      lvSalesRentalRemovalLine.SETRANGE("Document No.", SalesLine."Document No.");
+      lvSalesRentalRemovalLine.SETRANGE("Generated Sales Line No.", SalesLine."Line No.");
+      IF NOT lvSalesRentalRemovalLine.FINDFIRST THEN
+        EXIT(FALSE);
+
+      IF lvSalesRentalRemovalLine."Removal Order Type" = lvSalesRentalRemovalLine."Removal Order Type"::"Exit-order" THEN BEGIN
+        ExitOrderRec.CHANGECOMPANY(PlantMgtCompRec."Plant Company");
+        IF NOT ExitOrderRec.GET(lvSalesRentalRemovalLine."Removal Order No.") THEN
+          EXIT(FALSE);
+        EXIT(ExitOrderRec.Posted);
+      END ELSE BEGIN
+        lvPlantOrderRec.CHANGECOMPANY(PlantMgtCompRec."Plant Company");
+        IF NOT lvPlantOrderRec.GET(lvSalesRentalRemovalLine."Removal Order No.") THEN
+          EXIT(FALSE);
+        IF lvPlantOrderRec."Exit Order No." <> '' THEN BEGIN
+          ExitOrderRec.CHANGECOMPANY(PlantMgtCompRec."Plant Company");
+          IF ExitOrderRec.GET(lvPlantOrderRec."Exit Order No.") THEN;
+        END;
+        EXIT(lvPlantOrderRec.Posted);
+      END;
+    END;
+
+    PROCEDURE GetOrderInvoiceStatus@1100485001();
+    VAR
+      lvSalesHeader@1100485000 : Record 36;
+      lvSalesInvHeader@1100485001 : Record 112;
+      SalesCredMemoHeader@1100525000 : Record 114;
+    BEGIN
+      InvoicePaymentInAdvanceBln := FALSE;
+      InvoiceSalesLinesBln := FALSE;
+      PaymentInAdvanceAmount := 0;
+
+      IF "Sales Header"."Amount Payment in Advance" = 0 THEN BEGIN
+        InvoiceSalesLinesBln := TRUE;
+        EXIT;
+      END;
+
+      lvSalesHeader.SETRANGE("Document Type", lvSalesHeader."Document Type"::Invoice);
+      lvSalesHeader.SETRANGE("Related Sales Order No.", "Sales Header"."No.");
+      IF NOT lvSalesHeader.ISEMPTY THEN
+        EXIT;
+
+      lvSalesInvHeader.SETCURRENTKEY("Order No.");
+      lvSalesInvHeader.SETRANGE("Order No.", "Sales Header"."No.");
+      IF NOT lvSalesInvHeader.FINDFIRST THEN BEGIN
+        InvoicePaymentInAdvanceBln := TRUE;
+        PaymentInAdvanceAmount := "Sales Header"."Amount Payment in Advance";
+      END ELSE BEGIN
+        IF FORMAT("Sales Header"."Invoice Frequency Rental") <> '' THEN BEGIN
+          //No invoicing when frequency is not filled yet.
+          InvoiceSalesLinesBln := TRUE;
+          IF lvSalesInvHeader.NEXT = 0 THEN BEGIN
+            SalesCredMemoHeader.SETRANGE("Related Sales Order No.", "Sales Header"."No.");
+            SalesCredMemoHeader.SETRANGE("Sell-to Customer No.", "Sales Header"."Sell-to Customer No.");
+            IF SalesCredMemoHeader.ISEMPTY THEN BEGIN
+              InvoicePaymentInAdvanceBln := TRUE;
+              PaymentInAdvanceAmount := - "Sales Header"."Amount Payment in Advance";
+            END;
+          END;
+        END;
+      END;
+    END;
+
+    PROCEDURE CopyTempInvToInv@1100485022();
+    VAR
+      lvOffAmtRec@1100485000 : Record 11012786;
+      lvPaymentTerms@1100485001 : Record 3;
+      lvTempTotSalesInvLine@1100485002 : TEMPORARY Record 37;
+    BEGIN
+      //Get Total invoice amount
+      TempSalesInvLine.RESET;
+      SalesPost.GetSalesLinesTemp(SalesInvHeader,lvTempTotSalesInvLine,TempSalesInvLine,0);
+      lvTempTotSalesInvLine.CALCSUMS("Amount Including VAT");
+
+      WITH SalesInvHeader2 DO BEGIN
+        //Create Invoice Header
+        SalesInvHeader2 := SalesInvHeader;
+        SalesInvHeader.DELETE;
+
+        IF lvTempTotSalesInvLine."Amount Including VAT" < 0 THEN
+          "Document Type" := "Document Type"::"Credit Memo"
+        ELSE
+          "Document Type" := "Document Type"::Invoice;
+        "No." := '';
+        VALIDATE("No.");
+        INSERT(TRUE);
+
+        IF ReplacePostingDate THEN
+          "Posting Date" := PostingDateReq;
+        IF ReplaceDocumentDate THEN
+          "Document Date" := PostingDateReq;
+        Status := Status::Released;
+        "Amount Payment in Advance" := PaymentInAdvanceAmount;
+
+        IF "Document Type" = "Document Type"::"Credit Memo" THEN BEGIN
+          "Shipment Date" := 0D;
+          GLSetup.GET;
+          Correction := GLSetup."Mark Cr. Memos as Corrections";
+          IF ("Payment Terms Code" <> '') AND ("Document Date" <> 0D) THEN
+            lvPaymentTerms.GET("Payment Terms Code")
+          ELSE
+            CLEAR(lvPaymentTerms);
+          IF NOT lvPaymentTerms."Calc. Pmt. Disc. on Cr. Memos" THEN BEGIN
+            "Payment Terms Code" := '';
+            "Due Date" := 0D;
+            "Payment Discount %" := 0;
+            "Pmt. Discount Date" := 0D;
+            "Payment Discount % 2" := 0;
+            "Pmt. Discount Date 2" := 0D;
+            "Payment Discount % 3" := 0;
+            "Pmt. Discount Date 3" := 0D;
+          END;
+        END;
+        MODIFY;
+
+        //Create Invoice Lines
+        TempSalesInvLine.RESET; //Filters are set in func SalesPost.GetSalesLinesTemp
+        IF TempSalesInvLine.FINDSET THEN BEGIN
+          REPEAT
+            SalesInvLine := TempSalesInvLine;
+            SalesInvLine."Document Type" := "Document Type";
+            SalesInvLine."Document No." := "No.";
+            IF "Document Type" = "Document Type"::"Credit Memo" THEN BEGIN
+              IF (TempSalesInvLine."Plant Type" <> '') AND (TempSalesInvLine."Relate to" = TempSalesInvLine."Relate to"::Rental) THEN
+                SalesInvLine.VALIDATE("Number of Time Units", -1 * SalesInvLine."Number of Time Units")
+              ELSE BEGIN
+                SalesInvLine.VALIDATE(Quantity, -1 * SalesInvLine.Quantity);
+                SalesInvLine.InitQtyToShip;
+              END;
+              SalesInvLine.SuspendUpdateVATAmounts(FALSE);
+              SalesInvLine.UpdateAmounts;
+            END;
+            SalesInvLine.INSERT;
+          UNTIL TempSalesInvLine.NEXT = 0;
+          TempSalesInvLine.DELETEALL;
+        END;
+
+        //Create Invoice Header Dim
+        //Copy direct from Sales Header
+
+        //Create Invoice Lines Dim
+        //Copy From temporary created sales invoice lines (document '0');
+
+        //Copy Offered Amount
+        IF lvOffAmtRec.GET(lvOffAmtRec."Document Type"::Order, "Sales Header"."No.", 0) THEN BEGIN
+          lvOffAmtRec."Document Type" := "Document Type";
+          lvOffAmtRec."Document No." := "No.";
+          lvOffAmtRec.INSERT;
+        END;
+
+        //Correct Invoice No. on Sales Rental Inv History Lines
+        SalesRentInvLine.RESET;
+        SalesRentInvLine.SETCURRENTKEY("Invoice Status","Last Invoice No.");
+        SalesRentInvLine.SETRANGE("Invoice Status", SalesRentInvLine."Invoice Status"::"Temporary");
+        SalesRentInvLine.SETRANGE("Last Invoice No.", SalesInvHeader."No.");
+        SalesRentInvLine.SETRANGE(Location, "Sales Header"."Plant Location Code");
+        IF SalesRentInvLine.FINDSET(TRUE, TRUE) THEN
+          REPEAT
+            SalesRentInvLine2 := SalesRentInvLine;
+            SalesRentInvLine2."Last Invoice No." := "No.";
+            SalesRentInvLine2.MODIFY;
+          UNTIL SalesRentInvLine.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE GetPlantQtyPerSalesUnit@1210190000(PlantTypeCode@1210190002 : Code[20];LogistUnitCode@1210190001 : Code[10];SalesUnitCode@1210190000 : Code[10]) QuanPerSalesUnit : Decimal;
+    VAR
+      PlantUnit@1100485002 : Record 11012599;
+      LogistUnitQuan@1210190003 : Decimal;
+      SalesUnitQuan@1210190004 : Decimal;
+    BEGIN
+      QuanPerSalesUnit := 1;
+      IF (PlantTypeCode = '') OR (LogistUnitCode = '') OR (SalesUnitCode = '')THEN
+        EXIT;
+
+      IF LogistUnitCode = SalesUnitCode THEN
+        EXIT;
+
+      PlantUnit.GET(PlantTypeCode, LogistUnitCode);
+      PlantUnit.TESTFIELD("Qty. per Unit of Measure");
+      LogistUnitQuan := PlantUnit."Qty. per Unit of Measure";
+
+      PlantUnit.GET(PlantTypeCode, SalesUnitCode);
+      PlantUnit.TESTFIELD("Qty. per Unit of Measure");
+      SalesUnitQuan := PlantUnit."Qty. per Unit of Measure";
+
+      QuanPerSalesUnit := LogistUnitQuan/SalesUnitQuan;
+    END;
+
+    BEGIN
+    {
+      TODO:
+      Add check TotalSalesLine."Amount Including VAT". If < 0 then credit memo, else invoice;
+      Do not forget to empty temp tables for each order.
+      See cu 6204 CalcCustomerSpecificUnitPrice.
+    }
+    END.
+  }
+  RDLDATA
+  {
+  }
+}
+

@@ -1,0 +1,706 @@
+OBJECT Codeunit 11012008 Copy Budget Lines
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=39;
+    OnRun=VAR
+            ProjPurchaseActionRec@11012000 : Record 11012026;
+          BEGIN
+            PurchHeaderRec.GET("Document Type","Document No.");
+
+            IF PurchHeaderRec."Job No." <> '' THEN
+              ProjPurchaseActionRec.SETRANGE("Project No.", PurchHeaderRec."Job No.");
+            IF PurchHeaderRec."Received on Project" <> '' THEN
+              ProjPurchaseActionRec.SETRANGE("Project No.", PurchHeaderRec."Received on Project");
+            ProjPurchaseActionRec.SETFILTER(Status,'>=%1',ProjPurchaseActionRec.Status::Approved);
+            IF PurchHeaderRec."Document Type" = PurchHeaderRec."Document Type"::Quote THEN
+              ProjPurchaseActionRec.SETFILTER("Activate for", '%1|%2',
+              ProjPurchaseActionRec."Activate for"::" ", ProjPurchaseActionRec."Activate for"::Quote);
+            IF PurchHeaderRec."Document Type" = PurchHeaderRec."Document Type"::Order THEN
+              ProjPurchaseActionRec.SETFILTER("Activate for", '%1|%2',
+              ProjPurchaseActionRec."Activate for"::" ", ProjPurchaseActionRec."Activate for"::Purchase);
+            IF PAGE.RUNMODAL(PAGE::"Project Purchase Action List",ProjPurchaseActionRec) = ACTION::LookupOK THEN
+              IF PurchHeaderRec."Document Type" = PurchHeaderRec."Document Type"::Quote THEN
+                CopyLines(ProjPurchaseActionRec,Rec,FALSE)
+              ELSE
+                CopyLines(ProjPurchaseActionRec,Rec,TRUE);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      BudgetLineRec@11012000 : Record 11012001;
+      ItemRec@1100485000 : Record 27;
+      DimValRec@11012001 : Record 349;
+      PurchLineRec@1210190002 : Record 39;
+      PurchHeaderRec@1210190001 : Record 38;
+      OptionRec@1100525000 : Record 11012502;
+      OptionBudgetRec@1100525001 : Record 11012503;
+      ProjElemRec@1210190004 : Record 11012010;
+      DimMgt@1210190003 : Codeunit 408;
+      UOMMgt@1210190000 : Codeunit 5402;
+      NextLineNo@1210190005 : Integer;
+      TmpBudgetLineRec@1210190006 : TEMPORARY Record 11012001;
+      Text000@1100485002 : TextConst 'ENU=No Vendors selected for this Purchase Action';
+      Text001@1100485003 : TextConst 'ENU=Status of this Purchase Action must be Approve or Definitive.';
+      Text002@1100485004 : TextConst 'ENU=Purchase Order %1 is created.';
+      PurchLineCounter@1100485001 : Integer;
+      Text003@1100485005 : TextConst 'ENU=There is no Purchase Order created.';
+      Text004@1100525002 : TextConst 'ENU=Making Order Lines         @1@@@@@@@@@@@@@';
+
+    PROCEDURE CopyLines@1210190000(IProjPurchActionRec@1210190002 : Record 11012026;IPurchLineRec@1210190001 : Record 39;ICloseBudgetLine@1210190000 : Boolean);
+    BEGIN
+      BudgetLineRec.SETRANGE("Project No.",IProjPurchActionRec."Project No.");
+      BudgetLineRec.SETRANGE("Purchase Action",IProjPurchActionRec.Code);
+      BudgetLineRec.SETRANGE(Advised, FALSE);
+
+      InsertPurchLines(IPurchLineRec, ICloseBudgetLine);
+
+      IF ICloseBudgetLine THEN BEGIN
+        IF PurchHeaderRec."Document Type" = PurchHeaderRec."Document Type"::Quote THEN
+          IF IProjPurchActionRec."Activate for" < IProjPurchActionRec."Activate for"::Quote THEN
+            IProjPurchActionRec."Activate for" := IProjPurchActionRec."Activate for"::Quote;
+        IF PurchHeaderRec."Document Type" = PurchHeaderRec."Document Type"::Order THEN
+          IF IProjPurchActionRec."Activate for" < IProjPurchActionRec."Activate for"::Purchase THEN
+            IProjPurchActionRec."Activate for" := IProjPurchActionRec."Activate for"::Purchase;
+        IProjPurchActionRec.MODIFY;
+      END;
+      //COMMIT;  //* Geen commit want dan worden halverwege bepaalde processen al gegevens weggeschreven.
+                 //* Als ergens nodig dan moet op bewuste plek maar direct na aanroep een commit.
+    END;
+
+    PROCEDURE CopyMarkedBudgetLines@1210190001(VAR IBudgetRec@1210190002 : Record 11012001;IPurchLineRec@1210190001 : Record 39;ICloseBudgetLine@1210190000 : Boolean);
+    BEGIN
+      BudgetLineRec.COPY(IBudgetRec);
+
+      InsertPurchLines(IPurchLineRec, ICloseBudgetLine);
+    END;
+
+    PROCEDURE CopyMarkedBudgetLinesOption@1100525000(VAR IBudgetRec@1210190002 : Record 11012001;IOptionBudgetRec@1210190001 : Record 11012503);
+    BEGIN
+      BudgetLineRec.COPY(IBudgetRec);
+
+      InsertOptionBudget(IOptionBudgetRec);
+    END;
+
+    PROCEDURE CopyMarkedBudgetLinesPlantReq@1210190002(VAR IBudgetRec@1210190001 : Record 11012001;IPlantRequestLine@1210190000 : Record 11020521);
+    BEGIN
+      //mg, 03-03-11: M24448
+      BudgetLineRec.COPY(IBudgetRec);
+
+      InsertPlantRequest(IPlantRequestLine);
+    END;
+
+    PROCEDURE CopyMarkedBudgetLinesPlantOrd@1210190004(VAR IBudgetRec@1210190001 : Record 11012001;IPlantOrder@1210190000 : Record 11012556);
+    BEGIN
+      //mg, 03-03-11: M24448
+      BudgetLineRec.COPY(IBudgetRec);
+
+      InsertPlantOrder(IPlantOrder);
+    END;
+
+    PROCEDURE InsertPurchLines@1210190005(IPurchLineRec@1210190000 : Record 39;ICloseBudgetLine@1210190001 : Boolean);
+    VAR
+      BudgetLineWithSamePropertyFilters@1100528400 : Record 11012001;
+      RouteRefMgt@1100525003 : Codeunit 11012045;
+      CompressedTotal@1210190002 : Decimal;
+      NoOfRecords@1100525002 : Integer;
+      BudgetLineCounter@1100525001 : Integer;
+      Window@1100525000 : Dialog;
+      LastRefNo@1100525004 : Code[20];
+      PurchaseOrderNo@1100528401 : Code[20];
+      PurchaseOrderLineNo@1100528402 : Integer;
+    BEGIN
+      //db, 22-02-05: functie herschreven (melding 4691)
+      PurchLineCounter := 0;
+      PurchHeaderRec.GET(IPurchLineRec."Document Type",IPurchLineRec."Document No.");
+
+      PurchLineRec.LOCKTABLE;
+      PurchLineRec.SETRANGE("Document Type",IPurchLineRec."Document Type");
+      PurchLineRec.SETRANGE("Document No.",IPurchLineRec."Document No.");
+      IF PurchLineRec.FINDLAST THEN
+        NextLineNo := PurchLineRec."Line No."
+      ELSE
+        NextLineNo := 0;
+
+      //IF BudgetLineRec.FINDSET(ICloseBudgetLine, FALSE) THEN BEGIN  //C008807.o
+      IF BudgetLineRec.FINDSET(TRUE, FALSE) THEN BEGIN  //C008807.n
+        //C011532
+        NoOfRecords := BudgetLineRec.COUNT;
+        IF GUIALLOWED THEN
+          Window.OPEN(Text004);
+        //
+        REPEAT
+          //C011532
+          BudgetLineCounter := BudgetLineCounter + 1;
+          IF GUIALLOWED THEN
+            Window.UPDATE(1, 100 * ROUND(BudgetLineCounter/NoOfRecords * 100));
+          //
+          TmpBudgetLineRec := BudgetLineRec;       //db.sn, 01-07-05
+          IF NOT TmpBudgetLineRec.FIND('=') THEN BEGIN
+            CompressedTotal := CheckSameProperty(BudgetLineWithSamePropertyFilters);  //db.en, 01-07-05
+            IF CompressedTotal <> 0 THEN BEGIN
+              PurchLineRec.INIT;
+              NextLineNo := NextLineNo + 10000;
+              PurchLineRec."Document Type"  := IPurchLineRec."Document Type";
+              PurchLineRec."Document No." := IPurchLineRec."Document No.";
+              PurchLineRec."Line No." := NextLineNo;
+              PurchLineRec."Input by" := USERID; //DP00469
+              PurchLineRec."Input Date" := TODAY; //DP00469
+              PurchLineRec.INSERT;  //db, 13-09-05
+              PurchLineCounter := PurchLineCounter + 1;
+
+              PurchLineRec.SuspendUpdateAmounts(TRUE); //C011532
+              PurchLineRec.VALIDATE("Currency Code", IPurchLineRec."Currency Code");
+              PurchLineRec.VALIDATE("Job No.", BudgetLineRec."Project No.");
+              PurchLineRec.VALIDATE(Element, BudgetLineRec.Element);
+              PurchLineRec."Extension Contract" := BudgetLineRec."Extension Contract";
+              PurchLineRec."Plot No." := BudgetLineRec."Plot No.";
+              PurchLineRec."Budget Adjustment" := BudgetLineRec.Adjustment;
+              PurchLineRec."Tender Paragraph" := BudgetLineRec."Tender Paragraph";  //db, 03-12-09
+              PurchLineRec."Tender Paragraph Part" := BudgetLineRec."Tender Paragraph Part";  //db, 03-12-09
+              PurchLineRec.VALIDATE("Purchase Action", BudgetLineRec."Purchase Action");
+              PurchLineRec."Purchase Phase" := BudgetLineRec."Purchase Phase";
+              PurchLineRec."Cost Type" := BudgetLineRec."Cost Type" + 1;
+              PurchLineRec."Shortcut Dimension 2 Code" := BudgetLineRec."Cost Object";
+              DimMgt.GetDimValueRec(2, BudgetLineRec."Cost Object", DimValRec, TRUE, BudgetLineRec."Project No.");
+
+              PurchLineRec.VALIDATE("Unit of Measure Code", BudgetLineRec."Unit of Measure");
+              IF ItemRec.GET(BudgetLineRec."Item No.") THEN
+                PurchLineRec."Qty. per Unit of Measure" := UOMMgt.GetQtyPerUnitOfMeasure(ItemRec, PurchLineRec."Unit of Measure Code");
+              IF PurchHeaderRec."Amounts only" THEN BEGIN
+                PurchLineRec.VALIDATE("Direct Unit Cost", CompressedTotal);  //db, 01-07-05
+              END ELSE BEGIN
+                //*C002290.sn  Because of function CheckSign in T39 (Quantiy and LineAmount must have same sign)
+                IF ((CompressedTotal > 0) AND (BudgetLineRec.Price < 0)) OR
+                   ((CompressedTotal < 0) AND (BudgetLineRec.Price < 0))
+                THEN BEGIN
+                  PurchLineRec."Direct Unit Cost" := -BudgetLineRec.Price;
+                  PurchLineRec.VALIDATE(Quantity, -CompressedTotal);  //db, 01-07-05
+                END ELSE BEGIN
+                //*C002290.en
+                  PurchLineRec."Direct Unit Cost" := BudgetLineRec.Price;
+                  PurchLineRec.VALIDATE(Quantity, CompressedTotal);  //db, 01-07-05
+                END;
+              END;
+
+              IF BudgetLineRec."Cost Type" = BudgetLineRec."Cost Type"::Material THEN BEGIN
+                PurchLineRec."Item No." := BudgetLineRec."Item No.";
+                PurchLineRec.Manufacturer := BudgetLineRec.Manufacturer;
+                PurchLineRec."Basic Item" := BudgetLineRec."Basic Item";
+                PurchLineRec."Vendor (Trade Item)" := BudgetLineRec."Vendor (Trade Item)";
+                PurchLineRec."Trade Item" := BudgetLineRec."Trade Item";
+                IF BudgetLineRec."Item No." <> '' THEN BEGIN
+                  PurchLineRec."Item No." := '';  //check on xRec in validate itemdata
+                  PurchLineRec.VALIDATE("Item No.", BudgetLineRec."Item No.");
+                END ELSE BEGIN
+                  IF BudgetLineRec."Trade Item" <> '' THEN BEGIN
+                    PurchLineRec."Trade Item" := '';
+                    PurchLineRec.VALIDATE("Trade Item", BudgetLineRec."Trade Item");
+                  END ELSE BEGIN
+                    IF BudgetLineRec."Basic Item" <> '' THEN BEGIN
+                      PurchLineRec."Basic Item" := '';
+                      PurchLineRec.VALIDATE("Basic Item", BudgetLineRec."Basic Item");
+                    END;
+                  END;
+                END;
+              END;
+              PurchLineRec.VALIDATE("Shortcut Dimension 2 Code", BudgetLineRec."Cost Object");
+              IF BudgetLineRec."Trade Item" + BudgetLineRec."Basic Item" + BudgetLineRec."Item No." = '' THEN
+                PurchLineRec."Unit of Measure Code" := BudgetLineRec."Unit of Measure";  //db, 06-02-13: C005537
+              PurchLineRec."Posting Date" := PurchHeaderRec."Posting Date";
+
+              IF NOT ProjElemRec.GET(PurchLineRec."Job No.", PurchLineRec.Element) THEN ProjElemRec.INIT;
+              IF ProjElemRec."Starting Date" <= TODAY THEN
+                PurchLineRec.VALIDATE("Expected Receipt Date", TODAY)
+              ELSE
+                PurchLineRec.VALIDATE("Expected Receipt Date", ProjElemRec."Starting Date"-1);
+
+              PurchLineRec."Cost Component" := BudgetLineRec."Cost Component";
+              PurchLineRec."Variant Code" := BudgetLineRec."Variant Code"; // Variant, X0.71
+              PurchLineRec."FSC Type Code" := BudgetLineRec."FSC Type Code";  //DP00129
+
+              PurchLineRec.Description := BudgetLineRec.Description;
+              PurchLineRec."Description 2" := BudgetLineRec."Description 2";
+              PurchLineRec.VALIDATE(Text, BudgetLineRec."External Text");
+              //C011532
+              PurchLineRec.SuspendUpdateAmounts(FALSE);
+              PurchLineRec.UpdateAmounts;
+              //
+              IF PurchHeaderRec."Amounts only" THEN
+                PurchLineRec.InitAmntToReceive; //Call C-008771
+              //C008807.sn
+              IF BudgetLineRec."Purchase Route Reference" = '' THEN BEGIN
+                IF LastRefNo = '' THEN
+                  LastRefNo := RouteRefMgt.GetLastRefNo();
+                LastRefNo := INCSTR(LastRefNo);
+                BudgetLineRec."Purchase Route Reference" := LastRefNo;
+                BudgetLineRec.MODIFY;
+              END;
+              PurchLineRec."Purchase Route Reference" := BudgetLineRec."Purchase Route Reference";
+              UpdateTmpBudgetLines(BudgetLineWithSamePropertyFilters, PurchLineRec);
+              //C008807.en
+              PurchLineRec."Modified by" := USERID; //DP00469
+              PurchLineRec."Last Date Modified" := TODAY;//DP00469
+              PurchLineRec."Comments for Logistics" := BudgetLineRec."Comments for Logistics";
+              PurchLineRec.MODIFY;  //db, 13-09-05
+              PurchLineRec.CreatePurchOrderControl(FALSE);
+              IF PurchLineRec."Document Type" = PurchLineRec."Document Type"::Order THEN BEGIN
+                PurchaseOrderNo := PurchLineRec."Document No.";
+                PurchaseOrderLineNo := PurchLineRec."Line No.";
+              END ELSE BEGIN
+                PurchaseOrderNo := '';
+                PurchaseOrderLineNo := 0;
+              END;
+            END;
+          END ELSE BEGIN
+            BudgetLineRec."Purchase Route Reference" := TmpBudgetLineRec."Purchase Route Reference";
+            BudgetLineRec.MODIFY;
+            PurchaseOrderNo := TmpBudgetLineRec."Purchase Order No.";
+            PurchaseOrderLineNo := TmpBudgetLineRec."Purchase Order Line No.";
+          END;
+
+          IF ICloseBudgetLine THEN BEGIN
+            BudgetLineRec.Advised := TRUE;
+            BudgetLineRec."Purchase Order No." := PurchaseOrderNo;
+            BudgetLineRec."Purchase Order Line No." := PurchaseOrderLineNo;
+            BudgetLineRec.MODIFY;
+          END;
+        UNTIL BudgetLineRec.NEXT = 0;
+        IF (LastRefNo <> '') THEN
+          RouteRefMgt.WriteLastRefNo(LastRefNo);  //C008807.n
+      END;
+    END;
+
+    PROCEDURE InsertOptionBudget@1100525001(IOptionBudgetRec@1210190000 : Record 11012503);
+    BEGIN
+      OptionRec.GET(IOptionBudgetRec."Project No.",IOptionBudgetRec."Plot No.",IOptionBudgetRec."House Model",
+       IOptionBudgetRec."Main Group",IOptionBudgetRec.Group,IOptionBudgetRec."Sub Group", IOptionBudgetRec.Option);
+
+      OptionBudgetRec.LOCKTABLE;
+      OptionBudgetRec.SETRANGE("Project No.",IOptionBudgetRec."Project No.");
+      OptionBudgetRec.SETRANGE("Plot No.",IOptionBudgetRec."Plot No.");
+      OptionBudgetRec.SETRANGE("House Model",IOptionBudgetRec."House Model");
+      OptionBudgetRec.SETRANGE("Main Group",IOptionBudgetRec."Main Group");
+      OptionBudgetRec.SETRANGE(Group,IOptionBudgetRec.Group);
+      OptionBudgetRec.SETRANGE("Sub Group",IOptionBudgetRec."Sub Group");
+      OptionBudgetRec.SETRANGE(Option,IOptionBudgetRec.Option);
+
+      IF OptionBudgetRec.FINDLAST THEN
+        NextLineNo := OptionBudgetRec."Line No."
+      ELSE
+        NextLineNo := 0;
+
+      IF BudgetLineRec.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+
+          OptionBudgetRec.INIT;
+          NextLineNo := NextLineNo + 10000;
+          OptionBudgetRec."Project No." := IOptionBudgetRec."Project No.";
+          OptionBudgetRec."Plot No." := IOptionBudgetRec."Plot No.";
+          OptionBudgetRec."House Model" := IOptionBudgetRec."House Model";
+          OptionBudgetRec."Main Group" := IOptionBudgetRec."Main Group";
+          OptionBudgetRec.Group := IOptionBudgetRec.Group;
+          OptionBudgetRec."Sub Group" := IOptionBudgetRec."Sub Group";
+          OptionBudgetRec.Option := IOptionBudgetRec.Option;
+          OptionBudgetRec."Line No." := NextLineNo;
+          OptionBudgetRec.INSERT;
+
+          WITH BudgetLineRec DO BEGIN
+            OptionBudgetRec."Source Type" := "Option Line Type";
+            OptionBudgetRec."Cost Type" := "Cost Type";
+            OptionBudgetRec."Cost Object" := "Cost Object";
+            OptionBudgetRec."Cost Component" := "Cost Component";
+            OptionBudgetRec.Element := Element;
+            OptionBudgetRec.Chapter := Chapter;
+            OptionBudgetRec.Paragraph := Paragraph;
+            OptionBudgetRec."Item No." := "Item No.";
+            OptionBudgetRec."Basic Item" := "Basic Item";
+            OptionBudgetRec.Manufacturer := Manufacturer;
+            OptionBudgetRec."Trade Item" := "Trade Item";
+            OptionBudgetRec."Vendor (Trade Item)" := "Vendor (Trade Item)";
+            OptionBudgetRec.Description := Description;
+            OptionBudgetRec."Description 2" := "Description 2";
+            OptionBudgetRec."Unit of Measure" := "Unit of Measure";
+            OptionBudgetRec."Unit of Time" := "Unit of Time";
+            OptionBudgetRec.Quantity := Quantity;
+            OptionBudgetRec."Time Quantity" := "Time Quantity";
+            OptionBudgetRec.Amount := Amount;
+            OptionBudgetRec.Norm := Norm;
+            OptionBudgetRec."Rate Code" := "Rate Code";
+            OptionBudgetRec.Rate := Rate;
+            OptionBudgetRec.Hours := Hours;
+            OptionBudgetRec.Price := Price;
+            OptionBudgetRec."Gross Price" := "Gross Price";
+            OptionBudgetRec."Discount %" := "Discount %";
+            OptionBudgetRec."Recipe Group" := "Recipe Group";
+            OptionBudgetRec.Recipe := Recipe;
+          END;
+
+          OptionBudgetRec.MODIFY;
+        UNTIL BudgetLineRec.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE InsertPlantRequest@1210190006(IPlantRequestLine@1210190000 : Record 11020521);
+    VAR
+      PlantRequestLine@1210190002 : Record 11020521;
+      NextLineNo@1210190003 : Integer;
+    BEGIN
+      //mg, 03-03-11: M24448
+      PlantRequestLine.LOCKTABLE;
+      PlantRequestLine.SETRANGE("Plant Request No.", IPlantRequestLine."Plant Request No.");
+
+      IF PlantRequestLine.FINDLAST THEN
+        NextLineNo := PlantRequestLine."Line No."
+      ELSE
+        NextLineNo := 0;
+
+      IF BudgetLineRec.FINDSET(TRUE, FALSE) THEN BEGIN
+        REPEAT
+          IF ((BudgetLineRec."Cost Type" = BudgetLineRec."Cost Type"::Material) AND (BudgetLineRec."Item No." <> '')) OR
+            ((BudgetLineRec."Cost Type" = BudgetLineRec."Cost Type"::Plant) AND (BudgetLineRec."Plant Type" <> '')) THEN BEGIN
+            PlantRequestLine.INIT;
+            NextLineNo += 10000;
+            PlantRequestLine."Plant Request No." := IPlantRequestLine."Plant Request No.";
+            PlantRequestLine."Line No." := NextLineNo;
+            CASE BudgetLineRec."Cost Type" OF
+              BudgetLineRec."Cost Type"::Material:
+                BEGIN
+                  PlantRequestLine.VALIDATE(Type, PlantRequestLine.Type::Item);
+                  PlantRequestLine.VALIDATE("Item No.", BudgetLineRec."Item No.");
+                END;
+              BudgetLineRec."Cost Type"::Plant:
+                BEGIN
+                  PlantRequestLine.VALIDATE(Type, PlantRequestLine.Type::Plant);
+                  PlantRequestLine.VALIDATE("Plant Type", BudgetLineRec."Plant Type");
+                END;
+            END;
+            PlantRequestLine.VALIDATE(Quantity, BudgetLineRec.Quantity);
+            PlantRequestLine.VALIDATE(Element, BudgetLineRec.Element);
+            PlantRequestLine.INSERT(TRUE);
+
+            BudgetLineRec.Advised := TRUE;
+            BudgetLineRec.MODIFY;
+          END;
+        UNTIL BudgetLineRec.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE InsertPlantOrder@1210190007(IPlantOrder@1210190000 : Record 11012556);
+    VAR
+      PlantOrderLine@1210190001 : Record 11012557;
+    BEGIN
+      //mg, 03-03-11: M24448
+      PlantOrderLine.LOCKTABLE;
+      PlantOrderLine.SETRANGE("Plant Order No.", IPlantOrder."No.");
+      IF PlantOrderLine.FINDLAST THEN
+        NextLineNo := PlantOrderLine."Line No."
+      ELSE
+        NextLineNo := 0;
+
+      //BudgetLineRec.SETRANGE("Cost Type", BudgetLineRec."Cost Type"::Plant);
+      BudgetLineRec.SETFILTER("Cost Type", '%1|%2', BudgetLineRec."Cost Type"::Plant, BudgetLineRec."Cost Type"::Material);
+      IF BudgetLineRec.FINDSET(TRUE, FALSE) THEN BEGIN
+        REPEAT
+          CASE BudgetLineRec."Cost Type" OF
+            BudgetLineRec."Cost Type"::Plant:
+              BEGIN
+                IF BudgetLineRec."Plant Type" <> '' THEN BEGIN
+                  PlantOrderLine.INIT;
+                  NextLineNo += 10000;
+                  PlantOrderLine."Plant Order No." := IPlantOrder."No.";
+                  PlantOrderLine."Line No." := NextLineNo;
+                  PlantOrderLine.VALIDATE(Type, PlantOrderLine.Type::Plant);
+                  PlantOrderLine.VALIDATE("Plant Type", BudgetLineRec."Plant Type");
+                  PlantOrderLine.VALIDATE("Asked Quantity", BudgetLineRec.Quantity);
+                  PlantOrderLine.VALIDATE("From Location", IPlantOrder."From Location");
+                  PlantOrderLine.VALIDATE(Element, BudgetLineRec.Element);
+                  PlantOrderLine.INSERT(TRUE);
+                END;
+              END;
+            BudgetLineRec."Cost Type"::Material:
+              BEGIN
+                IF BudgetLineRec."Item No." <> '' THEN BEGIN
+                  PlantOrderLine.INIT;
+                  NextLineNo += 10000;
+                  PlantOrderLine."Plant Order No." := IPlantOrder."No.";
+                  PlantOrderLine."Line No." := NextLineNo;
+                  PlantOrderLine.VALIDATE(Type, PlantOrderLine.Type::Item);
+                  PlantOrderLine.SetNoInventoryWarning(TRUE);
+                  PlantOrderLine.VALIDATE("Item No.", BudgetLineRec."Item No.");
+                  PlantOrderLine.VALIDATE("Asked Quantity", BudgetLineRec.Quantity);
+                  PlantOrderLine.VALIDATE(Element, BudgetLineRec.Element);
+                  PlantOrderLine.INSERT(TRUE);
+                END;
+              END;
+          END;
+          BudgetLineRec.Advised := TRUE;
+          BudgetLineRec.MODIFY;
+        UNTIL BudgetLineRec.NEXT = 0;
+      END;
+
+      //PlantOrderItemLine.LOCKTABLE;
+      //PlantOrderItemLine.SETRANGE("Plant Order No.", IPlantOrder."No.");
+      //IF PlantOrderItemLine.FINDLAST THEN
+      //  NextLineNo := PlantOrderItemLine."Line No."
+      //ELSE
+      //  NextLineNo := 0;
+      //
+      //BudgetLineRec.SETRANGE("Cost Type", BudgetLineRec."Cost Type"::Material);
+      //IF BudgetLineRec.FINDSET(TRUE, FALSE) THEN BEGIN
+      //  REPEAT
+      //    IF BudgetLineRec."Item No." <> '' THEN BEGIN
+      //      PlantOrderItemLine.INIT;
+      //      NextLineNo += 10000;
+      //      PlantOrderItemLine."Plant Order No." := IPlantOrder."No.";
+      //      PlantOrderItemLine."Line No." := NextLineNo;
+      //      PlantOrderItemLine.VALIDATE(Type, PlantOrderItemLine.Type::Item);
+      //      PlantOrderItemLine.SetNoInventoryWarning(TRUE);
+      //      PlantOrderItemLine.VALIDATE("Item No.", BudgetLineRec."Item No.");
+      //      PlantOrderItemLine.VALIDATE("Asked Quantity", BudgetLineRec.Quantity);
+      //      PlantOrderItemLine.VALIDATE(Element, BudgetLineRec.Element);
+      //      PlantOrderItemLine.INSERT(TRUE);
+      //    END;
+      //    BudgetLineRec.Advised := TRUE;
+      //    BudgetLineRec.MODIFY;
+      //  UNTIL BudgetLineRec.NEXT = 0;
+      //END;
+    END;
+
+    PROCEDURE CheckSameProperty@1100485002(VAR lvBudgetLine@1100528400 : Record 11012001) SubTotal : Decimal;
+    BEGIN
+      //db, 01-07-05
+      IF PurchHeaderRec."Amounts only" THEN
+        SubTotal := BudgetLineRec.Amount
+      ELSE
+        SubTotal := BudgetLineRec.Quantity * BudgetLineRec."Time Quantity";
+
+      lvBudgetLine.RESET;
+      lvBudgetLine.COPY(BudgetLineRec);
+
+      lvBudgetLine.SETRANGE("Project No.", BudgetLineRec."Project No.");
+      lvBudgetLine.SETRANGE(Element, BudgetLineRec.Element);
+      lvBudgetLine.SETRANGE("Extension Contract", BudgetLineRec."Extension Contract");
+      lvBudgetLine.SETRANGE("Plot No.", BudgetLineRec."Plot No.");
+      //lvBudgetLine.SETRANGE(Adjustment, BudgetLineRec.Adjustment); //melding 7743 (april/mei 2007)
+      lvBudgetLine.SETRANGE("Item No.", BudgetLineRec."Item No.");
+      lvBudgetLine.SETRANGE("Basic Item", BudgetLineRec."Basic Item");
+      lvBudgetLine.SETRANGE(Manufacturer, BudgetLineRec.Manufacturer);
+      lvBudgetLine.SETRANGE("Trade Item", BudgetLineRec."Trade Item");
+      lvBudgetLine.SETRANGE("Vendor (Trade Item)", BudgetLineRec."Vendor (Trade Item)");
+      lvBudgetLine.SETRANGE("Cost Object", BudgetLineRec."Cost Object");
+      lvBudgetLine.SETRANGE("Cost Component", BudgetLineRec."Cost Component");
+
+      lvBudgetLine.SETRANGE(Description, BudgetLineRec.Description);
+      lvBudgetLine.SETRANGE("Description 2", BudgetLineRec."Description 2");
+      lvBudgetLine.SETRANGE("Unit of Measure", BudgetLineRec."Unit of Measure");
+      lvBudgetLine.SETRANGE("Purchase Action", BudgetLineRec."Purchase Action");
+      lvBudgetLine.SETRANGE("Purchase Route Reference", BudgetLineRec."Purchase Route Reference");
+      lvBudgetLine.SETRANGE("Price Agreement", BudgetLineRec."Price Agreement");
+      IF BudgetLineRec.Vendor <> '' THEN
+        lvBudgetLine.SETRANGE(Vendor, BudgetLineRec.Vendor);
+      lvBudgetLine.SETRANGE("External Text", BudgetLineRec."External Text");
+      lvBudgetLine.SETRANGE(Price, BudgetLineRec.Price);
+      lvBudgetLine.SETRANGE("Tender Paragraph",BudgetLineRec."Tender Paragraph"); //call C-028955
+      lvBudgetLine.SETRANGE("Purchase Route Reference", BudgetLineRec."Purchase Route Reference"); //C008807.n
+      lvBudgetLine.SETRANGE("FSC Type Code", BudgetLineRec."FSC Type Code");  //DP00129
+
+      //lvBudgetLine.SETFILTER("Line No.", '<>%1', BudgetLineRec."Line No.");
+      //* 21-06-2007: Voor melding 7743 (18-04-2006) is al eens een aanpassing gedaan dat er geen filter meer
+      //* wordt gezet op de correctiecode (Adjustment), zie hierboven. Maar het zetten van een filter op "Line No."
+      //* kan ook niet want de correctiecode zit in de index, zodat deze hetzelfde regelnummer kan hebben.
+      //* Index 1 bestaat uit de velden "Project No.", Adjustment, Extension Contract, Option en "Line No.".
+      //* Dus geen filter op regelnummer maar testen of niet gelijk aan huidig record, hierbij hoeft dan alleen
+      //* nog getest te worden of de keyvelden waarop geen filter is gezet, dus Adjustment, Option en "Line No."
+      IF lvBudgetLine.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          IF (lvBudgetLine.Adjustment <> BudgetLineRec.Adjustment) OR
+             (lvBudgetLine.Option <> BudgetLineRec.Option) OR
+             (lvBudgetLine."Line No." <> BudgetLineRec."Line No.")
+          THEN BEGIN
+            TmpBudgetLineRec := lvBudgetLine;
+            IF TmpBudgetLineRec.INSERT THEN;
+
+            IF PurchHeaderRec."Amounts only" THEN
+              SubTotal := SubTotal + lvBudgetLine.Amount
+            ELSE
+              SubTotal := SubTotal + lvBudgetLine.Quantity * lvBudgetLine."Time Quantity";
+          END;
+        UNTIL lvBudgetLine.NEXT = 0;
+      END;
+
+      EXIT(SubTotal);
+    END;
+
+    PROCEDURE CopyLinesToNewOrder@1100485000(iProjPurchActionRec@1100485000 : Record 11012026);
+    VAR
+      lvNoSeries@1100485001 : Code[10];
+      lvPurchHeadRec@1100485002 : Record 38;
+      lvPurchLineRec@1100485003 : Record 39;
+      lvPurchActVendRec@1100485005 : Record 11012068;
+      lvContRec@1100485006 : Record 5050;
+      lvPurchaserRec@1100485007 : Record 13;
+      PurchActDocRec@1100525001 : Record 11012071;
+      DocRelRec@1100525000 : Record 11012407;
+      TenderParagraphRec@1100525002 : Record 11012072;
+      TenderParagraphRec2@1100525003 : Record 11012072;
+      DocumentProperties@1100528400 : Record 11012746;
+    BEGIN
+      //**4PS01.sn
+      //first insert the new order header
+      IF iProjPurchActionRec.Status < iProjPurchActionRec.Status::Approved THEN
+        ERROR(Text001);
+
+      iProjPurchActionRec.CheckIfNoConsentLinesAvailable;
+
+      lvPurchHeadRec.INIT;
+      lvPurchHeadRec."Document Type" := lvPurchHeadRec."Document Type"::Order;
+      lvPurchHeadRec.CheckAskForNoSeries(lvPurchHeadRec."Document Type"::Order, lvNoSeries);
+      lvPurchHeadRec."No. Series" := lvNoSeries;
+      lvPurchHeadRec.GetNoForSelectedNoSeries(lvPurchHeadRec);
+      lvPurchHeadRec."Input by" := USERID; //DP00469
+      lvPurchHeadRec."Input Date" := TODAY; //DP00469
+      lvPurchHeadRec.INSERT(TRUE);
+
+      //lvPurchHeadRec."Amounts only" := iProjPurchActionRec."Amounts Only";  //C020772.o
+      lvPurchHeadRec."Job No." := iProjPurchActionRec."Project No.";
+      lvPurchHeadRec."Purchase Action" := iProjPurchActionRec.Code;
+      lvPurchActVendRec.SETRANGE("Project No.", iProjPurchActionRec."Project No.");
+      lvPurchActVendRec.SETRANGE("Purchase Action", iProjPurchActionRec.Code);
+      IF NOT lvPurchActVendRec.FIND('-') THEN
+        ERROR(Text000);
+      IF (lvPurchActVendRec.Type <> lvPurchActVendRec.Type::Contact) THEN
+        lvPurchHeadRec.VALIDATE("Buy-from Vendor No.",lvPurchActVendRec."Vendor No.")
+      ELSE
+        lvPurchHeadRec.VALIDATE("Buy-from Contact No.",lvPurchActVendRec."Vendor No.");
+      IF lvPurchActVendRec.Contact <> '' THEN BEGIN
+        lvPurchHeadRec."Buy-from Contact" := lvPurchActVendRec.Contact;
+        IF lvPurchActVendRec."Contact Person No." <> '' THEN BEGIN
+          IF lvContRec.GET(lvPurchActVendRec."Contact Person No.") THEN BEGIN
+            IF (lvContRec.Name = lvPurchActVendRec.Contact) THEN
+              lvPurchHeadRec."Buy-from Contact Person No." := lvPurchActVendRec."Contact Person No.";
+          END;
+        END;
+      END;
+      lvPurchHeadRec."Amounts only" := iProjPurchActionRec."Amounts Only";  //C020772.n
+      lvPurchHeadRec."Requested Receipt Date" := iProjPurchActionRec."Requested Quote Receipt Date";
+      lvPurchHeadRec."React before" := iProjPurchActionRec."Vendors React before";
+      IF iProjPurchActionRec."Responsible Employee" <> '' THEN
+        IF lvPurchaserRec.GET(iProjPurchActionRec."Responsible Employee") THEN
+          lvPurchHeadRec."Purchaser Code" := iProjPurchActionRec."Responsible Employee";
+      lvPurchHeadRec.VALIDATE("Received on Project", lvPurchHeadRec."Job No.");
+      lvPurchHeadRec."Modified by" := USERID;
+      lvPurchHeadRec."Last Date Modified" := TODAY;
+      lvPurchHeadRec.MODIFY(TRUE);
+      CopyTextLines(iProjPurchActionRec,lvPurchHeadRec."No.");
+
+      //secondly create the lines
+      lvPurchLineRec.INIT;
+      lvPurchLineRec."Document Type" := lvPurchHeadRec."Document Type"::Order;
+      lvPurchLineRec."Document No." := lvPurchHeadRec."No.";
+      CopyLines(iProjPurchActionRec,lvPurchLineRec, TRUE);
+
+      //Copy Document Relations & Tender Paragraphs
+      PurchActDocRec.SETRANGE(Source, PurchActDocRec.Source::Project);
+      PurchActDocRec.SETRANGE("Project No.", iProjPurchActionRec."Project No.");
+      PurchActDocRec.SETRANGE("Purchase Action", iProjPurchActionRec.Code);
+      IF PurchActDocRec.FINDSET THEN BEGIN
+        REPEAT
+          DocRelRec.INIT;
+          DocRelRec."Document Type" := DocRelRec."Document Type"::"Purchase Order";
+          DocRelRec."No." := lvPurchHeadRec."No.";
+          DocRelRec.Description := PurchActDocRec.Description;
+          DocRelRec."Description 2" := PurchActDocRec."Description 2";
+          DocRelRec.Quantity := PurchActDocRec.Quantity;
+          DocRelRec."Related Document No." := PurchActDocRec."Related Document No.";
+          PurchActDocRec.CALCFIELDS("Document No.");
+          DocRelRec."Document No." := PurchActDocRec."Document No.";
+          DocRelRec."Send by E-Mail" := TRUE;
+          IF DocumentProperties.GET(DocRelRec."Related Document No.") THEN
+            IF DocumentProperties.FileCanBeConvertedToPDF THEN
+              DocRelRec.Print := TRUE;
+          DocRelRec.INSERT(TRUE);
+
+          TenderParagraphRec.SETRANGE(Type, TenderParagraphRec.Type::PurchAction);
+          TenderParagraphRec.SETRANGE("No.", iProjPurchActionRec."Project No.");
+          TenderParagraphRec.SETRANGE("Purchase Action",iProjPurchActionRec.Code);
+          TenderParagraphRec.SETRANGE("Document No.", PurchActDocRec."Related Document No.");
+          IF TenderParagraphRec.FINDSET THEN BEGIN
+            REPEAT
+              TenderParagraphRec2.COPY(TenderParagraphRec);
+              TenderParagraphRec2.Type := TenderParagraphRec2.Type::Order;
+              TenderParagraphRec2."No." := lvPurchHeadRec."No.";
+              TenderParagraphRec2."Document No." := PurchActDocRec."Related Document No.";
+              TenderParagraphRec2."Purchase Action" := '';
+              TenderParagraphRec2.INSERT;
+            UNTIL TenderParagraphRec.NEXT = 0;
+          END;
+        UNTIL PurchActDocRec.NEXT = 0;
+      END;
+
+      IF PurchLineCounter > 0 THEN
+        MESSAGE(Text002, lvPurchHeadRec."No.")
+      ELSE
+        ERROR(Text003);
+      //**4PS01.en
+    END;
+
+    PROCEDURE CopyTextLines@1210190003(iProjPurchActionRec@1100525000 : Record 11012026;PurchHeaderNo@1100525001 : Code[20]);
+    VAR
+      PurchActTextRec@1210190001 : Record 11012067;
+      PurchActText1Rec@1210190002 : Record 11012067;
+    BEGIN
+      PurchActTextRec.SETRANGE("Line Type",PurchActTextRec."Line Type"::"Project Purchase Action");
+      PurchActTextRec.SETRANGE("No.",iProjPurchActionRec."Project No.");
+      PurchActTextRec.SETRANGE("Purchase Action",iProjPurchActionRec.Code);
+      IF PurchActTextRec.FINDSET THEN BEGIN
+        REPEAT
+          PurchActText1Rec.COPY(PurchActTextRec);
+          PurchActText1Rec."Line Type" := PurchActText1Rec."Line Type"::"Purchase Order";
+          PurchActText1Rec."Purchase Action" := '';
+          PurchActText1Rec."No." := PurchHeaderNo;
+          PurchActText1Rec.INSERT;
+        UNTIL PurchActTextRec.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdateTmpBudgetLines@1100528402(VAR BudgetLineWithSamePropertyFilters@1100528400 : Record 11012001;PurchaseLine@1100528402 : Record 39);
+    BEGIN
+      IF BudgetLineWithSamePropertyFilters.FINDSET THEN
+        REPEAT
+          IF TmpBudgetLineRec.GET(
+            BudgetLineWithSamePropertyFilters."Project No.",
+            BudgetLineWithSamePropertyFilters.Adjustment,
+            BudgetLineWithSamePropertyFilters."Extension Contract",
+            BudgetLineWithSamePropertyFilters.Option,
+            BudgetLineWithSamePropertyFilters."Line No.")
+          THEN BEGIN
+            IF PurchaseLine."Document Type" = PurchLineRec."Document Type"::Order THEN BEGIN
+              TmpBudgetLineRec."Purchase Order No." := PurchaseLine."Document No.";
+              TmpBudgetLineRec."Purchase Order Line No." := PurchaseLine."Line No.";
+              TmpBudgetLineRec.MODIFY;
+            END;
+            IF PurchaseLine."Purchase Route Reference" <> '' THEN BEGIN
+              TmpBudgetLineRec."Purchase Route Reference" := PurchaseLine."Purchase Route Reference";
+              TmpBudgetLineRec.MODIFY;
+            END;
+          END;
+        UNTIL BudgetLineWithSamePropertyFilters.NEXT = 0;
+    END;
+
+    BEGIN
+    {
+      4PS01 JD 13-12-2006 Call 8618, Make it possible to create a purchase order directly from a purchase action.
+    }
+    END.
+  }
+}
+

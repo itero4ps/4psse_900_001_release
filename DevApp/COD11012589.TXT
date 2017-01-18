@@ -1,0 +1,396 @@
+OBJECT Codeunit 11012589 Corr. Pl. Invent. Posted Order
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      PlantOrder@1100525001 : Record 11012556;
+      ExitOrder@1100525002 : Record 11012559;
+      OrderTypeOptions@1100525000 : ',PlantOrder,ExitOrder';
+      Text000@1100525008 : TextConst 'ENU=Post plant inventory correction?';
+      Text001@1100525007 : TextConst 'ENU=Select a new date';
+      Text003@1100525006 : TextConst 'ENU=Attention: a Rental Correction must be made for %1 %2 %3 %4 from %5 until %6';
+      Text002@1100525005 : TextConst 'ENU=%1 %2 %3 %4 is already removed on %5.\Correct %6 %7 first';
+      Text004@1100525004 : TextConst 'ENU=%1 ''%2-%3'' is only present since %4';
+      Text005@1100525003 : TextConst 'ENU=Rental Shift is not taken into account. Do you still want to continue?';
+      Text006@1100525009 : TextConst 'ENU=Plant linked to Fixed Asset, no FA correction posting is done. Do you still want to continue?';
+
+    PROCEDURE GetOrderDate@1100525002(OrderType@1100525001 : Option;OrderNo@1100525000 : Code[20]) : Date;
+    BEGIN
+      CASE OrderType OF
+        OrderTypeOptions::PlantOrder:
+          BEGIN
+            ReadPlantOrder(OrderNo);
+            EXIT(PlantOrder."Transfer Date");
+          END;
+        OrderTypeOptions::ExitOrder:
+          BEGIN
+            ReadExitOrder(OrderNo);
+            EXIT(ExitOrder."Exit-date");
+          END;
+        ELSE
+          ERROR('');
+      END;
+    END;
+
+    PROCEDURE CheckInclOrderDateAllowed@1100525003(OrderType@1100525001 : Option;OrderNo@1100525000 : Code[20];ErrorMode@1100525003 : Boolean) : Boolean;
+    BEGIN
+      //* Only allowed when not yet invoiced (Sales/BuyBack, Costs, Items).
+      //* Note: The fields '... Invoiced' are also set to 'True' when there are no lines, so also check
+      //* check if the 'Invoice No.' is filled (only filled when lines present and invoiced).
+      CASE OrderType OF
+        OrderTypeOptions::PlantOrder:
+          BEGIN
+            ReadPlantOrder(OrderNo);
+            IF (PlantOrder."From Location Invoiced" AND (PlantOrder."From Location Invoice No." <> '')) THEN BEGIN
+              IF NOT ErrorMode THEN
+                EXIT(FALSE);
+              PlantOrder.TESTFIELD("From Location Invoiced", FALSE);
+            END;
+            IF (PlantOrder."To Location Invoiced" AND (PlantOrder."To Location Invoice No." <> '')) THEN BEGIN
+              IF NOT ErrorMode THEN
+                EXIT(FALSE);
+              PlantOrder.TESTFIELD("To Location Invoiced", FALSE);
+            END;
+            IF (PlantOrder."Order Cost Invoiced"  AND (PlantOrder."Order Cost Invoice No." <> '')) THEN BEGIN
+              IF NOT ErrorMode THEN
+                EXIT(FALSE);
+              PlantOrder.TESTFIELD("Order Cost Invoiced", FALSE);
+            END;
+            EXIT(TRUE);
+          END;
+        OrderTypeOptions::ExitOrder:
+          BEGIN
+            ReadExitOrder(OrderNo);
+            IF (ExitOrder.Invoiced AND (ExitOrder."Invoice No." <> '')) THEN BEGIN
+              IF NOT ErrorMode THEN
+                EXIT(FALSE);
+              ExitOrder.TESTFIELD(Invoiced, FALSE);
+            END;
+            EXIT(TRUE);
+          END;
+      END;
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE FilterPlantInventoryOfOrder@1210190000(VAR PlantInvent@1100525000 : Record 11012555;OrderType@1100525001 : Option;OrderNo@1100525002 : Code[20]);
+    BEGIN
+      WITH PlantInvent DO BEGIN
+        CLEARMARKS;
+        RESET;
+        CASE OrderType OF
+          OrderTypeOptions::PlantOrder:
+            BEGIN
+              SETRANGE("Arrival Order Type", "Arrival Order Type"::"Plant Order");
+              SETRANGE("Arrival Order", OrderNo);
+              IF FINDSET THEN
+                REPEAT
+                  MARK(TRUE);
+                UNTIL NEXT = 0;
+              SETRANGE("Arrival Order Type");
+              SETRANGE("Arrival Order");
+              //
+              SETRANGE("Removal Order Type", "Removal Order Type"::"Plant Order");
+              SETRANGE("Removal Order", OrderNo);
+              IF FINDSET THEN
+                REPEAT
+                  MARK(TRUE);
+                UNTIL NEXT = 0;
+              SETRANGE("Removal Order Type");
+              SETRANGE("Removal Order");
+            END;
+          OrderTypeOptions::ExitOrder:
+            BEGIN
+              SETRANGE("Removal Order Type", "Removal Order Type"::"Exit Order");
+              SETRANGE("Removal Order", OrderNo);
+              IF FINDSET THEN
+                REPEAT
+                  MARK(TRUE);
+                UNTIL NEXT = 0;
+              SETRANGE("Removal Order Type");
+              SETRANGE("Removal Order");
+            END;
+        END;
+        MARKEDONLY(TRUE);
+      END;
+    END;
+
+    PROCEDURE PostCorrection@1210190001(VAR PlantInvent@1100525004 : Record 11012555;OrderType@1100525001 : Option;OrderNo@1100525000 : Code[20];NewDate@1100525002 : Date;InclOrderDate@1100525003 : Boolean);
+    BEGIN
+      IF NewDate = 0D THEN
+        ERROR(Text001, PlantOrder.FIELDCAPTION("Transfer Date"));
+
+      IF InclOrderDate THEN
+        CheckInclOrderDateAllowed(OrderType, OrderNo, TRUE);
+
+      IF NOT CONFIRM(Text000,FALSE) THEN
+        EXIT;
+
+      CASE OrderType OF
+        OrderTypeOptions::PlantOrder:
+          PostCorrectionPlantOrder(PlantInvent, OrderType, OrderNo, NewDate, InclOrderDate);
+        OrderTypeOptions::ExitOrder:
+          PostCorrectionExitOrder(PlantInvent, OrderType, OrderNo, NewDate, InclOrderDate);
+      END;
+    END;
+
+    LOCAL PROCEDURE PostCorrectionPlantOrder@1100525005(VAR PlantInvent@1100525004 : Record 11012555;OrderType@1100525001 : Option;OrderNo@1100525000 : Code[20];NewDate@1100525002 : Date;InclOrderDate@1100525003 : Boolean);
+    VAR
+      PlantInvent2@1100525005 : Record 11012555;
+    BEGIN
+      ReadPlantOrder(OrderNo);
+      IF PlantOrder."Rental Shift" THEN BEGIN
+        IF NOT CONFIRM(Text005,FALSE) THEN
+          EXIT;
+      END;
+      PlantInvent2.COPY(PlantInvent);
+
+      WITH PlantInvent2 DO BEGIN
+        SETRANGE("Arrival Order Type", "Arrival Order Type"::"Plant Order");
+        SETRANGE("Arrival Order", OrderNo);
+        IF FINDSET(TRUE, FALSE) THEN BEGIN
+          REPEAT
+            IF Sold THEN
+              "Present from" := NewDate
+            ELSE BEGIN
+              IF Removed AND (NewDate > "Removed on") THEN
+                ERROR(
+                  Text002, FIELDCAPTION("Plant Type"), "Plant Type", FIELDCAPTION("Plant No."), "Plant No.",
+                  "Removed on", PlantOrder.TABLECAPTION, "Removal Order");
+              IF "Invoiced until" > 0D THEN
+                MESSAGE(
+                  Text003, FIELDCAPTION("Plant Type"), "Plant Type", FIELDCAPTION("Plant No."), "Plant No.",
+                  "Rental Start Date", NewDate);
+
+              "Present from" := NewDate;
+              "Rental Start Date" := NewDate;
+              IF "Invoiced until" < NewDate THEN
+                "Invoiced until" := 0D;
+              VALIDATE("Completely Invoiced");
+            END;
+            "Manually Changed by" := USERID;
+            MODIFY;
+          UNTIL NEXT = 0;
+        END;
+        SETRANGE("Arrival Order Type");
+        SETRANGE("Arrival Order");
+        //
+        SETRANGE("Removal Order Type", "Removal Order Type"::"Plant Order");
+        SETRANGE("Removal Order", OrderNo);
+        IF FINDSET(TRUE, FALSE) THEN BEGIN
+          REPEAT
+            IF Quantity < 0 THEN
+              "Present from" := NewDate
+            ELSE BEGIN
+              IF (NewDate < "Present from") THEN
+                ERROR(Text004, FIELDCAPTION("Plant No."), "Plant Type", "Plant No.", "Present from");
+              "Removed on" := NewDate;
+              "Rental End Date" := NewDate;
+              VALIDATE("Completely Invoiced");
+            END;
+            "Manually Changed by" := USERID;
+            MODIFY;
+          UNTIL NEXT = 0;
+        END;
+        SETRANGE("Removal Order Type");
+        SETRANGE("Removal Order");
+      END;
+      IF InclOrderDate THEN
+        UpdatePlantOrderDate(OrderNo, NewDate);
+    END;
+
+    LOCAL PROCEDURE PostCorrectionExitOrder@1100525008(VAR PlantInvent@1100525004 : Record 11012555;OrderType@1100525001 : Option;OrderNo@1100525000 : Code[20];NewDate@1100525002 : Date;InclOrderDate@1100525003 : Boolean);
+    VAR
+      PlantInvent2@1100525005 : Record 11012555;
+    BEGIN
+      ReadExitOrder(OrderNo);
+      IF ExitOrderLinkedToFA(PlantInvent, OrderNo) THEN BEGIN
+        IF NOT CONFIRM(Text006,FALSE) THEN
+          EXIT;
+      END;
+
+      PlantInvent2.COPY(PlantInvent);
+      WITH PlantInvent2 DO BEGIN
+        SETRANGE("Removal Order Type", "Removal Order Type"::"Exit Order");
+        SETRANGE("Removal Order", OrderNo);
+        IF FINDSET(TRUE, FALSE) THEN BEGIN
+          REPEAT
+            IF (NewDate < "Present from") THEN
+              ERROR(Text004, FIELDCAPTION("Plant No."), "Plant Type", "Plant No.", "Present from");
+            "Removed on" := NewDate;
+            "Rental End Date" := NewDate;
+            VALIDATE("Completely Invoiced");
+            "Manually Changed by" := USERID;
+            MODIFY;
+          UNTIL NEXT = 0;
+        END;
+        SETRANGE("Removal Order Type");
+        SETRANGE("Removal Order");
+      END;
+      IF InclOrderDate THEN
+        UpdateExitOrderDate(OrderNo, NewDate);
+    END;
+
+    LOCAL PROCEDURE UpdatePlantOrderDate@1100525004(OrderNo@1100525004 : Code[20];NewDate@1100525003 : Date);
+    VAR
+      PlantOrderLine@1100525000 : Record 11012557;
+      PlantOrderCostLine@1100525001 : Record 11012558;
+    BEGIN
+      IF NewDate <> PlantOrder."Transfer Date" THEN BEGIN
+        PlantOrder."Transfer Date" := NewDate;
+        PlantOrder.MODIFY;
+      END;
+
+      WITH PlantOrderLine DO BEGIN
+        SETRANGE("Plant Order No.", OrderNo);
+        SETFILTER("Transfer Date", '<>%1', NewDate);
+        MODIFYALL("Transfer Date", NewDate);
+      END;
+
+      //WITH PlantOrderItemLine DO BEGIN
+      //  SETRANGE("Plant Order No.", OrderNo);
+      //  SETFILTER("Transfer Date", '<>%1', NewDate);
+      //  MODIFYALL("Transfer Date", NewDate);
+      //END;
+
+      WITH PlantOrderCostLine DO BEGIN
+        SETRANGE("Plant Order No.", OrderNo);
+        SETFILTER(Date, '<>%1', NewDate);
+        MODIFYALL(Date, NewDate);
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdateExitOrderDate@1100525009(OrderNo@1100525004 : Code[20];NewDate@1100525003 : Date);
+    VAR
+      ExitOrderLine@1100525000 : Record 11012560;
+      ExitOrderCostLine@1100525001 : Record 11012561;
+    BEGIN
+      IF NewDate <> ExitOrder."Exit-date" THEN BEGIN
+        ExitOrder."Exit-date" := NewDate;
+        ExitOrder.MODIFY;
+      END;
+
+      WITH ExitOrderLine DO BEGIN
+        SETRANGE("Exit-order No.", OrderNo);
+        SETFILTER("Exit-date", '<>%1', NewDate);
+        IF FINDSET(TRUE, FALSE) THEN BEGIN
+          REPEAT
+            "Exit-date" := NewDate;
+            MODIFY;
+            UpdateFASearchName(ExitOrderLine);
+          UNTIL NEXT = 0;
+        END;
+      END;
+
+      WITH ExitOrderCostLine DO BEGIN
+        SETRANGE("Exit-order No.", OrderNo);
+        SETFILTER("Exit-date", '<>%1', NewDate);
+        MODIFYALL("Exit-date", NewDate);
+      END;
+    END;
+
+    PROCEDURE UpdateFASearchName@1100525013(ExitOrderLine@1100525000 : Record 11012560);
+    VAR
+      PlantNumber@1100525001 : Record 11012552;
+      ExitOrderLineBulkPlant@1100525002 : Record 11012592;
+      FA@1100525003 : Record 5600;
+    BEGIN
+      WITH ExitOrderLine DO BEGIN
+        CALCFIELDS(Bulk);
+        IF NOT Bulk THEN BEGIN
+          IF PlantNumber.GET("Plant Type", "No.") THEN BEGIN
+            IF PlantNumber."Fixed Asset" <> '' THEN BEGIN
+              IF FA.GET(PlantNumber."Fixed Asset") THEN BEGIN
+                IF COPYSTR(FA."Search Description", 1, 1) <> '#' THEN BEGIN
+                  FA."Search Description" := COPYSTR('#' + FA."Search Description", 1, MAXSTRLEN(FA."Search Description"));
+                  FA.MODIFY;
+                END;
+              END;
+            END;
+          END;
+        END ELSE BEGIN
+          ExitOrderLineBulkPlant.SETRANGE("Exit-order No.", "Exit-order No.");
+          ExitOrderLineBulkPlant.SETRANGE("Exit-order Line No.", "Line No.");
+          IF ExitOrderLineBulkPlant.FINDSET THEN BEGIN
+            REPEAT
+              ExitOrderLineBulkPlant.CALCFIELDS("Fixed Asset");
+              IF ExitOrderLineBulkPlant."Fixed Asset" <> '' THEN BEGIN
+                IF FA.GET(ExitOrderLineBulkPlant."Fixed Asset") THEN BEGIN
+                  IF COPYSTR(FA."Search Description", 1, 1) <> '#' THEN BEGIN
+                    FA."Search Description" := COPYSTR('#' + FA."Search Description", 1, MAXSTRLEN(FA."Search Description"));
+                    FA.MODIFY;
+                  END;
+                END;
+              END;
+            UNTIL ExitOrderLineBulkPlant.NEXT = 0;
+          END;
+        END;
+      END;
+    END;
+
+    PROCEDURE ExitOrderLinkedToFA@1100525017(VAR PlantInvent@1100525001 : Record 11012555;OrderNo@1100525000 : Code[20]) : Boolean;
+    VAR
+      PlantInvent2@1100525002 : Record 11012555;
+      PlantNumber@1100525004 : Record 11012552;
+      ExitOrderLineBulkPlant@1100525003 : Record 11012592;
+    BEGIN
+      PlantInvent2.COPY(PlantInvent);
+      WITH PlantInvent2 DO BEGIN
+        SETRANGE("Removal Order Type", "Removal Order Type"::"Exit Order");
+        SETRANGE("Removal Order", OrderNo);
+        IF FINDSET(TRUE, FALSE) THEN BEGIN
+          REPEAT
+            CALCFIELDS(Bulk);
+            IF NOT Bulk THEN BEGIN
+              IF PlantNumber.GET("Plant Type", "Plant No.") THEN BEGIN
+                IF PlantNumber."Fixed Asset" <> '' THEN
+                  EXIT(TRUE);
+              END;
+            END ELSE BEGIN
+              ExitOrderLineBulkPlant.SETRANGE("Exit-order No.", "Removal Order");
+              ExitOrderLineBulkPlant.SETRANGE("Exit-order Line No.", "Removal Order Line");
+              IF ExitOrderLineBulkPlant.FINDSET THEN BEGIN
+                REPEAT
+                  ExitOrderLineBulkPlant.CALCFIELDS("Fixed Asset");
+                  IF ExitOrderLineBulkPlant."Fixed Asset" <> '' THEN
+                    EXIT(TRUE);
+                UNTIL ExitOrderLineBulkPlant.NEXT = 0;
+              END;
+            END;
+          UNTIL NEXT = 0;
+        END;
+      END;
+      EXIT(FALSE);
+    END;
+
+    LOCAL PROCEDURE ReadPlantOrder@1100525000(OrderNo@1100525000 : Code[20]);
+    BEGIN
+      PlantOrder.GET(OrderNo);
+      PlantOrder.TESTFIELD("No.");
+      PlantOrder.TESTFIELD(Posted, TRUE);
+    END;
+
+    LOCAL PROCEDURE ReadExitOrder@1100525001(OrderNo@1100525000 : Code[20]);
+    BEGIN
+      ExitOrder.GET(OrderNo);
+      ExitOrder.TESTFIELD("No.");
+      ExitOrder.TESTFIELD(Posted, TRUE);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

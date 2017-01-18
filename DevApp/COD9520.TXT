@@ -1,0 +1,400 @@
+OBJECT Codeunit 9520 Mail Management
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+            IF NOT IsEnabled THEN
+              ERROR(MailingNotSupportedErr);
+            IF NOT DoSend THEN
+              ERROR(MailWasNotSendErr);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      TempEmailItem@1001 : TEMPORARY Record 9500;
+      TempEmailAttachment@1100528500 : TEMPORARY Record 11229294;
+      SMTPMail@1010 : Codeunit 400;
+      FileManagement@1009 : Codeunit 419;
+      InvalidEmailAddressErr@1008 : TextConst 'ENU=The email address "%1" is not valid.';
+      DoEdit@1007 : Boolean;
+      HideMailDialog@1011 : Boolean;
+      Cancelled@1016 : Boolean;
+      MailSent@1017 : Boolean;
+      MailingNotSupportedErr@1013 : TextConst 'ENU=The required email is not supported.';
+      MailWasNotSendErr@1000 : TextConst 'ENU=The email was not sent.';
+      FromAddressWasNotFoundErr@1003 : TextConst 'ENU=An email from address was not found. Contact an administrator.';
+      SaveFileDialogTitleMsg@1005 : TextConst 'ENU=Save PDF file';
+      SaveFileDialogFilterMsg@1004 : TextConst 'ENU=PDF Files (*.pdf)|*.pdf';
+      OutlookSupported@1014 : Boolean;
+      SMTPSupported@1015 : Boolean;
+      CannotSendMailThenDownloadQst@1012 : TextConst 'ENU=You cannot send the e-mail.\\Verify that the SMTP settings are correct.\\Do you want to download the attachment(s)?';
+      OutlookNotAvailableContinueEditQst@1006 : TextConst 'ENU=Microsoft Outlook is not available.\\Do you want to continue to edit the e-mail?';
+      HideSMTPError@1002 : Boolean;
+
+    LOCAL PROCEDURE RunMailDialog@7() : Boolean;
+    VAR
+      EMailDialog@1001 : Page 9700;
+    BEGIN
+      EMailDialog.SetTempEmailAttachments(TempEmailAttachment); //**4PS.n
+      EMailDialog.SetValues(TempEmailItem,OutlookSupported,SMTPSupported);
+
+      IF NOT (EMailDialog.RUNMODAL = ACTION::OK) THEN BEGIN
+        DeleteTempEmailAttachmentFiles(TempEmailAttachment); //**4PS.n
+        Cancelled := TRUE;
+        EXIT(FALSE);
+      END;
+      EMailDialog.GETRECORD(TempEmailItem);
+      DoEdit := EMailDialog.GetDoEdit;
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE SendViaSMTP@5() : Boolean;
+    BEGIN
+      WITH TempEmailItem DO BEGIN
+        SMTPMail.CreateMessage("From Name","From Address","Send to",Subject,GetBodyText,NOT "Plaintext Formatted");
+        //SMTPMail.AddAttachment("Attachment File Path","Attachment Name"); //**4PS.o
+        //**4PS.sn
+        IF TempEmailAttachment.ISEMPTY THEN
+          SMTPMail.AddAttachment("Attachment File Path","Attachment Name")
+        ELSE
+          IF TempEmailAttachment.FINDSET THEN
+            REPEAT
+              SMTPMail.AddAttachment(
+                TempEmailAttachment."Attachment Server File Path",TempEmailAttachment."Attachment Name");
+            UNTIL TempEmailAttachment.NEXT = 0;
+        //**4PS.en
+        IF "Send CC" <> '' THEN
+          SMTPMail.AddCC("Send CC");
+        IF "Send BCC" <> '' THEN
+          SMTPMail.AddBCC("Send BCC");
+      END;
+      MailSent := SMTPMail.TrySend;
+      IF NOT MailSent AND NOT HideSMTPError THEN
+        ERROR(SMTPMail.GetLastSendMailErrorText);
+      //**4PS.sn
+      IF TempEmailAttachment.ISEMPTY AND (TempEmailItem."Attachment File Path" <> '') THEN BEGIN
+        IF EXISTS(TempEmailItem."Attachment File Path") THEN
+          ERASE(TempEmailItem."Attachment File Path");
+      END ELSE
+        DeleteTempEmailAttachmentFiles(TempEmailAttachment);
+      //**4PS.en
+      EXIT(MailSent);
+    END;
+
+    PROCEDURE InitializeFrom@10(NewHideMailDialog@1001 : Boolean;NewHideSMTPError@1000 : Boolean);
+    BEGIN
+      HideMailDialog := NewHideMailDialog;
+      HideSMTPError := NewHideSMTPError;
+    END;
+
+    LOCAL PROCEDURE SendMailOnWinClient@3() : Boolean;
+    VAR
+      Mail@1003 : Codeunit 397;
+      FileManagement@1006 : Codeunit 419;
+      ClientAttachmentFilePath@1005 : Text;
+      ClientAttachmentFullName@1009 : Text;
+    BEGIN
+      IF Mail.TryInitializeOutlook THEN
+        WITH TempEmailItem DO BEGIN
+          //**4PS.so
+          //IF "Attachment File Path" <> '' THEN BEGIN
+          //  ClientAttachmentFilePath := DownloadPdfOnClient("Attachment File Path");
+          //  ClientAttachmentFullName := FileManagement.MoveAndRenameClientFile(ClientAttachmentFilePath,"Attachment Name",'');
+          //END;
+          //**4PS.eo
+          //**4PS.sn
+          IF TempEmailAttachment.ISEMPTY THEN BEGIN
+            IF "Attachment File Path" <> '' THEN BEGIN
+              ClientAttachmentFilePath := DownloadPdfOnClient("Attachment File Path");
+              ClientAttachmentFullName := FileManagement.MoveAndRenameClientFile(ClientAttachmentFilePath,"Attachment Name",'');
+            END;
+          END ELSE BEGIN
+            DownloadAttachmentsToClient(TempEmailAttachment);
+            Mail.SetTempEmailAttachments(TempEmailAttachment);
+          END;
+          //**4PS.en
+          IF Mail.NewMessageAsync("Send to","Send CC","Send BCC",Subject,GetBodyText,ClientAttachmentFullName,NOT HideMailDialog) THEN BEGIN
+            //FileManagement.DeleteClientFile(ClientAttachmentFullName); //**4PS.o
+            //**4PS.sn
+            IF TempEmailAttachment.ISEMPTY THEN BEGIN
+              IF ("Attachment File Path" <> '') THEN BEGIN
+                IF EXISTS("Attachment File Path") THEN
+                  ERASE("Attachment File Path");
+                IF FileManagement.ClientFileExists(ClientAttachmentFullName) THEN
+                  FileManagement.DeleteClientFile(ClientAttachmentFullName);
+              END
+            END ELSE
+              DeleteTempEmailAttachmentFiles(TempEmailAttachment);
+            //**4PS.en
+            MailSent := TRUE;
+            EXIT(TRUE)
+          END;
+        END;
+      EXIT(FALSE);
+    END;
+
+    LOCAL PROCEDURE DownloadPdfOnClient@1(ServerPdfFilePath@1000 : Text) : Text;
+    VAR
+      FileManagement@1003 : Codeunit 419;
+      ClientPdfFilePath@1002 : Text;
+    BEGIN
+      ClientPdfFilePath := FileManagement.DownloadTempFile(ServerPdfFilePath);
+      //ERASE(ServerPdfFilePath); //4PS.o
+      EXIT(ClientPdfFilePath);
+    END;
+
+    PROCEDURE CheckValidEmailAddresses@8(Recipients@1000 : Text);
+    VAR
+      TmpRecipients@1001 : Text;
+    BEGIN
+      IF Recipients = '' THEN
+        ERROR(InvalidEmailAddressErr,Recipients);
+
+      TmpRecipients := DELCHR(Recipients,'<>',';');
+      WHILE STRPOS(TmpRecipients,';') > 1 DO BEGIN
+        CheckValidEmailAddress(COPYSTR(TmpRecipients,1,STRPOS(TmpRecipients,';') - 1));
+        TmpRecipients := COPYSTR(TmpRecipients,STRPOS(TmpRecipients,';') + 1);
+      END;
+      CheckValidEmailAddress(TmpRecipients);
+    END;
+
+    PROCEDURE CheckValidEmailAddress@12(EmailAddress@1000 : Text);
+    VAR
+      i@1001 : Integer;
+      NoOfAtSigns@1002 : Integer;
+    BEGIN
+      EmailAddress := DELCHR(EmailAddress,'<>');
+
+      IF EmailAddress = '' THEN
+        ERROR(InvalidEmailAddressErr,EmailAddress);
+
+      IF (EmailAddress[1] = '@') OR (EmailAddress[STRLEN(EmailAddress)] = '@') THEN
+        ERROR(InvalidEmailAddressErr,EmailAddress);
+
+      FOR i := 1 TO STRLEN(EmailAddress) DO BEGIN
+        IF EmailAddress[i] = '@' THEN
+          NoOfAtSigns := NoOfAtSigns + 1
+        ELSE
+          IF EmailAddress[i] = ' ' THEN
+            ERROR(InvalidEmailAddressErr,EmailAddress);
+      END;
+
+      IF NoOfAtSigns <> 1 THEN
+        ERROR(InvalidEmailAddressErr,EmailAddress);
+    END;
+
+    PROCEDURE IsSMTPEnabled@6() : Boolean;
+    BEGIN
+      EXIT(SMTPMail.IsEnabled);
+    END;
+
+    PROCEDURE IsEnabled@11() : Boolean;
+    BEGIN
+      OutlookSupported := FALSE;
+      SMTPSupported := FALSE;
+      IF IsSMTPEnabled THEN
+        SMTPSupported := TRUE;
+
+      IF FileManagement.IsWebClient THEN
+        EXIT(SMTPSupported);
+
+      // Assume Outlook is supported - a false check takes long time.
+      OutlookSupported := TRUE;
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE IsCancelled@14() : Boolean;
+    BEGIN
+      EXIT(Cancelled);
+    END;
+
+    PROCEDURE IsSent@15() : Boolean;
+    BEGIN
+      EXIT(MailSent);
+    END;
+
+    PROCEDURE Send@4(ParmEmailItem@1000 : Record 9500) : Boolean;
+    BEGIN
+      TempEmailItem := ParmEmailItem;
+      QualifyFromAddress;
+      MailSent := FALSE;
+      EXIT(DoSend);
+    END;
+
+    LOCAL PROCEDURE DoSend@13() : Boolean;
+    BEGIN
+      Cancelled := TRUE;
+      IF NOT HideMailDialog THEN BEGIN
+        IF RunMailDialog THEN
+          Cancelled := FALSE
+        ELSE
+          EXIT(TRUE);
+        IF OutlookSupported THEN
+          IF DoEdit THEN BEGIN
+            IF SendMailOnWinClient THEN
+              EXIT(TRUE);
+            OutlookSupported := FALSE;
+            IF NOT SMTPSupported THEN
+              EXIT(FALSE);
+            IF CONFIRM(OutlookNotAvailableContinueEditQst) THEN
+              EXIT(DoSend);
+          END
+      END;
+      IF SMTPSupported THEN
+        EXIT(SendViaSMTP);
+
+      EXIT(FALSE);
+    END;
+
+    LOCAL PROCEDURE QualifyFromAddress@2();
+    VAR
+      TempPossibleEmailNameValueBuffer@1000 : TEMPORARY Record 823;
+      MailForEmails@1001 : Codeunit 397;
+    BEGIN
+      IF TempEmailItem."From Address" <> '' THEN
+        EXIT;
+
+      MailForEmails.CollectCurrentUserEmailAddresses(TempPossibleEmailNameValueBuffer);
+      IF SMTPSupported THEN BEGIN
+        IF AssignFromAddressIfExist(TempPossibleEmailNameValueBuffer,'UserSetup') THEN
+          EXIT;
+        IF AssignFromAddressIfExist(TempPossibleEmailNameValueBuffer,'AuthEmail') THEN
+          EXIT;
+        IF AssignFromAddressIfExist(TempPossibleEmailNameValueBuffer,'AD') THEN
+          EXIT;
+        IF AssignFromAddressIfExist(TempPossibleEmailNameValueBuffer,'SMTPSetup') THEN
+          EXIT;
+      END;
+      IF TempPossibleEmailNameValueBuffer.ISEMPTY THEN BEGIN
+        IF FileManagement.IsWebClient THEN
+          ERROR(FromAddressWasNotFoundErr);
+        TempEmailItem."From Address" := '';
+        EXIT;
+      END;
+
+      IF AssignFromAddressIfExist(TempPossibleEmailNameValueBuffer,'') THEN
+        EXIT;
+    END;
+
+    LOCAL PROCEDURE AssignFromAddressIfExist@9(VAR TempPossibleEmailNameValueBuffer@1000 : TEMPORARY Record 823;FilteredName@1002 : Text) : Boolean;
+    BEGIN
+      IF FilteredName <> '' THEN
+        TempPossibleEmailNameValueBuffer.SETFILTER(Name,FilteredName);
+      IF NOT TempPossibleEmailNameValueBuffer.ISEMPTY THEN BEGIN
+        TempPossibleEmailNameValueBuffer.FINDFIRST;
+        IF TempPossibleEmailNameValueBuffer.Value <> '' THEN BEGIN
+          TempEmailItem."From Address" := TempPossibleEmailNameValueBuffer.Value;
+          EXIT(TRUE);
+        END;
+      END;
+
+      TempPossibleEmailNameValueBuffer.RESET;
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE SendMailOrDownload@17(TempEmailItem@1002 : TEMPORARY Record 9500;HideMailDialog@1000 : Boolean);
+    VAR
+      MailManagement@1001 : Codeunit 9520;
+    BEGIN
+      //**4PS.sn
+      IF (TempEmailItem."Send to" = '') AND
+          HideMailDialog
+      THEN BEGIN
+        TempEmailAttachment.DeleteTempEmailAttachmentFiles(TempEmailAttachment);
+        EXIT;
+      END;
+      //**4PS.en
+      MailManagement.InitializeFrom(HideMailDialog,TRUE);
+      IF MailManagement.IsEnabled THEN BEGIN
+        MailManagement.SetTempEmailAttachments(TempEmailAttachment); //**4PS
+        //IF MailManagement.Send(TempEmailItem) THEN //**4PS.o
+        IF MailManagement.Send(TempEmailItem) THEN BEGIN //**4PS.n
+          MailSent := MailManagement.IsSent; //**4PS.n
+          EXIT;
+        END; //**4PS.n
+      END;
+
+      IF NOT CONFIRM(CannotSendMailThenDownloadQst) THEN
+        EXIT;
+
+      //DownloadPdfAttachment(TempEmailItem); //**4PS.n
+      //**4PS.sn
+      IF TempEmailAttachment.COUNT <= 1 THEN
+        DownloadPdfAttachment(TempEmailItem)
+      ELSE
+        DownloadPdfAttachments(TempEmailAttachment);
+      //**4PS.en
+    END;
+
+    PROCEDURE DownloadPdfAttachment@16(TempEmailItem@1000 : TEMPORARY Record 9500);
+    VAR
+      FileManagement@1002 : Codeunit 419;
+    BEGIN
+      WITH TempEmailItem DO
+        IF "Attachment File Path" <> '' THEN
+          FileManagement.DownloadHandler("Attachment File Path",SaveFileDialogTitleMsg,'',SaveFileDialogFilterMsg,"Attachment Name");
+    END;
+
+    PROCEDURE DownloadPdfAttachments@1100528503(VAR TempEmailAttachment@1100528500 : TEMPORARY Record 11229294);
+    VAR
+      FileManagement@1002 : Codeunit 419;
+      ClientDirectory@1100528501 : Text[250];
+    BEGIN
+      //**4PS
+      IF FileManagement.SelectDirectoryNameWithBackSlash(ClientDirectory) THEN
+        IF TempEmailAttachment.FINDSET THEN
+          REPEAT
+            FileManagement.DownloadToFile(
+              TempEmailAttachment."Attachment Server File Path",
+              ClientDirectory + TempEmailAttachment."Attachment Name");
+          UNTIL TempEmailAttachment.NEXT = 0;
+    END;
+
+    PROCEDURE SetTempEmailAttachments@1100528500(VAR TempEmailAttachment2@1100528500 : TEMPORARY Record 11229294);
+    BEGIN
+      //**4PS
+      IF TempEmailAttachment2.FINDSET THEN
+        REPEAT
+          TempEmailAttachment := TempEmailAttachment2;
+          TempEmailAttachment.INSERT;
+        UNTIL TempEmailAttachment2.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE DownloadAttachmentsToClient@1100528501(VAR TempEmailAttachment@1100528500 : TEMPORARY Record 11229294);
+    VAR
+      TempClientFilePath@1100528501 : Text[250];
+      ClientFilePath@1100528503 : Text[250];
+    BEGIN
+      //**4PS
+      IF TempEmailAttachment.FINDSET THEN
+        REPEAT
+          IF TempEmailAttachment."Attachment Client File Path" = '' THEN BEGIN
+            TempClientFilePath := DownloadPdfOnClient(TempEmailAttachment."Attachment Server File Path");
+            ClientFilePath := FileManagement.MoveAndRenameClientFile(
+              TempClientFilePath, TempEmailAttachment."Attachment Name",'');
+            TempEmailAttachment."Attachment Client File Path" := ClientFilePath;
+            TempEmailAttachment."Delete Client File" := TRUE;
+            TempEmailAttachment.MODIFY;
+          END;
+        UNTIL TempEmailAttachment.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE DeleteTempEmailAttachmentFiles@1100528506(VAR TempEmailAttachment@1100528500 : TEMPORARY Record 11229294);
+    BEGIN
+      //**4PS
+      TempEmailAttachment.DeleteTempEmailAttachmentFiles(TempEmailAttachment);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

@@ -1,0 +1,1350 @@
+OBJECT Codeunit 11125740 Timesheet Portal sync to SQL
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+            IF StartRun(Text001) THEN BEGIN
+              Export();
+            END;
+            StopRun();
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Nav2SQL@1100525000 : DotNet "'NavisionToSql, Version=1.0.0.0, Culture=neutral, PublicKeyToken=284c6828aa038142'.NavisionToSql.DataProcessor";
+      Text000@1100525016 : TextConst 'ENU=Companies used by the timesheet portal:';
+      Text003@1100525019 : TextConst 'ENU=Synchronisation from Navision to SQLServer for timesheetportal site executed in %1 seconds.';
+      FileManagement@1100525008 : Codeunit 419;
+      Logfile@1100525025 : File;
+      LogStream@1100525026 : OutStream;
+      LogStreamOpen@1100525003 : Boolean;
+      CurrentSQLTable@1100525024 : Text[256];
+      Text002@1100525038 : TextConst 'ENU=" %2 records copied to table %1."';
+      SQLTablePrefix@1100525039 : Text[64];
+      Text001@1100525040 : TextConst 'ENU=Timesheet portal synchronisation started from Nav to SQLServer on %2 at %1.';
+      Text004@1100525017 : TextConst 'ENU=Processing company %1:';
+      Text005@1100525001 : TextConst 'ENU=Connecting the database failed: %1';
+      Text006@1100525002 : TextConst 'ENU=Synchronisation from SQLServer to Navision for timesheetportal executed in %1 seconds.';
+      LogFileName@1100525006 : Text[1024];
+      ClientLogFileName@1100525007 : Text[1024];
+      StartTime@1100525004 : Time;
+      Text007@1100525005 : TextConst 'ENU=An error occured during insert of a new record:';
+      Text008@1100525009 : TextConst 'ENU=Timesheet portal synchronisation started from SQLServer to Nav on %2 at %1.';
+
+    PROCEDURE StartRun@1100525013(LogMessage@1100525001 : Text[1024]) : Boolean;
+    VAR
+      ErrorMsg@1100525000 : Text[1024];
+    BEGIN
+      // start logging
+      LogOpen();
+
+      // instantiate dotnet object for SQLServer connectivity
+      IF ISNULL(Nav2SQL) THEN
+        Nav2SQL := Nav2SQL.DataProcessor;
+      Nav2SQL.DisableReturnExceptions();
+
+      StartTime := TIME;
+      LogWrite(STRSUBSTNO(LogMessage, StartTime, TODAY));
+
+      IF OpenSQLConnection(ErrorMsg) THEN BEGIN
+        EXIT(TRUE)
+      END ELSE BEGIN
+        LogWrite(STRSUBSTNO(Text005, ErrorMsg));
+        MESSAGE(STRSUBSTNO(Text005, ErrorMsg));
+      END;
+      EXIT(FALSE)
+    END;
+
+    PROCEDURE StopRun@1100525014();
+    BEGIN
+      CLEAR(Nav2SQL);
+      // stop logging
+      LogClose();
+    END;
+
+    PROCEDURE Export@1100525009();
+    BEGIN
+      SQLTablePrefix := TABLEPREFIX();
+      // start transaction: SetTransactionTimeout(timeout in seconds, sliding timeout or not)
+      Nav2SQL.SetTransactionTimeout(5, TRUE);       // 5 seconds
+      Nav2SQL.BeginTransaction();
+
+      // Find all companies that are used in the weburen site, then
+      //  ...delete all records from the SQLServer 'shadow' tables within these companies,
+      Nav2SQL_ClearSQLTables();
+      //  ...and copy all tablerecords from those tables-per-company to SQLServer
+      Nav2SQL_ProcessWebCompanies();
+
+      // commit and close transaction
+      Nav2SQL.EndTransaction();
+      Nav2SQL.CloseConnection();
+      LogWrite('');
+      LogWrite(STRSUBSTNO(Text003, (TIME - StartTime)/1000));
+      MESSAGE(Text003,(TIME - StartTime)/1000);
+    END;
+
+    PROCEDURE OpenSQLConnection@1100525000(VAR ErrorMsg@1100525001 : Text[1024]) : Boolean;
+    VAR
+      TimesheetPortalSetup@1100525000 : Record 11125740;
+    BEGIN
+      TimesheetPortalSetup.FINDFIRST();
+      IF NOT ISNULL(Nav2SQL) THEN BEGIN
+        IF Nav2SQL.OpenConnection(
+          TimesheetPortalSetup.SQLServer,
+          TimesheetPortalSetup.SQLDatabase,
+          '',
+          TimesheetPortalSetup.SQLUsername,
+          TimesheetPortalSetup.SQLPassword) THEN
+          EXIT(TRUE)
+        ELSE
+          ErrorMsg := Nav2SQL.GetLastException();
+          // in case a previous action crashed, and that connection/transaction is still active:
+          Nav2SQL.RollbackTransaction();
+          EXIT(FALSE)
+      END
+    END;
+
+    PROCEDURE Nav2SQLDate@1100525003(lDate@1100525000 : Date) : DateTime;
+    VAR
+      lvYearInt@1100525001 : Integer;
+    BEGIN
+      IF lDate = 0D THEN
+        EXIT(0DT);
+
+      lDate := NORMALDATE(lDate);
+
+      lvYearInt := DATE2DMY(lDate,3);
+      IF lvYearInt < 1753 THEN
+        EXIT(0DT);
+
+      EXIT(CREATEDATETIME(lDate,0T));
+    END;
+
+    PROCEDURE Nav2SQL_Customer@1100525015(Company@1100525000 : Text[128]) : Text;
+    VAR
+      Customer@1100525001 : Record 18;
+    BEGIN
+      IF NOT Customer.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$Customer]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      Customer.CHANGECOMPANY(Company);
+      Customer.SETRANGE(Blocked, Customer.Blocked::" ");
+
+      // get native data and insert in SQLServer table
+      IF Customer.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[Blocked]'                 ,Customer.Blocked                 ,'int'     );
+          Nav2SQL.InsertItem('[Name]'                    ,Customer.Name                    ,'varchar' );
+          Nav2SQL.InsertItem('[No_]'                     ,Customer."No."                   ,'varchar' );
+          Nav2SQL.InsertItem('[Post Code]'               ,Customer."Post Code"             ,'varchar' );
+          Nav2SQL.InsertItem('[Company]'                 ,Company                              ,'varchar' );
+
+          Nav2SQL_InsertRow();
+        UNTIL Customer.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, Customer.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_ShipToAddress@1100525016(Company@1100525000 : Text[128]) : Text;
+    VAR
+      ShipToAddress@1100525001 : Record 222;
+    BEGIN
+      IF NOT ShipToAddress.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$Ship-to Address]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      ShipToAddress.CHANGECOMPANY(Company);
+
+      // get native data and insert in SQLServer table
+      IF ShipToAddress.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[Address]'                 ,ShipToAddress.Address                 ,'varchar' );
+          Nav2SQL.InsertItem('[City]'                    ,ShipToAddress.City                    ,'varchar' );
+          Nav2SQL.InsertItem('[Code]'                    ,ShipToAddress.Code                    ,'varchar' );
+          Nav2SQL.InsertItem('[Customer No_]'            ,ShipToAddress."Customer No."          ,'varchar' );
+          Nav2SQL.InsertItem('[Post Code]'               ,ShipToAddress."Post Code"             ,'varchar' );
+          Nav2SQL.InsertItem('[Company]'                 ,Company                                   ,'varchar' );
+
+          Nav2SQL_InsertRow();
+        UNTIL ShipToAddress.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, ShipToAddress.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_ServiceOrder@1100525017(Company@1100525001 : Text[128]) : Text;
+    VAR
+      StartingDate@1100525000 : DateTime;
+      ServiceOrder@1100525002 : Record 11012823;
+    BEGIN
+      IF NOT ServiceOrder.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$Service Order]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      ServiceOrder.CHANGECOMPANY(Company);
+
+      // Only active serviceorders
+      ServiceOrder.SETFILTER(Status, '..%1', ServiceOrder.Status::"Technical Finished");
+
+      // get native data and insert in SQLServer table
+      IF ServiceOrder.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          StartingDate := Nav2SQLDate(ServiceOrder."Starting Date");
+
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[Customer No_]'     ,ServiceOrder."Customer No."      ,'varchar' );
+          Nav2SQL.InsertItem('[Description]'      ,ServiceOrder.Description         ,'varchar' );
+          Nav2SQL.InsertItem('[No_]'              ,ServiceOrder."No."               ,'varchar' );
+          Nav2SQL_SafeInsertDateTime('[Starting Date]'    ,StartingDate                         ,'datetime');
+          Nav2SQL.InsertItem('[Status]'           ,ServiceOrder.Status              ,'int'     );
+          Nav2SQL.InsertItem('[Company]'          ,Company                              ,'varchar' );
+          Nav2SQL.InsertItem('[Contract Manager]' ,ServiceOrder."Order Manager"     ,'varchar' );
+          Nav2SQL.InsertItem('[Global Dimension 1 Code]',ServiceOrder."Global Dimension 1 Code",'varchar' );
+
+          Nav2SQL.InsertItem('[Employees]',
+            GetEmployeeString(Company, ServiceOrder."No."),
+            'varchar'); //#C015273.n
+
+          Nav2SQL_InsertRow();
+        UNTIL ServiceOrder.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, ServiceOrder.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_Commission@1100525018(Company@1100525001 : Text[128]) : Text;
+    VAR
+      CommissionDate@1100525000 : DateTime;
+      Commission@1100525002 : Record 11012020;
+    BEGIN
+      IF NOT Commission.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$Commission]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      Commission.CHANGECOMPANY(Company);
+
+      // get native data and insert in SQLServer table
+      IF Commission.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          CommissionDate := Nav2SQLDate(Commission."Commission Date");
+
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL_SafeInsertDateTime('[Commission Date]'    ,CommissionDate                ,'datetime');
+          Nav2SQL.InsertItem('[Description]'        ,Commission.Description        ,'varchar' );
+          Nav2SQL.InsertItem('[No_]'                ,Commission."No."              ,'varchar' );
+          Nav2SQL.InsertItem('[Principal]'          ,Commission.Principal          ,'varchar' );
+          Nav2SQL.InsertItem('[Project No_]'        ,Commission."Project No."      ,'varchar' );
+          Nav2SQL.InsertItem('[Company]'            ,Company                       ,'varchar' );
+
+          Nav2SQL_InsertRow();
+        UNTIL Commission.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, Commission.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_CostCode@1100525019(Company@1100525000 : Text[128]) : Text;
+    VAR
+      CostCode@1100525001 : Record 11012083;
+    BEGIN
+      IF NOT CostCode.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$Cost Code]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      CostCode.CHANGECOMPANY(Company);
+
+      // get native data and insert in SQLServer table
+      IF CostCode.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[Code]'           ,CostCode.Code          ,'varchar' );
+          Nav2SQL.InsertItem('[Component]'      ,CostCode.Component     ,'varchar' );
+          Nav2SQL.InsertItem('[Description]'    ,CostCode.Description   ,'varchar' );
+          Nav2SQL.InsertItem('[Company]'        ,Company                ,'varchar' );
+          Nav2SQL.InsertItem('[Global Dimension 1 Code]',CostCode."Global Dimension 1 Code",'varchar' );
+
+          Nav2SQL_InsertRow();
+        UNTIL CostCode.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, CostCode.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_CC_ObjectSalesPrice@1100525020(Company@1100525002 : Text[128]) : Text;
+    VAR
+      StartingDate@1100525000 : DateTime;
+      EndingDate@1100525001 : DateTime;
+      CC_ObjectSalesPrice@1100525003 : Record 11012080;
+    BEGIN
+      IF NOT CC_ObjectSalesPrice.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$Cust - Cost Object Sales Price]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      CC_ObjectSalesPrice.CHANGECOMPANY(Company);
+
+      // get native data and insert in SQLServer table
+      IF CC_ObjectSalesPrice.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          StartingDate := Nav2SQLDate(CC_ObjectSalesPrice."Starting Date");
+          EndingDate := Nav2SQLDate(CC_ObjectSalesPrice."Ending Date");
+
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[Cost Object]'     ,CC_ObjectSalesPrice."Cost Object"     ,'varchar' );
+          Nav2SQL.InsertItem('[Customer No_]'    ,CC_ObjectSalesPrice."Customer No."    ,'varchar' );
+          Nav2SQL_SafeInsertDateTime('[Ending Date]'     ,EndingDate                                ,'datetime' );
+          Nav2SQL.InsertItem('[Sales Price]'     ,CC_ObjectSalesPrice."Sales Price (LCY)"     ,'decimal' );
+          Nav2SQL_SafeInsertDateTime('[Starting Date]'   ,StartingDate                              ,'datetime' );
+          Nav2SQL.InsertItem('[Company]'         ,Company                                   ,'varchar' );
+
+          Nav2SQL_InsertRow();
+        UNTIL CC_ObjectSalesPrice.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, CC_ObjectSalesPrice.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_DimensionValue@1100525021(Company@1100525000 : Text[128]) : Text;
+    VAR
+      DimensionValue@1100525001 : Record 349;
+      GeneralLedgerSetup@1100525002 : Record 98;
+    BEGIN
+      IF NOT DimensionValue.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+
+      GeneralLedgerSetup.GET;
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$Dimension Value]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      DimensionValue.CHANGECOMPANY(Company);
+      DimensionValue.SETCURRENTKEY("Global Dimension No.");
+      DimensionValue.SETRANGE(Blocked, FALSE);
+      DimensionValue.SETRANGE("Global Dimension No.", 2);
+      DimensionValue.SETRANGE("Dimension Code", GeneralLedgerSetup."Global Dimension 2 Code");
+      DimensionValue.SETFILTER("Cost Type", '%1|%2|%3',
+                       DimensionValue."Cost Type"::Labor, DimensionValue."Cost Type"::Plant, DimensionValue."Cost Type"::Sundry, DimensionValue."Cost Type"::Subcontracting);
+
+      // get native data and insert in SQLServer table
+      IF DimensionValue.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[Blocked]'                      ,DimensionValue.Blocked                      ,'tinyint' );
+          Nav2SQL.InsertItem('[Code]'                         ,DimensionValue.Code                         ,'varchar' );
+          Nav2SQL.InsertItem('[Cost Type]'                    ,DimensionValue."Cost Type"                  ,'int'     );
+          //Below code contains Dutch names, because on these is filtered in the Portal. Changing this is cumbersome.
+          IF DimensionValue."Global Dimension No." = 2 THEN
+            Nav2SQL.InsertItem('[Dimension Code]'               ,'KOSTENDRAGER'            ,'varchar' );
+          IF DimensionValue."Global Dimension No." = 1 THEN
+            Nav2SQL.InsertItem('[Dimension Code]'               ,'KOSTENPLAATS'            ,'varchar' );
+          Nav2SQL.InsertItem('[Hour Rate Code (Cost Plus)]'   ,DimensionValue."Hour Rate Code (Cost Plus)" ,'varchar' );
+          Nav2SQL.InsertItem('[Name]'                         ,DimensionValue.Name                         ,'varchar' );
+          Nav2SQL.InsertItem('[Wage Component]'               ,DimensionValue."Wage Component"             ,'varchar' );
+          Nav2SQL.InsertItem('[Price]'                        ,DimensionValue.Price                        ,'decimal' );
+          Nav2SQL.InsertItem('[SalesPrice]'                   ,DimensionValue."Sales Price"                ,'decimal' );
+          Nav2SQL.InsertItem('[Company]'                      ,Company                                     ,'varchar' );
+
+          Nav2SQL_InsertRow();
+        UNTIL DimensionValue.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, DimensionValue.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_Employee@1100525022(Company@1100525003 : Text[128]) : Text;
+    VAR
+      TerminationDate@1100525000 : DateTime;
+      EmploymentDate@1100525001 : DateTime;
+      InactiveDate@1100525002 : DateTime;
+      Employee@1100525005 : Record 5200;
+      TimesheetPortalSetup@1210190000 : Record 11125740;
+      UserSetup@1100409000 : Record 91;
+    BEGIN
+      IF NOT Employee.READPERMISSION  OR NOT UserSetup.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      // Only get Employees records for all unique Employee No.'s in the 'User Setup' table
+      CurrentSQLTable := '['+SQLTablePrefix+'$Employee]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      Employee.CHANGECOMPANY(Company);
+
+      // get native data and insert in SQLServer table
+      Employee.SETRANGE(Status, Employee.Status::Active);
+      Employee.SETRANGE("Account Hours", Employee."Account Hours"::"Required according to Norm", Employee."Account Hours"::Optional);
+      Employee.SETRANGE("Show in Hours Portal", TRUE);  //*31038.n
+      IF Employee.FINDFIRST THEN BEGIN
+        TimesheetPortalSetup.FINDFIRST();
+        REPEAT
+          TerminationDate := Nav2SQLDate(Employee."Termination Date");
+          EmploymentDate := Nav2SQLDate(Employee."Employment Date");
+          InactiveDate := Nav2SQLDate(Employee."Inactive Date");
+
+          //Nav2SQL.InsertItem('[Account Hours]'           ,TRUE                               ,'tinyint' ); //#C013834.o
+          //#C013834.sn
+          IF (Employee."Account Hours" = Employee."Account Hours"::Optional) THEN
+            Nav2SQL.InsertItem('[Account Hours]'           ,FALSE                              ,'tinyint' )
+          ELSE
+            Nav2SQL.InsertItem('[Account Hours]'           ,TRUE                               ,'tinyint' );
+          //#C013834.en
+          //Nav2SQL.InsertItem('[Blocked]'                 ,Employee.Blocked                   ,'int'     ); //C022471.o
+          Nav2SQL.InsertItem('[Blocked]'                 ,0                                  ,'int'     );   //C022471.n
+          Nav2SQL.InsertItem('[Commuter Time]'           ,Employee."Commuter Time"           ,'decimal' );
+          Nav2SQL.InsertItem('[Company Car]'             ,Employee."Company Car"             ,'tinyint' );
+          CASE TimesheetPortalSetup."E-Mail Employees" OF
+            TimesheetPortalSetup."E-Mail Employees"::"E-Mail":
+              BEGIN
+                Nav2SQL.InsertItem('[E-Mail]'            ,Employee."E-Mail"                  ,'varchar' );
+              END;
+            TimesheetPortalSetup."E-Mail Employees"::"Company E-Mail":
+              BEGIN
+                Nav2SQL.InsertItem('[E-Mail]'            ,Employee."Company E-Mail"          ,'varchar' );
+              END;
+            TimesheetPortalSetup."E-Mail Employees"::"Company E-Mail / E-Mail":  //C014468
+              BEGIN
+                IF Employee."Company E-Mail" <> '' THEN
+                  Nav2SQL.InsertItem('[E-Mail]'            ,Employee."Company E-Mail"          ,'varchar' )
+                ELSE
+                  Nav2SQL.InsertItem('[E-Mail]'            ,Employee."E-Mail"                  ,'varchar' );
+              END;
+            ELSE
+              BEGIN
+                Nav2SQL.InsertItem('[E-Mail]'            ,Employee."E-Mail"                  ,'varchar' );
+              END;
+          END;
+          Nav2SQL_SafeInsertDateTime('[Employment Date]' ,EmploymentDate                     ,'datetime');
+          Nav2SQL.InsertItem('[Emplymt_ Contract Code]'  ,Employee."Emplymt. Contract Code"  ,'varchar' );
+          Nav2SQL.InsertItem('[External]'                ,Employee.External                  ,'tinyint' );
+          Nav2SQL.InsertItem('[First Name]'              ,Employee."First Name"              ,'varchar' );
+          Nav2SQL.InsertItem('[Global Dimension 1 Code]' ,Employee."Global Dimension 1 Code" ,'varchar' );
+          Nav2SQL.InsertItem('[Global Dimension 2 Code]' ,Employee."Global Dimension 2 Code" ,'varchar' );
+          Nav2SQL.InsertItem('[Last Name]'               ,Employee."Last Name"               ,'varchar' );
+          Nav2SQL.InsertItem('[Middle Name]'             ,Employee."Middle Name"             ,'varchar' );
+          Nav2SQL.InsertItem('[No_]'                     ,Employee."No."                     ,'varchar' );
+          Nav2SQL.InsertItem('[Norm Hours]'              ,Employee."Norm Hours"              ,'decimal' );
+          Nav2SQL.InsertItem('[Norm Days]'               ,Employee."Norm Days"               ,'decimal' );
+          Nav2SQL.InsertItem('[Post Code]'               ,Employee."Post Code"               ,'varchar' );
+          Nav2SQL.InsertItem('[Status]'                  ,Employee.Status                    ,'int'     );
+          Nav2SQL_SafeInsertDateTime('[Termination Date]',TerminationDate                    ,'datetime');
+          Nav2SQL.InsertItem('[Trade Association]'       ,Employee."Trade Association"       ,'varchar' );
+          Nav2SQL.InsertItem('[UTA]'                     ,Employee.UTA                       ,'tinyint' );
+          Nav2SQL_SafeInsertDateTime('[Inactive Date]'   ,InactiveDate                       ,'datetime');
+          Nav2SQL.InsertItem('[Manager No_]'             ,Employee."Manager No."             ,'varchar' );
+          Nav2SQL.InsertItem('[Company]'                 ,Company                            ,'varchar' );
+          Nav2SQL.InsertItem('[ProposedUserName]'        ,GetProposedUserName(Company, Employee."No."),'varchar' );
+          Nav2SQL.InsertItem('[CAO]'                     ,Employee.CAO                       ,'varchar' );
+          Nav2SQL.InsertItem('[SearchName]'              ,Employee."Search Name"             ,'varchar' );
+          GetDeptAuthFields(Company, Employee."No.");
+          Nav2SQL_InsertRow();
+        UNTIL Employee.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, Employee.COUNT));
+    END;
+
+    PROCEDURE GetProposedUserName@1100525028(Company@1100525000 : Text[128];EmployeeNo@1100525001 : Code[20]) : Text[100];
+    VAR
+      UserSetup@1100525002 : Record 91;
+      User@1100525004 : Record 2000000120;
+    BEGIN
+      UserSetup.CHANGECOMPANY(Company);
+      UserSetup.SETCURRENTKEY("Employee No.");
+      UserSetup.SETRANGE("Employee No.", EmployeeNo);
+      IF UserSetup.FINDFIRST THEN BEGIN
+        User.SETRANGE("User Name", UserSetup."User ID");
+        IF User.FINDFIRST THEN
+          EXIT(User."User Name");
+      END;
+    END;
+
+    PROCEDURE GetDeptAuthFields@1100409002(Company@1100525000 : Text[128];EmployeeNo@1100525001 : Code[20]);
+    VAR
+      UserSetup@1100525002 : Record 91;
+      GeneralLedgerSetup@1100409000 : Record 98;
+    BEGIN
+      UserSetup.CHANGECOMPANY(Company);
+      UserSetup.SETCURRENTKEY("Employee No.");
+      UserSetup.SETRANGE("Employee No.", EmployeeNo);
+      IF NOT UserSetup.FINDFIRST THEN
+        UserSetup.INIT;
+      GeneralLedgerSetup.GET();
+      Nav2SQL.InsertItem('[Department Code Filter]' ,UserSetup."Department Code Filter"   ,'varchar' );
+      Nav2SQL.InsertItem('[Department Auth Active]',
+             (UserSetup."Department Authoriz. Active" AND GeneralLedgerSetup."Department Authoriz. Active"),'int');
+    END;
+
+    PROCEDURE Nav2SQL_TravelSetup@1100525032(Company@1100525000 : Text[128]) : Text;
+    VAR
+      TravelSetup@1100525001 : Record 11125741;
+    BEGIN
+      IF NOT TravelSetup.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$TravelSetup]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      TravelSetup.CHANGECOMPANY(Company);
+
+      // get native data and insert in SQLServer table
+      IF TravelSetup.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[CAO]'             ,TravelSetup.CAO               ,'varchar' );
+          Nav2SQL.InsertItem('[WageComponent]'   ,TravelSetup."Wage Component"  ,'varchar' );
+          Nav2SQL.InsertItem('[CostObject]'      ,TravelSetup."Cost Object"     ,'varchar' );
+          Nav2SQL.InsertItem('[KilometerGradeLimit]',TravelSetup."Kilometer Grade Limit"  ,'decimal' );
+          Nav2SQL.InsertItem('[Travelhours]'     ,TravelSetup."Travel Hours"    ,'decimal' );
+          Nav2SQL.InsertItem('[TravelhoursOwn]'  ,TravelSetup."Travel Hours Own (Single)",'decimal' );
+          Nav2SQL.InsertItem('[Company]'         ,Company                    ,'varchar' );
+
+          Nav2SQL_InsertRow();
+        UNTIL TravelSetup.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, TravelSetup.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_ExtensionContract@1100525023(Company@1100525000 : Text[128]) : Text;
+    VAR
+      ExtensionContract@1100525001 : Record 11012004;
+    BEGIN
+      IF NOT ExtensionContract.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$Extension Contract]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      ExtensionContract.CHANGECOMPANY(Company);
+
+      // get native data and insert in SQLServer table
+      IF ExtensionContract.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[Contract No_]'         ,ExtensionContract."Contract No."         ,'varchar' );
+          Nav2SQL.InsertItem('[Description]'          ,ExtensionContract.Description            ,'varchar' );
+          Nav2SQL.InsertItem('[Project No_]'          ,ExtensionContract."Project No."          ,'varchar' );
+          Nav2SQL.InsertItem('[Settlement Method]'    ,ExtensionContract."Settlement Method"    ,'int'     );
+          Nav2SQL.InsertItem('[Status]'               ,ExtensionContract.Status                 ,'int'     );
+          Nav2SQL.InsertItem('[Company]'              ,Company                                  ,'varchar' );
+
+          Nav2SQL_InsertRow();
+        UNTIL ExtensionContract.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, ExtensionContract.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_PCostObjectSalesPrice@1100525025(Company@1100525002 : Text[128]) : Text;
+    VAR
+      StartingDate@1100525000 : DateTime;
+      EndingDate@1100525001 : DateTime;
+      PCostObjectSalesPrice@1100525003 : Record 11020383;
+    BEGIN
+      IF NOT PCostObjectSalesPrice.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$Proj - Cost Object Sales Price]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      PCostObjectSalesPrice.CHANGECOMPANY(Company);
+
+      // get native data and insert in SQLServer table
+      IF PCostObjectSalesPrice.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          StartingDate := Nav2SQLDate(PCostObjectSalesPrice."Starting Date");
+          EndingDate := Nav2SQLDate(PCostObjectSalesPrice."Ending Date");
+
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[Cost Object]'       ,PCostObjectSalesPrice."Cost Object"    ,'varchar' );
+          Nav2SQL_SafeInsertDateTime('[Ending Date]'       ,EndingDate                                 ,'datetime');
+          Nav2SQL.InsertItem('[Project No_]'       ,PCostObjectSalesPrice."Project No."    ,'varchar' );
+          Nav2SQL.InsertItem('[Sales Price]'       ,PCostObjectSalesPrice."Sales Price"    ,'decimal' );
+          Nav2SQL_SafeInsertDateTime('[Starting Date]'     ,StartingDate                               ,'datetime');
+          Nav2SQL.InsertItem('[Company]'           ,Company                                    ,'varchar' );
+
+          Nav2SQL_InsertRow();
+        UNTIL PCostObjectSalesPrice.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, PCostObjectSalesPrice.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_ProjectElement@1100525026(Company@1100525000 : Text[128]) : Text;
+    VAR
+      ProjectElement@1100525001 : Record 11012010;
+    BEGIN
+      IF NOT ProjectElement.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$Project Element]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      ProjectElement.CHANGECOMPANY(Company);
+
+      // Only non-blocked elements
+      ProjectElement.SETRANGE(Blocked, FALSE);
+
+      // get native data and insert in SQLServer table
+      IF ProjectElement.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[Blocked]'          ,ProjectElement.Blocked         ,'tinyint' );
+          Nav2SQL.InsertItem('[Description]'      ,ProjectElement.Description     ,'varchar' );
+          Nav2SQL.InsertItem('[Element]'          ,ProjectElement.Element         ,'varchar' );
+          Nav2SQL.InsertItem('[Project No_]'      ,ProjectElement."Project No."   ,'varchar' );
+          Nav2SQL.InsertItem('[Company]'          ,Company                            ,'varchar' );
+
+          Nav2SQL_InsertRow();
+        UNTIL ProjectElement.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, ProjectElement.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_WageComponent@1100525027(Company@1100525000 : Text[128]) : Text;
+    VAR
+      WageComponent@1100525001 : Record 11012014;
+    BEGIN
+      IF NOT WageComponent.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$Wage Component]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      WageComponent.CHANGECOMPANY(Company);
+
+      // get native data and insert in SQLServer table
+      IF WageComponent.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[Code]'          ,WageComponent.Code         ,'varchar' );
+          Nav2SQL.InsertItem('[Description]'   ,WageComponent.Description  ,'varchar' );
+          Nav2SQL.InsertItem('[Overtime]'      ,WageComponent.Overtime     ,'tinyint' );
+          Nav2SQL.InsertItem('[Component Type]',WageComponent."Component Type",'int' );
+          Nav2SQL.InsertItem('[Company]'       ,Company                        ,'varchar' );
+
+          Nav2SQL_InsertRow();
+        UNTIL WageComponent.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, WageComponent.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_Job@1100525006(Company@1100525001 : Text[128]) : Text;
+    VAR
+      StartingDate@1100525000 : DateTime;
+      Job@1100525002 : Record 11072003;
+      BlockingCode@1100525003 : Record 11012027;
+      TimesheetPortalSetup@1100525005 : Record 11125740;
+      Consenter@1100525004 : Code[20];
+    BEGIN
+      IF NOT Job.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+
+      TimesheetPortalSetup.FINDFIRST();
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$Job]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      Job.CHANGECOMPANY(Company);
+
+      // Only unblocked active projects
+      Job.SETRANGE("Project Status", Job."Project Status"::Estimation, Job."Project Status"::"Technical Finished");
+      Job.SETRANGE(Blocked, Job.Blocked::" ");
+
+      // get native data and insert in SQLServer table
+      IF Job.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+
+          IF NOT BlockingCode.GET(Job."Blocking Code") THEN
+            BlockingCode.INIT;
+
+          IF NOT BlockingCode."Create Hour Accounting" OR NOT BlockingCode."Post Hours External" THEN BEGIN
+            StartingDate := Nav2SQLDate(Job."Starting Date");
+
+            IF TimesheetPortalSetup."Smart Determination Consenter" THEN BEGIN
+              IF Job."Site Manager" <> '' THEN
+                Consenter := Job."Site Manager"
+              ELSE
+                Consenter := Job."Project Manager";
+            END ELSE BEGIN
+              Consenter := Job."Project Manager";
+            END;
+            //Nav2SQL.InsertItem(string Column, object Value, string Type)
+            Nav2SQL.InsertItem('[Bill-to Customer No_]'       ,Job."Bill-to Customer No."           ,'varchar' );
+            Nav2SQL.InsertItem('[Blocked]'                    ,Job.Blocked                          ,'int'     );
+            Nav2SQL.InsertItem('[Description]'                ,Job.Description                      ,'varchar' );
+            Nav2SQL.InsertItem('[Global Dimension 1 Code]'    ,Job."Global Dimension 1 Code"        ,'varchar' );
+            Nav2SQL.InsertItem('[No_]'                        ,Job."No."                            ,'varchar' );
+            Nav2SQL.InsertItem('[Post Code]'                  ,Job."Post Code"                      ,'varchar' );
+            Nav2SQL.InsertItem('[Posting Element Mandatory]'  ,Job."Posting Element Mandatory"      ,'tinyint' );
+            Nav2SQL.InsertItem('[Project Address Code]'       ,Job."Project Address Code"           ,'varchar' );
+            Nav2SQL.InsertItem('[Project Manager]'            ,Consenter                            ,'varchar' );
+            Nav2SQL.InsertItem('[Project Status]'             ,Job."Project Status"                 ,'int'     );
+            Nav2SQL.InsertItem('[Settlement Method]'          ,Job."Settlement Method"              ,'int'     );
+            Nav2SQL.InsertItem('[Small Project]'              ,Job."Small Project"                  ,'tinyint' );
+            Nav2SQL_SafeInsertDateTime('[Starting Date]'              ,StartingDate                             ,'datetime');
+            Nav2SQL.InsertItem('[Status]'                     ,Job.Status                           ,'int'     );
+            Nav2SQL.InsertItem('[Company]'                    ,Company                                  ,'varchar' );
+
+            Nav2SQL_InsertRow();
+          END;
+        UNTIL Job.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, Job.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_ProcessWebCompanies@1100525002();
+    VAR
+      CompanyName@1100525000 : Text[64];
+      SQLCompanyTable@1100525002 : Text[256];
+      Company@1100525003 : Record 2000000006;
+      JobsSetup@1100525004 : Record 315;
+      TimesheetPortalSetup@1100525001 : Record 11125740;
+    BEGIN
+      // Set SQLServer table name to update, and clear data from destination table
+      SQLCompanyTable := '['+SQLTablePrefix+'$Company]';
+
+      TimesheetPortalSetup.FINDFIRST();
+      // Loop company-independent company records, and copy all company names
+      //  (that are set active for use in the weburen site) to the SQL table
+      IF Company.FINDSET THEN BEGIN
+        REPEAT
+          CompanyName := Company.Name;
+
+          // check if Company is activated to be used by the weburen site
+          JobsSetup.CHANGECOMPANY(CompanyName);
+          IF JobsSetup.READPERMISSION THEN BEGIN
+            JobsSetup.SETFILTER("Company active in Timesh.Port.",'1');
+            IF JobsSetup.FINDFIRST THEN
+              BEGIN
+                // Insert companyname into SQLServer table
+                Nav2SQL.SetTablename(SQLCompanyTable);
+                Nav2SQL.InsertItem('[Name]',  CompanyName,  'varchar' );
+                Nav2SQL_InsertRow();
+
+                LogWrite('');
+                LogWrite(STRSUBSTNO(Text004, CompanyName));
+
+                // Copy all tables from current Company to SQLServer, and log to file
+                LogWrite(Nav2SQL_Customer(CompanyName));
+                LogWrite( Nav2SQL_ShipToAddress(CompanyName));
+                LogWrite( Nav2SQL_ServiceOrder(CompanyName));
+                LogWrite( Nav2SQL_Commission(CompanyName));
+                LogWrite( Nav2SQL_CostCode(CompanyName));
+                LogWrite( Nav2SQL_CC_ObjectSalesPrice(CompanyName));
+                LogWrite( Nav2SQL_DimensionValue(CompanyName));
+                LogWrite( Nav2SQL_Employee(CompanyName));
+                LogWrite( Nav2SQL_ExtensionContract(CompanyName));
+                LogWrite( Nav2SQL_PCostObjectSalesPrice(CompanyName));
+                LogWrite( Nav2SQL_ProjectElement(CompanyName));
+                LogWrite( Nav2SQL_WageComponent(CompanyName));
+                LogWrite( Nav2SQL_Job(CompanyName));
+                //LogWrite( Nav2SQL_PlantType(CompanyName));
+                //LogWrite( Nav2SQL_PlantNumber(CompanyName));
+                //LogWrite( Nav2SQL_PlantLocation(CompanyName));
+                LogWrite( Nav2SQL_LeaveType(CompanyName));
+                LogWrite( Nav2SQL_LeaveLedgerEntry(CompanyName));
+                LogWrite( Nav2SQL_TravelSetup(CompanyName));
+                LogWrite( Nav2SQL_AuthorizerEmployee(CompanyName));
+                LogWrite( Nav2SQL_ReasonCode(CompanyName));
+                LogWrite( Nav2SQL_DepartmentAuthObj(CompanyName));
+                LogWrite( Nav2SQL_TemplateLine(CompanyName));
+                LogWrite( Nav2SQL_AllowancePerDay(CompanyName));
+
+                IF TimesheetPortalSetup."Sync. Static Data Once" THEN BEGIN
+                  //statis data doesn't have to be synced each time
+                  LogWrite( Nav2SQL_PostCode(CompanyName));
+                  TimesheetPortalSetup."Sync. Static Data Once" := FALSE;
+                  TimesheetPortalSetup.MODIFY;
+                END;
+              END;
+            END;
+        UNTIL Company.NEXT = 0;
+      END;
+
+      IF Company.FINDSET THEN BEGIN
+        LogWrite('');
+        LogWrite(Text000);
+        REPEAT
+          CompanyName := Company.Name;
+          JobsSetup.CHANGECOMPANY(CompanyName);
+          IF JobsSetup.READPERMISSION THEN BEGIN
+            JobsSetup.SETFILTER("Company active in Timesh.Port.",'1');
+            IF JobsSetup.FINDFIRST THEN
+              LogWrite('  [' + Company.Name + ']');
+          END;
+        UNTIL Company.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE Nav2SQL_PlantType@1100525033(Company@1100525000 : Text[128]) : Text;
+    VAR
+      PlantType@1100525001 : Record 11012551;
+    BEGIN
+      IF NOT PlantType.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$Plant Type]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      PlantType.CHANGECOMPANY(Company);
+
+      // Only non-bulk plant types
+      PlantType.SETRANGE(Bulk, FALSE);
+
+      // get native data and insert in SQLServer table
+      IF PlantType.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[Code]'                 ,PlantType.Code         ,'varchar' );
+          Nav2SQL.InsertItem('[Description]'          ,PlantType.Description  ,'varchar' );
+          Nav2SQL.InsertItem('[Company]'              ,Company                    ,'varchar' );
+
+          Nav2SQL_InsertRow();
+        UNTIL PlantType.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, PlantType.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_PlantNumber@1100525038(Company@1100525000 : Text[128]) : Text;
+    VAR
+      PlantNumber@1100525001 : Record 11012552;
+    BEGIN
+      IF NOT PlantNumber.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$Plant Number]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      PlantNumber.CHANGECOMPANY(Company);
+
+      // get native data and insert in SQLServer table
+      IF PlantNumber.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[Plant Type]'       ,PlantNumber."Plant Type"   ,'varchar' );
+          Nav2SQL.InsertItem('[No_]'              ,PlantNumber."No."          ,'varchar' );
+          Nav2SQL.InsertItem('[Description]'      ,PlantNumber.Description    ,'varchar' );
+          Nav2SQL.InsertItem('[Company]'          ,Company                        ,'varchar' );
+
+          Nav2SQL_InsertRow();
+        UNTIL PlantNumber.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, PlantNumber.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_PlantLocation@1100525040(Company@1100525000 : Text[1024]) : Text;
+    VAR
+      PlantLocation@1100525001 : Record 11012554;
+    BEGIN
+      IF NOT PlantLocation.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$Plant Location]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      PlantLocation.CHANGECOMPANY(Company);
+
+      // Only plant locations with status active
+      PlantLocation.SETRANGE(Status, PlantLocation.Status::Production);
+
+      // get native data and insert in SQLServer table
+      IF PlantLocation.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[Code]'         ,PlantLocation.Code         ,'varchar' );
+          Nav2SQL.InsertItem('[Description]'  ,PlantLocation.Description  ,'varchar' );
+          Nav2SQL.InsertItem('[Company]'      ,Company                    ,'varchar' );
+
+          Nav2SQL_InsertRow();
+        UNTIL PlantLocation.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, PlantLocation.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_ClearSQLTables@1100525008();
+    VAR
+      TimesheetPortalSetup@1100525000 : Record 11125740;
+    BEGIN
+      // delete all records from tables
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$Company]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$Commission]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$Cost Code]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$Cust - Cost Object Sales Price]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$Customer]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$Dimension Value]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$Employee]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$Extension Contract]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$Job]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$Proj - Cost Object Sales Price]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$Project Element]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$Service Order]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$Ship-to Address]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$Wage Component]');
+      //Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$Plant Type]');
+      //Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$Plant Number]');
+      //Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$Plant Location]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$LeaveType]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$LeaveLedgerEntry]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$TravelSetup]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$AuthorizerEmployee]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$ReasonCode]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$Department Auth Object]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$TemplateLine]');
+      Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$AllowancePerDay]');
+
+      TimesheetPortalSetup.FINDFIRST();
+      IF TimesheetPortalSetup."Sync. Static Data Once" THEN BEGIN
+        //static data doesn't have to be synced each time
+        Nav2SQL.DeleteRecordsFromTable('['+SQLTablePrefix+'$PostCode]');
+      END;
+    END;
+
+    PROCEDURE Nav2SQL_InsertRow@1100525012();
+    VAR
+      FirstSQLError@1100525000 : Text[1024];
+      SQLError@1100525001 : Text[1024];
+    BEGIN
+      IF (Nav2SQL.ExecuteRowInsert() < 0) THEN BEGIN   // error during rowInsert
+        SQLError := Nav2SQL.GetLastException();
+        FirstSQLError := SQLError;
+        LogWrite(Text007);
+        REPEAT
+          LogWrite(SQLError);
+          SQLError := Nav2SQL.GetLastException();
+        UNTIL SQLError = '';
+        Nav2SQL.CloseConnection();
+        LogWrite('');
+        StopRun();
+        ERROR(FirstSQLError);
+      END;
+    END;
+
+    PROCEDURE Nav2SQL_LeaveType@1100525024(Company@1100525000 : Text[128]) : Text;
+    VAR
+      LeaveType@1100525001 : Record 11020233;
+    BEGIN
+      IF NOT LeaveType.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$LeaveType]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      LeaveType.CHANGECOMPANY(Company);
+
+      // get native data and insert in SQLServer table
+      IF LeaveType.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[Code]'          ,LeaveType.Code         ,'varchar' );
+          Nav2SQL.InsertItem('[Description]'   ,LeaveType.Description  ,'varchar' );
+          Nav2SQL.InsertItem('[Company]'       ,Company                        ,'varchar' );
+
+          Nav2SQL_InsertRow();
+        UNTIL LeaveType.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, LeaveType.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_LeaveLedgerEntry@1100525029(Company@1100525000 : Text[128]) : Text;
+    VAR
+      LeaveLedgerEntry@1100525001 : Record 11020235;
+    BEGIN
+      IF NOT LeaveLedgerEntry.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$LeaveLedgerEntry]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      LeaveLedgerEntry.CHANGECOMPANY(Company);
+      LeaveLedgerEntry.SETRANGE("Entry Type", LeaveLedgerEntry."Entry Type"::Hours);
+
+      // get native data and insert in SQLServer table
+      IF LeaveLedgerEntry.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[EntryNo]'    ,LeaveLedgerEntry."Entry No."  ,              'int' );
+          Nav2SQL_SafeInsertDateTime('[PostingDate]',Nav2SQLDate(LeaveLedgerEntry."Posting Date"),'datetime' );
+          Nav2SQL.InsertItem('[NoOfHours]'  ,LeaveLedgerEntry."No. of Hours",             'decimal' );
+          Nav2SQL.InsertItem('[EmployeeNo]' ,LeaveLedgerEntry."Employee No.",             'varchar' );
+          Nav2SQL.InsertItem('[Description]',LeaveLedgerEntry.Description,              'varchar' );
+          Nav2SQL.InsertItem('[LeaveType]'  ,LeaveLedgerEntry."Leave Type",               'varchar' );
+          Nav2SQL.InsertItem('[Company]'    ,Company,                                     'varchar' );
+
+          Nav2SQL_InsertRow();
+        UNTIL LeaveLedgerEntry.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, LeaveLedgerEntry.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_PostCode@1100525030(Company@1100525000 : Text[128]) : Text;
+    VAR
+      PostCode@1100525001 : Record 225;
+    BEGIN
+      IF NOT PostCode.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$PostCode]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      PostCode.CHANGECOMPANY(Company);
+
+      // get native data and insert in SQLServer table
+      IF PostCode.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[Code]'    ,PostCode.Code,              'varchar' );
+          Nav2SQL.InsertItem('[City]'    ,PostCode.City,              'varchar' );
+          Nav2SQL.InsertItem('[Company]' ,Company,                    'varchar' );
+
+          Nav2SQL_InsertRow();
+        UNTIL PostCode.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, PostCode.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_ReasonCode@1100529000(Company@1100525000 : Text[128]) : Text;
+    VAR
+      ReasonCode@1100525001 : Record 231;
+    BEGIN
+      IF NOT ReasonCode.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$ReasonCode]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      ReasonCode.CHANGECOMPANY(Company);
+
+      // get native data and insert in SQLServer table
+      IF ReasonCode.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[Code]'       ,ReasonCode.Code,              'varchar' );
+          Nav2SQL.InsertItem('[Description]',ReasonCode.Description,       'varchar' );
+          Nav2SQL.InsertItem('[Company]' ,Company,                    'varchar' );
+          Nav2SQL_InsertRow();
+        UNTIL ReasonCode.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, ReasonCode.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_DepartmentAuthObj@1100409000(Company@1100525000 : Text[128]) : Text;
+    VAR
+      DepartmentAuthorizObject@1100525001 : Record 11012466;
+    BEGIN
+      IF NOT DepartmentAuthorizObject.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$Department Auth Object]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      DepartmentAuthorizObject.CHANGECOMPANY(Company);
+      DepartmentAuthorizObject.SETRANGE(Type, DepartmentAuthorizObject.Type::Table);
+
+      // get native data and insert in SQLServer table
+      IF  DepartmentAuthorizObject.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[ID]'                    ,DepartmentAuthorizObject.ID,                       'int' );
+          Nav2SQL.InsertItem('[Dimension 1 Code Filter]',DepartmentAuthorizObject."Dimension 1 Code Filter",'int' );
+          Nav2SQL.InsertItem('[Allow Empty Code]'      ,DepartmentAuthorizObject."Allow Empty Code",       'int' );
+          Nav2SQL.InsertItem('[Company]'                 ,Company                                   ,'varchar' );
+          Nav2SQL_InsertRow();
+        UNTIL DepartmentAuthorizObject.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, DepartmentAuthorizObject.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_TemplateLine@1100409001(Company@1100525000 : Text[128]) : Text;
+    VAR
+      TimesheetPortalTemplateLine@1100525001 : Record 11125854;
+    BEGIN
+      IF NOT TimesheetPortalTemplateLine.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$TemplateLine]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      TimesheetPortalTemplateLine.CHANGECOMPANY(Company);
+
+      // get native data and insert in SQLServer table
+      IF  TimesheetPortalTemplateLine.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          TimesheetPortalTemplateLine.CALCFIELDS("Cost Code Description", "Cost Object Description","Wage Component Description");
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[CAOCode]'      ,TimesheetPortalTemplateLine."CAO Code",      'varchar' );
+          Nav2SQL.InsertItem('[Type]'         ,TimesheetPortalTemplateLine.Type,            'int' );
+          Nav2SQL.InsertItem('[LineNo]'         ,TimesheetPortalTemplateLine."Line No.",    'int' );
+          Nav2SQL.InsertItem('[SequenceNo]'   ,TimesheetPortalTemplateLine."Sequence No.",    'int' );
+          Nav2SQL.InsertItem('[CostCode]'     ,TimesheetPortalTemplateLine."Cost Code",     'varchar' );
+          Nav2SQL.InsertItem('[CostObject]'   ,TimesheetPortalTemplateLine."Cost Object",   'varchar' );
+          Nav2SQL.InsertItem('[WageComponent]',TimesheetPortalTemplateLine."Wage Component",'varchar' );
+          Nav2SQL.InsertItem('[Comment]'      ,TimesheetPortalTemplateLine.Comment,         'varchar' );
+          Nav2SQL.InsertItem('[CostCodeDescription]',TimesheetPortalTemplateLine."Cost Code Description",'varchar' );
+          Nav2SQL.InsertItem('[CostObjectDescription]',TimesheetPortalTemplateLine."Cost Object Description",'varchar' );
+          Nav2SQL.InsertItem('[WageComponentDescription]',TimesheetPortalTemplateLine."Wage Component Description",'varchar' );
+          Nav2SQL.InsertItem('[Company]'      ,Company,                                     'varchar' );
+          Nav2SQL_InsertRow();
+        UNTIL TimesheetPortalTemplateLine.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, TimesheetPortalTemplateLine.COUNT));
+    END;
+
+    PROCEDURE Nav2SQL_AllowancePerDay@1100525036(Company@1100525000 : Text[128]) : Text;
+    VAR
+      TimeshPortAllowancePerDay@1100525001 : Record 11125855;
+    BEGIN
+      IF NOT TimeshPortAllowancePerDay.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$AllowancePerDay]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      TimeshPortAllowancePerDay.CHANGECOMPANY(Company);
+
+      // get native data and insert in SQLServer table
+      IF  TimeshPortAllowancePerDay.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+          //Nav2SQL.InsertItem(string Column, object Value, string Type)
+          Nav2SQL.InsertItem('[TradeAssociation]',TimeshPortAllowancePerDay."Trade Association",'varchar' );
+          Nav2SQL.InsertItem('[DepartmentCode]'  ,TimeshPortAllowancePerDay."Department Code",  'varchar' );
+          Nav2SQL.InsertItem('[CAOCode]'         ,TimeshPortAllowancePerDay."CAO Code",         'varchar' );
+          Nav2SQL.InsertItem('[EmployeeNo]'      ,TimeshPortAllowancePerDay."Employee No.",     'varchar' );
+          Nav2SQL.InsertItem('[WageComponent]'   ,TimeshPortAllowancePerDay."Wage Component",   'varchar' );
+          Nav2SQL.InsertItem('[AmountMonday]'    ,TimeshPortAllowancePerDay."Amount Monday",    'decimal' );
+          Nav2SQL.InsertItem('[AmountTuesday]'   ,TimeshPortAllowancePerDay."Amount Tuesday",   'decimal' );
+          Nav2SQL.InsertItem('[AmountWednesday]' ,TimeshPortAllowancePerDay."Amount Wednesday", 'decimal' );
+          Nav2SQL.InsertItem('[AmountThursday]'  ,TimeshPortAllowancePerDay."Amount Thursday",  'decimal' );
+          Nav2SQL.InsertItem('[AmountFriday]'    ,TimeshPortAllowancePerDay."Amount Friday",    'decimal' );
+          Nav2SQL.InsertItem('[AmountSaturday]'  ,TimeshPortAllowancePerDay."Amount Saturday",  'decimal' );
+          Nav2SQL.InsertItem('[AmountSunday]'    ,TimeshPortAllowancePerDay."Amount Sunday",    'decimal' );
+          Nav2SQL.InsertItem('[Company]'         ,Company,                                      'varchar' );
+          Nav2SQL_InsertRow();
+        UNTIL TimeshPortAllowancePerDay.NEXT = 0;
+      END;
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, TimeshPortAllowancePerDay.COUNT));
+    END;
+
+    PROCEDURE Import@1100525001();
+    BEGIN
+      IF StartRun(Text008) THEN BEGIN
+        Nav2SQL.SetTransactionTimeout(5, TRUE);
+        SQL2Nav_GetHourLines();
+        Nav2SQL.CloseConnection();
+
+        LogWrite('');
+        LogWrite(STRSUBSTNO(Text006, (TIME - StartTime)/1000));
+        MESSAGE(Text006,(TIME - StartTime)/1000);
+      END;
+      StopRun();
+    END;
+
+    PROCEDURE SQL2Nav_GetHourLines@1100525010();
+    VAR
+      TimesheetPortalHourLine@1100525002 : Record 11125853;
+      RecordCount@1100525000 : Integer;
+    BEGIN
+      Nav2SQL.NewQueryWithColumnsCSV('[Company], [Year], [Week], [Employee No_], ' +
+        '[Element], [Cost Object], [Wage Component], [Extension Contract], ' +
+        '[Service Order No_], [Project No_], [Monday], [Tuesday], [Wednesday], ' +
+        '[Thursday], [Friday], [Saturday], [Sunday], [Comment], [Cost Code], [Type], ' +
+        '[Amount], [Quantity], [Correction], [ReceivingCompanyName], [ReasonCode]');
+      Nav2SQL.AddQueryWhereCondition('[Company]', COMPANYNAME);
+      CurrentSQLTable := '[TempHourAccounting]';
+
+      RecordCount := Nav2SQL.ExecuteQuery(CurrentSQLTable);
+      //MESSAGE('Records: %1', RecordCount);
+
+      TimesheetPortalHourLine.INIT;
+      TimesheetPortalHourLine.SETCURRENTKEY("Line No.");
+      TimesheetPortalHourLine."Line No." := 0;
+      IF RecordCount > 0 THEN BEGIN
+        REPEAT
+          BEGIN
+            //Store line in the buffer table
+            WITH TimesheetPortalHourLine DO BEGIN
+              IF FINDLAST THEN;
+              "Line No." += 1;
+              TimesheetPortalHourLine."HAL Creation Error" := '';
+              EVALUATE(Year, Nav2SQL.GetField('[Year]'));
+              EVALUATE(Week, Nav2SQL.GetField('[Week]'));
+              EVALUATE("Employee No.", Nav2SQL.GetField('[Employee No_]'));
+              EVALUATE(Element, Nav2SQL.GetField('[Element]'));
+              EVALUATE("Cost Object", Nav2SQL.GetField('[Cost Object]'));
+              EVALUATE("Wage Component", Nav2SQL.GetField('[Wage Component]'));
+              EVALUATE("Receiving Company", Nav2SQL.GetField('[ReceivingCompanyName]'));
+              EVALUATE("Extension Contract", Nav2SQL.GetField('[Extension Contract]'));
+              EVALUATE("Service Order No.", Nav2SQL.GetField('[Service Order No_]'));
+              EVALUATE("Project No.", Nav2SQL.GetField('[Project No_]'));
+              EVALUATE(Monday, Nav2SQL.GetField('[Monday]'));
+              EVALUATE(Tuesday, Nav2SQL.GetField('[Tuesday]'));
+              EVALUATE(Wednesday, Nav2SQL.GetField('[Wednesday]'));
+              EVALUATE(Thursday, Nav2SQL.GetField('[Thursday]'));
+              EVALUATE(Friday, Nav2SQL.GetField('[Friday]'));
+              EVALUATE(Saturday, Nav2SQL.GetField('[Saturday]'));
+              EVALUATE(Sunday, Nav2SQL.GetField('[Sunday]'));
+              EVALUATE(Comment, Nav2SQL.GetField('[Comment]'));
+              EVALUATE("Cost Code", Nav2SQL.GetField('[Cost Code]'));
+              EVALUATE(Type, Nav2SQL.GetField('[Type]'));
+              EVALUATE(Amount, Nav2SQL.GetField('[Amount]'));
+              EVALUATE(Quantity, Nav2SQL.GetField('[Quantity]'));
+              EVALUATE(Correction, Nav2SQL.GetField('[Correction]'));
+              EVALUATE("Reason Code", Nav2SQL.GetField('[ReasonCode]'));
+              INSERT(FALSE);
+            END;
+          END;
+        UNTIL NOT Nav2SQL.NextRecord();
+        Nav2SQL.BeginTransaction();
+        Nav2SQL.DeleteRecordsFromTableWhere(CurrentSQLTable, '[Company] = ''' + COMPANYNAME + '''');
+        Nav2SQL.EndTransaction();
+      END;
+
+      IF TimesheetPortalHourLine.FINDSET(TRUE, TRUE) THEN BEGIN
+        REPEAT
+         COMMIT; //commit before we do the codeunit .RUN
+          //Try to store the line in the HAL
+          SQL2Nav_TryCreateHAL(TimesheetPortalHourLine);
+        UNTIL TimesheetPortalHourLine.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE SQL2Nav_TryCreateHAL@1100525035(TimesheetPortalHourLine@1100525000 : Record 11125853);
+    VAR
+      TimesheetPortCreateHAL@1100525001 : Codeunit 11125855;
+      ErrorMsg@1100525002 : Text[1024];
+    BEGIN
+      CLEARLASTERROR;
+      IF NOT TimesheetPortCreateHAL.RUN(TimesheetPortalHourLine) THEN BEGIN
+        ErrorMsg := GETLASTERRORTEXT;
+        CLEARLASTERROR;
+        IF ErrorMsg <> '' THEN BEGIN
+          TimesheetPortalHourLine."HAL Creation Error" := COPYSTR(ErrorMsg, 1, 250);
+          TimesheetPortalHourLine.MODIFY;
+        END;
+      END ELSE BEGIN
+        TimesheetPortalHourLine.DELETE;
+      END;
+    END;
+
+    PROCEDURE LogOpen@1100525005() : Boolean;
+    VAR
+      TimesheetPortalSetup@1100525000 : Record 11125740;
+    BEGIN
+      // Logfile is File object
+      // Logstream is OutStream object
+
+      TimesheetPortalSetup.FINDFIRST();
+      TimesheetPortalSetup.TESTFIELD(Logfile);
+
+      LogFileName := FileManagement.ServerTempFileName('txt');
+      ClientLogFileName := TimesheetPortalSetup.Logfile;
+
+      Logfile.TEXTMODE(TRUE);
+      IF FILE.EXISTS(LogFileName) THEN
+        ERASE(LogFileName);
+
+      IF NOT Logfile.CREATE(LogFileName) THEN
+        EXIT(FALSE);
+
+      Logfile.CREATEOUTSTREAM(LogStream);
+      LogStreamOpen := TRUE;
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE LogClose@1100525007();
+    BEGIN
+      IF LogStreamOpen THEN BEGIN
+        Logfile.CLOSE(); // To end the writing and write out to the file.
+        FileManagement.DownloadToFile(LogFileName, ClientLogFileName);
+        ERASE(LogFileName);
+      END;
+    END;
+
+    PROCEDURE LogWrite@1100525011(Message@1100525000 : Text[1024]);
+    BEGIN
+      IF LogStreamOpen THEN BEGIN
+        LogStream.WRITETEXT(Message);
+        LogStream.WRITETEXT();  // append newline
+      END;
+    END;
+
+    LOCAL PROCEDURE TABLEPREFIX@1100525004() : Text[30];
+    BEGIN
+      EXIT('NavSchaduw');
+    END;
+
+    PROCEDURE Nav2SQL_AuthorizerEmployee@1100525031(Company@1100525000 : Text[128]) : Text;
+    VAR
+      UserSetup@1100525001 : Record 91;
+      Counter@1100525003 : Integer;
+    BEGIN
+      //IF NOT Login.READPERMISSION OR NOT UserSetup.READPERMISSION THEN
+      IF NOT UserSetup.READPERMISSION THEN
+        EXIT(STRSUBSTNO(Text002, CurrentSQLTable, 0));
+      // Set SQLServer table name to update, and clear data from destination table
+      CurrentSQLTable := '['+SQLTablePrefix+'$AuthorizerEmployee]';
+      Nav2SQL.SetTablename(CurrentSQLTable);
+      //Login.CHANGECOMPANY(Company);
+      UserSetup.CHANGECOMPANY(Company);
+
+      // get native data and insert in SQLServer table
+      Counter := 0;
+      UserSetup.SETFILTER("Employee No.", '<>%1', '');
+      IF UserSetup.FINDSET(FALSE, FALSE) THEN BEGIN
+        REPEAT
+
+      //    Login.SETRANGE("User ID", UserSetup."User ID");
+      //    IF Login.FINDFIRST THEN BEGIN
+            Nav2SQL.InsertItem('[Company]'    ,Company                  ,'varchar' );
+            Nav2SQL.InsertItem('[No]'         ,UserSetup."Employee No." ,'varchar' );
+      //    IF Login."Windows Login" = TRUE THEN
+      //      Nav2SQL.InsertItem('[UserName]' ,Login."Windows Login ID" ,'varchar' )
+      //    ELSE
+      //      Nav2SQL.InsertItem('[UserName]' ,Login."User ID"          ,'varchar' );
+            Nav2SQL.InsertItem('[UserName]'   ,UserSetup."User ID"      ,'varchar' );
+            Nav2SQL_InsertRow();
+
+            Counter := Counter + 1;
+      //    END;
+
+        UNTIL UserSetup.NEXT = 0;
+      END;
+
+      EXIT(STRSUBSTNO(Text002, CurrentSQLTable, Counter));
+    END;
+
+    PROCEDURE Nav2SQL_SafeInsertDateTime@1100525034(fieldName@1100525000 : Text[250];date@1100525001 : DateTime;dataType@1100525002 : Text[30]);
+    BEGIN
+      IF (date = 0DT) THEN
+        Nav2SQL.InsertItem(fieldName,0,dataType)
+      ELSE
+        Nav2SQL.InsertItem(fieldName,date,dataType);
+    END;
+
+    LOCAL PROCEDURE GetEmployeeString@1100525037(Company@1100525000 : Text[128];ServiceOrderNo@1100525001 : Code[20]) : Text;
+    VAR
+      WorkOrder@1100525002 : Record 11229279;
+      ResourceWOP@1100525003 : Record 11229278;
+      TempEmployee@1100409000 : TEMPORARY Record 5200;
+      EmployeeString@1100525004 : Text;
+    BEGIN
+      WorkOrder.SETCURRENTKEY("Source Company","Source Type","Source No.");
+      WorkOrder.SETRANGE("Source Company", Company);
+      WorkOrder.SETRANGE("Source Type", WorkOrder."Source Type"::ServiceOrder);
+      WorkOrder.SETRANGE("Source No.", ServiceOrderNo);
+      WorkOrder.SETRANGE("Resource Type", WorkOrder."Resource Type"::Employee);
+      IF (NOT WorkOrder.FINDSET) THEN
+        EXIT('');
+      REPEAT
+        IF (ResourceWOP.GET(WorkOrder."Resource No.")) THEN BEGIN
+          IF (NOT TempEmployee.GET(ResourceWOP."Source No.")) THEN BEGIN
+            IF (EmployeeString = '') THEN
+              EmployeeString := ResourceWOP."Source No."
+            ELSE
+              EmployeeString := EmployeeString + 's' + ResourceWOP."Source No.";
+            TempEmployee."No." := ResourceWOP."Source No.";
+            IF (TempEmployee.INSERT) THEN;
+          END;
+        END;
+      UNTIL (WorkOrder.NEXT = 0);
+      EXIT(EmployeeString);
+    END;
+
+    BEGIN
+    {
+      This codeunit has 2 entrypoints:
+      1. OnRun which performs an export from Nav to SQL
+      2. Import which performs an import from SQL to Nav
+    }
+    END.
+  }
+}
+

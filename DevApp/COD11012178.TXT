@@ -1,0 +1,1693 @@
+OBJECT Codeunit 11012178 Site Mngmnt. Hours
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      TempHoursLineRec@1100485011 : TEMPORARY Record 11012039;
+      TempExpensesRec@1100525001 : TEMPORARY Record 11012361;
+      SiteMngmntHoursSetup@1100485006 : Record 11012355;
+      DimensionValueRec@1100485012 : Record 349;
+      DimensionValueRec2@1100485022 : Record 349;
+      DimensionValueRec3@1100525002 : Record 349;
+      gLineNoInt@1100485007 : Integer;
+      gLineNoInt2@1100525003 : Integer;
+      DrivenKm@1100485009 : Decimal;
+      Text000@1100409000 : TextConst 'ENU=Incorrect Start and End Time Setup of the CAO.';
+      Text001@1100528401 : TextConst 'ENU=Posting cancelled, there are still open %1s for %2 %3, %4 %5, %6 %7 and %8 %9.';
+      Text002@1100528300 : TextConst 'ENU=Not All Lines are consented.';
+      Text006@1100525000 : TextConst 'ENU=Process aborted, %1 %2 already has hours posted in %3 %4 %5 %6.';
+      Text007@1100485023 : TextConst 'ENU=Duty-free mileage repayment consists of multiple cost objects, \rate can not be calculated.';
+      i@1100485030 : Integer;
+      CUPostHours@1100525004 : Codeunit 11012179;
+      DimMgt@1100525006 : Codeunit 408;
+      ExternalBl@1100525005 : Boolean;
+      HourLinesInserted@1100528400 : Boolean;
+
+    PROCEDURE CreateLines@1100525004(HoursHeader@1100525001 : Record 11012360;ShowLines@1100525000 : Boolean;ProjectTotals@1100525012 : Boolean;ProjectNo@1100525013 : Code[20];CalcProjectTotals@1100525014 : Boolean;PostHoursBl@1100525015 : Boolean) : Boolean;
+    VAR
+      HoursLine@1100525002 : Record 11012361;
+      OvertimeRulesRec@1100525020 : Record 11012441;
+      PostedHourHeader@1100525019 : Record 11012084;
+      DaysInt@1100525003 : Integer;
+      PostHours@1100525004 : Decimal;
+      CumNormHours@1100525006 : Decimal;
+      NormHours@1100525007 : Decimal;
+      OvertimeDay@1100525008 : Decimal;
+      NormaltimeDay@1100525009 : Decimal;
+      OvertimeWeek@1100525010 : Decimal;
+      NormalTimeWeek@1100525011 : Decimal;
+      PlantLine@1100525005 : Boolean;
+    BEGIN
+      HourLinesInserted := FALSE;
+      TempHoursLineRec.RESET;
+      IF NOT CalcProjectTotals THEN
+        TempHoursLineRec.DELETEALL;
+      TempHoursLineRec.INIT; //Init and fill these fiels needed for if no hours found (else filled with fields of the previous header)
+      TempHoursLineRec.Year := HoursHeader.Year;
+      TempHoursLineRec.Week := HoursHeader.Week;
+      TempHoursLineRec."Employee No." := HoursHeader."Employee No.";
+      TempHoursLineRec."Supplying Company" := HoursHeader."Supplying Company";
+
+      TempExpensesRec.RESET;
+      TempExpensesRec.DELETEALL;
+
+      CalcProjectTotals := TRUE;
+      SiteMngmntHoursSetup.GET;
+
+      IF PostHoursBl THEN BEGIN
+        SiteMngmntHoursSetup.CheckPostingInWeekAllowed(HoursHeader.Year, HoursHeader.Week, HoursHeader."Supplying Company", TRUE);
+        CheckLines(HoursHeader);
+      END;
+
+      WITH HoursLine DO BEGIN
+        SETRANGE(Year,HoursHeader.Year);
+        SETRANGE(Week,HoursHeader.Week);
+        SETRANGE("Supplying Company",HoursHeader."Supplying Company");
+        SETRANGE("Employee No.",HoursHeader."Employee No.");
+        SETFILTER(Type, '<>%1', Type::UnmannedPlant);
+        IF (SiteMngmntHoursSetup."Consent Hours") THEN //T005907.n
+          SETFILTER(Status, '<>%1', Status::Posted);
+        IF ((SiteMngmntHoursSetup."Consent Hours") AND (SiteMngmntHoursSetup."Overrule Created")) AND PostHoursBl THEN
+          SETRANGE(Status, Status::Approved);
+        IF ProjectTotals THEN
+          SETRANGE("Object No.",ProjectNo);
+        FOR DaysInt := 1 TO 7 DO BEGIN
+          PostHours := 0;
+          IF GetOvertimeRules(
+            HoursHeader.Year, HoursHeader.Week,
+            HoursHeader."Supplying Company", HoursHeader."Employee No.",
+            OvertimeRulesRec, DaysInt, CumNormHours, PostHoursBl)
+          THEN BEGIN
+            NormHours := CumNormHours;
+            IF FINDSET(FALSE,FALSE) THEN BEGIN
+              REPEAT
+                //kzwerver, 120824, sn, #T000635
+                IF (PostHoursBl) AND (HoursLine.Type = Type::Project) THEN
+                  CheckCAO(HoursLine."Object No.", "Employee No.");
+                //kzwerver, 120824, sn, #T000635
+                //27-01-10 check hours already posted
+                IF (NOT SiteMngmntHoursSetup."Overrule Created") AND PostHoursBl THEN
+                  IF ("Employee No." <> '') AND (("Supplying Company" = '') OR ("Supplying Company" = COMPANYNAME)) THEN BEGIN
+                    PostedHourHeader.SETRANGE(Year, Year);
+                    PostedHourHeader.SETRANGE(Week, Week);
+                    PostedHourHeader.SETRANGE("Employee No.", "Employee No.");
+                    IF PostedHourHeader.FINDFIRST THEN
+                      ERROR(
+                        Text006, FIELDCAPTION("Employee No."), "Employee No.",
+                        FIELDCAPTION(Year), Year, FIELDCAPTION(Week), Week);
+                  END;
+                //
+
+                //Call C005136 sn
+                PlantLine := FALSE;
+                IF "Cost Object" <> '' THEN BEGIN
+                //C011306
+                //DimensionValueRec3.RESET;
+                //DimensionValueRec3.CHANGECOMPANY("Receiving Company");
+                //DimensionValueRec3.SETRANGE("Global Dimension No.",2);
+                //DimensionValueRec3.SETRANGE(Code, "Cost Object");
+                //IF DimensionValueRec3.FINDFIRST THEN
+                  DimMgt.GetDimValueRec(2,"Cost Object",DimensionValueRec3,FALSE,'');
+                //
+                  IF DimensionValueRec3."Cost Type" = DimensionValueRec3."Cost Type"::Plant THEN
+                    PlantLine := TRUE;
+                END;
+                //Call C005136 en
+
+                //
+                CASE DaysInt OF
+                  1:BEGIN
+                      IF "Component Type" = "Component Type"::Hours THEN
+                        CreateTempProjectExpenses(HoursLine,1);
+                      IF ("Wage Component" = '') AND (NOT PlantLine) THEN BEGIN   //call C005136 c
+                        Monday := Monday - "Overtime Hours Monday";
+                        EvaluateCAO(Monday,PostHours,NormHours,CumNormHours,OvertimeRulesRec,OvertimeDay,NormaltimeDay,
+                                    OvertimeWeek,NormalTimeWeek,HoursLine,DaysInt,1);
+                        IF "Overtime Hours Monday" > 0 THEN
+                          InsertHourLines(HoursLine,"Overtime Comp. Monday",DaysInt,
+                                          "Overtime Hours Monday",Amount,0,"Cost Object",0,'',0,0D)
+                      END ELSE BEGIN
+                        IF "Component Type" = "Component Type"::Kilometers THEN BEGIN
+                          IF NOT ProjectTotals THEN
+                            CreateTravelRewards(HoursLine,DaysInt,"Supplying Company")
+                        END ELSE BEGIN
+                          IF (Monday <> 0) AND ("Component Type" = "Component Type"::Hours) THEN
+                            InsertHourLines(HoursLine,"Wage Component",1,Monday,0,0,"Cost Object",0,'',0,0D);
+                          //*C-027136.so
+                          //IF (Amount <> 0) AND ("Component Type" = "Component Type"::Expenses) THEN
+                          //  InsertHourLines(HoursLine,"Wage Component",1,Monday,Amount,6,"Cost Object",0,'');
+                          //*C-027136.eo
+                          //*C-027136.sn
+                          IF (Quantity <> 0) AND (Amount <> 0) AND ("Component Type" = "Component Type"::Expenses) THEN
+                            InsertHourLines(HoursLine,"Wage Component",1,0,Amount,6,"Cost Object",0,'',Quantity,0D);
+                          //*C-027136.en
+                        END;
+                      END;
+                    END;
+                  2:BEGIN
+                      IF "Component Type" = "Component Type"::Hours THEN
+                        CreateTempProjectExpenses(HoursLine,2);
+                      //IF "Wage Component" = '' THEN BEGIN
+                      IF ("Wage Component" = '') AND (NOT PlantLine) THEN BEGIN   //call C005136 c
+                        Tuesday := Tuesday - "Overtime Hours Tuesday";
+                        EvaluateCAO(Tuesday,PostHours,NormHours,CumNormHours,OvertimeRulesRec,OvertimeDay,NormaltimeDay,
+                                    OvertimeWeek,NormalTimeWeek,HoursLine,DaysInt,1);
+                        IF "Overtime Hours Tuesday" > 0 THEN
+                          InsertHourLines(HoursLine,"Overtime Comp.Tuesday",DaysInt,
+                                          "Overtime Hours Tuesday",0,0,"Cost Object",0,'',0,0D)
+                      END ELSE BEGIN
+                        IF "Component Type" = "Component Type"::Kilometers THEN BEGIN
+                          IF NOT ProjectTotals THEN
+                            CreateTravelRewards(HoursLine,DaysInt,"Supplying Company")
+                        END ELSE
+                          IF (Tuesday <> 0) AND ("Component Type" = "Component Type"::Hours) THEN
+                            InsertHourLines(HoursLine,"Wage Component",2,Tuesday,0,0,"Cost Object",0,'',0,0D);
+                      END;
+                    END;
+                  3:BEGIN
+                      IF "Component Type" = "Component Type"::Hours THEN
+                        CreateTempProjectExpenses(HoursLine,3);
+                      //IF "Wage Component" = '' THEN BEGIN
+                      IF ("Wage Component" = '') AND (NOT PlantLine) THEN BEGIN   //call C005136 c
+                        Wednesday := Wednesday - "Overtime Hours Wednesday";
+                        EvaluateCAO(Wednesday,PostHours,NormHours,CumNormHours,OvertimeRulesRec,OvertimeDay,NormaltimeDay,
+                                    OvertimeWeek,NormalTimeWeek,HoursLine,DaysInt,1);
+                        IF "Overtime Hours Wednesday" > 0 THEN
+                          InsertHourLines(HoursLine,"Overtime Comp.Wednesday",DaysInt,
+                                          "Overtime Hours Wednesday",0,0,"Cost Object",0,'',0,0D)
+                      END ELSE BEGIN
+                        IF "Component Type" = "Component Type"::Kilometers THEN BEGIN
+                          IF NOT ProjectTotals THEN
+                            CreateTravelRewards(HoursLine,DaysInt,"Supplying Company")
+                        END ELSE
+                          IF (Wednesday <> 0) AND ("Component Type" = "Component Type"::Hours) THEN
+                            InsertHourLines(HoursLine,"Wage Component",3,Wednesday,0,0,"Cost Object",0,'',0,0D);
+                      END;
+                    END;
+                  4:BEGIN
+                      IF "Component Type" = "Component Type"::Hours THEN
+                        CreateTempProjectExpenses(HoursLine,4);
+                      //IF "Wage Component" = '' THEN BEGIN
+                      IF ("Wage Component" = '') AND (NOT PlantLine) THEN BEGIN   //call C005136 c
+                        Thursday := Thursday - "Overtime Hours Thursday";
+                        EvaluateCAO(Thursday,PostHours,NormHours,CumNormHours,OvertimeRulesRec,OvertimeDay,NormaltimeDay,
+                                    OvertimeWeek,NormalTimeWeek,HoursLine,DaysInt,1);
+                        IF "Overtime Hours Thursday" > 0 THEN
+                          InsertHourLines(HoursLine,"Overtime Comp.Thursday",DaysInt,
+                                          "Overtime Hours Thursday",0,0,"Cost Object",0,'',0,0D)
+                      END ELSE BEGIN
+                        IF "Component Type" = "Component Type"::Kilometers THEN BEGIN
+                          IF NOT ProjectTotals THEN
+                            CreateTravelRewards(HoursLine,DaysInt,"Supplying Company")
+                        END ELSE
+                          IF (Thursday <> 0) AND ("Component Type" = "Component Type"::Hours) THEN
+                            InsertHourLines(HoursLine,"Wage Component",4,Thursday,0,0,"Cost Object",0,'',0,0D);
+                      END;
+                    END;
+                  5:BEGIN
+                      IF "Component Type" = "Component Type"::Hours THEN
+                        CreateTempProjectExpenses(HoursLine,5);
+                      //IF "Wage Component" = '' THEN BEGIN
+                      IF ("Wage Component" = '') AND (NOT PlantLine) THEN BEGIN   //call C005136 c
+                         Friday := Friday - "Overtime Hours Friday";
+                        EvaluateCAO(Friday,PostHours,NormHours,CumNormHours,OvertimeRulesRec,OvertimeDay,NormaltimeDay,
+                                    OvertimeWeek,NormalTimeWeek,HoursLine,DaysInt,1);
+                        IF "Overtime Hours Friday" > 0 THEN
+                          InsertHourLines(HoursLine,"Overtime Comp.Friday",DaysInt,
+                                          "Overtime Hours Friday",0,0,"Cost Object",0,'',0,0D)
+                      END ELSE BEGIN
+                        IF "Component Type" = "Component Type"::Kilometers THEN BEGIN
+                          IF NOT ProjectTotals THEN
+                            CreateTravelRewards(HoursLine,DaysInt,"Supplying Company")
+                        END ELSE
+                          IF (Friday <> 0) AND ("Component Type" = "Component Type"::Hours) THEN
+                            InsertHourLines(HoursLine,"Wage Component",5,Friday,0,0,"Cost Object",0,'',0,0D);
+                      END;
+                    END;
+                  6:BEGIN
+                      IF "Component Type" = "Component Type"::Hours THEN
+                        CreateTempProjectExpenses(HoursLine,6);
+                      //IF "Wage Component" = '' THEN BEGIN
+                      IF ("Wage Component" = '') AND (NOT PlantLine) THEN BEGIN   //call C005136 c
+                        Saturday := Saturday - "Overtime Hours Saturday";
+                        EvaluateCAO(Saturday,PostHours,NormHours,CumNormHours,OvertimeRulesRec,OvertimeDay,NormaltimeDay,
+                                    OvertimeWeek,NormalTimeWeek,HoursLine,DaysInt,1);
+                        IF "Overtime Hours Saturday" > 0 THEN
+                          InsertHourLines(HoursLine,"Overtime Comp.Saturday",DaysInt,
+                                          "Overtime Hours Saturday",0,0,"Cost Object",0,'',0,0D)
+                      END ELSE BEGIN
+                        IF "Component Type" = "Component Type"::Kilometers THEN BEGIN
+                          IF NOT ProjectTotals THEN
+                            CreateTravelRewards(HoursLine,DaysInt,"Supplying Company")
+                        END ELSE
+                          IF (Saturday <> 0) AND ("Component Type" = "Component Type"::Hours) THEN
+                            InsertHourLines(HoursLine,"Wage Component",6,Saturday,0,0,"Cost Object",0,'',0,0D);
+                      END;
+                    END;
+                  7:BEGIN
+                      IF "Component Type" = "Component Type"::Hours THEN
+                        CreateTempProjectExpenses(HoursLine,7);
+                      //IF "Wage Component" = '' THEN BEGIN
+                      IF ("Wage Component" = '') AND (NOT PlantLine) THEN BEGIN   //call C005136 c
+                        Sunday := Sunday - "Overtime Hours Sunday";
+                        EvaluateCAO(Sunday,PostHours,NormHours,CumNormHours,OvertimeRulesRec,OvertimeDay,NormaltimeDay,
+                                    OvertimeWeek,NormalTimeWeek,HoursLine,DaysInt,1);
+                        IF "Overtime Hours Sunday" > 0 THEN
+                          InsertHourLines(HoursLine,"Overtime Comp.Sunday",DaysInt,
+                                          "Overtime Hours Sunday",0,0,"Cost Object",0,'',0,0D)
+                      END ELSE BEGIN
+                        IF "Component Type" = "Component Type"::Kilometers THEN BEGIN
+                          IF NOT ProjectTotals THEN
+                            CreateTravelRewards(HoursLine,DaysInt,"Supplying Company")
+                        END ELSE
+                          IF (Sunday <> 0) AND ("Component Type" = "Component Type"::Hours) THEN
+                            InsertHourLines(HoursLine,"Wage Component",7,Sunday,0,0,"Cost Object",0,'',0,0D);
+                      END;
+                    END;
+                 END;
+              UNTIL NEXT = 0
+            END;
+          END;
+        END;
+      END;
+
+      //evalueren projectvergoedingen
+      EvaluateTempExpensesRec;
+
+      TempHoursLineRec.RESET;
+      IF ShowLines THEN
+        PAGE.RUNMODAL(PAGE::"Site Mngmnt Temp. hour lines", TempHoursLineRec);
+
+      IF PostHoursBl THEN BEGIN
+        CUPostHours.PostHours(TempHoursLineRec);
+        IF HoursLine.FINDSET THEN
+          REPEAT
+          IF SiteMngmntHoursSetup."Consent Hours" THEN //T005907.n
+              HandleHoursConsentLines(HoursLine);
+            HoursLine.Posted;
+          UNTIL HoursLine.NEXT = 0;
+      END;
+
+      EXIT(HourLinesInserted);
+    END;
+
+    PROCEDURE CheckLines@1100525009(HoursHeader@1100525000 : Record 11012360);
+    VAR
+      HoursLine@1100525001 : Record 11012361;
+    BEGIN
+      WITH HoursLine DO BEGIN
+        //* Type Plant: Check Plant Location filled (17430)
+        SETRANGE(Year,HoursHeader.Year);
+        SETRANGE(Week,HoursHeader.Week);
+        SETRANGE("Supplying Company",HoursHeader."Supplying Company");
+        SETRANGE("Employee No.",HoursHeader."Employee No.");
+        SETRANGE(Type, Type::Plant);
+        IF FINDSET(FALSE,FALSE) THEN BEGIN
+          REPEAT
+            TESTFIELD("Plant Location");
+            ValidatePlantNo;//**4PS,sn, SR, 10-12-13 Melding C004021
+          UNTIL NEXT = 0;
+        END;
+      END;
+
+      IF ((SiteMngmntHoursSetup."Consent Hours") AND (NOT SiteMngmntHoursSetup."Overrule Created")) THEN BEGIN
+        IF (NOT CheckAllConsentLinesApproved(HoursHeader)) THEN //all lines this week: consent=true
+          ERROR(Text002);
+      END;
+    END;
+
+    PROCEDURE CheckCAO@1100409000(ProjectCode@1100409001 : Code[20];EmployeeCode@1100409002 : Code[20]);
+    VAR
+      ProjectShiftSMF@1100409000 : Record 11125538;
+      Employee@1100409003 : Record 5200;
+      SiteMngmntOvertimeRules@1100409004 : Record 11012441;
+    BEGIN
+      //kzwerver, 120824, sn, #T000635
+      //kzwerver, 121219, c, #C004044
+      SiteMngmntHoursSetup.GET;
+      IF (NOT SiteMngmntHoursSetup."Overtime Rules Based on Times") THEN
+        EXIT;
+
+      ProjectShiftSMF.SETRANGE("Project No.", ProjectCode);
+      ProjectShiftSMF.SETFILTER("Shift Code", '%1', '');
+      ProjectShiftSMF.SETFILTER("Starting Time", '<>%1', 0T);
+      IF (ProjectShiftSMF.FINDFIRST) THEN BEGIN
+        IF (Employee.GET(EmployeeCode)) AND (Employee.CAO <> '') THEN BEGIN
+          SiteMngmntOvertimeRules.SETRANGE(Type, SiteMngmntOvertimeRules.Type::CAO);
+          SiteMngmntOvertimeRules.SETRANGE(Code, Employee.CAO);
+          SiteMngmntOvertimeRules.SETFILTER("Starting Time", '%1', 0T);
+          IF (SiteMngmntOvertimeRules.FINDFIRST) THEN
+            ERROR(Text000);
+        END;
+      END;
+    END;
+
+    PROCEDURE CreateUnmannedPlantLines@1100525003(IHoursHeader@1100525005 : Record 11012360;IProjectNo@1100525002 : Code[20];VAR OCreatedLines@1100525001 : Integer);
+    VAR
+      lvHoursLine@1100525006 : Record 11012361;
+      lvHourProjLine@1100525000 : Record 11012363;
+      lvLineNo@1100525007 : Integer;
+      PrevPlantCompany@1210190000 : Text[30];
+    BEGIN
+      OCreatedLines := 0;
+      IF IHoursHeader."Employee No." <> '' THEN  //* Unmanned plant only possible if employee is not filled
+        EXIT;
+      SiteMngmntHoursSetup.GET;
+
+      WITH lvHoursLine DO BEGIN
+        SETRANGE(Year,IHoursHeader.Year);
+        SETRANGE(Week,IHoursHeader.Week);
+        SETRANGE("Supplying Company",IHoursHeader."Supplying Company");
+        SETRANGE("Employee No.",IHoursHeader."Employee No.");
+        SETRANGE(Type, Type::UnmannedPlant);
+        SETRANGE("Plant Hour Rev. Line No.", 0);  //* Indication 'Not created'
+        //* Note: When the unmanned plant hour line is created and afterwards the hour acc. line is modified, then the
+        //*       plant hour line is deleted (if not posted, otherwise modify is not possible) and "Plant Hour Rev. Line No."
+        //*       is set to 0. So always create new plant hour lines, update is not necessary.
+        IF IProjectNo <> '' THEN
+          SETRANGE("Object No.",IProjectNo);
+
+        //* Check
+        IF FINDSET(FALSE,FALSE) THEN BEGIN
+          REPEAT
+            TESTFIELD("Plant Location");
+            TESTFIELD("Plant Type");
+            TESTFIELD("Plant No.");
+            TESTFIELD("Plant Company");
+            IF "Plant Company" <> PrevPlantCompany THEN BEGIN
+              SiteMngmntHoursSetup.CheckPostingInWeekAllowed(Year, Week, "Plant Company", TRUE);
+              PrevPlantCompany := "Plant Company";
+            END;
+          UNTIL NEXT = 0
+        END;
+
+        //* Create
+        IF FINDSET(TRUE,FALSE) THEN BEGIN
+          REPEAT
+            IF SiteMngmntHoursSetup."Consent Hours" THEN BEGIN
+              HandleHoursConsentLines(lvHoursLine);
+              lvHoursLine.Posted;
+            END;
+
+            lvLineNo := CUPostHours.UpdatePlantHourRevLine(IHoursHeader, lvHoursLine);
+            IF lvLineNo <> 0 THEN BEGIN
+              OCreatedLines := OCreatedLines + 1;
+              "Plant Hour Rev. Line No." := lvLineNo;
+              MODIFY;
+              IF "Connection No." <> 0 THEN BEGIN
+                lvHourProjLine.RESET;
+                lvHourProjLine.SETCURRENTKEY("Connection No.");
+                lvHourProjLine.SETRANGE("Connection No.", "Connection No.");
+                IF lvHourProjLine.FINDFIRST THEN BEGIN
+                  lvHourProjLine."Plant Hour Rev. Line No." := "Plant Hour Rev. Line No.";
+                  lvHourProjLine.MODIFY;
+                END;
+              END;
+            END;
+          UNTIL NEXT = 0
+        END;
+      END;
+    END;
+
+    PROCEDURE CalcTotals@1100525001(HourLine@1100525005 : Record 11012361;VAR TotalHoursOvertime@1100525006 : ARRAY [8] OF Decimal;VAR TotalHoursNormal@1100525007 : ARRAY [8] OF Decimal);
+    VAR
+      lvTimeLines@1100525000 : Record 11012361;
+      lvDayTotal@1100525001 : ARRAY [7] OF Decimal;
+      i@1100525002 : Integer;
+      OvertimeRulesRec@1100525008 : Record 11012441;
+      lvNormHours@1100525009 : Decimal;
+      lvPostHours@1100525010 : Decimal;
+    BEGIN
+      WITH lvTimeLines DO BEGIN
+        SETRANGE(Year,HourLine.Year);
+        SETRANGE(Week,HourLine.Week);
+        SETRANGE("Supplying Company",HourLine."Supplying Company");
+        SETRANGE("Employee No.",HourLine."Employee No.");
+        SETFILTER(Type, '<>%1', Type::UnmannedPlant);
+
+        IF FINDSET(FALSE,FALSE) THEN BEGIN
+          REPEAT
+            HandleScreenTotals(TotalHoursOvertime,TotalHoursNormal,lvDayTotal,lvTimeLines);
+          UNTIL NEXT = 0;
+        END;
+
+        FOR i := 1 TO 7 DO BEGIN
+          GetOvertimeRules(
+            HourLine.Year, HourLine.Week, HourLine."Supplying Company", HourLine."Employee No.",
+            OvertimeRulesRec,i,lvNormHours,FALSE);
+          EvaluateCAO(lvDayTotal[i],lvPostHours,lvNormHours,lvNormHours,OvertimeRulesRec,TotalHoursOvertime[i],TotalHoursNormal[i],
+                      TotalHoursOvertime[8],TotalHoursNormal[8],lvTimeLines,i,0);
+        END;
+
+        //Call C-026960
+        TotalHoursOvertime[8] :=0;
+        TotalHoursNormal[8] := 0;
+        FOR i := 1 TO 7 DO BEGIN
+          TotalHoursOvertime[8] := TotalHoursOvertime[8] + TotalHoursOvertime[i];
+          TotalHoursNormal[8] := TotalHoursNormal[8] + TotalHoursNormal[i];
+        END;
+        //
+
+      END;
+    END;
+
+    PROCEDURE CalcProjHourLines@1100525011(VAR TotalProjectHoursOvertime@1100525004 : ARRAY [8] OF Decimal;VAR TotalProjectHoursNormal@1100525003 : ARRAY [8] OF Decimal);
+    VAR
+      lvWageCompRec@1100525002 : Record 11012014;
+    BEGIN
+      WITH TempHoursLineRec DO BEGIN
+        RESET;
+        IF FINDSET THEN
+          REPEAT
+            "Total Line" := (Monday + Tuesday + Wednesday + Thursday + Friday + Saturday + Sunday);
+            IF GetWageComp("Wage Component","Supplying Company",lvWageCompRec) THEN BEGIN
+              TotalProjectHoursOvertime[1] := TotalProjectHoursOvertime[1] + Monday;
+              TotalProjectHoursOvertime[2] := TotalProjectHoursOvertime[2] + Tuesday;
+              TotalProjectHoursOvertime[3] := TotalProjectHoursOvertime[3] + Wednesday;
+              TotalProjectHoursOvertime[4] := TotalProjectHoursOvertime[4] + Thursday;
+              TotalProjectHoursOvertime[5] := TotalProjectHoursOvertime[5] + Friday;
+              TotalProjectHoursOvertime[6] := TotalProjectHoursOvertime[6] + Saturday;
+              TotalProjectHoursOvertime[7] := TotalProjectHoursOvertime[7] + Sunday;
+              TotalProjectHoursOvertime[8] := TotalProjectHoursOvertime[8] + "Total Line";
+            END ELSE BEGIN
+              TotalProjectHoursNormal[1] := TotalProjectHoursNormal[1] + Monday;
+              TotalProjectHoursNormal[2] := TotalProjectHoursNormal[2] + Tuesday;
+              TotalProjectHoursNormal[3] := TotalProjectHoursNormal[3] + Wednesday;
+              TotalProjectHoursNormal[4] := TotalProjectHoursNormal[4] + Thursday;
+              TotalProjectHoursNormal[5] := TotalProjectHoursNormal[5] + Friday;
+              TotalProjectHoursNormal[6] := TotalProjectHoursNormal[6] + Saturday;
+              TotalProjectHoursNormal[7] := TotalProjectHoursNormal[7] + Sunday;
+              TotalProjectHoursNormal[8] := TotalProjectHoursNormal[8] + "Total Line";
+            END;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE HandleScreenTotals@1100525006(VAR TotalHoursOvertime@1100525002 : ARRAY [8] OF Decimal;VAR TotalHoursNormal@1100525001 : ARRAY [8] OF Decimal;VAR lvDayTotal@1100525003 : ARRAY [7] OF Decimal;lvTimeLines@1100525000 : Record 11012361);
+    VAR
+      lvWageCompRec@1100525004 : Record 11012014;
+    BEGIN
+      WITH lvTimeLines DO BEGIN
+        IF "Wage Component" <> '' THEN BEGIN
+          GetWageComp("Wage Component","Supplying Company",lvWageCompRec);
+          IF lvWageCompRec."Component Type" <> lvWageCompRec."Component Type"::Hours THEN
+            EXIT;
+        END;
+        IF "Wage Component" = '' THEN BEGIN
+          IF "Component Type" = "Component Type"::Hours THEN BEGIN
+            lvDayTotal[1] := lvDayTotal[1] + Monday - "Overtime Hours Monday";
+            CalcOvertimeException(TotalHoursOvertime,TotalHoursNormal,"Overtime Hours Monday",1,"Overtime Comp. Monday",
+                                  "Supplying Company");
+            lvDayTotal[2] := lvDayTotal[2] + Tuesday - "Overtime Hours Tuesday";
+            CalcOvertimeException(TotalHoursOvertime,TotalHoursNormal,"Overtime Hours Tuesday",2,"Overtime Comp.Tuesday",
+                                  "Supplying Company");
+            lvDayTotal[3] := lvDayTotal[3] + Wednesday - "Overtime Hours Wednesday";
+            CalcOvertimeException(TotalHoursOvertime,TotalHoursNormal,"Overtime Hours Wednesday",3,"Overtime Comp.Wednesday",
+                                  "Supplying Company");
+            lvDayTotal[4] := lvDayTotal[4] + Thursday - "Overtime Hours Thursday";
+            CalcOvertimeException(TotalHoursOvertime,TotalHoursNormal,"Overtime Hours Thursday",4,"Overtime Comp.Thursday",
+                                  "Supplying Company");
+            lvDayTotal[5] := lvDayTotal[5] + Friday - "Overtime Hours Friday";
+            CalcOvertimeException(TotalHoursOvertime,TotalHoursNormal,"Overtime Hours Friday",5,"Overtime Comp.Friday",
+                                  "Supplying Company");
+            lvDayTotal[6] := lvDayTotal[6] + Saturday - "Overtime Hours Saturday";
+            CalcOvertimeException(TotalHoursOvertime,TotalHoursNormal,"Overtime Hours Saturday",6,"Overtime Comp.Saturday",
+                                  "Supplying Company");
+            lvDayTotal[7] := lvDayTotal[7] + Sunday - "Overtime Hours Sunday";
+            CalcOvertimeException(TotalHoursOvertime,TotalHoursNormal,"Overtime Hours Sunday",7,"Overtime Comp.Sunday",
+                                  "Supplying Company");
+          END;
+        END ELSE BEGIN
+          CALCFIELDS("Total Hours");
+          IF NOT lvWageCompRec.Overtime THEN BEGIN
+            //TotalHoursNormal[8] := TotalHoursNormal[8] + "Total Hours";
+            TotalHoursNormal[1] := TotalHoursNormal[1] + Monday;
+            TotalHoursNormal[2] := TotalHoursNormal[2] + Tuesday;
+            TotalHoursNormal[3] := TotalHoursNormal[3] + Wednesday;
+            TotalHoursNormal[4] := TotalHoursNormal[4] + Thursday;
+            TotalHoursNormal[5] := TotalHoursNormal[5] + Friday;
+            TotalHoursNormal[6] := TotalHoursNormal[6] + Saturday;
+            TotalHoursNormal[7] := TotalHoursNormal[7] + Sunday;
+          END ELSE BEGIN
+            TotalHoursOvertime[8] := TotalHoursOvertime[8] + "Total Line";
+            TotalHoursOvertime[1] := TotalHoursOvertime[1] + Monday;
+            TotalHoursOvertime[2] := TotalHoursOvertime[2] + Tuesday;
+            TotalHoursOvertime[3] := TotalHoursOvertime[3] + Wednesday;
+            TotalHoursOvertime[4] := TotalHoursOvertime[4] + Thursday;
+            TotalHoursOvertime[5] := TotalHoursOvertime[5] + Friday;
+            TotalHoursOvertime[6] := TotalHoursOvertime[6] + Saturday;
+            TotalHoursOvertime[7] := TotalHoursOvertime[7] + Sunday;
+          END;
+        END;
+      END;
+    END;
+
+    PROCEDURE GetOvertimeRules@1100485009(IYear@1100525004 : Integer;IWeek@1100525005 : Integer;ISupplyingCompany@1100525000 : Text[30];IEmployeeNo@1100525001 : Code[20];VAR OvertimeRulesRec@1100485000 : Record 11012441;IDayNo@1100485001 : Integer;VAR Normhours@1100485004 : Decimal;ThrowErrorIfNoRulesFound@1100528400 : Boolean) OvertimePresent : Boolean;
+    VAR
+      lvEmplRec@1100485003 : Record 5200;
+      lvWrkHrsStartTime@1100525003 : Time;
+      lvTimeZero@1100525002 : Time;
+    BEGIN
+      lvEmplRec.CHANGECOMPANY(ISupplyingCompany);
+      IF NOT lvEmplRec.GET(IEmployeeNo) THEN
+        EXIT;
+      lvEmplRec.TESTFIELD(CAO);
+      IF lvEmplRec.External THEN
+        ExternalBl := TRUE
+      ELSE
+        ExternalBl := FALSE;
+
+      OvertimeRulesRec.CHANGECOMPANY(ISupplyingCompany);
+      OvertimeRulesRec.SETRANGE(Type,OvertimeRulesRec.Type::CAO);
+      OvertimeRulesRec.SETRANGE(Code,lvEmplRec.CAO);
+
+      CASE IDayNo OF
+        1: OvertimeRulesRec.SETRANGE(Day,OvertimeRulesRec.Day::Monday);
+        2: OvertimeRulesRec.SETRANGE(Day,OvertimeRulesRec.Day::Tuesday);
+        3: OvertimeRulesRec.SETRANGE(Day,OvertimeRulesRec.Day::Wednesday);
+        4: OvertimeRulesRec.SETRANGE(Day,OvertimeRulesRec.Day::Thursday);
+        5: OvertimeRulesRec.SETRANGE(Day,OvertimeRulesRec.Day::Friday);
+        6: OvertimeRulesRec.SETRANGE(Day,OvertimeRulesRec.Day::Saturday);
+        7: OvertimeRulesRec.SETRANGE(Day,OvertimeRulesRec.Day::Sunday);
+      END;
+      GetProjectWorkingTimes(IYear, IWeek, ISupplyingCompany, IEmployeeNo, IDayNo, lvWrkHrsStartTime);
+      IF (lvWrkHrsStartTime <> 0T) THEN BEGIN
+        EVALUATE(lvTimeZero, '0');
+        OvertimeRulesRec.SETFILTER("Starting Time", '<=%1', lvWrkHrsStartTime);
+        OvertimeRulesRec.SETFILTER("Ending Time", '>%1|%2', lvWrkHrsStartTime,lvTimeZero); //* Greater than start (so not '>=') or 0:00.
+      END ELSE BEGIN
+        OvertimeRulesRec.SETRANGE("Starting Time");  //* Reset filters on Start and End Time
+        OvertimeRulesRec.SETRANGE("Ending Time");
+      END;
+
+      IF ThrowErrorIfNoRulesFound THEN BEGIN
+        OvertimeRulesRec.FINDFIRST;
+        Normhours := OvertimeRulesRec.Hours;
+        EXIT(TRUE);
+      END ELSE
+        IF OvertimeRulesRec.FINDFIRST THEN BEGIN
+          Normhours := OvertimeRulesRec.Hours;
+          EXIT(TRUE);
+        END ELSE BEGIN
+          Normhours := 0;
+          EXIT(FALSE);
+        END;
+    END;
+
+    PROCEDURE GetProjectWorkingTimes@1100525008(IYear@1100525003 : Integer;IWeek@1100525009 : Integer;ISupplCompany@1100525010 : Text[30];IEmplNo@1100525011 : Code[20];IDayNo@1100525008 : Integer;VAR OWrkHrsStartTime@1100525005 : Time);
+    VAR
+      lvSiteMgtHourLineRec@1100525012 : Record 11012361;
+      lvOvertimeRulesRec@1100525000 : Record 11012441;
+      SiteMgtWorkingTimes@1100525002 : Record 11125528;
+      ProjShift@1210190000 : Record 11125538;
+      ProjNo@1100525013 : Code[20];
+      ShiftCode@1210190001 : Code[10];
+      ReceivingComp@1210190002 : Text[50];
+    BEGIN
+      OWrkHrsStartTime := 0T;
+
+      IF NOT lvOvertimeRulesRec.CheckSiteMgtBRWTimeBased(ISupplCompany) THEN
+        EXIT;
+
+      WITH lvSiteMgtHourLineRec DO BEGIN
+        SETRANGE(Year, IYear);
+        SETRANGE(Week, IWeek);
+        SETRANGE("Supplying Company", ISupplCompany);
+        SETRANGE("Employee No.", IEmplNo);
+        SETFILTER(Type, '%1|%2', Type::Project, Type::Plant);
+        SETFILTER("Object No.", '<>%1', '');  //* Project No. filled
+        CASE IDayNo OF
+          1: lvSiteMgtHourLineRec.SETFILTER(Monday, '<>%1', 0);
+          2: lvSiteMgtHourLineRec.SETFILTER(Tuesday, '<>%1', 0);
+          3: lvSiteMgtHourLineRec.SETFILTER(Wednesday, '<>%1', 0);
+          4: lvSiteMgtHourLineRec.SETFILTER(Thursday, '<>%1', 0);
+          5: lvSiteMgtHourLineRec.SETFILTER(Friday, '<>%1', 0);
+          6: lvSiteMgtHourLineRec.SETFILTER(Saturday, '<>%1', 0);
+          7: lvSiteMgtHourLineRec.SETFILTER(Sunday, '<>%1', 0);
+        END;
+        //* DP00033 OPMERKING
+        //* Projectnummer werd hier al bepaald. Men is er vanuit gegaan dat werknemer op een dag maar op 1 project werkt.
+        //* Als werknemer op een dag op meerdere project dan heb je dus mogelijk de verkeerde.
+        //* Nu komt er dus ook nog ploegendienst bij. Meestal zal werknemer op een dag maar op 1 project in 1 ploegendienst
+        //* werken, maar dit hoeft beslist niet zo te zijn. Probleem is dat programma hier niet voor elke regel komt, maar
+        //* voor totaal van aantal regels. Nog geprobeerd om dit op te lossen, maar lukt niet zo maar.
+        //* We gaan daarvoor nu niet meer de hele structuur v/g programma aanpassen, zou ook al niet weten hoe dit moet en wordt
+        //* mogelijk ook een drama voor de performance (wordt bij elke regel steeds opnieuw allemaal berekend). Urenverantwoording
+        //* uitvoerder wordt toch nog een keer helemaal aangepakt (aktie bij TZ), dan moet het maar meegenomen worden. Er moet
+        //* dan nog maar eens goed bekeken worden of al die totalen op het muteerscherm nu wel echt nodig zijn.
+        //* Besproken met Tom Z.: Voorlopig maar simpel te houden, dan maar niet helemaal correct. Bovendien komt
+        //* dit niet zo vaak voor, en als iemand al op 2 project werkt in 2 diensten mee draait dan moet men toch eigenlijk
+        //* al zelf de juiste looncomponent ingeven (is maar de vraag og systeem dit dan wel automatisch kan bepalen.
+
+        //*DP00033.so
+        //IF NOT FINDFIRST THEN
+        //  EXIT;
+        //lvProjectNo := "Object No.";
+        //*DP00033.eo
+        //*DP00033.sn
+        SETFILTER("Shift Code", '<>%1', '');  //* First search for shift level
+        IF NOT FINDFIRST THEN BEGIN
+          SETRANGE("Shift Code");  //* Reset filter
+          IF NOT FINDFIRST THEN
+            EXIT;
+        END;
+        ProjNo := "Object No.";
+        ShiftCode := "Shift Code";
+        ReceivingComp := "Receiving Company";
+        //*DP00033.en
+      END;
+
+      //*DP00033.so    Was also not okay for project level (with date=0D), that must be read in the receiving (project) company
+      //IF lvSiteMgtWorkingHoursBRWRec.GET(lvProjectNo, DWY2DATE(IDayNo, IWeek, IYear)) THEN  //* Project-Date Level
+      //  OWrkHrsStartTime := lvSiteMgtWorkingHoursBRWRec."Starting Time"
+      //ELSE BEGIN
+      //  IF lvSiteMgtWorkingHoursBRWRec.GET(lvProjectNo, 0D) THEN  //* Project Level
+      //    OWrkHrsStartTime := lvSiteMgtWorkingHoursBRWRec."Starting Time";
+      //END;
+      //*DP00033.eo
+
+      //*DP00033.sn   If ShiftCode is filled then only read on Shift levels, so not on project levels (with Shift empty)
+      IF SiteMgtWorkingTimes.GET(ProjNo, ShiftCode, DWY2DATE(IDayNo, IWeek, IYear)) THEN BEGIN  //*Project(-Shift)-Date Level
+        IF SiteMgtWorkingTimes."Starting Time" <> 0T THEN
+          OWrkHrsStartTime := SiteMgtWorkingTimes."Starting Time";
+      END;
+      IF OWrkHrsStartTime = 0T THEN BEGIN
+        IF (ReceivingComp <> '') AND (ReceivingComp <> COMPANYNAME) THEN
+          ProjShift.CHANGECOMPANY(ReceivingComp);
+        IF ProjShift.GET(ProjNo, ShiftCode) THEN BEGIN //* Project(-Shift) Level
+          IF  ProjShift."Starting Time" <> 0T THEN
+            OWrkHrsStartTime := ProjShift."Starting Time";
+        END;
+      END;
+    END;
+
+    PROCEDURE GetWageComp@1100525000(WageComp@1100525001 : Code[10];SupplyingCompanyTxt@1100525002 : Text[50];VAR lvWageCompRec@1100525000 : Record 11012014) : Boolean;
+    BEGIN
+      //lvWageCompRec.CHANGECOMPANY(SupplyingCompanyTxt);
+      IF NOT lvWageCompRec.GET(WageComp) THEN
+        EXIT;
+      IF lvWageCompRec.Overtime THEN
+        EXIT(TRUE)
+      ELSE
+        EXIT(FALSE);
+    END;
+
+    PROCEDURE EvaluateCAO@1100525013(VAR TotalHoursDay@1100525011 : Decimal;VAR PostHours@1100525010 : Decimal;VAR NormHours@1100525005 : Decimal;VAR CumNormHours@1100525003 : Decimal;VAR OvertimeRulesRec@1100525002 : Record 11012441;VAR OvertimeDay@1100525004 : Decimal;VAR NormalHoursDay@1100525012 : Decimal;VAR TotalOvertimeWeek@1100525006 : Decimal;VAR TotalNormalTimeWeek@1100525007 : Decimal;HoursLine@1100525001 : Record 11012361;Daysint@1100525000 : Integer;FunctionOpt@1100525013 : 'Screentotals,DisplayLines');
+    VAR
+      lvProcessedHours@1100525008 : Decimal;
+      lvRemainHours@1100525009 : Decimal;
+    BEGIN
+      WHILE TotalHoursDay <> 0 DO BEGIN
+        IF NormHours = 0 THEN BEGIN
+          IF OvertimeRulesRec.NEXT = 0 THEN BEGIN
+            OvertimeDay := OvertimeDay + TotalHoursDay;
+            EXIT;
+          END ELSE BEGIN
+            NormHours := OvertimeRulesRec.Hours - CumNormHours;
+            CumNormHours := OvertimeRulesRec.Hours;
+          END;
+        END;
+        IF PostHours + TotalHoursDay <= NormHours THEN BEGIN
+
+          CASE FunctionOpt OF
+            FunctionOpt::Screentotals:
+              TotalNormalOvertimeHours(HoursLine."Supplying Company",TotalHoursDay,OvertimeRulesRec."Wage Component",
+                                       OvertimeDay,NormalHoursDay,TotalOvertimeWeek,TotalNormalTimeWeek);
+            FunctionOpt::DisplayLines: InsertHourLines(HoursLine,OvertimeRulesRec."Wage Component",Daysint,TotalHoursDay,0,0,
+                                                       HoursLine."Cost Object",0,'',0,0D);
+          END;
+
+          lvProcessedHours := lvProcessedHours + TotalHoursDay;
+          PostHours := PostHours + TotalHoursDay;
+          NormHours := NormHours - TotalHoursDay;
+          TotalHoursDay := 0;
+         END ELSE BEGIN
+          IF TotalHoursDay > NormHours THEN
+            lvRemainHours := NormHours
+          ELSE
+            lvRemainHours := TotalHoursDay;
+
+          CASE FunctionOpt OF
+            FunctionOpt::Screentotals:
+              TotalNormalOvertimeHours(HoursLine."Supplying Company",lvRemainHours,OvertimeRulesRec."Wage Component",
+                                       OvertimeDay,NormalHoursDay,TotalOvertimeWeek,TotalNormalTimeWeek);
+            FunctionOpt::DisplayLines: InsertHourLines(HoursLine,OvertimeRulesRec."Wage Component",Daysint,lvRemainHours,0,0,
+                                                       HoursLine."Cost Object",0,'',0,0D);
+          END;
+
+          NormHours := NormHours - lvRemainHours;
+          PostHours := PostHours + lvRemainHours;
+          TotalHoursDay := TotalHoursDay - lvRemainHours;
+        END;
+      END;
+    END;
+
+    PROCEDURE TotalNormalOvertimeHours@1100525005(SupplyingCompanyTxt@1100525003 : Text[50];lvRemainHoursDec@1100525004 : Decimal;WageCompCde@1100525005 : Code[20];VAR OvertimeDay@1100525001 : Decimal;VAR NormalHoursDay@1100525000 : Decimal;VAR TotalOvertimeWeek@1100525006 : Decimal;VAR TotalNormalTimeWeek@1100525007 : Decimal);
+    VAR
+      lvWageCompRec@1100525002 : Record 11012014;
+    BEGIN
+      IF GetWageComp(WageCompCde,SupplyingCompanyTxt,lvWageCompRec) THEN BEGIN
+        OvertimeDay := OvertimeDay + lvRemainHoursDec;
+        TotalOvertimeWeek := TotalOvertimeWeek + lvRemainHoursDec;
+      END ELSE BEGIN
+        NormalHoursDay := NormalHoursDay + lvRemainHoursDec;
+        TotalNormalTimeWeek := TotalNormalTimeWeek + lvRemainHoursDec;
+      END;
+    END;
+
+    PROCEDURE CalcOvertimeException@1100525014(VAR TotalHoursOvertime@1100525003 : ARRAY [8] OF Decimal;VAR TotalHoursNormal@1100525001 : ARRAY [8] OF Decimal;HoursDec@1100525004 : Decimal;i@1100525000 : Integer;WageCompCde@1100525002 : Code[20];SupplyingCompanyTxt@1100525005 : Text[50]);
+    VAR
+      lvWageCompRec@1100525006 : Record 11012014;
+    BEGIN
+      IF GetWageComp(WageCompCde,SupplyingCompanyTxt,lvWageCompRec) THEN BEGIN
+        TotalHoursOvertime[i] := TotalHoursOvertime[i] + HoursDec;
+        TotalHoursOvertime[8] := TotalHoursOvertime[8] + HoursDec;
+      END ELSE BEGIN
+        TotalHoursNormal[i] :=  TotalHoursNormal[i] + HoursDec;
+        TotalHoursOvertime[8] := TotalHoursOvertime[8] + HoursDec;
+      END;
+    END;
+
+    PROCEDURE InsertHourLines@1100525016(HoursLine@1100525000 : Record 11012361;WageCompCode@1100525001 : Code[10];DaysInt@1100525002 : Integer;HoursDec@1100525003 : Decimal;AmountDec@1100525004 : Decimal;FunctionOpt@1100525005 : 'Hourline,ProjectReward,KMReward,KMExtraReward,KMExtraRewardInsert,ExtraDriverRew,Rewards,ProjectIndReward';CostObject@1100525006 : Code[20];Price@1100525007 : Decimal;CostCode@1100525009 : Code[10];QtyDec@1210190001 : Decimal;PostingDate@1210190000 : Date);
+    VAR
+      lvCostCodeRec@1100525008 : Record 11012083;
+      lvServiceOrder@1100528000 : Record 11012823;
+    BEGIN
+      gLineNoInt := gLineNoInt + 10000;
+
+      TempHoursLineRec.RESET;
+      TempHoursLineRec.SETRANGE(Year,HoursLine.Year);
+      TempHoursLineRec.SETRANGE(Week,HoursLine.Week);
+      TempHoursLineRec.SETRANGE("Employee No.",HoursLine."Employee No.");
+      TempHoursLineRec.SETRANGE("Supplying Company",HoursLine."Supplying Company");
+      TempHoursLineRec.SETRANGE("Receiving Company",HoursLine."Receiving Company");
+      TempHoursLineRec.SETRANGE("Document No.",HoursLine."Document No.");
+      CASE HoursLine.Type OF
+        HoursLine.Type::Project:
+          BEGIN
+            TempHoursLineRec.SETRANGE("Project No.",HoursLine."Object No.");
+            TempHoursLineRec.SETRANGE("Extension Contract",HoursLine."Extension Contract");
+          END;
+        HoursLine.Type::Plant:
+          BEGIN
+            TempHoursLineRec.SETRANGE("Plant Location",HoursLine."Plant Location");
+            TempHoursLineRec.SETRANGE("Plant Type",HoursLine."Plant Type");
+            TempHoursLineRec.SETRANGE("Plant No.",HoursLine."Plant No.");
+            TempHoursLineRec.SETRANGE("Cost Component Plant",HoursLine."Cost Component Plant");
+          END;
+        HoursLine.Type::Indirect:
+          TempHoursLineRec.SETRANGE("Cost Code",HoursLine."Object No.");
+        HoursLine.Type::Service:
+          TempHoursLineRec.SETRANGE("Service Order No.",HoursLine."Object No.");
+      END;
+      TempHoursLineRec.SETRANGE(Comment,HoursLine.Comment);
+      TempHoursLineRec.SETRANGE(Element,HoursLine.Element);
+      TempHoursLineRec.SETRANGE("Department Code",HoursLine."Department Code");
+
+      CASE FunctionOpt OF
+        FunctionOpt:: Hourline:
+          BEGIN
+            TempHoursLineRec.SETRANGE("Cost Object",CostObject);
+            TempHoursLineRec.SETFILTER("Connection No.",'10');
+            //Call C024379 sn
+            TempHoursLineRec.SETRANGE("Start Time", HoursLine."Start Time");
+            TempHoursLineRec.SETRANGE("End Time", HoursLine."End Time" );
+            //Call C024379 en
+          END;
+        FunctionOpt::ProjectReward:
+          BEGIN
+            TempHoursLineRec.SETRANGE("Cost Object",CostObject);
+            TempHoursLineRec.SETFILTER("Connection No.",'20');
+          END;
+        FunctionOpt::KMReward:
+          BEGIN
+            TempHoursLineRec.SETRANGE("Cost Object",CostObject);
+            TempHoursLineRec.SETFILTER("Connection No.",'30');
+          //C011306
+          //DimensionValueRec.RESET;
+          //DimensionValueRec.SETRANGE("Global Dimension No.",2);
+          //DimensionValueRec.SETRANGE(Code,HoursLine."Cost Object");
+          //IF DimensionValueRec.FINDFIRST THEN
+            DimMgt.GetDimValueRec(2,HoursLine."Cost Object",DimensionValueRec,FALSE,'');
+            IF DimensionValueRec.Code <> '' THEN
+          //
+              TempHoursLineRec."Unit Cost (LCY)" := DimensionValueRec.Price;
+          END;
+        FunctionOpt::KMExtraReward:
+          BEGIN
+            TempHoursLineRec.SETFILTER("Connection No.",'40');
+          //C011306
+          //DimensionValueRec.RESET;
+          //DimensionValueRec.SETRANGE("Global Dimension No.",2);
+          //DimensionValueRec.SETRANGE(Code,CostObject);
+          //IF DimensionValueRec.FINDFIRST THEN
+            DimMgt.GetDimValueRec(2,CostObject,DimensionValueRec,FALSE,'');
+            IF DimensionValueRec.Code <> '' THEN
+          //
+              TempHoursLineRec."Unit Cost (LCY)" := DimensionValueRec.Price;
+          END;
+        FunctionOpt::KMExtraRewardInsert:TempHoursLineRec.SETFILTER("Connection No.",'50');
+        FunctionOpt::ExtraDriverRew:TempHoursLineRec.SETFILTER("Connection No.",'60');
+      //*C-027136.sn
+        FunctionOpt::Rewards:
+          //* Set filter on a value that does not exist in tmp  table (so do not fill TempHoursLineRec."Connection No. with this
+          //* value (-999) in the tmp table, so recorn never found. Because expences must never be compressed.
+          TempHoursLineRec.SETRANGE("Connection No.",-999);
+      //*C-027136.en
+        FunctionOpt::ProjectIndReward:
+          BEGIN
+            TempHoursLineRec.SETFILTER("Connection No.",'70');
+            TempHoursLineRec.SETRANGE("Project No.");
+          END;
+      END;
+
+      TempHoursLineRec.SETRANGE("Wage Component",WageCompCode);
+
+      IF TempHoursLineRec.FIND('-') THEN BEGIN
+        CASE DaysInt OF
+          1:  TempHoursLineRec.Monday := TempHoursLineRec.Monday + HoursDec;
+          2:  TempHoursLineRec.Tuesday := TempHoursLineRec.Tuesday + HoursDec;
+          3:  TempHoursLineRec.Wednesday := TempHoursLineRec.Wednesday + HoursDec;
+          4:  TempHoursLineRec.Thursday := TempHoursLineRec.Thursday + HoursDec;
+          5:  TempHoursLineRec.Friday := TempHoursLineRec.Friday + HoursDec;
+          6:  TempHoursLineRec.Saturday := TempHoursLineRec.Saturday + HoursDec;
+          7:  TempHoursLineRec.Sunday := TempHoursLineRec.Sunday + HoursDec;
+        END;
+        TempHoursLineRec."Amount (LCY)" := TempHoursLineRec."Amount (LCY)" + AmountDec;
+        CASE FunctionOpt OF
+          FunctionOpt::ProjectReward: TempHoursLineRec.Quantity := TempHoursLineRec.Quantity + 1;
+          FunctionOpt::KMExtraReward:
+            BEGIN
+              TempHoursLineRec.Quantity := TempHoursLineRec.Quantity + HoursDec;
+              TempHoursLineRec."Amount (LCY)" := TempHoursLineRec.Quantity * TempHoursLineRec."Unit Cost (LCY)";
+            END;
+          FunctionOpt::KMExtraRewardInsert: TempHoursLineRec.Quantity := TempHoursLineRec.Quantity + HoursDec;
+          //FunctionOpt::ExtraDriverRew:TempHoursLineRec.Quantity := TempHoursLineRec.Quantity + 1;        //CALL C026975.0
+          FunctionOpt::ExtraDriverRew:TempHoursLineRec.Quantity := TempHoursLineRec.Quantity + QtyDec;     //CALL C026975.n
+
+          FunctionOpt::Rewards:TempHoursLineRec."Amount (LCY)" := AmountDec;
+          FunctionOpt::ProjectIndReward:
+            BEGIN
+              TempHoursLineRec."Cost Code" := CostCode;
+              TempHoursLineRec.Type := TempHoursLineRec.Type::Indirect;
+              TempHoursLineRec.Quantity := TempHoursLineRec.Quantity + 1;
+              TempHoursLineRec."Project No." := '';
+              TempHoursLineRec."Extension Contract" := '';
+              TempHoursLineRec."Plant Location" := '';
+              TempHoursLineRec."Plant Type" := '';
+              TempHoursLineRec."Plant No." := '';
+              TempHoursLineRec."Cost Component Plant" := '';
+              TempHoursLineRec."Plant Rate Code" := '';
+            END;
+        END;
+
+        IF (FunctionOpt = FunctionOpt::KMExtraReward) OR (FunctionOpt = FunctionOpt::KMExtraRewardInsert) THEN BEGIN
+          TempHoursLineRec.Monday := 0;
+          TempHoursLineRec.Tuesday := 0;
+          TempHoursLineRec.Wednesday := 0;
+          TempHoursLineRec.Thursday := 0;
+          TempHoursLineRec.Friday := 0;
+          TempHoursLineRec.Saturday := 0;
+          TempHoursLineRec.Sunday := 0;
+        END;
+
+        TempHoursLineRec."Total Line" := (TempHoursLineRec.Monday + TempHoursLineRec.Tuesday + TempHoursLineRec.Wednesday +
+                                           TempHoursLineRec.Thursday + TempHoursLineRec.Friday + TempHoursLineRec.Saturday +
+                                           TempHoursLineRec.Sunday);
+
+        TempHoursLineRec.MODIFY;
+
+        IF FunctionOpt = FunctionOpt::KMExtraReward THEN
+          CheckUnchargedWageComp(HoursLine,DaysInt,HoursDec,HoursLine."Wage Component");
+      END ELSE BEGIN
+        WITH TempHoursLineRec DO BEGIN
+          INIT;
+          Year := HoursLine.Year;
+          Week := HoursLine.Week;
+          "Employee No." := HoursLine."Employee No.";
+          "Line No." := gLineNoInt;
+          "Supplying Company" := HoursLine."Supplying Company";
+          "Receiving Company" := HoursLine."Receiving Company";
+          "Document No." := HoursLine."Document No.";
+          //Call C024379 sn
+          "Start Time" := HoursLine."Start Time";
+          "End Time" := HoursLine."End Time";
+          //Call C024379 en
+
+          CASE HoursLine.Type OF
+            HoursLine.Type::Project:
+              BEGIN
+                Type := Type::Project;
+                "Project No." := HoursLine."Object No.";
+                "Extension Contract" := HoursLine."Extension Contract";
+              END;
+            HoursLine.Type::Plant:
+              BEGIN
+                Type := Type::Plant;
+                "Plant Location" := HoursLine."Plant Location";
+                "Plant Type" := HoursLine."Plant Type";
+                "Plant No." := HoursLine."Plant No.";
+                "Cost Component Plant" := HoursLine."Cost Component Plant";
+                "Receiving Company" := HoursLine."Plant Company";
+                "Plant Rate Code" := CUPostHours.GetDefaultPlantRateCode("Plant Location", HoursLine."Plant Company");
+              END;
+            HoursLine.Type::Indirect:
+              BEGIN
+                Type := Type::Indirect;
+                IF "Connection No." <> 0 THEN BEGIN
+                  lvCostCodeRec.SETRANGE(Component,WageCompCode);
+                  IF lvCostCodeRec.FINDFIRST THEN
+                    "Cost Code" := lvCostCodeRec.Code;
+                END ELSE
+                  "Cost Code" := HoursLine."Object No.";
+              END;
+            HoursLine.Type::Service:
+              BEGIN
+                Type := Type::Service;
+                //lvServiceOrder.CHANGECOMPANY(HoursLine."Supplying Company"); //#C027697.o
+                lvServiceOrder.CHANGECOMPANY(HoursLine."Receiving Company"); //#C027697.n
+                "Service Order No." := HoursLine."Object No.";
+                lvServiceOrder.GET(HoursLine."Object No.");
+                "Service Location No." := lvServiceOrder."Service Location No.";
+              END;
+          END;
+
+          Element := HoursLine.Element;
+          "Amount (LCY)" := AmountDec;
+          "Department Code" := HoursLine."Department Code";
+
+          CASE FunctionOpt OF
+            FunctionOpt::Hourline:
+              BEGIN
+                 "Cost Object" := CostObject;
+                 Quantity := 0;
+                 "Connection No." := 10;
+               END;
+            FunctionOpt::ProjectReward:
+              BEGIN
+                 "Cost Object" := CostObject;
+                  "Unit Cost (LCY)" := Price;
+                  Quantity := 1;
+                  "Connection No." := 20;
+              END;
+            FunctionOpt::KMReward:
+              BEGIN
+                "Cost Object" := CostObject;
+                "Connection No." := 30;
+              END;
+            FunctionOpt::KMExtraReward:
+              BEGIN
+                 Quantity := HoursDec;
+                 "Cost Object" := CostObject;
+                 "Unit Cost (LCY)" := DimensionValueRec.Price;
+                 "Amount (LCY)" := "Unit Cost (LCY)" * Quantity;
+                 "Connection No." := 40;
+               END;
+            FunctionOpt::KMExtraRewardInsert:
+              BEGIN
+               Quantity := HoursDec;
+                "Cost Object" := CostObject;
+                "Unit Cost (LCY)" := Price;
+                "Amount (LCY)" := "Unit Cost (LCY)" * Quantity;
+                "Connection No." := 50;
+              END;
+            FunctionOpt::ExtraDriverRew:
+              BEGIN
+                "Cost Object" := CostObject;
+                //Quantity := 1;     //CALL C026975.o
+                Quantity := QtyDec; //CALL C026975.n
+                "Unit Cost (LCY)" := Price;
+                "Connection No." := 60;
+              END;
+            //*C-027136.sn
+            FunctionOpt::Rewards:
+              BEGIN
+                "Cost Object" := CostObject;
+                Quantity := HoursLine.Quantity;
+                "Unit Cost (LCY)" := "Amount (LCY)" / Quantity;
+                "Posting Date" := HoursLine."Posting Date";
+              END;
+            //*C-027136.sn
+            FunctionOpt::ProjectIndReward:
+              BEGIN
+                "Connection No." := 70;
+                "Cost Object" := '';
+                "Unit Cost (LCY)" := Price;
+                Quantity := 1;
+                "Cost Code" := CostCode;
+                "Project No." := '';
+                "Extension Contract" := '';
+                "Plant Location" := '';
+                "Plant Type" := '';
+                "Plant No." := '';
+                "Cost Component Plant" := '';
+                "Plant Rate Code" := '';
+              END;
+          END;
+
+          "Wage Component" := WageCompCode;
+          Comment := HoursLine.Comment;
+          CASE DaysInt OF
+            1:  TempHoursLineRec.Monday := HoursDec;
+            2:  TempHoursLineRec.Tuesday := HoursDec;
+            3:  TempHoursLineRec.Wednesday := HoursDec;
+            4:  TempHoursLineRec.Thursday := HoursDec;
+            5:  TempHoursLineRec.Friday := HoursDec;
+            6:  TempHoursLineRec.Saturday := HoursDec;
+            7:  TempHoursLineRec.Sunday := HoursDec;
+          END;
+
+          IF (FunctionOpt = FunctionOpt::KMExtraReward) OR (FunctionOpt = FunctionOpt::KMExtraRewardInsert) THEN BEGIN
+            TempHoursLineRec.Monday := 0;
+            TempHoursLineRec.Tuesday := 0;
+            TempHoursLineRec.Wednesday := 0;
+            TempHoursLineRec.Thursday := 0;
+            TempHoursLineRec.Friday := 0;
+            TempHoursLineRec.Saturday := 0;
+            TempHoursLineRec.Sunday := 0;
+          END;
+
+          TempHoursLineRec."Total Line" := (TempHoursLineRec.Monday + TempHoursLineRec.Tuesday + TempHoursLineRec.Wednesday +
+                                           TempHoursLineRec.Thursday + TempHoursLineRec.Friday + TempHoursLineRec.Saturday +
+                                           TempHoursLineRec.Sunday);
+           IF ExternalBl THEN
+             TempHoursLineRec.External := TRUE;
+
+            //Call C005136 sn
+           IF TempHoursLineRec."Cost Object" <> '' THEN BEGIN
+           //C011306
+           //DimensionValueRec3.RESET;
+           //DimensionValueRec3.CHANGECOMPANY("Receiving Company");
+           //DimensionValueRec3.SETRANGE("Global Dimension No.",2);
+           //DimensionValueRec3.SETRANGE(Code, TempHoursLineRec."Cost Object");
+           //IF DimensionValueRec3.FINDFIRST THEN
+             DimMgt.GetDimValueRec(2,TempHoursLineRec."Cost Object",DimensionValueRec3,FALSE,'');
+             IF DimensionValueRec3.Code <> '' THEN
+           //
+               TempHoursLineRec."Cost Type" := DimensionValueRec3."Cost Type";
+           END;
+           //Call C005136 en
+
+           IF (TempHoursLineRec.Monday <> 0)
+           OR (TempHoursLineRec.Tuesday <> 0)
+           OR (TempHoursLineRec.Wednesday <> 0)
+           OR (TempHoursLineRec.Thursday <> 0)
+           OR (TempHoursLineRec.Friday <> 0)
+           OR (TempHoursLineRec.Saturday <> 0)
+           OR (TempHoursLineRec.Sunday <> 0)
+           OR (TempHoursLineRec."Unit Cost (LCY)" <> 0)
+           OR (TempHoursLineRec."Amount (LCY)" <> 0) THEN BEGIN
+             CheckCostObjectAllowed(TempHoursLineRec); //CALL T004140 new
+             CheckCostCodeAllowed(TempHoursLineRec);
+             INSERT;
+             HourLinesInserted := TRUE;
+           END;
+
+          IF FunctionOpt = FunctionOpt::KMExtraReward THEN
+            CheckUnchargedWageComp(HoursLine,DaysInt,HoursDec,HoursLine."Wage Component");
+        END;
+      END;
+    END;
+
+    PROCEDURE CreateTempProjectExpenses@1100525007(HoursLine@1100525000 : Record 11012361;DayInt@1100525001 : Integer);
+    BEGIN
+      gLineNoInt2 := gLineNoInt2 + 1000;
+      WITH HoursLine DO BEGIN
+        IF ("Component Type" <> "Component Type"::Hours) OR
+           (Type <> Type::Project) THEN
+          EXIT;
+
+        TempExpensesRec.RESET;
+        TempExpensesRec.SETRANGE(Year,Year);
+        TempExpensesRec.SETRANGE(Week,Week);
+        TempExpensesRec.SETRANGE("Supplying Company","Supplying Company");
+        TempExpensesRec.SETRANGE("Receiving Company","Receiving Company");
+        TempExpensesRec.SETRANGE("Employee No.","Employee No.");
+        TempExpensesRec.SETRANGE(Type,Type);
+        TempExpensesRec.SETRANGE("Object No.","Object No.");
+        TempExpensesRec.SETRANGE("Document No.","Document No.");
+        TempExpensesRec.SETRANGE("Cost Object","Cost Object");
+        TempExpensesRec.SETRANGE("Department Code","Department Code");
+
+        IF TempExpensesRec.FIND('-') THEN BEGIN
+          CASE DayInt OF
+            1:TempExpensesRec.Monday := TempExpensesRec.Monday + Monday;
+            2:TempExpensesRec.Tuesday := TempExpensesRec.Tuesday + Tuesday;
+            3:TempExpensesRec.Wednesday := TempExpensesRec.Wednesday + Wednesday;
+            4:TempExpensesRec.Thursday := TempExpensesRec.Thursday + Thursday;
+            5:TempExpensesRec.Friday := TempExpensesRec.Friday + Friday;
+            6:TempExpensesRec.Saturday := TempExpensesRec.Saturday + Saturday;
+            7:TempExpensesRec.Sunday := TempExpensesRec.Sunday + Sunday;
+          END;
+          TempExpensesRec.MODIFY;
+        END ELSE BEGIN
+          TempExpensesRec.INIT;
+          TempExpensesRec."Line No." := gLineNoInt2;
+          TempExpensesRec.Year := Year;
+          TempExpensesRec.Week := Week;
+          TempExpensesRec."Supplying Company" := "Supplying Company";
+          TempExpensesRec."Receiving Company" := "Receiving Company";
+          TempExpensesRec."Employee No." := "Employee No.";
+          TempExpensesRec.Type := Type;
+          TempExpensesRec."Object No." := "Object No.";
+          TempExpensesRec."Document No." := "Document No.";
+          TempExpensesRec."Cost Object" := "Cost Object";
+          TempExpensesRec."Department Code" := "Department Code";
+
+          CASE DayInt OF
+            1:TempExpensesRec.Monday := Monday;
+            2:TempExpensesRec.Tuesday := Tuesday;
+            3:TempExpensesRec.Wednesday := Wednesday;
+            4:TempExpensesRec.Thursday := Thursday;
+            5:TempExpensesRec.Friday := Friday;
+            6:TempExpensesRec.Saturday := Saturday;
+            7:TempExpensesRec.Sunday := Sunday;
+          END;
+          TempExpensesRec.INSERT;
+        END;
+      END;
+    END;
+
+    PROCEDURE CreateTravelRewards@1100525015(HoursLine@1100485002 : Record 11012361;DayInt@1100485004 : Integer;SupplyingCompanyTxt@1100525001 : Text[50]);
+    VAR
+      LvEmployeeRec@1100485000 : Record 5200;
+      LvKmStaffels@1100485003 : Record 11012442;
+      CalcReward@1100525000 : Decimal;
+      WorkToWorkKM@1100525002 : Boolean;
+    BEGIN
+      CalcReward := 0;
+      LvEmployeeRec.CHANGECOMPANY(SupplyingCompanyTxt);
+      LvEmployeeRec.GET(HoursLine."Employee No.");
+      LvEmployeeRec.TESTFIELD(CAO);
+      DrivenKm := 0;
+      LvKmStaffels.SETRANGE(CAO,LvEmployeeRec.CAO);
+      LvKmStaffels.SETRANGE("Extra Expense",FALSE);
+
+      CASE DayInt OF
+        1: BEGIN
+             LvKmStaffels.SETRANGE(Type,HoursLine."Travel Hours Monday");
+             DrivenKm := HoursLine.Monday;
+             WorkToWorkKM := (HoursLine."Travel Hours Monday" = HoursLine."Travel Hours Monday"::"Work to Work");
+           END;
+        2: BEGIN
+             LvKmStaffels.SETRANGE(Type,HoursLine."Travel Hours Tuesday");
+             DrivenKm := HoursLine.Tuesday;
+             WorkToWorkKM := (HoursLine."Travel Hours Tuesday" = HoursLine."Travel Hours Tuesday"::"Work to work");
+           END;
+        3: BEGIN
+             LvKmStaffels.SETRANGE(Type,HoursLine."Travel Hours Wednesday");
+             DrivenKm := HoursLine.Wednesday;
+             WorkToWorkKM := (HoursLine."Travel Hours Wednesday" = HoursLine."Travel Hours Wednesday"::"Work to Work");
+           END;
+        4: BEGIN
+             LvKmStaffels.SETRANGE(Type,HoursLine."Travel Hours Thursday");
+             DrivenKm := HoursLine.Thursday;
+             WorkToWorkKM := (HoursLine."Travel Hours Thursday" = HoursLine."Travel Hours Thursday"::"Work to work");
+           END;
+        5: BEGIN
+             LvKmStaffels.SETRANGE(Type,HoursLine."Travel Hours Friday");
+             DrivenKm := HoursLine.Friday;
+             WorkToWorkKM := (HoursLine."Travel Hours Friday" = HoursLine."Travel Hours Friday"::"Work to Work");
+           END;
+        6: BEGIN
+             LvKmStaffels.SETRANGE(Type,HoursLine."Travel Hours Saturday");
+             DrivenKm := HoursLine.Saturday;
+             WorkToWorkKM := (HoursLine."Travel Hours Saturday" = HoursLine."Travel Hours Saturday"::"Work to Work");
+           END;
+        7: BEGIN
+             LvKmStaffels.SETRANGE(Type,HoursLine."Travel Hours Sunday");
+             DrivenKm := HoursLine.Sunday;
+             WorkToWorkKM := (HoursLine."Travel Hours Sunday" = HoursLine."Travel Hours Sunday"::"Work to Work");
+           END;
+      END;
+
+      IF DrivenKm = 0 THEN
+        EXIT;
+
+      IF (NOT SiteMngmntHoursSetup."Kilometers One Way Trip") AND (NOT WorkToWorkKM) THEN
+        DrivenKm := DrivenKm / 2;
+
+      //LvKmStaffels.SETFILTER(Kilometerstaffel,'>=%1',DrivenKm);     //CALL C026975.o
+      LvKmStaffels.SETFILTER(Kilometerstaffel,'>=%1',ABS(DrivenKm));  //CALL C026975.n
+      IF LvKmStaffels.FINDFIRST THEN BEGIN
+        IF NOT LvEmployeeRec."Company Car" THEN BEGIN
+          IF LvKmStaffels.Calculate THEN BEGIN
+            //CalcReward := (DrivenKm * LvKmStaffels.Travelhours) / LvKmStaffels.Kilometerstaffel;       //CALL C026975.o
+            CalcReward := (ABS(DrivenKm) * LvKmStaffels.Travelhours) / LvKmStaffels.Kilometerstaffel;    //CALL C026975.n
+            IF LvKmStaffels."Apply Correction" THEN
+              CalcReward := ApplyCorrection(CalcReward, SiteMngmntHoursSetup."Correction Value (min.)");
+
+            //InsertHourLines(HoursLine,LvKmStaffels."Wage Component",DayInt,CalcReward,                //CALL C026975.o
+            //                LvKmStaffels."Expense Amount",2,LvKmStaffels."Cost Object",0,'',0,0D));   //CALL C026975.o
+
+            CreateHourLineFromStaffels(HoursLine,LvKmStaffels."Wage Component",DayInt,CalcReward,                       //CALL C026975.n
+                            LvKmStaffels."Expense Amount",2,LvKmStaffels."Cost Object",0,'',0,0D, (DrivenKm >= 0));     //CALL C026975.n
+          END ELSE BEGIN
+            IF LvKmStaffels."Apply Correction" THEN
+              LvKmStaffels.Travelhours := ApplyCorrection(
+                LvKmStaffels.Travelhours, SiteMngmntHoursSetup."Correction Value (min.)");
+
+
+            //InsertHourLines(HoursLine,LvKmStaffels."Wage Component",DayInt,LvKmStaffels.Travelhours,                  //CALL C026975.o
+            //                LvKmStaffels."Expense Amount",2,LvKmStaffels."Cost Object",0,'',0,0D, (DrivenKm >= 0));   //CALL C026975.o
+
+            CreateHourLineFromStaffels(HoursLine,LvKmStaffels."Wage Component",DayInt,LvKmStaffels.Travelhours,         //CALL C026975.n
+                            LvKmStaffels."Expense Amount",2,LvKmStaffels."Cost Object",0,'',0,0D, (DrivenKm >= 0));     //CALL C026975.n
+
+
+          END;
+          IF NOT WorkToWorkKM THEN
+            DrivenKm := DrivenKm * 2;
+          IF LvKmStaffels.Type <> LvKmStaffels.Type::Meerijders THEN
+            InsertHourLines(HoursLine,HoursLine."Wage Component",DayInt,DrivenKm,0,3,HoursLine."Cost Object",0,'',0,0D);
+        END ELSE BEGIN
+          IF LvKmStaffels.Calculate THEN BEGIN
+            //CalcReward := (DrivenKm * LvKmStaffels.Travelhours) / LvKmStaffels.Kilometerstaffel;      //CALL C026975.o
+            CalcReward := (ABS(DrivenKm) * LvKmStaffels.Travelhours) / LvKmStaffels.Kilometerstaffel;   //CALL C026975.n
+            IF LvKmStaffels."Apply Correction" THEN
+              CalcReward := ApplyCorrection(CalcReward, SiteMngmntHoursSetup."Correction Value (min.)");
+
+            //InsertHourLines(HoursLine,LvKmStaffels."Wage Component",DayInt,CalcReward,                //CALL C026975.o
+            //                LvKmStaffels."Expense Amount",2,LvKmStaffels."Cost Object",0,'',0,0D)     //CALL C026975.o
+
+            CreateHourLineFromStaffels(HoursLine,LvKmStaffels."Wage Component",DayInt,CalcReward,                   //CALL C026975.n
+                            LvKmStaffels."Expense Amount",2,LvKmStaffels."Cost Object",0,'',0,0D, (DrivenKm >= 0))  //CALL C026975.n
+
+           END ELSE BEGIN
+             IF LvKmStaffels."Apply Correction" THEN
+               LvKmStaffels.Travelhours := ApplyCorrection(
+                 LvKmStaffels.Travelhours, SiteMngmntHoursSetup."Correction Value (min.)");
+
+             //InsertHourLines(HoursLine,LvKmStaffels."Wage Component",DayInt,LvKmStaffels.Travelhours, //CALL C026975.o
+             //                LvKmStaffels."Expense Amount",2,LvKmStaffels."Cost Object",0,'',0,0D);   //CALL C026975.o
+
+             CreateHourLineFromStaffels(HoursLine,LvKmStaffels."Wage Component",DayInt,LvKmStaffels.Travelhours,       //CALL C026975.n
+                             LvKmStaffels."Expense Amount",2,LvKmStaffels."Cost Object",0,'',0,0D, (DrivenKm >= 0));   //CALL C026975.n
+
+           END;
+        END;
+      END ELSE BEGIN
+        CASE DayInt OF
+          1:IF HoursLine."Travel Hours Monday" <> HoursLine."Travel Hours Monday"::Passenger THEN BEGIN
+              IF HoursLine."Travel Hours Monday" = HoursLine."Travel Hours Monday"::"Work to Work" THEN  //let op zonder cost object
+                InsertHourLines(HoursLine,HoursLine."Wage Component",DayInt,DrivenKm,0,3,HoursLine."Cost Object",0,'',0,0D)
+              ELSE
+                IF NOT LvEmployeeRec."Company Car" THEN
+                  InsertHourLines(HoursLine,HoursLine."Wage Component",DayInt,DrivenKm * 2,0,3,HoursLine."Cost Object",0,'',0,0D);
+            END;
+          2:IF HoursLine."Travel Hours Tuesday" <> HoursLine."Travel Hours Tuesday"::Passenger THEN BEGIN
+              IF HoursLine."Travel Hours Tuesday" = HoursLine."Travel Hours Tuesday"::"Work to work" THEN
+                InsertHourLines(HoursLine,HoursLine."Wage Component",DayInt,DrivenKm,0,3,HoursLine."Cost Object",0,'',0,0D)
+              ELSE
+                IF NOT LvEmployeeRec."Company Car" THEN
+                  InsertHourLines(HoursLine,HoursLine."Wage Component",DayInt,DrivenKm * 2,0,3,HoursLine."Cost Object",0,'',0,0D);
+            END;
+          3:IF HoursLine."Travel Hours Wednesday" <> HoursLine."Travel Hours Wednesday"::Passenger THEN BEGIN
+              IF HoursLine."Travel Hours Wednesday" = HoursLine."Travel Hours Wednesday"::"Work to Work" THEN
+                InsertHourLines(HoursLine,HoursLine."Wage Component",DayInt,DrivenKm,0,3,HoursLine."Cost Object",0,'',0,0D)
+              ELSE
+                IF NOT LvEmployeeRec."Company Car" THEN
+                  InsertHourLines(HoursLine,HoursLine."Wage Component",DayInt,DrivenKm * 2,0,3,HoursLine."Cost Object",0,'',0,0D);
+            END;
+          4:IF HoursLine."Travel Hours Thursday" <> HoursLine."Travel Hours Thursday"::Passenger THEN BEGIN
+              IF HoursLine."Travel Hours Thursday" = HoursLine."Travel Hours Thursday"::"Work to work" THEN
+                InsertHourLines(HoursLine,HoursLine."Wage Component",DayInt,DrivenKm,0,3,HoursLine."Cost Object",0,'',0,0D)
+              ELSE
+                IF NOT LvEmployeeRec."Company Car" THEN
+                  InsertHourLines(HoursLine,HoursLine."Wage Component",DayInt,DrivenKm * 2,0,3,HoursLine."Cost Object",0,'',0,0D);
+            END;
+          5:IF HoursLine."Travel Hours Friday" <> HoursLine."Travel Hours Friday"::Passenger THEN BEGIN
+              IF HoursLine."Travel Hours Friday" = HoursLine."Travel Hours Friday"::"Work to Work" THEN
+                InsertHourLines(HoursLine,HoursLine."Wage Component",DayInt,DrivenKm,0,3,HoursLine."Cost Object",0,'',0,0D)
+              ELSE
+                IF NOT LvEmployeeRec."Company Car" THEN
+                  InsertHourLines(HoursLine,HoursLine."Wage Component",DayInt,DrivenKm * 2,0,3,HoursLine."Cost Object",0,'',0,0D);
+            END;
+          6:IF HoursLine."Travel Hours Saturday" <> HoursLine."Travel Hours Saturday"::Passenger THEN BEGIN
+              IF HoursLine."Travel Hours Saturday" = HoursLine."Travel Hours Saturday"::"Work to Work" THEN
+                InsertHourLines(HoursLine,HoursLine."Wage Component",DayInt,DrivenKm,0,3,HoursLine."Cost Object",0,'',0,0D)
+              ELSE
+                IF NOT LvEmployeeRec."Company Car" THEN
+                  InsertHourLines(HoursLine,HoursLine."Wage Component",DayInt,DrivenKm * 2,0,3,HoursLine."Cost Object",0,'',0,0D);
+            END;
+          7:IF HoursLine."Travel Hours Sunday" <> HoursLine."Travel Hours Sunday"::Passenger THEN BEGIN
+              IF HoursLine."Travel Hours Sunday" = HoursLine."Travel Hours Sunday"::"Work to Work" THEN
+                InsertHourLines(HoursLine,HoursLine."Wage Component",DayInt,DrivenKm,0,3,HoursLine."Cost Object",0,'',0,0D)
+              ELSE
+                IF NOT LvEmployeeRec."Company Car" THEN
+                  InsertHourLines(HoursLine,HoursLine."Wage Component",DayInt,DrivenKm * 2,0,3,HoursLine."Cost Object",0,'',0,0D);
+            END;
+        END;
+      END;
+
+      //extra meerijdersvergoeding berekenen.
+      LvKmStaffels.SETRANGE("Extra Expense",TRUE);
+      IF LvKmStaffels.FINDFIRST THEN BEGIN
+        CASE DayInt OF
+          1:IF HoursLine."Travel Hours Monday" = HoursLine."Travel Hours Monday"::"Driver with passengers" THEN
+              IF NOT LvEmployeeRec."Company Car" THEN BEGIN
+                CalculateExtraDriverReward(LvKmStaffels,DayInt,HoursLine, (DrivenKm >= 0));
+              END ELSE
+                IF LvKmStaffels."Extra Epense By Company Car" THEN
+                  CalculateExtraDriverReward(LvKmStaffels,DayInt,HoursLine, (DrivenKm >= 0));
+          2:IF HoursLine."Travel Hours Tuesday" = HoursLine."Travel Hours Tuesday"::"Driver with passengers" THEN
+              IF NOT LvEmployeeRec."Company Car" THEN BEGIN
+                CalculateExtraDriverReward(LvKmStaffels,DayInt,HoursLine, (DrivenKm >= 0));
+              END ELSE
+                IF LvKmStaffels."Extra Epense By Company Car" THEN
+                  CalculateExtraDriverReward(LvKmStaffels,DayInt,HoursLine, (DrivenKm >= 0));
+          3:IF HoursLine."Travel Hours Wednesday" = HoursLine."Travel Hours Wednesday"::"Driver with passengers" THEN
+              IF NOT LvEmployeeRec."Company Car" THEN BEGIN
+                CalculateExtraDriverReward(LvKmStaffels,DayInt,HoursLine, (DrivenKm >= 0));
+              END ELSE
+                IF LvKmStaffels."Extra Epense By Company Car" THEN
+                  CalculateExtraDriverReward(LvKmStaffels,DayInt,HoursLine, (DrivenKm >= 0));
+          4:IF HoursLine."Travel Hours Thursday" = HoursLine."Travel Hours Thursday"::"Driver with passengers" THEN
+              IF NOT LvEmployeeRec."Company Car" THEN BEGIN
+                CalculateExtraDriverReward(LvKmStaffels,DayInt,HoursLine, (DrivenKm >= 0));
+              END ELSE
+                IF LvKmStaffels."Extra Epense By Company Car" THEN
+                  CalculateExtraDriverReward(LvKmStaffels,DayInt,HoursLine, (DrivenKm >= 0));
+          5:IF HoursLine."Travel Hours Friday" = HoursLine."Travel Hours Friday"::"Driver with passengers" THEN
+              IF NOT LvEmployeeRec."Company Car" THEN BEGIN
+                CalculateExtraDriverReward(LvKmStaffels,DayInt,HoursLine, (DrivenKm >= 0));
+              END ELSE
+                IF LvKmStaffels."Extra Epense By Company Car" THEN
+                  CalculateExtraDriverReward(LvKmStaffels,DayInt,HoursLine, (DrivenKm >= 0));
+          6:IF HoursLine."Travel Hours Saturday" = HoursLine."Travel Hours Saturday"::"Driver with passengers" THEN
+              IF NOT LvEmployeeRec."Company Car" THEN BEGIN
+                CalculateExtraDriverReward(LvKmStaffels,DayInt,HoursLine, (DrivenKm >= 0));
+              END ELSE
+                IF LvKmStaffels."Extra Epense By Company Car" THEN
+                  CalculateExtraDriverReward(LvKmStaffels,DayInt,HoursLine, (DrivenKm >= 0));
+          7:IF HoursLine."Travel Hours Sunday" = HoursLine."Travel Hours Sunday"::"Driver with passengers" THEN
+              IF NOT LvEmployeeRec."Company Car" THEN BEGIN
+                CalculateExtraDriverReward(LvKmStaffels,DayInt,HoursLine, (DrivenKm >= 0));
+              END ELSE
+                IF LvKmStaffels."Extra Epense By Company Car" THEN
+                  CalculateExtraDriverReward(LvKmStaffels,DayInt,HoursLine, (DrivenKm >= 0));
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE CreateHourLineFromStaffels@1100525012(HoursLine@1100525010 : Record 11012361;WageCompCode@1100525009 : Code[10];DaysInt@1100525008 : Integer;HoursDec@1100525007 : Decimal;AmountDec@1100525006 : Decimal;FunctionOpt@1100525005 : 'Hourline,ProjectReward,KMReward,KMExtraReward,KMExtraRewardInsert,ExtraDriverRew,Rewards,ProjectIndReward';CostObject@1100525004 : Code[20];Price@1100525003 : Decimal;CostCode@1100525002 : Code[10];QtyDec@1100525001 : Decimal;PostingDate@1100525000 : Date;Positive@1100525011 : Boolean);
+    BEGIN
+      IF Positive THEN
+        InsertHourLines(HoursLine,WageCompCode,DaysInt,HoursDec,
+                        AmountDec,FunctionOpt,CostObject,Price,CostCode,QtyDec,PostingDate)
+      ELSE
+        InsertHourLines(HoursLine,WageCompCode,DaysInt, -HoursDec,
+                        -AmountDec,FunctionOpt,CostObject,Price,CostCode,QtyDec,PostingDate);
+    END;
+
+    PROCEDURE CalculateExtraDriverReward@1100525002(StaffelRec@1100525000 : Record 11012442;Dayint@1100525001 : Integer;HourLine@1100525002 : Record 11012361;Positive@1100525003 : Boolean);
+    BEGIN
+      //Positive as new argument CALL C026975, Also use parameter QtyDec
+      IF Positive THEN
+        InsertHourLines(HourLine,StaffelRec."Wage Component",Dayint,StaffelRec.Travelhours,
+        StaffelRec."Expense Amount",5,StaffelRec."Cost Object",StaffelRec."Expense Amount",'',1,0D)
+      ELSE
+        InsertHourLines(HourLine,StaffelRec."Wage Component",Dayint,-StaffelRec.Travelhours,
+        -StaffelRec."Expense Amount",5,StaffelRec."Cost Object",StaffelRec."Expense Amount",'',-1,0D);
+    END;
+
+    PROCEDURE CheckUnchargedWageComp@1100525032(HoursLine@1100525004 : Record 11012361;DaysInt@1100525003 : Integer;HoursDec@1100525005 : Decimal;WageComp@1100525007 : Code[10]);
+    VAR
+      LvWageCompRec@1100525002 : Record 11012014;
+      LvWageCompRec2@1100525001 : Record 11012014;
+      lvAmountDec@1100525006 : Decimal;
+      Km@1100525008 : Decimal;
+    BEGIN
+      //Check om te kijken of er een onbelast deel aan het looncomponent verbonden is
+      LvWageCompRec.CHANGECOMPANY(HoursLine."Receiving Company");
+      LvWageCompRec.GET(WageComp);
+        IF (LvWageCompRec."Kilometer Expense") AND (LvWageCompRec."Wage Component to Post Rest" <>'') THEN BEGIN
+          LvWageCompRec2.GET(LvWageCompRec."Wage Component to Post Rest");
+          DimensionValueRec2.RESET;
+          DimensionValueRec2.SETRANGE("Global Dimension No.",2);
+          DimensionValueRec2.SETRANGE("Wage Component",LvWageCompRec2.Code);
+          IF DimensionValueRec2.FINDFIRST THEN BEGIN
+            IF DimensionValueRec2.COUNT > 1 THEN
+              ERROR(Text007);
+            lvAmountDec := (DimensionValueRec2.Price * HoursDec);
+            CASE DaysInt OF
+              1: Km := HoursLine.Monday;
+              2: Km := HoursLine.Tuesday;
+              3: Km := HoursLine.Wednesday;
+              4: Km := HoursLine.Thursday;
+              5: Km := HoursLine.Friday;
+              6: Km := HoursLine.Saturday;
+              7: Km := HoursLine.Sunday;
+            END;
+            CASE DaysInt OF
+              1:IF HoursLine."Travel Hours Monday" <> HoursLine."Travel Hours Monday"::"Work to Work" THEN BEGIN
+                  IF SiteMngmntHoursSetup."Kilometers One Way Trip" THEN BEGIN
+                    TempHoursLineRec.Quantity := TempHoursLineRec.Quantity * 2;
+                    Km := Km * 2;
+                  END;
+                END;
+              2:IF HoursLine."Travel Hours Tuesday" <> HoursLine."Travel Hours Tuesday"::"Work to work" THEN BEGIN
+                  IF SiteMngmntHoursSetup."Kilometers One Way Trip" THEN BEGIN
+                    TempHoursLineRec.Quantity := TempHoursLineRec.Quantity * 2;
+                    Km := Km * 2;
+                  END;
+                END;
+              3:IF HoursLine."Travel Hours Wednesday" <> HoursLine."Travel Hours Wednesday"::"Work to Work" THEN BEGIN
+                  IF SiteMngmntHoursSetup."Kilometers One Way Trip" THEN BEGIN
+                    TempHoursLineRec.Quantity := TempHoursLineRec.Quantity * 2;
+                    Km := Km * 2;
+                  END;
+                END;
+              4:IF HoursLine."Travel Hours Thursday" <> HoursLine."Travel Hours Thursday"::"Work to work" THEN BEGIN
+                  IF SiteMngmntHoursSetup."Kilometers One Way Trip" THEN BEGIN
+                    TempHoursLineRec.Quantity := TempHoursLineRec.Quantity * 2;
+                    Km := Km * 2;
+                  END;
+                END;
+              5:IF HoursLine."Travel Hours Friday" <> HoursLine."Travel Hours Friday"::"Work to Work" THEN BEGIN
+                  IF SiteMngmntHoursSetup."Kilometers One Way Trip" THEN BEGIN
+                    TempHoursLineRec.Quantity := TempHoursLineRec.Quantity * 2;
+                    Km := Km * 2;
+                  END;
+                END;
+              6:IF HoursLine."Travel Hours Saturday" <> HoursLine."Travel Hours Saturday"::"Work to Work" THEN BEGIN
+                  IF SiteMngmntHoursSetup."Kilometers One Way Trip" THEN BEGIN
+                    TempHoursLineRec.Quantity := TempHoursLineRec.Quantity * 2;
+                    Km := Km * 2;
+                  END;
+                END;
+              7:IF HoursLine."Travel Hours Sunday" <> HoursLine."Travel Hours Sunday"::"Work to Work" THEN BEGIN
+                  IF SiteMngmntHoursSetup."Kilometers One Way Trip" THEN BEGIN
+                    TempHoursLineRec.Quantity := TempHoursLineRec.Quantity * 2;
+                    Km := Km * 2;
+                  END;
+                END;
+            END;
+
+            InsertHourLines(HoursLine,LvWageCompRec."Wage Component to Post Rest",DaysInt,Km,
+                            lvAmountDec,4,DimensionValueRec2.Code,DimensionValueRec2.Price,'',0,0D);
+          END;
+        END;
+    END;
+
+    PROCEDURE EvaluateTempExpensesRec@1100525023();
+    VAR
+      lvProjectRewardsRec@1100525000 : Record 11012443;
+      lvProjectRewardsByCao@1100525001 : Record 11012444;
+      lvEmployeeRec@1100525002 : Record 5200;
+    BEGIN
+      TempExpensesRec.RESET;
+      WITH TempExpensesRec DO BEGIN
+        REPEAT
+          lvEmployeeRec.CHANGECOMPANY(TempExpensesRec."Supplying Company");
+          IF lvEmployeeRec.GET("Employee No.") THEN BEGIN
+            lvProjectRewardsByCao.CHANGECOMPANY(TempExpensesRec."Receiving Company");
+            lvProjectRewardsByCao.SETRANGE(CAO,lvEmployeeRec.CAO);
+            lvProjectRewardsByCao.SETRANGE("Job No.",TempExpensesRec."Object No.");
+            IF lvProjectRewardsByCao.FINDSET(FALSE,FALSE) THEN BEGIN
+              REPEAT
+                lvProjectRewardsRec.CHANGECOMPANY(TempExpensesRec."Receiving Company");
+                IF lvProjectRewardsRec.GET(lvProjectRewardsByCao."Reward Line Code") THEN;   //GB
+                IF Monday >= lvProjectRewardsRec.Dagdeel THEN
+                  IF lvProjectRewardsRec.Kostendrager <>'' THEN
+                    InsertHourLines(TempExpensesRec,lvProjectRewardsRec.Looncomponent,1,0,lvProjectRewardsRec.Reward,1,
+                                    lvProjectRewardsRec.Kostendrager,lvProjectRewardsRec.Reward,'',0,0D)
+                  ELSE
+                    InsertHourLines(TempExpensesRec,lvProjectRewardsRec.Looncomponent,1,0,lvProjectRewardsRec.Reward,7,
+                                    '',lvProjectRewardsRec.Reward,lvProjectRewardsRec."Cost Code",0,0D);
+                IF Tuesday >= lvProjectRewardsRec.Dagdeel THEN
+                  IF lvProjectRewardsRec.Kostendrager <>'' THEN
+                    InsertHourLines(TempExpensesRec,lvProjectRewardsRec.Looncomponent,2,0,lvProjectRewardsRec.Reward,1,
+                                  lvProjectRewardsRec.Kostendrager,lvProjectRewardsRec.Reward,'',0,0D)
+                  ELSE
+                    InsertHourLines(TempExpensesRec,lvProjectRewardsRec.Looncomponent,2,0,lvProjectRewardsRec.Reward,7,
+                                    '',lvProjectRewardsRec.Reward,lvProjectRewardsRec."Cost Code",0,0D);
+                IF Wednesday >= lvProjectRewardsRec.Dagdeel THEN
+                  IF lvProjectRewardsRec.Kostendrager <>'' THEN
+                    InsertHourLines(TempExpensesRec,lvProjectRewardsRec.Looncomponent,3,0,lvProjectRewardsRec.Reward,1,
+                                  lvProjectRewardsRec.Kostendrager,lvProjectRewardsRec.Reward,'',0,0D)
+                  ELSE
+                    InsertHourLines(TempExpensesRec,lvProjectRewardsRec.Looncomponent,3,0,lvProjectRewardsRec.Reward,7,
+                                    '',lvProjectRewardsRec.Reward,lvProjectRewardsRec."Cost Code",0,0D);
+                IF Thursday >= lvProjectRewardsRec.Dagdeel THEN
+                  IF lvProjectRewardsRec.Kostendrager <>'' THEN
+                    InsertHourLines(TempExpensesRec,lvProjectRewardsRec.Looncomponent,4,0,lvProjectRewardsRec.Reward,1,
+                                  lvProjectRewardsRec.Kostendrager,lvProjectRewardsRec.Reward,'',0,0D)
+                  ELSE
+                    InsertHourLines(TempExpensesRec,lvProjectRewardsRec.Looncomponent,4,0,lvProjectRewardsRec.Reward,7,
+                                    '',lvProjectRewardsRec.Reward,lvProjectRewardsRec."Cost Code",0,0D);
+                IF Friday >= lvProjectRewardsRec.Dagdeel THEN
+                  IF lvProjectRewardsRec.Kostendrager <>'' THEN
+                    InsertHourLines(TempExpensesRec,lvProjectRewardsRec.Looncomponent,5,0,lvProjectRewardsRec.Reward,1,
+                                  lvProjectRewardsRec.Kostendrager,lvProjectRewardsRec.Reward,'',0,0D)
+                  ELSE
+                    InsertHourLines(TempExpensesRec,lvProjectRewardsRec.Looncomponent,5,0,lvProjectRewardsRec.Reward,7,
+                                    '',lvProjectRewardsRec.Reward,lvProjectRewardsRec."Cost Code",0,0D);
+                IF Saturday >= lvProjectRewardsRec.Dagdeel THEN
+                  IF lvProjectRewardsRec.Kostendrager <>'' THEN
+                    InsertHourLines(TempExpensesRec,lvProjectRewardsRec.Looncomponent,6,0,lvProjectRewardsRec.Reward,1,
+                                  lvProjectRewardsRec.Kostendrager,lvProjectRewardsRec.Reward,'',0,0D)
+                  ELSE
+                    InsertHourLines(TempExpensesRec,lvProjectRewardsRec.Looncomponent,6,0,lvProjectRewardsRec.Reward,7,
+                                    '',lvProjectRewardsRec.Reward,lvProjectRewardsRec."Cost Code",0,0D);
+                IF Sunday >= lvProjectRewardsRec.Dagdeel THEN
+                  IF lvProjectRewardsRec.Kostendrager <>'' THEN
+                    InsertHourLines(TempExpensesRec,lvProjectRewardsRec.Looncomponent,7,0,lvProjectRewardsRec.Reward,1,
+                                  lvProjectRewardsRec.Kostendrager,lvProjectRewardsRec.Reward,'',0,0D)
+                  ELSE
+                    InsertHourLines(TempExpensesRec,lvProjectRewardsRec.Looncomponent,7,0,lvProjectRewardsRec.Reward,7,
+                                    '',lvProjectRewardsRec.Reward,lvProjectRewardsRec."Cost Code",0,0D);
+              UNTIL lvProjectRewardsByCao.NEXT = 0;
+            END;
+
+          END;
+        UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE StartAssistEdit@1100485008(lSupplyingCompany@1100485006 : Text[50];lCompType@1100485008 : 'Hours,Days,Expenses,Kilometers';lOvertimeBln@1100485004 : Boolean;VAR OvertimeComp@1100485002 : Code[20];VAR OvertimeHours@1100485003 : Decimal;PostedHours@1100485001 : Decimal;VAR TravelHoursOpt@1100485007 : 'Passenger,Driver whithout Passenger,Driver with Passenger');
+    BEGIN
+      CASE lCompType OF
+        lCompType::Hours:
+          StartOvertimeForm(lSupplyingCompany,OvertimeComp,OvertimeHours,PostedHours);
+        lCompType::Kilometers:
+          StartTravelHoursForm(TravelHoursOpt);
+      END;
+    END;
+
+    PROCEDURE StartOvertimeForm@1100485007(lSupplyingCompany@1100485004 : Text[50];VAR OvertimeComp@1100485002 : Code[20];VAR OvertimeHours@1100485001 : Decimal;PostedHours@1100485003 : Decimal);
+    VAR
+      OvertimeFrm@1100485000 : Page 11072219;
+    BEGIN
+      CLEAR(OvertimeFrm);
+      OvertimeFrm.SetDefaults(lSupplyingCompany,OvertimeHours,OvertimeComp,PostedHours);
+      OvertimeFrm.RUNMODAL;
+      OvertimeFrm.GetValues(OvertimeHours,OvertimeComp);
+    END;
+
+    PROCEDURE StartTravelHoursForm@1100485004(VAR TravelHoursOpt@1100485001 : 'Passenger,Driver whithout Passenger,Driver with Passenger');
+    VAR
+      TravelHoursFrm@1100485000 : Page 11072220;
+    BEGIN
+      TravelHoursFrm.SetDefaults(TravelHoursOpt);
+      TravelHoursFrm.RUNMODAL;
+      TravelHoursFrm.GetValues(TravelHoursOpt);
+    END;
+
+    PROCEDURE StartTravelExceptionForm@1100485011(VAR HoursDec@1100485001 : Decimal;VAR CostObjectCode@1100485002 : Code[10]);
+    VAR
+      TravelExceptionFrm@1100485000 : Page 11072224;
+    BEGIN
+      TravelExceptionFrm.RUNMODAL;
+      TravelExceptionFrm.GetValues(HoursDec,CostObjectCode);
+    END;
+
+    PROCEDURE CheckCostObjectAllowed@1100528400(HourAccountingLine@1100525000 : Record 11012039);
+    VAR
+      ProjectCostObject@1100528400 : Record 11012065;
+    BEGIN
+      //CALL T004140 new
+      IF (HourAccountingLine.Type = HourAccountingLine.Type::Project) AND
+         (HourAccountingLine."Project No." <> '') AND
+         (HourAccountingLine."Cost Object" <> '') THEN
+      BEGIN
+        ProjectCostObject.CHANGECOMPANY(HourAccountingLine."Receiving Company");
+        IF ProjectCostObject.GET(HourAccountingLine."Project No.", HourAccountingLine."Cost Object") THEN
+          ProjectCostObject.TESTFIELD(Blocked, FALSE);
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckCostCodeAllowed@1100528401(HourAccountingLine@1100525000 : Record 11012039);
+    VAR
+      CostCode@1100528400 : Record 11012083;
+    BEGIN
+      IF (HourAccountingLine.Type = HourAccountingLine.Type::Indirect) AND
+         (HourAccountingLine."Cost Code" <> '') THEN
+      BEGIN
+        CostCode.CHANGECOMPANY(HourAccountingLine."Receiving Company");
+        IF CostCode.GET(HourAccountingLine."Cost Code") THEN
+          CostCode.TESTFIELD(Blocked, FALSE);
+      END;
+    END;
+
+    LOCAL PROCEDURE ApplyCorrection@1100525010(TravelHours@1100525000 : Decimal;CorrectionValueMinutes@1100525001 : Decimal) CorrectedTravelHours : Decimal;
+    VAR
+      CorrectionValueHours@1100525002 : Decimal;
+    BEGIN
+      CorrectionValueHours := CorrectionValueMinutes / 60;
+      IF TravelHours > CorrectionValueHours THEN
+        CorrectedTravelHours := TravelHours - CorrectionValueHours
+      ELSE
+        CorrectedTravelHours := 0;
+    END;
+
+    LOCAL PROCEDURE HandleHoursConsentLines@1100528402(VAR SiteMngmntHoursLine@1100528403 : Record 11012361);
+    VAR
+      SiteMngmntHoursSetup@1100528401 : Record 11012355;
+      HoursConsentLine@1100528402 : Record 11020437;
+      UserSetup@1100528400 : Record 91;
+    BEGIN
+      IF UserSetup.CurrentUserIsSuperConsenter THEN
+        SiteMngmntHoursLine.SuperConsentHoursConsentLines
+      ELSE
+        IF SiteMngmntHoursLine.HasOpenHoursConsentLines THEN
+          ERROR(
+            Text001, HoursConsentLine.TABLECAPTION,
+            SiteMngmntHoursLine.FIELDCAPTION(Year), SiteMngmntHoursLine.Year,
+            SiteMngmntHoursLine.FIELDCAPTION(Week), SiteMngmntHoursLine.Week,
+            SiteMngmntHoursLine.FIELDCAPTION("Supplying Company"), SiteMngmntHoursLine."Supplying Company",
+            SiteMngmntHoursLine.FIELDCAPTION("Employee No."), SiteMngmntHoursLine."Employee No.");
+    END;
+
+    PROCEDURE CheckAllConsentLinesApproved@1100528300(SiteMngmntHoursHeader@1100528300 : Record 11012360) : Boolean;
+    VAR
+      SiteMngmntHoursLine@1100528302 : Record 11012361;
+    BEGIN
+      SiteMngmntHoursLine.SETRANGE(Year, SiteMngmntHoursHeader.Year);
+      SiteMngmntHoursLine.SETRANGE(Week, SiteMngmntHoursHeader.Week);
+      SiteMngmntHoursLine.SETRANGE("Supplying Company", SiteMngmntHoursHeader."Supplying Company");
+      SiteMngmntHoursLine.SETRANGE("Employee No.", SiteMngmntHoursHeader."Employee No.");
+      SiteMngmntHoursLine.SETFILTER(Status, '%1|%2|%3',
+        SiteMngmntHoursLine.Status::Open,
+        SiteMngmntHoursLine.Status::Released,
+        SiteMngmntHoursLine.Status::Rejected);
+      EXIT(NOT SiteMngmntHoursLine.FINDFIRST);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

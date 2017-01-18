@@ -1,0 +1,328 @@
+OBJECT Codeunit 448 Job Queue Dispatcher
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00.00.43402;
+  }
+  PROPERTIES
+  {
+    OnRun=VAR
+            NoOfAttempts@1002 : Integer;
+            MaxNoOfAttempts@1000 : Integer;
+          BEGIN
+            JobQueue.SETRANGE("Server Instance ID",SERVICEINSTANCEID);
+            JobQueue.SETRANGE("Session ID",SESSIONID);
+            JobQueue.LOCKTABLE;
+            MaxNoOfAttempts := 10;
+            WHILE (NoOfAttempts < MaxNoOfAttempts) AND NOT TryFindFirstJobQueue(JobQueue) DO BEGIN
+              COMMIT;
+              NoOfAttempts := NoOfAttempts + 1;
+              SLEEP(2000);
+              JobQueue.LOCKTABLE;
+            END;
+            IF NoOfAttempts >= MaxNoOfAttempts THEN BEGIN
+              COMMIT;
+              EXIT;
+            END;
+            JobQueue.UpdateHeartbeat;
+            COMMIT;
+
+            IF AdjustJobQueueEntries THEN; // May encounter a (dead-)lock.
+            COMMIT;
+
+            JobQueueLoop;
+
+            JobQueue.LOCKTABLE;
+            IF JobQueue.GET(JobQueue.Code) THEN BEGIN
+              JobQueue.ResetServiceValues;
+              JobQueue.MODIFY;
+              COMMIT;
+            END;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      JobQueue@1000 : Record 470;
+      Text001@1001 : TextConst 'ENU=The job has been canceled.';
+      Text002@1002 : TextConst 'ENU=The user process has terminated unexpectedly. Check the Windows Event Viewer or the Session Event table for more information.';
+      Text003@1003 : TextConst 'ENU=The job has timed out.';
+
+    [TryFunction]
+    LOCAL PROCEDURE TryFindFirstJobQueue@14(VAR JobQueue@1000 : Record 470);
+    BEGIN
+      JobQueue.FINDFIRST;
+    END;
+
+    LOCAL PROCEDURE JobQueueLoop@10();
+    BEGIN
+      WHILE JobQueue.Started DO BEGIN
+        HandleRequest;
+        COMMIT;
+        JobQueue.LOCKTABLE;
+        IF NOT JobQueue.GET(JobQueue.Code) THEN
+          EXIT;
+        IF NOT JobQueue.Started THEN
+          EXIT;
+        IF NOT (JobQueue."Session ID" = SESSIONID) THEN
+          EXIT;
+        JobQueue.UpdateHeartbeat;
+        COMMIT;
+        SLEEP(10000);
+      END;
+    END;
+
+    LOCAL PROCEDURE HandleRequest@6();
+    VAR
+      JobQueueEntry@1000 : Record 472;
+      JobLogEntryNo@1002 : Integer;
+      MoreRequests@1006 : Boolean;
+    BEGIN
+      MoreRequests := GetNextRequest(JobQueueEntry);  // locks table
+
+      WHILE JobQueue.Started AND MoreRequests DO BEGIN
+        JobLogEntryNo := InsertLogEntry(JobQueueEntry);
+
+        IF RunRequest(JobQueueEntry) THEN
+          JobQueueEntry.CleanupAfterExecution
+        ELSE
+          JobQueueEntry.HandleExecutionError;
+        COMMIT;
+        UpdateLogEntry(JobLogEntryNo,JobQueueEntry);
+        COMMIT;
+
+        JobQueue.UpdateHeartbeat;
+        COMMIT;
+        MoreRequests := GetNextRequest(JobQueueEntry);  // locks table
+      END;
+      COMMIT;
+    END;
+
+    LOCAL PROCEDURE GetNextRequest@5(VAR JobQueueEntry@1000 : Record 472) : Boolean;
+    VAR
+      Found@1001 : Boolean;
+    BEGIN
+      JobQueueEntry.LOCKTABLE;
+      JobQueueEntry.SETFILTER("Expiration Date/Time",'>%1|%2',CURRENTDATETIME,CREATEDATETIME(0D,0T));
+      JobQueueEntry.SETFILTER("Earliest Start Date/Time",'<=%1',CURRENTDATETIME);
+      IF JobQueue."Job Queue Category Filter" <> '' THEN
+        JobQueueEntry.SETFILTER("Job Queue Category Code",JobQueue."Job Queue Category Filter");
+
+      JobQueueEntry.SETRANGE(Status,JobQueueEntry.Status::Ready);
+      JobQueueEntry.SETCURRENTKEY(Priority);
+      JobQueueEntry.LOCKTABLE;
+      Found := TryFindNextJobQueueEntry(JobQueueEntry) AND (JobQueueEntry.Status = JobQueueEntry.Status::Ready);
+      IF Found THEN BEGIN
+        IF JobQueueEntry."Recurring Job" THEN
+          JobQueueEntry."Earliest Start Date/Time" := CalcNextRunTimeForRecurringJob(JobQueueEntry,CURRENTDATETIME);
+        JobQueueEntry.Status := JobQueueEntry.Status::"In Process";
+        JobQueueEntry.MODIFY;
+      END;
+      EXIT(Found);
+    END;
+
+    [TryFunction]
+    LOCAL PROCEDURE TryFindNextJobQueueEntry@9(VAR JobQueueEntry@1000 : Record 472);
+    BEGIN
+      JobQueueEntry.FINDFIRST;
+    END;
+
+    LOCAL PROCEDURE RunRequest@2(VAR JobQueueEntry@1000 : Record 472) : Boolean;
+    VAR
+      EntryExists@1005 : Boolean;
+      SessionExists@1004 : Boolean;
+      TimedOut@1003 : Boolean;
+      T0@1002 : DateTime;
+      T1@1001 : DateTime;
+      WasSuccess@1006 : Boolean;
+    BEGIN
+      IF NOT JobQueueEntry."Run in User Session" THEN BEGIN
+        WORKDATE := TODAY; // Set WorkDate for Nas
+        STARTSESSION(JobQueueEntry."User Session ID",CODEUNIT::"Job Queue User Session",COMPANYNAME,JobQueueEntry);
+        JobQueueEntry.MODIFY;
+      END;
+      COMMIT;
+      EntryExists := TRUE;
+      SessionExists := TRUE;
+      TimedOut := FALSE;
+      T0 := CURRENTDATETIME;
+      T1 := T0;
+      WHILE NOT TimedOut AND EntryExists AND SessionExists AND (JobQueueEntry.Status = JobQueueEntry.Status::"In Process") DO BEGIN
+        COMMIT;
+        SLEEP(1000);
+        JobQueueEntry.LOCKTABLE;
+        EntryExists := JobQueueEntry.GET(JobQueueEntry.ID);
+        TimedOut := (CURRENTDATETIME - T1) DIV 1000 > JobQueueEntry.GetTimeout;
+        IF NOT TimedOut AND
+           EntryExists AND (JobQueueEntry.Status = JobQueueEntry.Status::"In Process") AND (CURRENTDATETIME - T0 > 60000)
+        THEN BEGIN
+          SessionExists := UserSessionExists(JobQueueEntry);
+          T0 := CURRENTDATETIME;
+        END;
+      END;
+      IF NOT TimedOut AND EntryExists AND SessionExists THEN
+        WasSuccess := JobQueueEntry.Status <> JobQueueEntry.Status::Error
+      ELSE BEGIN
+        WasSuccess := FALSE;
+        JobQueueEntry.Status := JobQueueEntry.Status::Error;
+        IF TimedOut THEN BEGIN
+          STOPSESSION(JobQueueEntry."User Session ID",Text003);
+          JobQueueEntry.SetErrorMessage(Text003)
+        END ELSE
+          IF NOT EntryExists THEN
+            JobQueueEntry.SetErrorMessage(Text001)
+          ELSE
+            JobQueueEntry.SetErrorMessage(Text002);
+      END;
+      EXIT(WasSuccess);
+    END;
+
+    LOCAL PROCEDURE InsertLogEntry@7(VAR JobQueueEntry@1000 : Record 472) : Integer;
+    VAR
+      JobQueueLogEntry@1001 : Record 474;
+    BEGIN
+      JobQueueLogEntry.INIT;
+      JobQueueLogEntry.ID := JobQueueEntry.ID;
+      JobQueueLogEntry."User ID" := JobQueueEntry."User ID";
+      JobQueueLogEntry."Start Date/Time" := CURRENTDATETIME;
+      JobQueueLogEntry."Object Type to Run" := JobQueueEntry."Object Type to Run";
+      JobQueueLogEntry."Object ID to Run" := JobQueueEntry."Object ID to Run";
+      JobQueueLogEntry.Description := JobQueueEntry.Description;
+      JobQueueLogEntry."Job Queue Code" := JobQueue.Code;
+      JobQueueLogEntry.Status := JobQueueLogEntry.Status::"In Process";
+      IF JobQueueEntry."Run in User Session" THEN
+        JobQueueLogEntry."Processed by User ID" := JobQueueEntry."User ID"
+      ELSE
+        JobQueueLogEntry."Processed by User ID" := USERID;
+      JobQueueLogEntry."Job Queue Category Code" := JobQueueEntry."Job Queue Category Code";
+      JobQueueLogEntry.INSERT(TRUE);
+      EXIT(JobQueueLogEntry."Entry No.");
+    END;
+
+    LOCAL PROCEDURE UpdateLogEntry@8(LogEntryNo@1000 : Integer;VAR JobQueueEntry@1002 : Record 472);
+    VAR
+      JobQueueLogEntry@1003 : Record 474;
+    BEGIN
+      JobQueueLogEntry.LOCKTABLE;
+      IF JobQueueLogEntry.GET(LogEntryNo) THEN BEGIN
+        JobQueueLogEntry."End Date/Time" := CURRENTDATETIME;
+        IF JobQueueEntry.Status = JobQueueEntry.Status::Error THEN BEGIN
+          JobQueueLogEntry.Status := JobQueueLogEntry.Status::Error;
+          JobQueueLogEntry.SetErrorMessage(JobQueueEntry.GetErrorMessage);
+        END ELSE
+          JobQueueLogEntry.Status := JobQueueLogEntry.Status::Success;
+        JobQueueLogEntry.MODIFY;
+      END;
+    END;
+
+    PROCEDURE CalcNextRunTimeForRecurringJob@1(VAR JobQueueEntry@1000 : Record 472;StartingDateTime@1008 : DateTime) : DateTime;
+    VAR
+      NewRunDateTime@1002 : DateTime;
+    BEGIN
+      IF JobQueueEntry."No. of Minutes between Runs" > 0 THEN
+        NewRunDateTime := StartingDateTime + 60000 * JobQueueEntry."No. of Minutes between Runs"
+      ELSE
+        NewRunDateTime := CREATEDATETIME(DT2DATE(StartingDateTime) + 1,0T);
+
+      EXIT(CalcRunTimeForRecurringJob(JobQueueEntry,NewRunDateTime));
+    END;
+
+    PROCEDURE CalcInitialRunTime@4(VAR JobQueueEntry@1000 : Record 472;StartingDateTime@1008 : DateTime) : DateTime;
+    VAR
+      EarliestPossibleRunTime@1001 : DateTime;
+    BEGIN
+      IF (JobQueueEntry."Earliest Start Date/Time" <> 0DT) AND (JobQueueEntry."Earliest Start Date/Time" > StartingDateTime) THEN
+        EarliestPossibleRunTime := JobQueueEntry."Earliest Start Date/Time"
+      ELSE
+        EarliestPossibleRunTime := StartingDateTime;
+
+      IF JobQueueEntry."Recurring Job" THEN
+        EXIT(CalcRunTimeForRecurringJob(JobQueueEntry,EarliestPossibleRunTime));
+
+      EXIT(EarliestPossibleRunTime);
+    END;
+
+    LOCAL PROCEDURE CalcRunTimeForRecurringJob@11(VAR JobQueueEntry@1000 : Record 472;StartingDateTime@1008 : DateTime) : DateTime;
+    VAR
+      NewRunDateTime@1001 : DateTime;
+      RunOnDate@1003 : ARRAY [7] OF Boolean;
+      StartingWeekDay@1005 : Integer;
+      NoOfExtraDays@1004 : Integer;
+      NoOfDays@1007 : Integer;
+      Found@1006 : Boolean;
+    BEGIN
+      JobQueueEntry.TESTFIELD("Recurring Job");
+      RunOnDate[7] := JobQueueEntry."Run on Sundays";
+      RunOnDate[1] := JobQueueEntry."Run on Mondays";
+      RunOnDate[2] := JobQueueEntry."Run on Tuesdays";
+      RunOnDate[3] := JobQueueEntry."Run on Wednesdays";
+      RunOnDate[4] := JobQueueEntry."Run on Thursdays";
+      RunOnDate[5] := JobQueueEntry."Run on Fridays";
+      RunOnDate[6] := JobQueueEntry."Run on Saturdays";
+
+      NewRunDateTime := StartingDateTime;
+      NoOfDays := 0;
+      IF (JobQueueEntry."Ending Time" <> 0T) AND (NewRunDateTime > JobQueueEntry.GetEndingDateTime(NewRunDateTime)) THEN BEGIN
+        NewRunDateTime := JobQueueEntry.GetStartingDateTime(NewRunDateTime);
+        NoOfDays := NoOfDays + 1;
+      END;
+
+      StartingWeekDay := DATE2DWY(DT2DATE(StartingDateTime),1);
+      Found := RunOnDate[(StartingWeekDay - 1 + NoOfDays) MOD 7 + 1];
+      WHILE NOT Found AND (NoOfExtraDays < 7) DO BEGIN
+        NoOfExtraDays := NoOfExtraDays + 1;
+        NoOfDays := NoOfDays + 1;
+        Found := RunOnDate[(StartingWeekDay - 1 + NoOfDays) MOD 7 + 1];
+      END;
+
+      IF (JobQueueEntry."Starting Time" <> 0T) AND (NewRunDateTime < JobQueueEntry.GetStartingDateTime(NewRunDateTime)) THEN
+        NewRunDateTime := JobQueueEntry.GetStartingDateTime(NewRunDateTime);
+
+      IF (NoOfDays > 0) AND (NewRunDateTime > JobQueueEntry.GetStartingDateTime(NewRunDateTime)) THEN
+        NewRunDateTime := JobQueueEntry.GetStartingDateTime(NewRunDateTime);
+
+      IF (JobQueueEntry."Starting Time" = 0T) AND (NoOfExtraDays > 0) AND (JobQueueEntry."No. of Minutes between Runs" <> 0) THEN
+        NewRunDateTime := CREATEDATETIME(DT2DATE(NewRunDateTime),0T);
+
+      IF Found THEN
+        NewRunDateTime := CREATEDATETIME(DT2DATE(NewRunDateTime) + NoOfDays,DT2TIME(NewRunDateTime));
+
+      EXIT(NewRunDateTime);
+    END;
+
+    LOCAL PROCEDURE UserSessionExists@13(VAR JobQueueEntry@1000 : Record 472) : Boolean;
+    VAR
+      ActiveSession@1001 : Record 2000000110;
+    BEGIN
+      ActiveSession.SETRANGE("Server Instance ID",JobQueue."Server Instance ID");
+      ActiveSession.SETRANGE("Session ID",JobQueueEntry."User Session ID");
+      ActiveSession.SETRANGE("Client Type",ActiveSession."Client Type"::Background);
+      EXIT(NOT ActiveSession.ISEMPTY);
+    END;
+
+    [TryFunction]
+    LOCAL PROCEDURE AdjustJobQueueEntries@3();
+    VAR
+      JobQueueEntry@1000 : Record 472;
+    BEGIN
+      WITH JobQueueEntry DO BEGIN
+        SETFILTER("Expiration Date/Time",'>%1|%2',CURRENTDATETIME,CREATEDATETIME(0D,0T));
+        SETFILTER("Earliest Start Date/Time",'<=%1',CURRENTDATETIME);
+        SETFILTER("Ending Time",'<%1',DT2TIME(CURRENTDATETIME));
+        SETRANGE("Recurring Job",TRUE);
+        IF FINDSET(TRUE) THEN
+          REPEAT
+            "Earliest Start Date/Time" := CalcNextRunTimeForRecurringJob(JobQueueEntry,CURRENTDATETIME);
+            MODIFY;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

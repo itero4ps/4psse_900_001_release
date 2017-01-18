@@ -1,0 +1,212 @@
+OBJECT Codeunit 11125708 Assign Activity Capacity Mgt.
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      ProjActCapComMgt@1100525000 : Codeunit 11125706;
+
+    PROCEDURE UpdateAssignActCapByDay@1100525000(AssignActCapRec@1100525000 : Record 11125710);
+    VAR
+      AssignActCapByDayRec@1100525003 : Record 11125711;
+      ReqActCapRec@1100525005 : Record 11125708;
+      EmplRec@1100525014 : Record 5200;
+      TeamRec@1100525013 : Record 11012437;
+      TeamResourceRec@1100525002 : Record 11012440;
+      TmpTeamResourceRec@1100525011 : TEMPORARY Record 11012440;
+      TmpAssignActCapRec@1100525001 : TEMPORARY Record 11125710;
+      JobsSetup@1100528400 : Record 315;
+      ProjectTimeTable@1100528401 : Record 11020684;
+      PlanDate@1100525007 : Date;
+      DateIsWorkingDate@1100525009 : Boolean;
+      NextLineNo@1100525004 : Integer;
+      HoursByDay@1100525008 : Decimal;
+      PercOnDate@1100525012 : Decimal;
+      CalendarCode@1100525006 : Code[10];
+    BEGIN
+      JobsSetup.GET;
+      JobsSetup.TESTFIELD("Project Time Table");
+      ProjectTimeTable.GET(JobsSetup."Project Time Table");
+
+      AssignActCapRec.DeleteAssignActCapByDay();
+      IF (AssignActCapRec."Resource Code" = '') OR
+         ((AssignActCapRec."Resource Type" = AssignActCapRec."Resource Type"::Plant) AND (AssignActCapRec."Plant No." = '')) OR
+         (AssignActCapRec."Starting Date" = 0D) OR (AssignActCapRec."Ending Date" = 0D)
+      THEN
+        EXIT;
+
+      IF NOT ReqActCapRec.GET(AssignActCapRec."Project No.", AssignActCapRec."Activity Code", AssignActCapRec."Line No. Request") THEN
+        EXIT;
+
+      CASE AssignActCapRec."Resource Type" OF
+        AssignActCapRec."Resource Type"::Team:
+          BEGIN
+            IF TeamRec.GET(AssignActCapRec."Resource Code") THEN BEGIN
+              TeamResourceRec.SETRANGE("Team Code", TeamRec.Code);
+              TeamResourceRec.SETFILTER(Percentage, '>%1', 0);
+              IF TeamResourceRec.FINDSET(FALSE,FALSE) THEN BEGIN
+                NextLineNo := 1;
+                REPEAT
+                  TmpTeamResourceRec := TeamResourceRec;
+                  TmpTeamResourceRec.INSERT;
+                  //
+                  TmpAssignActCapRec := AssignActCapRec;
+                  TmpAssignActCapRec."Line No." := NextLineNo;
+                  CASE TeamResourceRec."Resource Type" OF
+                    TeamResourceRec."Resource Type"::Employee:
+                      TmpAssignActCapRec."Resource Type" := TmpAssignActCapRec."Resource Type"::Employee;
+                    TeamResourceRec."Resource Type"::Plant:
+                      BEGIN
+                        TmpAssignActCapRec."Resource Type" := TmpAssignActCapRec."Resource Type"::Plant;
+                        TmpAssignActCapRec."Plant No." := TeamResourceRec."Plant No.";
+                      END;
+                  END;
+                  TmpAssignActCapRec."Resource Code" := TeamResourceRec."Resource Code";
+                  TmpAssignActCapRec.INSERT;
+                  NextLineNo := NextLineNo + 1;
+                UNTIL TeamResourceRec.NEXT = 0;
+              END;
+            END;
+          END;
+        AssignActCapRec."Resource Type"::Employee,
+        AssignActCapRec."Resource Type"::Plant:
+          BEGIN
+            TmpAssignActCapRec := AssignActCapRec;
+            TmpAssignActCapRec.INSERT;
+          END;
+      END;
+
+      CalendarCode := ProjActCapComMgt.GetCalendarCode();
+
+      FOR PlanDate := AssignActCapRec."Starting Date" TO AssignActCapRec."Ending Date" DO BEGIN
+        DateIsWorkingDate := TRUE;
+        IF CalendarCode <> '' THEN
+          DateIsWorkingDate := ProjActCapComMgt.DateIsWorkingDate(CalendarCode, PlanDate);
+        IF DateIsWorkingDate THEN BEGIN
+          IF TmpAssignActCapRec.FINDSET(FALSE,FALSE) THEN BEGIN
+            NextLineNo := 1;
+            REPEAT
+              HoursByDay := 0;
+              PercOnDate := 100;
+
+              IF AssignActCapRec."Resource Type" = AssignActCapRec."Resource Type"::Team THEN BEGIN
+                IF TmpAssignActCapRec."Resource Type" = TmpAssignActCapRec."Resource Type"::Employee THEN BEGIN
+                  TmpTeamResourceRec.GET(
+                    AssignActCapRec."Resource Code", TmpTeamResourceRec."Resource Type"::Employee,
+                    TmpAssignActCapRec."Resource Code", '');
+                END ELSE BEGIN
+                  TmpTeamResourceRec.GET(
+                    AssignActCapRec."Resource Code", TmpTeamResourceRec."Resource Type"::Plant,
+                    TmpAssignActCapRec."Resource Code", TmpAssignActCapRec."Plant No.");
+                END;
+                PercOnDate := TmpTeamResourceRec.Percentage;
+                IF NOT ProjActCapComMgt.CheckResourceInTeamOnDate(
+                  TmpTeamResourceRec."Team Code", TmpTeamResourceRec."Resource Type",
+                  TmpTeamResourceRec."Resource Code", TmpTeamResourceRec."Plant No.", PlanDate)
+                THEN
+                  PercOnDate := 0;
+              END;
+
+              IF PercOnDate > 0 THEN BEGIN
+                CASE TmpAssignActCapRec."Resource Type" OF
+                  TmpAssignActCapRec."Resource Type"::Employee:
+                    HoursByDay := ProjActCapComMgt.CalcAvailableEmplHoursOnDate(TmpAssignActCapRec."Resource Code", PlanDate);
+                  TmpAssignActCapRec."Resource Type"::Plant:
+                    BEGIN
+                      IF ProjActCapComMgt.CheckPlantNoAvailableOnDate(
+                        TmpAssignActCapRec."Resource Code", TmpAssignActCapRec."Plant No.", PlanDate)
+                      THEN
+                        HoursByDay := ProjectTimeTable.GetHoursByDay(PlanDate);
+                    END;
+                END;
+                IF (HoursByDay > 0) AND (AssignActCapRec."Hours by Day" <> 0) AND (AssignActCapRec."Hours by Day" < HoursByDay) THEN
+                  HoursByDay := AssignActCapRec."Hours by Day";
+                HoursByDay := HoursByDay * (PercOnDate / 100);
+                HoursByDay := ROUND(HoursByDay, 0.01);
+              END;
+
+              IF HoursByDay > 0 THEN BEGIN
+                AssignActCapByDayRec.INIT;
+                AssignActCapByDayRec."Project No." := AssignActCapRec."Project No.";
+                AssignActCapByDayRec."Activity Code" := AssignActCapRec."Activity Code";
+                AssignActCapByDayRec."Line No. Request" := AssignActCapRec."Line No. Request";
+                AssignActCapByDayRec."Line No. Assign" := AssignActCapRec."Line No.";
+                AssignActCapByDayRec.Date := PlanDate;
+                AssignActCapByDayRec."Line No." := NextLineNo;
+                AssignActCapByDayRec."Resource Code" := TmpAssignActCapRec."Resource Code";
+                CASE TmpAssignActCapRec."Resource Type" OF
+                  TmpAssignActCapRec."Resource Type"::Employee:
+                    BEGIN
+                      AssignActCapByDayRec."Resource Type" := AssignActCapByDayRec."Resource Type"::Employee;
+                      IF AssignActCapRec."Resource Type" = AssignActCapRec."Resource Type"::Team THEN
+                        AssignActCapByDayRec.Discipline := TmpTeamResourceRec.Discipline;
+                      IF AssignActCapByDayRec.Discipline = '' THEN BEGIN
+                        IF EmplRec.GET(AssignActCapByDayRec."Resource Code") THEN
+                          AssignActCapByDayRec.Discipline := EmplRec.Discipline;
+                      END;
+                    END;
+                  TmpAssignActCapRec."Resource Type"::Plant:
+                    BEGIN
+                      AssignActCapByDayRec."Resource Type" := AssignActCapByDayRec."Resource Type"::Plant;
+                      AssignActCapByDayRec."Plant No." := TmpAssignActCapRec."Plant No.";
+                      AssignActCapByDayRec.Discipline := '';  //* Empty for plant!
+                    END;
+                END;
+                IF AssignActCapRec."Resource Type" = AssignActCapRec."Resource Type"::Team THEN BEGIN
+                  AssignActCapByDayRec."Team Code" := AssignActCapRec."Resource Code";
+                  AssignActCapByDayRec."Team Type Code" := TeamRec."Team Type Code";
+                END;
+                AssignActCapByDayRec.Hours := HoursByDay;
+                IF AssignActCapByDayRec.Hours > 0 THEN
+                  AssignActCapByDayRec.INSERT;
+                NextLineNo := NextLineNo + 1;
+              END;
+            UNTIL TmpAssignActCapRec.NEXT = 0;
+          END;
+        END;
+      END;
+    END;
+
+    PROCEDURE UpdAllAssActCapChangedByGPP@1100528400();
+    VAR
+      AssignedActivityCapacity@1100528401 : Record 11125710;
+    BEGIN
+      AssignedActivityCapacity.SETCURRENTKEY(Changed);
+      AssignedActivityCapacity.SETRANGE(Changed, TRUE);
+      IF AssignedActivityCapacity.FINDSET THEN
+        REPEAT
+          UpdAssignedActCapAfterGPP(
+            AssignedActivityCapacity."Project No.",
+            AssignedActivityCapacity."Activity Code",
+            AssignedActivityCapacity."Line No. Request",
+            AssignedActivityCapacity."Line No.");
+        UNTIL AssignedActivityCapacity.NEXT = 0;
+    END;
+
+    PROCEDURE UpdAssignedActCapAfterGPP@1100528401(ProjectNo@1100528403 : Code[20];ActivityCode@1100528402 : Text[10];LineNoRequest@1100528401 : Integer;LineNo@1100528400 : Integer);
+    VAR
+      AssignedActivityCapacity@1100528404 : Record 11125710;
+    BEGIN
+      IF AssignedActivityCapacity.GET(ProjectNo, ActivityCode, LineNoRequest, LineNo) THEN BEGIN
+        UpdateAssignActCapByDay(AssignedActivityCapacity);
+        AssignedActivityCapacity.Changed := FALSE;
+        AssignedActivityCapacity.MODIFY(TRUE);
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

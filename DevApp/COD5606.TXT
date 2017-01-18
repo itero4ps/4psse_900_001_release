@@ -1,0 +1,409 @@
+OBJECT Codeunit 5606 FA Check Consistency
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW17.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=5601;
+    Permissions=TableData 5601=r,
+                TableData 5604=r,
+                TableData 5612=rm,
+                TableData 11072085=rm,
+                TableData 11072088=rm;
+    OnRun=BEGIN
+            IF ("FA Posting Category" <> "FA Posting Category"::" ") OR
+               ("FA Posting Type" = "FA Posting Type"::"Gain/Loss") OR
+               ("FA Posting Type" = "FA Posting Type"::"Book Value on Disposal")
+            THEN
+              EXIT;
+            CLEARALL;
+            FALedgEntry := Rec;
+            // This record is not modified in the codeunit.
+            FALedgEntry2 := Rec;
+            WITH FALedgEntry DO BEGIN
+              DeprBookCode := "Depreciation Book Code";
+              FANo := "FA No.";
+              FAPostingDate := "FA Posting Date";
+              PostingDate := "Posting Date";
+              FA.GET(FANo);
+              DeprBook.GET(DeprBookCode);
+              FADeprBook.GET(FANo,DeprBookCode);
+              CASE "FA Posting Type" OF
+                "FA Posting Type"::"Write-Down":
+                  FAPostingTypeSetup.GET(
+                    DeprBookCode,FAPostingTypeSetup."FA Posting Type"::"Write-Down");
+                "FA Posting Type"::Appreciation:
+                  FAPostingTypeSetup.GET(
+                    DeprBookCode,FAPostingTypeSetup."FA Posting Type"::Appreciation);
+                "FA Posting Type"::"Custom 1":
+                  FAPostingTypeSetup.GET(
+                    DeprBookCode,FAPostingTypeSetup."FA Posting Type"::"Custom 1");
+                "FA Posting Type"::"Custom 2":
+                  FAPostingTypeSetup.GET(
+                    DeprBookCode,FAPostingTypeSetup."FA Posting Type"::"Custom 2");
+              END;
+              IF "FA Posting Type" = "FA Posting Type"::"Proceeds on Disposal" THEN
+                CheckSalesPosting
+              ELSE
+                CheckNormalPosting;
+            END;
+            SetFAPostingDate(FALedgEntry2,TRUE);
+            CheckInsuranceIntegration;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1000 : TextConst 'ENU=The first entry must be an %2 for %1.';
+      Text001@1001 : TextConst 'ENU=%1 is disposed.';
+      Text002@1002 : TextConst 'ENU=%2 must be the last date for %1.';
+      Text003@1003 : TextConst 'ENU=Accumulated';
+      Text004@1004 : TextConst 'ENU=%2%3 must not be positive on %4 for %1.';
+      Text005@1005 : TextConst 'ENU=%2%3 must not be negative on %4 for %1.';
+      Text006@1006 : TextConst 'ENU=%2 (%5) must not be negative or less than %3 (%6) on %4 for %1.';
+      Text007@1007 : TextConst 'ENU=%2 must not be negative on %3 for %1.';
+      DeprBook@1008 : Record 5611;
+      FA@1009 : Record 5600;
+      FADeprBook@1010 : Record 5612;
+      FAPostingTypeSetup@1011 : Record 5604;
+      FALedgEntry@1012 : Record 5601;
+      FALedgEntry2@1013 : Record 5601;
+      FAJnlLine@1014 : Record 5621;
+      FANo@1015 : Code[20];
+      DeprBookCode@1016 : Code[10];
+      FAPostingDate@1017 : Date;
+      PostingDate@1018 : Date;
+      BookValue@1019 : Decimal;
+      DeprBasis@1020 : Decimal;
+      SalvageValue@1021 : Decimal;
+      NewAmount@1022 : Decimal;
+
+    LOCAL PROCEDURE CheckNormalPosting@1();
+    BEGIN
+      WITH FALedgEntry DO BEGIN
+        IF FADeprBook."Disposal Date" > 0D THEN
+          CreateDisposedError;
+        SETCURRENTKEY("FA No.","Depreciation Book Code","FA Posting Date");
+        SETRANGE("FA No.",FANo);
+        SETRANGE("Depreciation Book Code",DeprBookCode);
+        IF FIND('-') THEN BEGIN
+          IF "FA Posting Type" <> "FA Posting Type"::"Acquisition Cost" THEN
+            CreateAcquisitionCostError;
+          IF NOT FADeprBook."Use FA Ledger Check" THEN
+            DeprBook.TESTFIELD("Use FA Ledger Check",FALSE)
+          ELSE BEGIN
+            SETCURRENTKEY("FA No.","Depreciation Book Code","Part of Book Value","FA Posting Date");
+            SETRANGE("Part of Book Value",TRUE);
+            SETRANGE("FA Posting Date",0D,FAPostingDate - 1);
+            CALCSUMS(Amount);
+            BookValue := Amount;
+            SETRANGE("Part of Book Value");
+            SETCURRENTKEY("FA No.","Depreciation Book Code","Part of Depreciable Basis","FA Posting Date");
+            SETRANGE("Part of Depreciable Basis",TRUE);
+            CALCSUMS(Amount);
+            DeprBasis := Amount;
+            SETRANGE("Part of Depreciable Basis");
+            SETCURRENTKEY(
+              "FA No.","Depreciation Book Code",
+              "FA Posting Category","FA Posting Type","FA Posting Date");
+            SETRANGE("FA Posting Category","FA Posting Category"::" ");
+            SETRANGE("FA Posting Type","FA Posting Type"::"Salvage Value");
+            CALCSUMS(Amount);
+            SalvageValue := Amount;
+            SETRANGE("FA Posting Type",FALedgEntry2."FA Posting Type");
+            CALCSUMS(Amount);
+            NewAmount := Amount;
+            SETRANGE("FA Posting Type");
+            SETCURRENTKEY("FA No.","Depreciation Book Code","FA Posting Date");
+            SETFILTER("FA Posting Date",'%1..',FAPostingDate);
+            SETRANGE(Reversed,FALSE);
+            IF FIND('-') THEN
+              REPEAT
+                IF "Part of Book Value" THEN
+                  BookValue := BookValue + Amount;
+                IF "Part of Depreciable Basis" THEN
+                  DeprBasis := DeprBasis + Amount;
+                IF "FA Posting Type" = "FA Posting Type"::"Salvage Value" THEN
+                  SalvageValue := SalvageValue + Amount;
+                IF "FA Posting Type" = FALedgEntry2."FA Posting Type" THEN
+                  NewAmount := NewAmount + Amount;
+                CheckForError;
+              UNTIL NEXT = 0;
+          END;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckSalesPosting@2();
+    VAR
+      lvErrorMess@1100485000 : Boolean;
+    BEGIN
+      WITH FALedgEntry DO BEGIN
+        IF FADeprBook."Acquisition Date" = 0D THEN
+          CreateAcquisitionCostError;
+        SETCURRENTKEY("FA No.","Depreciation Book Code","Part of Book Value","FA Posting Date");
+        SETRANGE("FA No.",FANo);
+        SETRANGE("Depreciation Book Code",DeprBookCode);
+        SETRANGE("Part of Book Value",TRUE);
+        SETFILTER("FA Posting Date",'%1..',FAPostingDate + 1);
+        //**4PS.so
+        //IF FIND('-') THEN
+        //  CreateDisposalError;
+        //**4PS.eo
+        //**4PS.sn
+        IF FIND('-') THEN BEGIN
+          lvErrorMess := TRUE;
+          IF FA."Original Asset" = '' THEN BEGIN
+            FA.CALCFIELDS("Plant No.");
+            IF FA."Plant No." <> '' THEN BEGIN
+              REPEAT
+                IF ("Document Type" = 0) AND "Reclassification Entry" AND (Quantity < 0) THEN
+                  lvErrorMess := FALSE
+                ELSE
+                  lvErrorMess := TRUE;
+              UNTIL (NEXT = 0) OR lvErrorMess;
+            END;
+          END;
+          IF lvErrorMess THEN
+            CreateDisposalError;
+        END;
+        //**4PS.en
+
+        SETRANGE("Part of Book Value");
+        SETCURRENTKEY("FA No.","Depreciation Book Code","Part of Depreciable Basis","FA Posting Date");
+        SETRANGE("Part of Depreciable Basis",TRUE);
+        //**4PS.so
+        //IF FIND('-') THEN
+        //  CreateDisposalError;
+        //**4PS.eo
+        //**4PS.sn
+        IF FIND('-') THEN BEGIN
+          lvErrorMess := TRUE;
+          IF FA."Original Asset" = '' THEN BEGIN
+            FA.CALCFIELDS("Plant No.");
+            IF FA."Plant No." <> '' THEN BEGIN
+              REPEAT
+                IF ("Document Type" = 0) AND "Reclassification Entry" AND (Quantity < 0) THEN
+                  lvErrorMess := FALSE
+                ELSE
+                  lvErrorMess := TRUE;
+              UNTIL (NEXT = 0) OR lvErrorMess;
+            END;
+          END;
+          IF lvErrorMess THEN
+            CreateDisposalError;
+        END;
+        //**4PS.en
+
+        SETRANGE("Part of Depreciable Basis");
+        IF NOT FADeprBook."Use FA Ledger Check" THEN
+          DeprBook.TESTFIELD("Use FA Ledger Check",FALSE)
+        ELSE BEGIN
+          SETCURRENTKEY(
+            "FA No.","Depreciation Book Code",
+            "FA Posting Category","FA Posting Type","FA Posting Date");
+          SETRANGE("FA Posting Category","FA Posting Category"::" ");
+          SETRANGE("FA Posting Type","FA Posting Type"::"Proceeds on Disposal");
+          SETRANGE("FA Posting Date");
+          IF FIND('-') THEN
+            REPEAT
+              NewAmount := NewAmount + Amount;
+              IF NewAmount > 0 THEN
+                CreatePostingTypeError;
+            UNTIL NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE SetFAPostingDate@6(VAR FALedgEntry2@1000 : Record 5601;LocalCall@1001 : Boolean);
+    VAR
+      MaxDate@1002 : Date;
+      MinDate@1003 : Date;
+      GLDate@1004 : Date;
+    BEGIN
+      WITH FALedgEntry2 DO
+        IF NOT LocalCall THEN BEGIN
+          FANo := "FA No.";
+          DeprBookCode := "Depreciation Book Code";
+          FADeprBook.GET(FANo,DeprBookCode);
+        END;
+      WITH FALedgEntry DO BEGIN
+        RESET;
+        SETCURRENTKEY(
+          "FA No.","Depreciation Book Code","FA Posting Category","FA Posting Type","FA Posting Date");
+        SETRANGE("Depreciation Book Code",DeprBookCode);
+        SETRANGE("FA No.",FANo);
+        SETRANGE("FA Posting Category","FA Posting Category"::" ");
+        SETRANGE("FA Posting Type",FALedgEntry2."FA Posting Type");
+        IF FIND('+') THEN
+          MaxDate := "FA Posting Date"
+        ELSE
+          MaxDate := 0D;
+        CASE FALedgEntry2."FA Posting Type" OF
+          FALedgEntry2."FA Posting Type"::"Acquisition Cost",
+          FALedgEntry2."FA Posting Type"::"Proceeds on Disposal":
+            IF FIND('-') THEN
+              MinDate := "FA Posting Date"
+            ELSE
+              MinDate := 0D;
+        END;
+        CASE FALedgEntry2."FA Posting Type" OF
+          FALedgEntry2."FA Posting Type"::"Acquisition Cost":
+            BEGIN
+              SETCURRENTKEY(
+                "FA No.","Depreciation Book Code",
+                "FA Posting Category","FA Posting Type","Posting Date");
+              IF FIND('-') THEN
+                GLDate := "Posting Date"
+              ELSE
+                GLDate := 0D;
+            END;
+        END;
+      END;
+      WITH FALedgEntry2 DO
+        CASE "FA Posting Type" OF
+          "FA Posting Type"::"Acquisition Cost":
+            BEGIN
+              FADeprBook."Last Acquisition Cost Date" := MaxDate;
+              FADeprBook."Acquisition Date" := MinDate;
+              FADeprBook."G/L Acquisition Date" := GLDate;
+            END;
+          "FA Posting Type"::"Salvage Value":
+            FADeprBook."Last Salvage Value Date" := MaxDate;
+          "FA Posting Type"::Depreciation:
+            FADeprBook."Last Depreciation Date" := MaxDate;
+          "FA Posting Type"::"Write-Down":
+            FADeprBook."Last Write-Down Date" := MaxDate;
+          "FA Posting Type"::Appreciation:
+            FADeprBook."Last Appreciation Date" := MaxDate;
+          "FA Posting Type"::"Custom 1":
+            FADeprBook."Last Custom 1 Date" := MaxDate;
+          "FA Posting Type"::"Custom 2":
+            FADeprBook."Last Custom 2 Date" := MaxDate;
+          "FA Posting Type"::"Proceeds on Disposal":
+            FADeprBook."Disposal Date" := MinDate;
+        END;
+
+      FADeprBook.MODIFY;
+    END;
+
+    LOCAL PROCEDURE CheckInsuranceIntegration@10();
+    VAR
+      FASetup@1000 : Record 5603;
+      InsCoverageLedgEntry@1001 : Record 11072088;
+    BEGIN
+      IF FALedgEntry2."FA Posting Type" <> FALedgEntry2."FA Posting Type"::"Proceeds on Disposal" THEN
+        EXIT;
+      IF NOT InsCoverageLedgEntry.FINDFIRST THEN
+        EXIT;
+      FASetup.GET;
+      FASetup.TESTFIELD("Insurance Depr. Book");
+      IF DeprBook.Code <> FASetup."Insurance Depr. Book" THEN
+        EXIT;
+      InsCoverageLedgEntry.SETCURRENTKEY("FA No.");
+      InsCoverageLedgEntry.SETRANGE("FA No.",FA."No.");
+      InsCoverageLedgEntry.MODIFYALL("Disposed FA",FADeprBook."Disposal Date" > 0D)
+    END;
+
+    LOCAL PROCEDURE CheckForError@3();
+    BEGIN
+      WITH FALedgEntry2 DO BEGIN
+        CASE "FA Posting Type" OF
+          "FA Posting Type"::"Acquisition Cost":
+            IF NewAmount < 0 THEN
+              CreatePostingTypeError;
+          "FA Posting Type"::Depreciation,
+          "FA Posting Type"::"Salvage Value":
+            IF NewAmount > 0 THEN
+              CreatePostingTypeError;
+          "FA Posting Type"::"Write-Down",
+          "FA Posting Type"::Appreciation,
+          "FA Posting Type"::"Custom 1",
+          "FA Posting Type"::"Custom 2":
+            BEGIN
+              IF NewAmount > 0 THEN
+                IF FAPostingTypeSetup.Sign = FAPostingTypeSetup.Sign::Credit THEN
+                  CreatePostingTypeError;
+              IF NewAmount < 0 THEN
+                IF FAPostingTypeSetup.Sign = FAPostingTypeSetup.Sign::Debit THEN
+                  CreatePostingTypeError;
+            END;
+        END;
+        //IF BookValue + SalvageValue < 0 THEN  //**4PS.o
+        IF ROUND(BookValue + SalvageValue) < 0 THEN   //**4PS.n (C027989)
+          IF NOT DeprBook."Allow Depr. below Zero" OR
+             ("FA Posting Type" <> "FA Posting Type"::Depreciation)
+          THEN
+            IF NOT DeprBook."Allow Acq. Cost below Zero" OR
+               ("FA Posting Type" <> "FA Posting Type"::"Acquisition Cost") OR
+               NOT "Index Entry"
+            THEN
+              CreateBookValueError;
+        IF DeprBasis < 0 THEN
+          CreateDeprBasisError;
+      END;
+    END;
+
+    LOCAL PROCEDURE CreateAcquisitionCostError@4();
+    BEGIN
+      FAJnlLine."FA Posting Type" := FAJnlLine."FA Posting Type"::"Acquisition Cost";
+      ERROR(Text000,
+        FAName,FAJnlLine."FA Posting Type");
+    END;
+
+    LOCAL PROCEDURE CreateDisposedError@9();
+    BEGIN
+      ERROR(Text001,FAName);
+    END;
+
+    LOCAL PROCEDURE CreateDisposalError@8();
+    BEGIN
+      FAJnlLine."FA Posting Type" := FAJnlLine."FA Posting Type"::Disposal;
+      ERROR(Text002,FAName,FADeprBook.FIELDCAPTION("Disposal Date"));
+    END;
+
+    LOCAL PROCEDURE CreatePostingTypeError@5();
+    VAR
+      AccumText@1000 : Text[30];
+    BEGIN
+      FAJnlLine."FA Posting Type" := FALedgEntry2.ConvertPostingType;
+      IF FAJnlLine."FA Posting Type" = FAJnlLine."FA Posting Type"::Depreciation THEN
+        AccumText := STRSUBSTNO('%1 %2',Text003,'');
+      IF NewAmount > 0 THEN
+        ERROR(Text004,FAName,AccumText,FAJnlLine."FA Posting Type",FALedgEntry."FA Posting Date");
+      IF NewAmount < 0 THEN
+        ERROR(Text005,FAName,AccumText,FAJnlLine."FA Posting Type",FALedgEntry."FA Posting Date");
+    END;
+
+    LOCAL PROCEDURE CreateBookValueError@7();
+    BEGIN
+      FAJnlLine."FA Posting Type" := FAJnlLine."FA Posting Type"::"Salvage Value";
+      ERROR(
+        Text006,
+        FAName,FADeprBook.FIELDCAPTION("Book Value"),FAJnlLine."FA Posting Type",FALedgEntry."FA Posting Date",
+        BookValue, SalvageValue);  //**4PS.n (C027989)
+    END;
+
+    LOCAL PROCEDURE CreateDeprBasisError@12();
+    BEGIN
+      ERROR(
+        Text007,FAName,FADeprBook.FIELDCAPTION("Depreciable Basis"),FALedgEntry."FA Posting Date");
+    END;
+
+    LOCAL PROCEDURE FAName@15() : Text[200];
+    VAR
+      DepreciationCalc@1000 : Codeunit 5616;
+    BEGIN
+      EXIT(DepreciationCalc.FAName(FA,DeprBookCode));
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

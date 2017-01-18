@@ -1,0 +1,322 @@
+OBJECT Codeunit 5930 ServAllocationManagement
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW17.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 5950=rimd;
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1000 : TextConst 'ENU=You cannot allocate a resource to the service order %1 because it is %2.';
+      Text001@1001 : TextConst 'ENU=%1 with the field %2 selected cannot be found.';
+      Text002@1002 : TextConst 'ENU=Do you want to allocate the %1 %2 to all nonactive Service Order Allocations on the Service Item Lines with the %3 other than %4?';
+      Text003@1003 : TextConst 'ENU=There are no %1 lines to split the corresponding %2.';
+      Text004@1004 : TextConst 'ENU=You cannot change the resource allocation for service item line %1 because the %2 is %3.';
+
+    PROCEDURE AllocateDate@7(DocumentType@1000 : Integer;DocumentNo@1008 : Code[20];EntryNo@1001 : Integer;ResNo@1002 : Code[20];ResGrNo@1003 : Code[20];CurrentDate@1004 : Date;Quantity@1005 : Decimal);
+    VAR
+      ServHeader@1006 : Record 5900;
+      ServOrderAlloc@1007 : Record 5950;
+    BEGIN
+      ServHeader.GET(DocumentType,DocumentNo);
+      IF ServHeader.Status = ServHeader.Status::Finished THEN
+        ERROR(
+          STRSUBSTNO(
+            Text000,
+            ServHeader."No.",ServHeader.Status));
+      IF ServOrderAlloc.GET(EntryNo) THEN BEGIN
+        CheckServiceItemLineFinished(ServHeader,ServOrderAlloc."Service Item Line No.");
+        ServOrderAlloc."Allocation Date" := CurrentDate;
+        ServOrderAlloc.VALIDATE("Resource No.",ResNo);
+        IF ResGrNo <> '' THEN
+          ServOrderAlloc.VALIDATE("Resource Group No.",ResGrNo);
+        ServOrderAlloc.VALIDATE("Allocated Hours",Quantity);
+        ServOrderAlloc.MODIFY(TRUE);
+      END;
+    END;
+
+    PROCEDURE CancelAllocation@3(VAR ServOrderAlloc@1000 : Record 5950);
+    VAR
+      ServHeader@1001 : Record 5900;
+      ServItemLine@1002 : Record 5901;
+      RepairStatus@1003 : Record 5927;
+      RepairStatus2@1004 : Record 5927;
+      AddReasonCodeCancelation@1005 : Page 6002;
+      ReasonCode@1006 : Code[10];
+      RepairStatusCode@1007 : Code[10];
+    BEGIN
+      IF ServOrderAlloc."Entry No." = 0 THEN
+        EXIT;
+      ServHeader.GET(ServOrderAlloc."Document Type",ServOrderAlloc."Document No.");
+      CheckServiceItemLineFinished(ServHeader,ServOrderAlloc."Service Item Line No.");
+      CLEAR(AddReasonCodeCancelation);
+      AddReasonCodeCancelation.SETRECORD(ServOrderAlloc);
+      AddReasonCodeCancelation.SETTABLEVIEW(ServOrderAlloc);
+      IF AddReasonCodeCancelation.RUNMODAL = ACTION::Yes THEN BEGIN
+        ReasonCode := AddReasonCodeCancelation.ReturnReasonCode;
+        ServOrderAlloc.VALIDATE(Status,ServOrderAlloc.Status::"Reallocation Needed");
+        ServOrderAlloc."Reason Code" := ReasonCode;
+        ServOrderAlloc.MODIFY(TRUE);
+        IF ServItemLine.GET(
+             ServOrderAlloc."Document Type",ServOrderAlloc."Document No.",ServOrderAlloc."Service Item Line No.")
+        THEN BEGIN
+          ServItemLine.VALIDATE(Priority,AddReasonCodeCancelation.ReturnPriority);
+          RepairStatusCode := ServItemLine."Repair Status Code";
+          RepairStatus.GET(RepairStatusCode);
+          IF RepairStatus.Initial THEN BEGIN
+            CLEAR(RepairStatus2);
+            RepairStatus2.SETRANGE(Referred,TRUE);
+            IF RepairStatus2.FINDFIRST THEN
+              RepairStatusCode := RepairStatus2.Code
+            ELSE
+              ERROR(
+                Text001,
+                RepairStatus.TABLECAPTION,RepairStatus.FIELDCAPTION(Referred));
+          END ELSE
+            IF RepairStatus."In Process" THEN BEGIN
+              CLEAR(RepairStatus2);
+              RepairStatus2.SETRANGE("Partly Serviced",TRUE);
+              IF RepairStatus2.FINDFIRST THEN
+                RepairStatusCode := RepairStatus2.Code
+              ELSE
+                ERROR(
+                  Text001,
+                  RepairStatus.TABLECAPTION,RepairStatus.FIELDCAPTION("Partly Serviced"));
+            END;
+          ServItemLine."Repair Status Code" := RepairStatusCode;
+          ServItemLine.MODIFY(TRUE);
+        END ELSE BEGIN
+          ServHeader.GET(ServOrderAlloc."Document Type",ServOrderAlloc."Document No.");
+          ServHeader.VALIDATE(Priority,AddReasonCodeCancelation.ReturnPriority);
+          ServHeader.MODIFY(TRUE);
+        END;
+      END;
+    END;
+
+    PROCEDURE CreateAllocationEntry@8(DocumentType@1007 : Integer;DocumentNo@1000 : Code[20];ServItemLineNo@1001 : Integer;ServItemNo@1002 : Code[20];ServSerialNo@1003 : Code[40]);
+    VAR
+      ServHeader@1004 : Record 5900;
+      ServOrderAlloc@1005 : Record 5950;
+      NewServOrderAlloc@1006 : Record 5950;
+    BEGIN
+      ServHeader.GET(DocumentType,DocumentNo);
+      IF ServHeader.Status <> ServHeader.Status::Finished THEN BEGIN
+        CheckServiceItemLineFinished(ServHeader,ServOrderAlloc."Service Item Line No.");
+        ServOrderAlloc.RESET;
+        ServOrderAlloc.SETCURRENTKEY(Status,"Document Type","Document No.","Service Item Line No.");
+        ServOrderAlloc.SETFILTER(Status,'<>%1',ServOrderAlloc.Status::Canceled);
+        ServOrderAlloc.SETRANGE("Document Type",DocumentType);
+        ServOrderAlloc.SETRANGE("Document No.",DocumentNo);
+        ServOrderAlloc.SETRANGE("Service Item Line No.",ServItemLineNo);
+        IF NOT ServOrderAlloc.FINDFIRST THEN BEGIN
+          NewServOrderAlloc.INIT;
+          NewServOrderAlloc."Document Type" := DocumentType;
+          NewServOrderAlloc."Document No." := DocumentNo;
+          NewServOrderAlloc."Service Item Line No." := ServItemLineNo;
+          NewServOrderAlloc."Service Item No." := ServItemNo;
+          NewServOrderAlloc."Service Item Serial No." := ServSerialNo;
+          NewServOrderAlloc.INSERT(TRUE);
+        END;
+      END;
+    END;
+
+    PROCEDURE SplitAllocation@4(VAR SplitServOrderAlloc@1000 : Record 5950);
+    VAR
+      ServOrderAlloc@1001 : Record 5950;
+      ServOrderAllocTemp@1006 : TEMPORARY Record 5950;
+      ServItemLine@1002 : Record 5901;
+      Res@1003 : Record 156;
+      RepairStatus@1008 : Record 5927;
+      NoOfRecords@1004 : Integer;
+      SplitAllocHours@1005 : Decimal;
+    BEGIN
+      WITH SplitServOrderAlloc DO BEGIN
+        TESTFIELD(Status,Status::Active);
+        IF NOT
+           CONFIRM(
+             Text002,
+             FALSE,
+             Res.TABLECAPTION,
+             "Resource No.",
+             RepairStatus.TABLECAPTION,
+             RepairStatus.FIELDCAPTION(Finished))
+        THEN
+          EXIT;
+
+        ServOrderAlloc.RESET;
+        ServOrderAlloc.SETCURRENTKEY("Document Type","Document No.",Status);
+        ServOrderAlloc.SETRANGE("Document Type","Document Type");
+        ServOrderAlloc.SETRANGE("Document No.","Document No.");
+        ServOrderAlloc.SETFILTER(Status,'%1|%2',
+          ServOrderAlloc.Status::Nonactive,ServOrderAlloc.Status::"Reallocation Needed");
+        ServOrderAlloc.SetHideDialog(TRUE);
+        IF NOT ServOrderAlloc.FIND('-') THEN
+          ERROR(Text003,
+            ServOrderAlloc.TABLECAPTION,FIELDCAPTION("Allocated Hours"));
+        ServOrderAllocTemp.DELETEALL;
+        REPEAT
+          ServItemLine.GET(
+            ServOrderAlloc."Document Type",
+            ServOrderAlloc."Document No.",
+            ServOrderAlloc."Service Item Line No.");
+          IF RepairStatus.GET(ServItemLine."Repair Status Code") THEN
+            IF NOT RepairStatus.Finished THEN BEGIN
+              ServOrderAllocTemp := ServOrderAlloc;
+              ServOrderAllocTemp.INSERT;
+            END;
+        UNTIL ServOrderAlloc.NEXT = 0;
+
+        NoOfRecords := ServOrderAllocTemp.COUNT + 1;
+        IF NoOfRecords <> 1 THEN BEGIN
+          SplitAllocHours := ROUND("Allocated Hours" / NoOfRecords,0.1);
+          ServOrderAllocTemp.FIND('-');
+          REPEAT
+            ServOrderAlloc.GET(ServOrderAllocTemp."Entry No.");
+            IF ServOrderAlloc."Entry No." <> "Entry No." THEN BEGIN
+              ServOrderAlloc.VALIDATE("Allocation Date","Allocation Date");
+              ServOrderAlloc.VALIDATE("Resource No.","Resource No.");
+              ServOrderAlloc.VALIDATE("Resource Group No.","Resource Group No.");
+              ServOrderAlloc.VALIDATE("Allocated Hours",SplitAllocHours);
+              ServOrderAlloc.MODIFY(TRUE);
+            END;
+            VALIDATE("Allocated Hours",SplitAllocHours);
+            MODIFY(TRUE);
+          UNTIL ServOrderAllocTemp.NEXT = 0;
+        END ELSE
+          ERROR(Text003,
+            ServOrderAlloc.TABLECAPTION,FIELDCAPTION("Allocated Hours"));
+      END;
+    END;
+
+    PROCEDURE ResourceQualified@2(ResourceNo@1000 : Code[20];Type@1001 : 'Resource,Service Item Group,Item,Service Item';No@1002 : Code[20]) : Boolean;
+    VAR
+      ServMgtSetup@1003 : Record 5911;
+      ResourceSkill@1004 : Record 5956;
+      ResourceSkill2@1005 : Record 5956;
+    BEGIN
+      ServMgtSetup.GET;
+      IF ServMgtSetup."Resource Skills Option" = ServMgtSetup."Resource Skills Option"::"Not Used" THEN
+        EXIT(FALSE);
+
+      IF ResourceNo = '' THEN
+        EXIT(FALSE);
+
+      ResourceSkill.SETRANGE(Type,Type);
+      ResourceSkill.SETRANGE("No.",No);
+      IF ResourceSkill.FIND('-') THEN
+        REPEAT
+          IF NOT
+             ResourceSkill2.GET(
+               Type::Resource,
+               ResourceNo,
+               ResourceSkill."Skill Code")
+          THEN
+            EXIT(FALSE);
+        UNTIL ResourceSkill.NEXT = 0;
+
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE QualifiedForServiceItemLine@5(VAR ServiceItemLine@1000 : Record 5901;ResourceNo@1002 : Code[20]) : Boolean;
+    VAR
+      ResourceSkill@1001 : Record 5956;
+    BEGIN
+      CASE TRUE OF
+        ServiceItemLine."Service Item No." <> '':
+          IF NOT
+             ResourceQualified(
+               ResourceNo,
+               ResourceSkill.Type::"Service Item",
+               ServiceItemLine."Service Item No.")
+          THEN
+            EXIT(FALSE);
+        ServiceItemLine."Item No." <> '':
+          IF NOT
+             ResourceQualified(
+               ResourceNo,
+               ResourceSkill.Type::Item,
+               ServiceItemLine."Item No.")
+          THEN
+            EXIT(FALSE);
+        ServiceItemLine."Service Item Group Code" <> '':
+          IF NOT
+             ResourceQualified(
+               ResourceNo,
+               ResourceSkill.Type::"Service Item Group",
+               ServiceItemLine."Service Item Group Code")
+          THEN
+            EXIT(FALSE);
+      END;
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE CheckServiceItemLineFinished@1(VAR ServHeader@1002 : Record 5900;ServiceItemLineNo@1000 : Integer);
+    VAR
+      ServiceItemLine@1003 : Record 5901;
+      RepairStatus@1001 : Record 5927;
+    BEGIN
+      WITH ServiceItemLine DO
+        IF GET(ServHeader."Document Type",ServHeader."No.",ServiceItemLineNo) THEN
+          IF "Repair Status Code" <> '' THEN BEGIN
+            RepairStatus.GET("Repair Status Code");
+            IF RepairStatus.Finished THEN
+              ERROR(Text004,"Line No.",FIELDCAPTION("Repair Status Code"),"Repair Status Code");
+          END;
+    END;
+
+    PROCEDURE SetServOrderAllocStatus@65(VAR ServHeader@1000 : Record 5900);
+    VAR
+      ServOrderAlloc@1001 : Record 5950;
+      ServOrderAlloc2@1002 : Record 5950;
+    BEGIN
+      ServOrderAlloc.RESET;
+      ServOrderAlloc.SETCURRENTKEY("Document Type","Document No.");
+      ServOrderAlloc.SETRANGE("Document Type",ServHeader."Document Type");
+      ServOrderAlloc.SETRANGE("Document No.",ServHeader."No.");
+      IF ServOrderAlloc.FIND('-') THEN
+        REPEAT
+          ServOrderAlloc2 := ServOrderAlloc;
+          ServOrderAlloc2.Posted := TRUE;
+          IF ServOrderAlloc2.Status = ServOrderAlloc2.Status::Active THEN
+            ServOrderAlloc2.Status := ServOrderAlloc2.Status::Finished;
+          ServOrderAlloc2.MODIFY;
+        UNTIL ServOrderAlloc.NEXT = 0;
+    END;
+
+    PROCEDURE SetServLineAllocStatus@6(VAR ServLine@1000 : Record 5902);
+    VAR
+      ServOrderAlloc@1002 : Record 5950;
+      ServOrderAlloc2@1001 : Record 5950;
+    BEGIN
+      IF (ServLine."Service Item Line No." = 0) OR (ServLine."Qty. to Ship" = 0) THEN
+        EXIT;
+      ServOrderAlloc.RESET;
+      ServOrderAlloc.SETCURRENTKEY("Document Type","Document No.");
+      ServOrderAlloc.SETRANGE("Document Type",ServLine."Document Type");
+      ServOrderAlloc.SETRANGE("Document No.",ServLine."Document No.");
+      ServOrderAlloc.SETRANGE("Service Item Line No.",ServLine."Service Item Line No.");
+      IF ServOrderAlloc.FIND('-') THEN
+        REPEAT
+          ServOrderAlloc2 := ServOrderAlloc;
+          ServOrderAlloc2.Posted := TRUE;
+          ServOrderAlloc2.MODIFY;
+        UNTIL ServOrderAlloc.NEXT = 0;
+    END;
+
+    BEGIN
+    {
+      4PS, Serial No. from 20 to 40
+    }
+    END.
+  }
+}
+

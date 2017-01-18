@@ -1,0 +1,365 @@
+OBJECT Codeunit 6080 Service Price Management
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text001@1000 : TextConst 'ENU=There are no Service Lines to adjust.';
+      ServHeader@1010 : Record 5900;
+      Currency@1005 : Record 4;
+      TotalAmount@1001 : Decimal;
+      Text002@1002 : TextConst 'ENU=Perform price adjustment?';
+      Text003@1003 : TextConst 'ENU=This will remove all discounts on the Service Lines. Continue?';
+      Text004@1004 : TextConst 'ENU=No Service Lines were found for %1 no. %2.';
+      Text008@1008 : TextConst 'ENU=Perform price adjustment?';
+
+    PROCEDURE ShowPriceAdjustment@2(ServItemLine@1000 : Record 5901);
+    VAR
+      ServPriceGrSetup@1006 : Record 6081;
+      ServLinePriceAdjmt@1001 : Record 6084;
+      ServLine@1002 : Record 5902;
+      ServPriceAdjmtForm@1004 : Page 6084;
+    BEGIN
+      ServItemLine.TESTFIELD("Service Price Group Code");
+
+      IF ServItemLine."Serv. Price Adjmt. Gr. Code" = '' THEN
+        ERROR(Text001);
+
+      ServLinePriceAdjmt."Document Type" := ServItemLine."Document Type";
+      ServLinePriceAdjmt."Document No." := ServItemLine."Document No.";
+      GetServHeader(ServLinePriceAdjmt);
+      GetServPriceGrSetup(ServPriceGrSetup,ServHeader,ServItemLine);
+      WITH ServLinePriceAdjmt DO BEGIN
+        RESET;
+        SETRANGE("Document Type",ServItemLine."Document Type");
+        SETRANGE("Document No.",ServItemLine."Document No.");
+        SETRANGE("Service Item Line No.",ServItemLine."Line No.");
+        IF FINDFIRST THEN
+          DELETEALL;
+        ServLine.RESET;
+        ServLine.SETCURRENTKEY("Document Type","Document No.","Service Item Line No.");
+        ServLine.SETRANGE("Document Type",ServItemLine."Document Type");
+        ServLine.SETRANGE("Document No.",ServItemLine."Document No.");
+        ServLine.SETRANGE("Service Item Line No.",ServItemLine."Line No.");
+        IF NOT ServLine.FIND('-') THEN
+          ERROR(Text004,ServItemLine.TABLECAPTION,ServItemLine."Line No.");
+
+        IF NOT ServPriceGrSetup."Include Discounts" THEN
+          IF NOT CONFIRM(Text003,FALSE) THEN
+            EXIT;
+        REPEAT
+          IF LineWithinFilter(ServLine,ServItemLine."Serv. Price Adjmt. Gr. Code") AND
+             (ServItemLine."Serv. Price Adjmt. Gr. Code" <> '')
+          THEN BEGIN
+            "Vat %" := ServLine."VAT %";
+            IF ServHeader."Prices Including VAT" THEN
+              ServLine."VAT %" := 0;
+            IF NOT ServPriceGrSetup."Include Discounts" THEN BEGIN
+              ServLine.TESTFIELD(Warranty,FALSE);
+              ServLine.VALIDATE("Line Discount %",0);
+            END;
+            "Document Type" := ServLine."Document Type";
+            "Document No." := ServLine."Document No.";
+            "Service Line No." := ServLine."Line No.";
+            "Service Item Line No." := ServLine."Service Item Line No.";
+            "Service Item No." := ServLine."Service Item No.";
+            "Serv. Price Adjmt. Gr. Code" := ServItemLine."Serv. Price Adjmt. Gr. Code";
+            Type := ServLine.Type;
+            "No." := ServLine."No.";
+            Description := ServLine.Description;
+            Quantity := ServLine.Quantity - ServLine."Quantity Consumed" - ServLine."Qty. to Consume";
+
+            Amount := ServLine."Line Amount";
+            "New Amount" := ServLine."Line Amount";
+            "Unit Price" := ServLine."Unit Price";
+            "New Unit Price" := ServLine."Unit Price";
+            "Unit Cost" := ServLine."Unit Cost";
+            "Discount %" := ServLine."Line Discount %";
+            "Discount Amount" := ServLine."Line Discount Amount";
+            "Amount incl. VAT" := ServLine."Amount Including VAT";
+            "New Amount incl. VAT" := ServLine."Amount Including VAT";
+            "New Amount Excl. VAT" :=
+              ROUND(
+                ServLine."Amount Including VAT" / (1 + "Vat %" / 100),
+                Currency."Amount Rounding Precision");
+            "Adjustment Type" := ServPriceGrSetup."Adjustment Type";
+            "Service Price Group Code" := ServItemLine."Service Price Group Code";
+            INSERT;
+          END;
+        UNTIL ServLine.NEXT = 0;
+        CalculateWeight(ServLinePriceAdjmt,ServPriceGrSetup);
+      END;
+
+      IF ServLinePriceAdjmt.FINDFIRST THEN BEGIN
+        COMMIT;
+        CLEAR(ServPriceAdjmtForm);
+        ServPriceAdjmtForm.SetVars(ServPriceGrSetup.Amount,ServPriceGrSetup."Include VAT");
+        ServPriceAdjmtForm.SETTABLEVIEW(ServLinePriceAdjmt);
+        IF ServPriceAdjmtForm.RUNMODAL = ACTION::OK THEN
+          IF CONFIRM(Text002,FALSE) THEN
+            PerformAdjustment(ServLinePriceAdjmt,ServPriceGrSetup."Include VAT");
+        WITH ServLinePriceAdjmt DO BEGIN
+          RESET;
+          SETRANGE("Document Type",ServItemLine."Document Type");
+          SETRANGE("Document No.",ServItemLine."Document No.");
+          SETRANGE("Service Item Line No.",ServItemLine."Line No.");
+          IF FINDFIRST THEN
+            DELETEALL;
+        END;
+      END ELSE
+        ERROR(Text001);
+    END;
+
+    PROCEDURE AdjustLines@1(ServLinePriceAdjmt@1000 : Record 6084;ServPriceGrSetup@1003 : Record 6081);
+    VAR
+      TotalAmount@1004 : Decimal;
+    BEGIN
+      IF NOT CONFIRM(Text008,FALSE) THEN
+        EXIT;
+      WITH ServLinePriceAdjmt DO
+        IF ServPriceGrSetup."Adjustment Type" = ServPriceGrSetup."Adjustment Type"::Fixed THEN
+          AdjustFixed(ServLinePriceAdjmt,ServPriceGrSetup.Amount,ServPriceGrSetup."Include VAT")
+        ELSE BEGIN
+          RESET;
+          SETRANGE("Document Type","Document Type");
+          SETRANGE("Document No.","Document No.");
+          SETRANGE("Service Item Line No.","Service Item Line No.");
+          CALCSUMS(Amount,"Amount incl. VAT");
+          TotalAmount := Amount;
+          IF ServPriceGrSetup."Include VAT" THEN
+            TotalAmount := "Amount incl. VAT";
+          IF ServPriceGrSetup."Adjustment Type" = ServPriceGrSetup."Adjustment Type"::Maximum THEN BEGIN
+            IF TotalAmount > ServPriceGrSetup.Amount THEN
+              AdjustFixed(ServLinePriceAdjmt,ServPriceGrSetup.Amount,ServPriceGrSetup."Include VAT");
+          END ELSE BEGIN
+            IF TotalAmount < ServPriceGrSetup.Amount THEN
+              AdjustFixed(ServLinePriceAdjmt,ServPriceGrSetup.Amount,ServPriceGrSetup."Include VAT");
+          END;
+        END;
+    END;
+
+    LOCAL PROCEDURE AdjustFixed@6(ServLinePriceAdjmt@1000 : Record 6084;FixedPrice@1001 : Decimal;InclVat@1002 : Boolean);
+    BEGIN
+      GetServHeader(ServLinePriceAdjmt);
+      WITH ServLinePriceAdjmt DO BEGIN
+        RESET;
+        SETRANGE("Document Type","Document Type");
+        SETRANGE("Document No.","Document No.");
+        IF FIND('-') THEN
+          REPEAT
+            IF ServHeader."Prices Including VAT" AND NOT InclVat THEN
+              FixedPrice := ROUND(FixedPrice + FixedPrice * "Vat %" / 100,0.00001);
+            IF InclVat THEN
+              VALIDATE("New Amount incl. VAT",ROUND(FixedPrice * Weight / 100,Currency."Amount Rounding Precision"))
+            ELSE
+              VALIDATE("New Amount",ROUND(FixedPrice * Weight / 100,Currency."Amount Rounding Precision"));
+            MODIFY;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE CalculateWeight@5(ServLinePriceAdjmt@1000 : Record 6084;ServPriceGrSetup@1001 : Record 6081);
+    BEGIN
+      WITH ServLinePriceAdjmt DO BEGIN
+        RESET;
+        SETRANGE("Document Type","Document Type");
+        SETRANGE("Document No.","Document No.");
+        SETRANGE("Service Item Line No.","Service Item Line No.");
+        CALCSUMS(Amount,"Amount incl. VAT");
+        IF ServPriceGrSetup."Include VAT" THEN
+          TotalAmount := "Amount incl. VAT"
+        ELSE
+          TotalAmount := Amount;
+        IF NOT FIND('-') THEN
+          EXIT;
+        REPEAT
+          IF ServPriceGrSetup."Include VAT" THEN BEGIN
+            IF TotalAmount <> 0 THEN
+              Weight := ROUND("Amount incl. VAT" * 100 / TotalAmount,0.00001);
+          END ELSE BEGIN
+            IF TotalAmount <> 0 THEN
+              Weight := ROUND(Amount * 100 / TotalAmount,0.00001);
+          END;
+          MODIFY;
+        UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE GetServPriceGrSetup@12(VAR ServPriceGrSetup@1000 : Record 6081;ServHeader@1001 : Record 5900;ServItemLine@1002 : Record 5901);
+    BEGIN
+      WITH ServPriceGrSetup DO BEGIN
+        RESET;
+        SETRANGE("Service Price Group Code",ServItemLine."Service Price Group Code");
+        SETFILTER("Fault Area Code",'%1|%2',ServItemLine."Fault Area Code",'');
+        SETFILTER("Cust. Price Group Code",'%1|%2',ServHeader."Customer Price Group",'');
+        SETRANGE("Currency Code",ServHeader."Currency Code");
+        SETRANGE("Starting Date",0D,ServHeader."Posting Date");
+        IF NOT FIND('+') THEN
+          CLEAR(ServPriceGrSetup);
+      END;
+    END;
+
+    LOCAL PROCEDURE LineWithinFilter@7(ServLine@1000 : Record 5902;ServPriceAdjmtGrCode@1002 : Code[10]) : Boolean;
+    VAR
+      Resource@1005 : Record 156;
+      ServPriceAdjmtDetail@1001 : Record 6083;
+    BEGIN
+      IF ServLine.Type = ServLine.Type::" " THEN
+        EXIT(FALSE);
+      IF ServLine.Warranty THEN
+        EXIT(FALSE);
+
+      WITH ServPriceAdjmtDetail DO BEGIN
+        RESET;
+        SETRANGE("Serv. Price Adjmt. Gr. Code",ServPriceAdjmtGrCode);
+        IF NOT FINDFIRST THEN
+          EXIT(TRUE);
+        CASE ServLine.Type OF
+          ServLine.Type::Item:
+            SETRANGE(Type,Type::Item);
+          ServLine.Type::Resource:
+            SETRANGE(Type,Type::Resource);
+          ServLine.Type::Cost:
+            SETRANGE(Type,Type::"Service Cost");
+          ServLine.Type::"G/L Account":
+            SETRANGE(Type,Type::"G/L Account");
+          ELSE
+            EXIT(FALSE);
+        END;
+        SETFILTER("No.",'%1|%2',ServLine."No.",'');
+        SETFILTER("Work Type",'%1|%2',ServLine."Work Type Code",'');
+        SETFILTER("Gen. Prod. Posting Group",'%1|%2',ServLine."Gen. Prod. Posting Group",'');
+        IF FINDFIRST THEN
+          EXIT(TRUE);
+        IF ServLine.Type = ServLine.Type::Resource THEN BEGIN
+          Resource.GET(ServLine."No.");
+          SETRANGE(Type,Type::"Resource Group");
+          SETFILTER("No.",'%1|%2',Resource."Resource Group No.",'');
+          EXIT(FINDFIRST);
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE PerformAdjustment@3(ServLinePriceAdjmt@1000 : Record 6084;InclVat@1002 : Boolean);
+    VAR
+      ServHeader@1003 : Record 5900;
+      ServLine@1001 : Record 5902;
+      OldVatPct@1004 : Decimal;
+    BEGIN
+      WITH ServLinePriceAdjmt DO BEGIN
+        ServHeader.GET("Document Type","Document No.");
+        RESET;
+        SETRANGE("Document Type","Document Type");
+        SETRANGE("Document No.","Document No.");
+        SETRANGE("Service Item Line No.","Service Item Line No.");
+        IF FIND('-') THEN
+          REPEAT
+            ServLine.GET("Document Type","Document No.","Service Line No.");
+            IF ServHeader."Prices Including VAT" THEN BEGIN
+              OldVatPct := ServLine."VAT %";
+              ServLine."VAT %" := 0;
+            END;
+            ServLine.VALIDATE("Unit Price","New Unit Price");
+            IF "Discount %" = 0 THEN
+              ServLine.VALIDATE("Line Discount %",0);
+            IF "New Amount incl. VAT" <> 0 THEN BEGIN
+              IF InclVat THEN
+                ServLine.VALIDATE("Amount Including VAT","New Amount incl. VAT")
+              ELSE
+                ServLine.VALIDATE("Line Amount","New Amount");
+            END ELSE
+              ServLine.VALIDATE("Unit Price",0);
+            IF "Manually Adjusted" THEN
+              ServLine."Price Adjmt. Status" := ServLine."Price Adjmt. Status"::Modified
+            ELSE
+              ServLine."Price Adjmt. Status" := ServLine."Price Adjmt. Status"::Adjusted;
+            IF ServHeader."Prices Including VAT" THEN BEGIN
+              ServLine."VAT %" := OldVatPct;
+              OldVatPct := 0;
+            END;
+            ServLine.MODIFY;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE ResetAdjustedLines@4(ServLine@1000 : Record 5902);
+    BEGIN
+      WITH ServLine DO BEGIN
+        RESET;
+        SETRANGE("Document Type","Document Type");
+        SETRANGE("Document No.","Document No.");
+        SETRANGE("Service Item Line No.","Service Item Line No.");
+        SETRANGE("Price Adjmt. Status","Price Adjmt. Status"::Adjusted);
+        IF FIND('-') THEN
+          REPEAT
+            SetHideReplacementDialog(TRUE);
+            UpdateUnitPrice(FIELDNO("Unit Price"));
+            "Price Adjmt. Status" := "Price Adjmt. Status"::" ";
+            MODIFY;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE CheckServItemGrCode@13(VAR ServLine@1000 : Record 5902);
+    VAR
+      ServItemLine@1001 : Record 5901;
+    BEGIN
+      WITH ServLine DO BEGIN
+        IF ServItemLine.GET(ServItemLine."Document Type"::Order,"Document No.","Service Item Line No.") THEN
+          ServItemLine.TESTFIELD("Service Price Group Code");
+
+        IF ServItemLine."Serv. Price Adjmt. Gr. Code" = '' THEN
+          ERROR(Text001);
+      END;
+    END;
+
+    LOCAL PROCEDURE GetServHeader@10(ServLinePriceAdjmt@1001 : Record 6084);
+    BEGIN
+      ServHeader.GET(ServLinePriceAdjmt."Document Type",ServLinePriceAdjmt."Document No.");
+      IF ServHeader."Currency Code" = '' THEN
+        Currency.InitRoundingPrecision
+      ELSE BEGIN
+        ServHeader.TESTFIELD("Currency Factor");
+        Currency.GET(ServHeader."Currency Code");
+        Currency.TESTFIELD("Amount Rounding Precision");
+      END;
+    END;
+
+    PROCEDURE IsLineToAdjustFirstInvoiced@11(VAR ServLine@1000 : Record 5902) : Boolean;
+    VAR
+      ServLine2@1001 : Record 5902;
+    BEGIN
+      ServLine2 := ServLine;
+      WITH ServLine2 DO BEGIN
+        ServLine.RESET;
+        ServLine.SETCURRENTKEY("Document Type","Document No.","Service Item Line No.");
+        ServLine.SETRANGE("Document Type","Document Type");
+        ServLine.SETRANGE("Document No.","Document No.");
+        ServLine.SETRANGE("Service Item Line No.","Service Item Line No.");
+        ServLine.SETRANGE("Price Adjmt. Status",ServLine."Price Adjmt. Status"::" ");
+        ServLine.SETRANGE("Quantity Invoiced",0);
+        IF ServLine.FIND('-') THEN BEGIN
+          ServLine := ServLine2;
+          EXIT(TRUE);
+        END;
+      END;
+      ServLine := ServLine2;
+      EXIT(FALSE);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

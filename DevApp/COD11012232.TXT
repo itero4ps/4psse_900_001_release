@@ -1,0 +1,1683 @@
+OBJECT Codeunit 11012232 Estimate Plant Mgt
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      TmpCostLine@1100525000 : TEMPORARY Record 11012591;
+      Text000@1100525001 : TextConst 'ENU=There is not enough space to insert all lines.';
+      TmpSetLine@1100525006 : TEMPORARY Record 11012588;
+      TmpPlantNeed@1100525011 : TEMPORARY Record 11012579;
+      EstimateSetup@1100525028 : Record 11012150;
+      DimManagement@1100525005 : Codeunit 408;
+      Window@1100525015 : Dialog;
+      WindowLastUpdated@1100525012 : Time;
+      QuantityRatio@1100525007 : Decimal;
+      NewHeadLineNo@1100525023 : Integer;
+      NextLineNo@1100525004 : Integer;
+      LineSpacing@1100525003 : Integer;
+      Counter@1100525014 : Integer;
+      MaxCounter@1100525013 : Integer;
+      MakeUpdateRequired@1100525002 : Boolean;
+      Text001@1100525008 : TextConst 'ENU=%1 %2 is already transferred to %3 %4.\Do you want to replace the existing lines?';
+      Text002@1100525009 : TextConst 'ENU=No lines transferred.';
+      Text003@1100525010 : TextConst 'ENU=%1 %2 is already transferred to %3 %4, and some of the %3 lines are already processed.';
+      Text004@1100525016 : TextConst 'ENU=Do you want to create %1 lines?';
+      Text005@1100525017 : TextConst 'ENU=Reading Estimate lines     @3@@@@@@@@@@@@@\';
+      Text006@1100525018 : TextConst 'ENU=Reading Recipe lines     @4@@@@@@@@@@@@@\';
+      Text007@1100525019 : TextConst 'ENU=Writing Plant Need lines @5@@@@@@@@@@@@@';
+      Text008@1100525021 : TextConst 'ENU=Total Weight: %2\';
+      Text009@1100525020 : TextConst 'ENU=Total Buy Back: %3';
+      Text010@1100525022 : TextConst 'ENU=Calculating totals...';
+      Text011@1100525025 : TextConst 'ENU=Applied filter:\%1 \ \';
+      Text012@1100525024 : TextConst 'ENU=Estimate,Part of Estimate';
+      Text013@1100525026 : TextConst 'ENU=Do you want to add standard Item and Cost Lines?';
+      Text014@1100525027 : TextConst 'ENU=Do you want to explode %1s?';
+      EstimateSetupRead@1100525029 : Boolean;
+      EstLine@1100528901 : Record 11072072;
+      EstRcpLine@1100528900 : Record 11072075;
+      BaseRcpLine@1100528902 : Record 11020582;
+
+    PROCEDURE CalcBuyBackRates@1100525005(ItemNo@1100525000 : Code[20];PlantTypeCode@1100525007 : Code[20];FieldTriggered@1100525001 : 'Sales,BuyBack,Percentage';SalesRate@1100525004 : Decimal;VAR BuyBackRate@1100525005 : Decimal;VAR BuyBackPerc@1100525006 : Decimal);
+    VAR
+      Item2@1100525002 : Record 27;
+      PlantType2@1100525003 : Record 11012551;
+    BEGIN
+      IF ItemNo <> '' THEN BEGIN
+        Item2.GET(ItemNo);
+        IF (BuyBackRate <> 0) OR (BuyBackPerc <> 0) THEN
+          Item2.TESTFIELD(Item2."Sales/Buy-Back Item (Plant)");
+      END;
+
+      IF PlantTypeCode <> '' THEN BEGIN
+        PlantType2.GET(PlantTypeCode);
+        IF (BuyBackRate <> 0) OR (BuyBackPerc <> 0) THEN
+          PlantType2.TESTFIELD(PlantType2."Rental Type",PlantType2."Rental Type"::"Sales/Buy Back");
+      END;
+
+      CASE FieldTriggered OF
+        FieldTriggered::BuyBack:
+          IF SalesRate <> 0 THEN
+            BuyBackPerc := ROUND(BuyBackRate / SalesRate * 100, 0.00001)
+          ELSE
+            BuyBackPerc := 0;
+        FieldTriggered::Sales,FieldTriggered::Percentage:
+          BuyBackRate := ROUND(SalesRate * BuyBackPerc / 100,PriceRoundingPrecision);
+      END;
+    END;
+
+    PROCEDURE PriceRoundingPrecision@1100525006() : Decimal;
+    VAR
+      GLSetup@1100525000 : Record 98;
+    BEGIN
+      GLSetup.GET;
+      GLSetup.TESTFIELD("Unit-Amount Rounding Precision");
+      EXIT(GLSetup."Unit-Amount Rounding Precision");
+    END;
+
+    PROCEDURE ConvPeriodToTimesPerYear@1100525008(PeriodFormula@1100525000 : DateFormula) : Decimal;
+    VAR
+      PeriodFormText@1100525001 : Text[30];
+      NumberPart@1100485001 : Decimal;
+      PeriodPart@1100485002 : Text[30];
+    BEGIN
+      //db, 16-03-11: for service (maintenance interval), use same function in codeunit 11012809
+      PeriodFormText := FORMAT(PeriodFormula);
+      IF PeriodFormText = '' THEN
+        EXIT(1);
+
+      PeriodPart := DELCHR(PeriodFormText,'=','0123456789');
+      IF (PeriodPart = '') THEN
+        EXIT(0);
+
+      EVALUATE(NumberPart, COPYSTR(PeriodFormText,1,STRPOS(PeriodFormText,PeriodPart) - 1));
+      IF NumberPart = 0 THEN
+        EXIT(0);
+
+      CASE PeriodPart OF
+        'D': EXIT(365/NumberPart);
+        'W': EXIT(52/NumberPart);
+        'M': EXIT(12/NumberPart);
+      //'K','Q': EXIT(4/NumberPart);
+      //'J','Y': EXIT(1/NumberPart);
+      END;
+    END;
+
+    PROCEDURE ConvPlantCalcPeriod@1100525010(PeriodFormula@1100525000 : DateFormula;PlantPriceType@1100525001 : ' ,Day,Week,,Month') : Decimal;
+    VAR
+      Result@1100525002 : Decimal;
+      PeriodFormText@1210190001 : Text[30];
+      PeriodPart@1210190000 : Text[30];
+    BEGIN
+      IF FORMAT(PeriodFormula) = '' THEN
+        EXIT(1);
+
+      //Call 33688 sn
+      PeriodPart := '';
+      PeriodFormText := FORMAT(PeriodFormula);
+      PeriodPart := DELCHR(PeriodFormText,'=','0123456789');
+      //Call 33688 en
+
+      CASE PlantPriceType OF
+        PlantPriceType::Day:
+          BEGIN
+            IF PeriodPart = 'W' THEN
+              Result := 364/ConvPeriodToTimesPerYear(PeriodFormula)   //Call 33688, ivm afronding dagen bij weekformule
+            ELSE
+              Result := 365/ConvPeriodToTimesPerYear(PeriodFormula);
+          END;
+        PlantPriceType::Week:  Result := 52/ConvPeriodToTimesPerYear(PeriodFormula);
+        PlantPriceType::Month:  Result := 12/ConvPeriodToTimesPerYear(PeriodFormula);
+        ELSE
+          EXIT(1);
+      END;
+
+      //to avoid e.g. rental period of 7.02 days when converted from week to days
+      IF Result > 10 THEN EXIT(ROUND(Result,1));
+      IF Result > 5 THEN EXIT(ROUND(Result,0.5));
+      IF Result > 1 THEN EXIT(ROUND(Result,0.1));
+      IF Result > 0.5 THEN EXIT(ROUND(Result,0.05));
+      //everything else should be rounded to 0.01
+      IF Result > 0.005 THEN EXIT(ROUND(Result,0.01));
+      //and below rounding threshold round up to 0.01
+      IF Result > 0 THEN EXIT(ROUND(Result,0.01,'>'));
+    END;
+
+    PROCEDURE CostTypeEstLineIsMat@1100525013(EstimateLine@1100525001 : Record 11072072) : Boolean;
+    BEGIN
+      WITH EstimateLine DO BEGIN
+        EXIT(
+          ("Item No." + "Basic Item" + "Trade Item" <> '') OR
+          ("Nett Cost Price" <> 0) OR
+          ("Cost Object Price" <>''));
+      END;
+    END;
+
+    PROCEDURE CostTypeEstLineRAWIsMat@1100525032(EstimateLineRAW@1100525000 : Record 11125680) : Boolean;
+    BEGIN
+      WITH EstimateLineRAW DO BEGIN
+        EXIT(
+          ("Item No." + "Basic Item" + "Trade Item" <> '') OR
+          ("Material Price" <> 0) OR
+          ("Cost Object Material" <>''));
+      END;
+    END;
+
+    PROCEDURE CostTypeEstCompositionIsMat@1100526000(EstimateComposition@1100525001 : Record 11020458) : Boolean;
+    BEGIN
+      WITH EstimateComposition DO BEGIN
+        EXIT(
+          ("Item No." + "Basic Item" + "Trade Item" <> '') OR
+          ("Nett Cost Price" <> 0) OR
+          ("Cost Type (Price)" = EstimateComposition."Cost Type (Price)"::Material));
+      END;
+    END;
+
+    PROCEDURE CostTypeRcpLineIsMat@1100525022(RecipeLine@1100525001 : Record 11072075) : Boolean;
+    BEGIN
+      WITH RecipeLine DO BEGIN
+        EXIT(
+          ("Item No." + "Basic Item" + "Trade Item" <> '') OR
+          ("Nett Cost Price" <> 0) OR
+          ("Cost Object Price" <>''));
+      END;
+    END;
+
+    PROCEDURE CostTypeEstLineIsPlant@1100525014(EstimateLine@1100525001 : Record 11072072) : Boolean;
+    BEGIN
+      WITH EstimateLine DO BEGIN
+        EXIT(
+          ("Plant Type" <> '') OR
+          ("Nett Cost Price" <> 0) OR
+          ("Cost Object Price" <> ''));
+      END;
+    END;
+
+    PROCEDURE CostTypeEstLineRAWIsPlant@1100525033(EstimateLineRAW@1100525000 : Record 11125680) : Boolean;
+    BEGIN
+      WITH EstimateLineRAW DO BEGIN
+        EXIT(
+          ("Plant Type" <> '') OR
+          ("Plant Price" <> 0) OR
+          ("Cost Object Plant" <> ''));
+      END;
+    END;
+
+    PROCEDURE CostTypeEstCompositionIsPlant@1100526001(EstimateComposition@1100525001 : Record 11020458) : Boolean;
+    BEGIN
+      WITH EstimateComposition DO BEGIN
+        EXIT(
+          ("Plant Type" <> '') OR
+          ("Nett Cost Price" <> 0) OR
+          ("Cost Type (Price)" = "Cost Type (Price)"::Plant));
+      END;
+    END;
+
+    PROCEDURE CostTypeRcpLineIsPlant@1100525024(RecipeLine@1100525000 : Record 11072075) : Boolean;
+    BEGIN
+      WITH RecipeLine DO BEGIN
+        EXIT(
+          ("Plant Type" <> '') OR
+          ("Nett Cost Price" <> 0) OR
+          ("Cost Object Price" <> ''));
+      END;
+    END;
+
+    PROCEDURE InsPltCostItmLinesToEstLine@1100525031(VAR Rec2@1100525002 : Record 11072072) : Boolean;
+    BEGIN
+      IF Rec2.FINDSET THEN BEGIN
+        IF Rec2.COUNT = 1 THEN
+          IF NOT PlantCostItmLnsExist(Rec2."Plant Type") THEN
+            EXIT(FALSE);
+
+        IF NOT CONFIRM(Text013,TRUE) THEN
+          EXIT(FALSE);
+
+        REPEAT
+          IF CheckIfPltCostItmLnsForEstLine(Rec2) THEN
+            TmpBuffersInsertToEstLine(Rec2);
+        UNTIL Rec2.NEXT = 0;
+
+        EXIT(MakeUpdate);
+      END;
+    END;
+
+    PROCEDURE InsPltCostItmLinesToEstRcpLine@1100525028(VAR Rec2@1100525002 : Record 11072075) : Boolean;
+    BEGIN
+      IF Rec2.FINDSET THEN BEGIN
+        IF Rec2.COUNT = 1 THEN
+          IF NOT PlantCostItmLnsExist(Rec2."Plant Type") THEN
+            EXIT(FALSE);
+
+        IF NOT CONFIRM(Text013,TRUE) THEN
+          EXIT;
+
+        REPEAT
+          IF CheckIfPltCostItmLnsForRcpLine(Rec2) THEN
+            TmpBuffersInsertToEstRcpLine(Rec2);
+        UNTIL Rec2.NEXT = 0;
+
+        EXIT(MakeUpdate);
+      END;
+    END;
+
+    PROCEDURE InsPltCostItmLinesToBasRcpLine@1100528923(VAR Rec2@1100528900 : Record 11020582) : Boolean;
+    BEGIN
+      //DP00381
+      IF Rec2.FINDSET THEN BEGIN
+        IF Rec2.COUNT = 1 THEN
+          IF NOT PlantCostItmLnsExist(Rec2."Plant Type") THEN
+            EXIT(FALSE);
+
+        IF NOT CONFIRM(Text013,TRUE) THEN
+          EXIT;
+
+        REPEAT
+          IF CheckIfPltCostItmLnsForBasLine(Rec2) THEN
+            TmpBuffersInsertToBaseRcpLine(Rec2);
+        UNTIL Rec2.NEXT = 0;
+
+        EXIT(MakeUpdate);
+      END;
+    END;
+
+    PROCEDURE ExplodeSetLinesToEstLine@1100525030(VAR Rec2@1100525001 : Record 11072072) : Boolean;
+    VAR
+      Set2@1100525000 : Record 11012587;
+    BEGIN
+      IF NOT CONFIRM(Text014,TRUE,Set2.TABLECAPTION) THEN
+        EXIT;
+
+      IF Rec2.FINDSET THEN
+        REPEAT
+          IF CheckIfSetLnsForEstLine(Rec2) THEN
+            TmpBuffersInsertToEstLine(Rec2);
+        UNTIL Rec2.NEXT = 0;
+
+      EXIT(MakeUpdate);
+    END;
+
+    PROCEDURE ExplodeSetLinesToEstRcpLine@1100525029(VAR Rec2@1100525001 : Record 11072075) : Boolean;
+    VAR
+      Set2@1100525000 : Record 11012587;
+    BEGIN
+      IF NOT CONFIRM(Text014,TRUE,Set2.TABLECAPTION) THEN
+        EXIT;
+
+      IF Rec2.FINDSET THEN
+        REPEAT
+          IF CheckIfSetLnsForEstRcpLine(Rec2) THEN
+            TmpBuffersInsertToEstRcpLine(Rec2);
+        UNTIL Rec2.NEXT = 0;
+
+      EXIT(MakeUpdate);
+    END;
+
+    PROCEDURE ExplodeSetLinesToBaseRcpLine@1100528917(VAR Rec2@1100525001 : Record 11020582) : Boolean;
+    VAR
+      Set2@1100525000 : Record 11012587;
+    BEGIN
+      //Dp00381
+      IF NOT CONFIRM(Text014,TRUE,Set2.TABLECAPTION) THEN
+        EXIT;
+
+      IF Rec2.FINDSET THEN
+        REPEAT
+          IF CheckIfSetLnsForBaseRcpLine(Rec2) THEN
+            TmpBuffersInsertToBaseRcpLine(Rec2);
+        UNTIL Rec2.NEXT = 0;
+
+      EXIT(MakeUpdate);
+    END;
+
+    PROCEDURE AssignPltCostItmFldsToEstLn@1100525003(PlantCostLine@1100525000 : Record 11012591;VAR Rec2@1100525001 : Record 11072072);
+    VAR
+      DimValue@1100525003 : Record 349;
+      Est@1100529000 : Record 11012151;
+      RefDate@1100529001 : Date;
+    BEGIN
+      DimManagement.GetDimValueRec(2,PlantCostLine."No.",DimValue,TRUE,'');
+      IF Est.GET(Rec2."Estimate No.") THEN  //DP00241.n (16930)
+        RefDate := Est."Reference Date (Rate)";
+
+      CASE DimValue."Cost Type" OF
+        DimValue."Cost Type"::Labor:
+          BEGIN
+            Rec2.VALIDATE("Cost Object Labor",PlantCostLine."No.");
+            Rec2.VALIDATE("Cost Rate",PlantCostLine.GetCostLinePrice(RefDate));  //DP00241.n (16930)
+            Rec2.Norm := 1;
+          END;
+        DimValue."Cost Type"::Material,
+        DimValue."Cost Type"::Subcontracting,
+        DimValue."Cost Type"::Plant,
+        DimValue."Cost Type"::Sundry:
+          BEGIN
+            Rec2.VALIDATE("Cost Object Price",PlantCostLine."No.");
+            Rec2.VALIDATE("Nett Cost Price",PlantCostLine.GetCostLinePrice(RefDate));  //DP00241.n (16930)
+          END;
+        DimValue."Cost Type"::Revenue: EXIT;
+      END;
+
+      Rec2.Description := PlantCostLine.Description;
+      Rec2.VALIDATE(Vendor,PlantCostLine."Vendor No.");
+      Rec2.VALIDATE("Unit of Measure",PlantCostLine."Unit of Measure");
+      Rec2.VALIDATE(Quantity,PlantCostLine.Quantity * Rec2.Quantity);
+    END;
+
+    PROCEDURE AssignPltCostItmFldsToEstRcpLn@1100525016(PlantCostLine@1100525000 : Record 11012591;VAR Rec2@1100525001 : Record 11072075);
+    VAR
+      DimValue@1100525003 : Record 349;
+      Est@1100529000 : Record 11012151;
+      RefDate@1100529001 : Date;
+    BEGIN
+      IF PlantCostLine.Type <> PlantCostLine.Type::Text THEN BEGIN // T000362.n
+        DimManagement.GetDimValueRec(2,PlantCostLine."No.",DimValue,TRUE,'');
+        IF Est.GET(Rec2."Estimate No.") THEN  //DP00241.n (16930)
+          RefDate := Est."Reference Date (Rate)";
+
+        CASE DimValue."Cost Type" OF
+          DimValue."Cost Type"::Labor:
+            BEGIN
+              Rec2.VALIDATE("Cost Object Labor",PlantCostLine."No.");
+              Rec2.VALIDATE("Cost Rate",PlantCostLine.GetCostLinePrice(RefDate));  //DP00241.n (16930)
+              Rec2.Norm := 1;
+            END;
+          DimValue."Cost Type"::Material,
+          DimValue."Cost Type"::Subcontracting,
+          DimValue."Cost Type"::Plant,
+          DimValue."Cost Type"::Sundry:
+            BEGIN
+              Rec2.VALIDATE("Cost Object Price",PlantCostLine."No.");
+              Rec2.VALIDATE("Nett Cost Price",PlantCostLine.GetCostLinePrice(RefDate));  //DP00241.n (16930)
+            END;
+          DimValue."Cost Type"::Revenue: EXIT;
+        END;
+
+      END; // T000362.n
+
+      Rec2.Description := PlantCostLine.Description;
+      Rec2.VALIDATE(Vendor,PlantCostLine."Vendor No.");
+      Rec2.VALIDATE("Unit of Measure",PlantCostLine."Unit of Measure");
+      Rec2.VALIDATE(Quantity,PlantCostLine.Quantity * Rec2.Quantity);
+    END;
+
+    PROCEDURE AssignPltCostItmFldsToBasRcpLn@1100528921(PlantCostLine@1100525000 : Record 11012591;VAR Rec2@1100525001 : Record 11020582);
+    VAR
+      DimValue@1100525003 : Record 349;
+      RefDate@1100529001 : Date;
+    BEGIN
+      //DP00381
+      IF PlantCostLine.Type <> PlantCostLine.Type::Text THEN BEGIN // T000362.n
+        DimManagement.GetDimValueRec(2,PlantCostLine."No.",DimValue,TRUE,'');
+        RefDate := TODAY;  //db, 12-08-13
+
+        CASE DimValue."Cost Type" OF
+          DimValue."Cost Type"::Labor:
+            BEGIN
+              Rec2.VALIDATE("Cost Object Labor",PlantCostLine."No.");
+              Rec2.VALIDATE("Cost Rate",PlantCostLine.GetCostLinePrice(RefDate));  //DP00241.n (16930)
+              Rec2.Norm := 1;
+            END;
+          DimValue."Cost Type"::Material,
+          DimValue."Cost Type"::Subcontracting,
+          DimValue."Cost Type"::Plant,
+          DimValue."Cost Type"::Sundry:
+            BEGIN
+              Rec2.VALIDATE("Cost Object Price",PlantCostLine."No.");
+              Rec2.VALIDATE("Nett Cost Price",PlantCostLine.GetCostLinePrice(RefDate));  //DP00241.n (16930)
+            END;
+          DimValue."Cost Type"::Revenue: EXIT;
+        END;
+
+      END; // T000362.n
+
+      Rec2.Description := PlantCostLine.Description;
+      Rec2.VALIDATE(Vendor,PlantCostLine."Vendor No.");
+      Rec2.VALIDATE("Unit of Measure",PlantCostLine."Unit of Measure");
+      Rec2.VALIDATE(Quantity,PlantCostLine.Quantity * Rec2.Quantity);
+    END;
+
+    PROCEDURE AssignSetFldsToEstLn@1100525002(PlantSetLine@1100525000 : Record 11012588;VAR Rec2@1100525001 : Record 11072072);
+    BEGIN
+      CASE PlantSetLine.Type OF
+        PlantSetLine.Type::Plant: Rec2.VALIDATE("Plant Type",PlantSetLine."Plant Type");
+        PlantSetLine.Type::Item: Rec2.VALIDATE("Item No.",PlantSetLine."Item No.");
+      END;
+
+      Rec2.VALIDATE(Quantity,PlantSetLine.Quantity * Rec2.Quantity);
+    END;
+
+    PROCEDURE AssignSetFldsToEstRcpLn@1100525023(PlantSetLine@1100525000 : Record 11012588;VAR Rec2@1100525001 : Record 11072075);
+    BEGIN
+      CASE PlantSetLine.Type OF
+        PlantSetLine.Type::Plant: Rec2.VALIDATE("Plant Type",PlantSetLine."Plant Type");
+        PlantSetLine.Type::Item: Rec2.VALIDATE("Item No.",PlantSetLine."Item No.");
+      END;
+
+      Rec2.VALIDATE(Quantity,PlantSetLine.Quantity * Rec2.Quantity);
+    END;
+
+    PROCEDURE AssignSetFldsToBaseRcpLn@1100528920(PlantSetLine@1100525000 : Record 11012588;VAR Rec2@1100525001 : Record 11020582);
+    BEGIN
+      //Dpp00381
+      CASE PlantSetLine.Type OF
+        PlantSetLine.Type::Plant: Rec2.VALIDATE("Plant Type",PlantSetLine."Plant Type");
+        PlantSetLine.Type::Item: Rec2.VALIDATE("Item No.",PlantSetLine."Item No.");
+      END;
+
+      Rec2.VALIDATE(Quantity,PlantSetLine.Quantity * Rec2.Quantity);
+    END;
+
+    PROCEDURE CheckIfPltCostItmLnsForEstLine@1(VAR Rec2@1000 : Record 11072072) : Boolean;
+    BEGIN
+      MakeUpdateRequired := FALSE;
+      IF Rec2."Line No." <> 0 THEN
+        MakeUpdateRequired := ModifyLinkedEstLines(0,Rec2,0); //0:delete
+
+      EXIT(ReadPlantCostLines(Rec2."Plant Type") OR ReadPlantItmLines(Rec2."Plant Type"));
+    END;
+
+    PROCEDURE CheckIfPltCostItmLnsForRcpLine@1100525025(VAR Rec2@1000 : Record 11072075) : Boolean;
+    BEGIN
+      MakeUpdateRequired := FALSE;
+      IF Rec2."Line No." <> 0 THEN
+        MakeUpdateRequired := ModifyLinkedEstRcpLines(0,Rec2,0); //0:delete
+
+      EXIT(ReadPlantCostLines(Rec2."Plant Type") OR ReadPlantItmLines(Rec2."Plant Type"));
+    END;
+
+    PROCEDURE CheckIfPltCostItmLnsForBasLine@1100528922(VAR Rec2@1000 : Record 11020582) : Boolean;
+    BEGIN
+      //DP00381
+      MakeUpdateRequired := FALSE;
+      IF Rec2."Line No." <> 0 THEN
+        MakeUpdateRequired := ModifyLinkedBaseRcpLines(0,Rec2,0); //0:delete
+
+      EXIT(ReadPlantCostLines(Rec2."Plant Type") OR ReadPlantItmLines(Rec2."Plant Type"));
+    END;
+
+    PROCEDURE CheckIfSetLnsForEstLine@1100525000(VAR Rec2@1000 : Record 11072072) : Boolean;
+    BEGIN
+      MakeUpdateRequired := FALSE;
+      IF Rec2."Line No." <> 0 THEN
+        MakeUpdateRequired := ModifyLinkedEstLines(0,Rec2, 0); //0:delete
+
+      EXIT(ReadSetCostLines(Rec2."Set Code") OR ReadSetItmPltLines(Rec2."Set Code"));
+    END;
+
+    PROCEDURE CheckIfSetLnsForEstRcpLine@1100525026(VAR Rec2@1000 : Record 11072075) : Boolean;
+    BEGIN
+      MakeUpdateRequired := FALSE;
+      IF Rec2."Line No." <> 0 THEN
+        MakeUpdateRequired := ModifyLinkedEstRcpLines(0,Rec2,0); //0:delete
+
+      EXIT(ReadSetCostLines(Rec2."Set Code") OR ReadSetItmPltLines(Rec2."Set Code"));
+    END;
+
+    PROCEDURE CheckIfSetLnsForBaseRcpLine@1100528918(VAR Rec2@1000 : Record 11020582) : Boolean;
+    BEGIN
+      //DP00381
+      MakeUpdateRequired := FALSE;
+      IF Rec2."Line No." <> 0 THEN
+        MakeUpdateRequired := ModifyLinkedBaseRcpLines(0,Rec2,0); //0:delete
+
+      EXIT(ReadSetCostLines(Rec2."Set Code") OR ReadSetItmPltLines(Rec2."Set Code"));
+    END;
+
+    PROCEDURE TmpBuffersInsertToEstLine@2(VAR Rec2@1000 : Record 11072072);
+    VAR
+      ToRec@1001 : Record 11072072;
+    BEGIN
+      ToRec.RESET;
+      ToRec.SETRANGE("Estimate No.",Rec2."Estimate No.");
+      ToRec.SETRANGE("Sub-Estimate No.",Rec2."Sub-Estimate No.");
+      ToRec.SETRANGE("Part Group",Rec2."Part Group");
+      ToRec.SETRANGE(Part,Rec2.Part);
+
+      ToRec := Rec2;
+      IF ToRec.FIND('>') THEN BEGIN
+        LineSpacing :=
+          (ToRec."Line No." - Rec2."Line No.") DIV
+          (1 + TmpCostLine.COUNT + TmpSetLine.COUNT);
+        IF LineSpacing = 0 THEN
+          ERROR(Text000);
+      END ELSE
+        LineSpacing := 10000;
+
+      NextLineNo := Rec2."Line No." + LineSpacing;
+
+      TmpSetLine.RESET;
+      IF TmpSetLine.FINDSET THEN BEGIN
+        REPEAT
+          ToRec.INIT;
+          ToRec."Estimate No." := Rec2."Estimate No.";
+          ToRec."Sub-Estimate No." := Rec2."Sub-Estimate No.";
+          ToRec."Part Group" := Rec2."Part Group";
+          ToRec.Part := Rec2.Part;
+          ToRec."Line No." := NextLineNo;
+          NextLineNo := NextLineNo + LineSpacing;
+          ToRec.INSERT(TRUE);
+          ToRec."Attached to Line No." := Rec2."Line No.";
+          ToRec."Set Level" := Rec2."Set Level" + 1;
+          ToRec.Quantity := Rec2.Quantity;
+          AssignSetFldsToEstLn(TmpSetLine,ToRec);
+          ToRec.MODIFY;
+        UNTIL TmpSetLine.NEXT = 0;
+        MakeUpdateRequired := TRUE;
+      END;
+      TmpSetLine.DELETEALL;
+
+      TmpCostLine.RESET;
+      IF TmpCostLine.FINDSET THEN BEGIN
+        REPEAT
+          ToRec.INIT;
+          ToRec."Estimate No." := Rec2."Estimate No.";
+          ToRec."Sub-Estimate No." := Rec2."Sub-Estimate No.";
+          ToRec."Part Group" := Rec2."Part Group";
+          ToRec.Part := Rec2.Part;
+          ToRec."Line No." := NextLineNo;
+          NextLineNo := NextLineNo + LineSpacing;
+          ToRec.INSERT(TRUE);
+          ToRec."Attached to Line No." := Rec2."Line No.";
+          ToRec."Set Level" := Rec2."Set Level" + 1;
+          ToRec.Quantity := Rec2.Quantity;
+          AssignPltCostItmFldsToEstLn(TmpCostLine,ToRec);
+          ToRec.MODIFY;
+        UNTIL TmpCostLine.NEXT = 0;
+        MakeUpdateRequired := TRUE;
+      END;
+      TmpCostLine.DELETEALL;
+    END;
+
+    PROCEDURE TmpBuffersInsertToEstRcpLine@1100525027(VAR Rec2@1000 : Record 11072075);
+    VAR
+      ToRec@1001 : Record 11072075;
+    BEGIN
+      ToRec.RESET;
+      ToRec.SETRANGE("Estimate No.",Rec2."Estimate No.");
+      ToRec.SETRANGE("Sub-Estimate No.",Rec2."Sub-Estimate No.");
+      ToRec.SETRANGE("Part Group",Rec2."Part Group");
+      ToRec.SETRANGE(Part,Rec2.Part);
+      ToRec.SETRANGE("Estimate Line",Rec2."Estimate Line");
+      ToRec.SETRANGE("Recipe Group",Rec2."Recipe Group");
+      ToRec.SETRANGE(Recipe,Rec2.Recipe);
+
+      ToRec := Rec2;
+      IF ToRec.FIND('>') THEN BEGIN
+        LineSpacing :=
+          (ToRec."Line No." - Rec2."Line No.") DIV
+          (1 + TmpCostLine.COUNT + TmpSetLine.COUNT);
+        IF LineSpacing = 0 THEN
+          ERROR(Text000);
+      END ELSE
+        LineSpacing := 10000;
+
+      NextLineNo := Rec2."Line No." + LineSpacing;
+
+      TmpSetLine.RESET;
+      IF TmpSetLine.FINDSET THEN BEGIN
+        REPEAT
+          ToRec.INIT;
+          ToRec."Estimate No." := Rec2."Estimate No.";
+          ToRec."Sub-Estimate No." := Rec2."Sub-Estimate No.";
+          ToRec."Part Group" := Rec2."Part Group";
+          ToRec.Part := Rec2.Part;
+          ToRec."Estimate Line" := Rec2."Estimate Line";
+          ToRec."Recipe Group" := Rec2."Recipe Group";
+          ToRec.Recipe := Rec2.Recipe;
+          ToRec."Line No." := NextLineNo;
+          NextLineNo := NextLineNo + LineSpacing;
+          ToRec.INSERT(TRUE);
+          ToRec."Attached to Line No." := Rec2."Line No.";
+          ToRec."Set Level" := Rec2."Set Level" + 1;
+          ToRec.Quantity := Rec2.Quantity;
+          AssignSetFldsToEstRcpLn(TmpSetLine,ToRec);
+          ToRec.MODIFY;
+        UNTIL TmpSetLine.NEXT = 0;
+        MakeUpdateRequired := TRUE;
+      END;
+      TmpSetLine.DELETEALL;
+
+      TmpCostLine.RESET;
+      IF TmpCostLine.FINDSET THEN BEGIN
+        REPEAT
+          ToRec.INIT;
+          ToRec."Estimate No." := Rec2."Estimate No.";
+          ToRec."Sub-Estimate No." := Rec2."Sub-Estimate No.";
+          ToRec."Part Group" := Rec2."Part Group";
+          ToRec.Part := Rec2.Part;
+          ToRec."Estimate Line" := Rec2."Estimate Line";
+          ToRec."Recipe Group" := Rec2."Recipe Group";
+          ToRec.Recipe := Rec2.Recipe;
+          ToRec."Line No." := NextLineNo;
+          NextLineNo := NextLineNo + LineSpacing;
+          ToRec.INSERT(TRUE);
+          ToRec."Attached to Line No." := Rec2."Line No.";
+          ToRec."Set Level" := Rec2."Set Level" + 1;
+          ToRec.Quantity := Rec2.Quantity;
+          AssignPltCostItmFldsToEstRcpLn(TmpCostLine,ToRec);
+          ToRec.MODIFY;
+        UNTIL TmpCostLine.NEXT = 0;
+        MakeUpdateRequired := TRUE;
+      END;
+      TmpCostLine.DELETEALL;
+    END;
+
+    PROCEDURE TmpBuffersInsertToBaseRcpLine@1100528919(VAR Rec2@1000 : Record 11020582);
+    VAR
+      ToRec@1001 : Record 11020582;
+    BEGIN
+      //DP00381
+      ToRec.RESET;
+      ToRec.SETRANGE("Recipe Group",Rec2."Recipe Group");
+      ToRec.SETRANGE(Recipe,Rec2.Recipe);
+
+      ToRec := Rec2;
+      IF ToRec.FIND('>') THEN BEGIN
+        LineSpacing :=
+          (ToRec."Line No." - Rec2."Line No.") DIV
+          (1 + TmpCostLine.COUNT + TmpSetLine.COUNT);
+        IF LineSpacing = 0 THEN
+          ERROR(Text000);
+      END ELSE
+        LineSpacing := 10000;
+
+      NextLineNo := Rec2."Line No." + LineSpacing;
+
+      TmpSetLine.RESET;
+      IF TmpSetLine.FINDSET THEN BEGIN
+        REPEAT
+          ToRec.INIT;
+          ToRec."Recipe Group" := Rec2."Recipe Group";
+          ToRec.Recipe := Rec2.Recipe;
+          ToRec."Line No." := NextLineNo;
+          NextLineNo := NextLineNo + LineSpacing;
+          ToRec.INSERT(TRUE);
+          ToRec."Attached to Line No." := Rec2."Line No.";
+          ToRec."Set Level" := Rec2."Set Level" + 1;
+          ToRec.Quantity := Rec2.Quantity;
+          AssignSetFldsToBaseRcpLn(TmpSetLine,ToRec);
+          ToRec.MODIFY;
+        UNTIL TmpSetLine.NEXT = 0;
+        MakeUpdateRequired := TRUE;
+      END;
+      TmpSetLine.DELETEALL;
+
+      TmpCostLine.RESET;
+      IF TmpCostLine.FINDSET THEN BEGIN
+        REPEAT
+          ToRec.INIT;
+          ToRec."Recipe Group" := Rec2."Recipe Group";
+          ToRec.Recipe := Rec2.Recipe;
+          ToRec."Line No." := NextLineNo;
+          NextLineNo := NextLineNo + LineSpacing;
+          ToRec.INSERT(TRUE);
+          ToRec."Attached to Line No." := Rec2."Line No.";
+          ToRec."Set Level" := Rec2."Set Level" + 1;
+          ToRec.Quantity := Rec2.Quantity;
+          AssignPltCostItmFldsToBasRcpLn(TmpCostLine,ToRec);
+          ToRec.MODIFY;
+        UNTIL TmpCostLine.NEXT = 0;
+        MakeUpdateRequired := TRUE;
+      END;
+      TmpCostLine.DELETEALL;
+    END;
+
+    PROCEDURE ModifyLinkedEstLines@1100525004(ModifyAction@1100525000 : 'Delete,ModQuantity,Rename,Fields';VAR Rec2@1000 : Record 11072072;FieldNo@1100525001 : Integer) : Boolean;
+    VAR
+      Rec3@1001 : Record 11072072;
+    BEGIN
+      //call 30195
+      IF (ModifyAction = ModifyAction::ModQuantity) AND (QuantityRatio = 1) THEN
+        EXIT;
+      //
+
+      Rec3.SETCURRENTKEY("Estimate No.", "Sub-Estimate No.", "Part Group", Part, "Attached to Line No."); //mg, 11-01-11: M24378
+      Rec3.SETRANGE("Estimate No.",Rec2."Estimate No.");
+      Rec3.SETRANGE("Sub-Estimate No.",Rec2."Sub-Estimate No.");
+      Rec3.SETRANGE("Part Group",Rec2."Part Group");
+      Rec3.SETRANGE(Part,Rec2.Part);
+      Rec3.SETRANGE("Attached to Line No.",Rec2."Line No.");
+      Rec3.SETFILTER("Line No.",'>%1',Rec2."Line No.");
+      Rec3.SETRANGE("Set Level",Rec2."Set Level" + 1);
+
+      //IF Rec3.FINDSET(TRUE) THEN BEGIN //Call 23762
+      IF Rec3.FINDSET(ModifyAction <> ModifyAction::Delete) THEN BEGIN //Call 23762
+        REPEAT
+          CASE ModifyAction OF
+            ModifyAction::Delete:
+              Rec3.DELETE(TRUE);
+            ModifyAction::ModQuantity:
+              BEGIN
+                Rec3.VALIDATE(Quantity,ROUND(Rec3.Quantity * QuantityRatio, 0.00001));
+                Rec3.MODIFY(TRUE);
+              END;
+            ModifyAction::Rename:
+              BEGIN
+                Rec3."Attached to Line No." := NewHeadLineNo;
+                Rec3.MODIFY;
+              END;
+            ModifyAction::Fields:
+              //**dbeekman.sn: 22671
+              IF (Rec3."Plant Type" <> '') OR
+                 (Rec3."Set Code" <> '')
+              THEN BEGIN
+              //**dbeekman.en
+                CASE FieldNo OF
+                  Rec2.FIELDNO("Start Rental Period"):
+                    BEGIN;
+                      Rec3.VALIDATE("Start Rental Period", Rec2."Start Rental Period");
+                      Rec3.MODIFY;
+                    END;
+                  Rec2.FIELDNO("End Rental Period"):
+                    BEGIN;
+                      Rec3.VALIDATE("End Rental Period", Rec2."End Rental Period");
+                      Rec3.MODIFY;
+                    END;
+                  Rec2.FIELDNO("Rental Period Formula"):
+                    BEGIN;
+                      Rec3.VALIDATE("Rental Period Formula", Rec2."Rental Period Formula");
+                      Rec3.MODIFY;
+                    END;
+                  Rec2.FIELDNO("Rental Time Units"):
+                    BEGIN;
+                      Rec3.VALIDATE("Rental Time Units", Rec2."Rental Time Units");
+                      Rec3.MODIFY;
+                    END;
+                END;
+              END;
+          END;
+        UNTIL Rec3.NEXT = 0;
+        MakeUpdateRequired := TRUE;
+        EXIT(TRUE);
+      END;
+    END;
+
+    PROCEDURE ModifyLinkedEstRcpLines@1100525001(ModifyAction@1100525000 : 'Delete,ModQuantity,,Fields';VAR Rec2@1000 : Record 11072075;FieldNo@1100525001 : Integer) : Boolean;
+    VAR
+      Rec3@1001 : Record 11072075;
+    BEGIN
+      //call 30195
+      IF (ModifyAction = ModifyAction::ModQuantity) AND (QuantityRatio = 1) THEN
+        EXIT;
+      //
+
+      Rec3.SETRANGE("Estimate No.",Rec2."Estimate No.");
+      Rec3.SETRANGE("Sub-Estimate No.",Rec2."Sub-Estimate No.");
+      Rec3.SETRANGE("Part Group",Rec2."Part Group");
+      Rec3.SETRANGE(Part,Rec2.Part);
+      Rec3.SETRANGE("Estimate Line",Rec2."Estimate Line");
+      Rec3.SETRANGE("Recipe Group",Rec2."Recipe Group");
+      Rec3.SETRANGE(Recipe,Rec2.Recipe);
+      Rec3.SETRANGE("Attached to Line No.",Rec2."Line No.");
+      Rec3.SETFILTER("Line No.",'>%1',Rec2."Line No.");
+
+      //IF Rec3.FINDSET(TRUE) THEN BEGIN //Call 23762
+      IF Rec3.FINDSET(ModifyAction <> ModifyAction::Delete) THEN BEGIN //Call 23762
+        REPEAT
+          CASE ModifyAction OF
+            ModifyAction::Delete:
+              Rec3.DELETE(TRUE);
+            ModifyAction::ModQuantity:
+              BEGIN
+                Rec3.VALIDATE(Quantity,ROUND(Rec3.Quantity * QuantityRatio, 0.00001));
+                Rec3.MODIFY(TRUE);
+              END;
+            ModifyAction::Fields:
+              //**dbeekman.sn: 22671
+              IF (Rec3."Plant Type" <> '') OR
+                 (Rec3."Set Code" <> '')
+              THEN BEGIN
+              //**dbeekman.en
+                CASE FieldNo OF
+                  Rec2.FIELDNO("Start Rental Period"):
+                    BEGIN;
+                      Rec3.VALIDATE("Start Rental Period", Rec2."Start Rental Period");
+                      Rec3.MODIFY;
+                    END;
+                  Rec2.FIELDNO("End Rental Period"):
+                    BEGIN;
+                      Rec3.VALIDATE("End Rental Period", Rec2."End Rental Period");
+                      Rec3.MODIFY;
+                    END;
+                  Rec2.FIELDNO("Rental Period Formula"):
+                    BEGIN;
+                      Rec3.VALIDATE("Rental Period Formula", Rec2."Rental Period Formula");
+                      Rec3.MODIFY;
+                    END;
+                  Rec2.FIELDNO("Rental Time Units"):
+                    BEGIN;
+                      Rec3.VALIDATE("Rental Time Units", Rec2."Rental Time Units");
+                      Rec3.MODIFY;
+                    END;
+                END;
+              END;
+          END;
+        UNTIL Rec3.NEXT = 0;
+        MakeUpdateRequired := TRUE;
+        EXIT(TRUE);
+      END;
+    END;
+
+    PROCEDURE ModifyLinkedBaseRcpLines@1100528901(ModifyAction@1100525000 : 'Delete,ModQuantity,,Fields';VAR Rec2@1000 : Record 11020582;FieldNo@1100525001 : Integer) : Boolean;
+    VAR
+      Rec3@1001 : Record 11020582;
+    BEGIN
+      //DP00381
+      IF (ModifyAction = ModifyAction::ModQuantity) AND (QuantityRatio = 1) THEN
+        EXIT;
+
+      Rec3.SETRANGE("Attached to Line No.",Rec2."Line No.");
+      Rec3.SETFILTER("Line No.",'>%1',Rec2."Line No.");
+
+      //IF Rec3.FINDSET(TRUE) THEN BEGIN //Call 23762
+      IF Rec3.FINDSET(ModifyAction <> ModifyAction::Delete) THEN BEGIN //Call 23762
+        REPEAT
+          CASE ModifyAction OF
+            ModifyAction::Delete:
+              Rec3.DELETE(TRUE);
+            ModifyAction::ModQuantity:
+              BEGIN
+                Rec3.VALIDATE(Quantity,ROUND(Rec3.Quantity * QuantityRatio, 0.00001));
+                Rec3.MODIFY(TRUE);
+              END;
+            ModifyAction::Fields:
+              //**dbeekman.sn: 22671
+              IF (Rec3."Plant Type" <> '') OR
+                 (Rec3."Set Code" <> '')
+              THEN BEGIN
+              //**dbeekman.en
+                CASE FieldNo OF
+                  Rec2.FIELDNO("Start Rental Period"):
+                    BEGIN;
+                      Rec3.VALIDATE("Start Rental Period", Rec2."Start Rental Period");
+                      Rec3.MODIFY;
+                    END;
+                  Rec2.FIELDNO("End Rental Period"):
+                    BEGIN;
+                      Rec3.VALIDATE("End Rental Period", Rec2."End Rental Period");
+                      Rec3.MODIFY;
+                    END;
+                  Rec2.FIELDNO("Rental Period Formula"):
+                    BEGIN;
+                      Rec3.VALIDATE("Rental Period Formula", Rec2."Rental Period Formula");
+                      Rec3.MODIFY;
+                    END;
+                  Rec2.FIELDNO("Rental Time Units"):
+                    BEGIN;
+                      Rec3.VALIDATE("Rental Time Units", Rec2."Rental Time Units");
+                      Rec3.MODIFY;
+                    END;
+                END;
+              END;
+          END;
+        UNTIL Rec3.NEXT = 0;
+        MakeUpdateRequired := TRUE;
+        EXIT(TRUE);
+      END;
+    END;
+
+    PROCEDURE ModifyLinkedSalesRcpLines@1100525036(ModifyAction@1100525000 : 'Delete,ModQuantity,,Fields';VAR Rec2@1000 : Record 11229789;FieldNo@1100525001 : Integer) : Boolean;
+    VAR
+      Rec3@1001 : Record 11229789;
+    BEGIN
+      //DP00481
+      IF (ModifyAction = ModifyAction::ModQuantity) AND (QuantityRatio = 1) THEN
+        EXIT;
+
+      Rec3.SETRANGE("Sales Document Type", Rec2."Sales Document Type");
+      Rec3.SETRANGE("Sales Document No.", Rec2."Sales Document No.");
+      Rec3.SETRANGE("Sales Line No.", Rec2."Sales Line No.");
+      Rec3.SETRANGE("Recipe Group",Rec2."Recipe Group");
+      Rec3.SETRANGE(Recipe,Rec2.Recipe);
+      Rec3.SETRANGE("Attached to Line No.",Rec2."Line No.");
+      Rec3.SETFILTER("Line No.",'>%1',Rec2."Line No.");
+
+      //IF Rec3.FINDSET(TRUE) THEN BEGIN //Call 23762
+      IF Rec3.FINDSET(ModifyAction <> ModifyAction::Delete) THEN BEGIN //Call 23762
+        REPEAT
+          CASE ModifyAction OF
+            ModifyAction::Delete:
+              Rec3.DELETE(TRUE);
+            ModifyAction::ModQuantity:
+              BEGIN
+                Rec3.VALIDATE(Quantity,ROUND(Rec3.Quantity * QuantityRatio, 0.00001));
+                Rec3.MODIFY(TRUE);
+              END;
+            ModifyAction::Fields:
+              //**dbeekman.sn: 22671
+              IF (Rec3."Plant Type" <> '') OR
+                 (Rec3."Set Code" <> '')
+              THEN BEGIN
+              //**dbeekman.en
+                CASE FieldNo OF
+                  Rec2.FIELDNO("Start Rental Period"):
+                    BEGIN;
+                      Rec3.VALIDATE("Start Rental Period", Rec2."Start Rental Period");
+                      Rec3.MODIFY;
+                    END;
+                  Rec2.FIELDNO("End Rental Period"):
+                    BEGIN;
+                      Rec3.VALIDATE("End Rental Period", Rec2."End Rental Period");
+                      Rec3.MODIFY;
+                    END;
+                  Rec2.FIELDNO("Rental Period Formula"):
+                    BEGIN;
+                      Rec3.VALIDATE("Rental Period Formula", Rec2."Rental Period Formula");
+                      Rec3.MODIFY;
+                    END;
+                  Rec2.FIELDNO("Rental Time Units"):
+                    BEGIN;
+                      Rec3.VALIDATE("Rental Time Units", Rec2."Rental Time Units");
+                      Rec3.MODIFY;
+                    END;
+                END;
+              END;
+          END;
+        UNTIL Rec3.NEXT = 0;
+        MakeUpdateRequired := TRUE;
+        EXIT(TRUE);
+      END;
+    END;
+
+    PROCEDURE ModifyLinkedPartLines@1100525039(ModifyAction@1100525000 : 'Delete,ModQuantity,,Fields';VAR Rec2@1000 : Record 11072076;FieldNo@1100525001 : Integer) : Boolean;
+    VAR
+      Rec3@1001 : Record 11072076;
+    BEGIN
+      //DP00381
+      //db, 24-02-14: C012367
+      IF (ModifyAction = ModifyAction::ModQuantity) AND (QuantityRatio = 1) THEN
+        EXIT;
+
+      Rec3.SETRANGE("Attached to Line No.",Rec2."Line No.");
+      Rec3.SETFILTER("Line No.",'>%1',Rec2."Line No.");
+
+      IF Rec3.FINDSET(ModifyAction <> ModifyAction::Delete) THEN BEGIN
+        REPEAT
+          CASE ModifyAction OF
+            ModifyAction::Delete:
+              Rec3.DELETE(TRUE);
+            ModifyAction::ModQuantity:
+              BEGIN
+                Rec3.VALIDATE(Quantity,ROUND(Rec3.Quantity * QuantityRatio, 0.00001));
+                Rec3.MODIFY(TRUE);
+              END;
+          END;
+        UNTIL Rec3.NEXT = 0;
+        MakeUpdateRequired := TRUE;
+        EXIT(TRUE);
+      END;
+    END;
+
+    PROCEDURE MakeUpdate@6() : Boolean;
+    BEGIN
+      EXIT(MakeUpdateRequired);
+    END;
+
+    PROCEDURE ReadEstimateSetup@1100525034();
+    BEGIN
+      IF EstimateSetupRead THEN
+        EXIT;
+
+      EstimateSetup.GET;
+      EstimateSetupRead := TRUE;
+    END;
+
+    PROCEDURE IsLineDiscountMaterialOnly@1100525035() : Boolean;
+    BEGIN
+      ReadEstimateSetup;
+      EXIT(EstimateSetup."Line Disc. Applies To" = EstimateSetup."Line Disc. Applies To"::"Material only");
+    END;
+
+    LOCAL PROCEDURE ReadPlantCostLines@10(PlantType@1000 : Code[20]) : Boolean;
+    VAR
+      PlantCostLine@1003 : Record 11012591;
+      LineNo@1100525000 : Integer;
+    BEGIN
+      PlantCostLine.SETRANGE("Cost Level", PlantCostLine."Cost Level"::PlantType);  //DP00671
+      PlantCostLine.SETRANGE(Code,PlantType);
+      PlantCostLine.SETFILTER(Type, '<>%1', PlantCostLine.Type::Damage);  //DP00241 (C004697)
+      IF NOT PlantCostLine.FINDSET() THEN
+        EXIT(FALSE);
+
+      TmpCostLine.DELETEALL;
+      REPEAT
+        //* Note: Here only Arrival and/or Removal, so nothing to do with 'Other Transfer' ("Incl. Arrival Other Transfers")
+        TmpCostLine := PlantCostLine;
+        LineNo := LineNo + 10000;
+        TmpCostLine."Line No." := LineNo;
+        TmpCostLine.INSERT;
+        IF PlantCostLine."Type Cost" = PlantCostLine."Type Cost"::Both THEN BEGIN
+          LineNo := LineNo + 10000;
+          TmpCostLine."Line No." := LineNo;
+          TmpCostLine.INSERT;
+        END;
+      UNTIL PlantCostLine.NEXT = 0;
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE ReadSetCostLines@1100525011(SetCode@1000 : Code[20]) : Boolean;
+    VAR
+      PlantCostLine@1003 : Record 11012591;
+      LineNo@1100525000 : Integer;
+    BEGIN
+      PlantCostLine.SETRANGE("Cost Level", PlantCostLine."Cost Level"::Set);  //DP00671
+      PlantCostLine.SETRANGE(Code,SetCode);
+      PlantCostLine.SETFILTER(Type, '<>%1', PlantCostLine.Type::Damage);  //DP00241 (C004697)
+      IF NOT PlantCostLine.FINDSET THEN
+        EXIT(FALSE);
+
+      TmpCostLine.DELETEALL;
+      REPEAT
+        //* Note: Here only Arrival and/or Removal, so nothing to do with 'Other Transfer' ("Incl. Arrival Other Transfers")
+        TmpCostLine := PlantCostLine;
+        LineNo := LineNo + 10000;
+        TmpCostLine."Line No." := LineNo;
+        TmpCostLine.INSERT;
+        IF PlantCostLine."Type Cost" = PlantCostLine."Type Cost"::Both THEN BEGIN
+          LineNo := LineNo + 10000;
+          TmpCostLine."Line No." := LineNo;
+          TmpCostLine.INSERT;
+        END;
+      UNTIL PlantCostLine.NEXT = 0;
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE ReadPlantItmLines@1100525020(PlantType@1100525001 : Code[20]) : Boolean;
+    VAR
+      PlantItemLine@1003 : Record 11020519;
+      LineNo@1100525000 : Integer;
+    BEGIN
+      PlantItemLine.SETRANGE("Plant Type",PlantType);
+      IF NOT PlantItemLine.FINDSET THEN
+        EXIT(FALSE);
+
+      TmpSetLine.DELETEALL;
+      TmpSetLine.Type := TmpSetLine.Type ::Item;
+      REPEAT
+        TmpSetLine."Item No." := PlantItemLine."Item No.";
+        TmpSetLine.Quantity := PlantItemLine.Quantity;
+        TmpSetLine."Unit of Measure" := PlantItemLine."Unit of Measure";
+        LineNo := LineNo + 10000;
+        TmpSetLine."Line No." := LineNo;
+        TmpSetLine.INSERT;
+      UNTIL PlantItemLine.NEXT = 0;
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE ReadSetItmPltLines@1100525012(SetCode@1000 : Code[20]) : Boolean;
+    VAR
+      PlantSetLine@1003 : Record 11012588;
+      LineNo@1100525000 : Integer;
+    BEGIN
+      PlantSetLine.SETRANGE("Set Code",SetCode);
+      IF NOT PlantSetLine.FINDSET THEN
+        EXIT(FALSE);
+
+      TmpSetLine.DELETEALL;
+      REPEAT
+        TmpSetLine := PlantSetLine;
+        LineNo := LineNo + 10000;
+        TmpSetLine."Line No." := LineNo;
+        TmpSetLine.INSERT;
+      UNTIL PlantSetLine.NEXT = 0;
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE PlantCostItmLnsExist@1100525038(PlantType@1000 : Code[20]) : Boolean;
+    VAR
+      PlantCostLine@1003 : Record 11012591;
+      PlantItemLine@1100525000 : Record 11020519;
+    BEGIN
+      PlantCostLine.SETRANGE("Cost Level", PlantCostLine."Cost Level"::PlantType);  //DP00671
+      PlantCostLine.SETRANGE(Code,PlantType);
+      PlantCostLine.SETFILTER(Type, '<>%1', PlantCostLine.Type::Damage);  //DP00241 (C004697)
+      IF PlantCostLine.FINDSET THEN
+        EXIT(TRUE);
+
+      PlantItemLine.SETRANGE("Plant Type",PlantType);
+      IF PlantItemLine.FINDSET THEN
+        EXIT(TRUE);
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE SetQuantityRatio@1100525007(Ratio@1100525000 : Decimal);
+    BEGIN
+      //xRec.Quantity/Rec.Quantity, used when called from outside and xRec is not available
+      QuantityRatio := Ratio;
+    END;
+
+    PROCEDURE SetNewHeadLineNo@1100525015(NewHeadLineNo2@1100525000 : Integer);
+    BEGIN
+      NewHeadLineNo := NewHeadLineNo2;
+    END;
+
+    PROCEDURE GeneratePlantNeed@1100525009(EstimateNo@1100525000 : Code[20]);
+    VAR
+      PlantNeed@1100525001 : Record 11012579;
+      Estimate@1100525005 : Record 11012151;
+      Action@1100525003 : ' ,Add,Replace';
+      LineNo@1100525004 : Integer;
+      LastLineNoTmpPlantNeed@1100525002 : Integer;
+    BEGIN
+      //Determine appropriate action
+      IF NOT CONFIRM(Text004,TRUE,PlantNeed.TABLECAPTION) THEN
+        EXIT;
+      Estimate.GET(EstimateNo);
+      Estimate.TESTFIELD(Estimate."Plant Location");
+      Estimate.CALCFIELDS(Estimate."Transf. to Plant Need");
+      IF Estimate."Transf. to Plant Need" THEN BEGIN
+        IF PlantNeedUnTouched(Estimate) THEN BEGIN
+          IF CONFIRM(Text001,TRUE,Estimate.TABLECAPTION,Estimate."No.",PlantNeed.TABLECAPTION,Estimate."Plant Location") THEN
+            Action := Action::Replace
+          ELSE BEGIN
+            MESSAGE(Text002);
+            EXIT;
+          END;
+        END ELSE
+          ERROR(Text003,Estimate.TABLECAPTION,Estimate."No.",PlantNeed.TABLECAPTION,Estimate."Plant Location");
+      END ELSE
+         Action := Action::Add;
+
+      Window.OPEN(Text005 +Text006 + Text007);
+      //Fill TempBuffer
+      TmpPlantNeed.DELETEALL;
+      LastLineNoTmpPlantNeed := 0;
+      FillPlantNeedFromEstLns(Estimate,LastLineNoTmpPlantNeed);
+      FillPlantNeedFromRcpLns(Estimate,LastLineNoTmpPlantNeed);
+
+      //Delete existing Plant Need belonging to this Estimate
+      IF Action = Action::Replace THEN BEGIN
+        PlantNeed.SETCURRENTKEY(PlantNeed."Transf. from Estimate");
+        PlantNeed.SETRANGE("Transf. from Estimate",Estimate."No.");
+        PlantNeed.DELETEALL;
+      END;
+
+      //Write TempBuffer to Plant Need
+      PlantNeed.RESET;
+      PlantNeed.SETRANGE(PlantNeed.Location,Estimate."Plant Location");
+      IF TmpPlantNeed.FINDSET THEN BEGIN
+        MaxCounter := TmpPlantNeed.COUNT;
+        ResetCounters;
+        IF PlantNeed.FINDLAST THEN
+          LineNo := PlantNeed."Line No."
+        ELSE
+          LineNo := 0;
+        REPEAT
+          Counter := Counter + 1;
+          UpdateWindow(5);
+          LineNo := LineNo + 10000;
+          PlantNeed.COPY(TmpPlantNeed);
+          PlantNeed."Line No." := LineNo;
+          PlantNeed.INSERT;
+        UNTIL TmpPlantNeed.NEXT = 0;
+      END;
+      Window.CLOSE;
+    END;
+
+    PROCEDURE PlantNeedUnTouched@1100525017(Estimate@1100525000 : Record 11012151) : Boolean;
+    VAR
+      PlantNeed@1100525001 : Record 11012579;
+    BEGIN
+      PlantNeed.SETCURRENTKEY(PlantNeed."Transf. from Estimate");
+      PlantNeed.SETRANGE("Transf. from Estimate",Estimate."No.");
+      PlantNeed.SETRANGE(Location,Estimate."Plant Location");
+      PlantNeed.SETFILTER("Copied Quantity",'<>%1',0);
+      EXIT(NOT PlantNeed.FINDFIRST);
+    END;
+
+    PROCEDURE FillPlantNeedFromEstLns@1100525018(Estimate@1100525001 : Record 11012151;VAR LastLineNoTmpPlantNeed@1100525002 : Integer);
+    VAR
+      Line@1100525000 : Record 11072072;
+    BEGIN
+      IF NOT Line.SETCURRENTKEY("Estimate No.","Plant Type") THEN
+        Line.SETCURRENTKEY("Estimate No.");
+      Line.SETRANGE("Estimate No.",Estimate."No.");
+      Line.SETFILTER("Plant Type",'<>%1','');
+      IF Line.FINDSET THEN BEGIN
+        MaxCounter := Line.COUNT;
+        ResetCounters;
+        REPEAT
+          Counter := Counter + 1;
+          UpdateWindow(3);
+          TmpPlantNeed.INIT;
+          TmpPlantNeed.Location := Estimate."Plant Location";
+          TmpPlantNeed."Transf. from Estimate" := Estimate."No.";
+          LastLineNoTmpPlantNeed := LastLineNoTmpPlantNeed + 10000;
+          TmpPlantNeed."Line No." := LastLineNoTmpPlantNeed;
+          TmpPlantNeed."Plant Type" := Line."Plant Type";
+          IF Line."Start Rental Period" <> 0D THEN
+            TmpPlantNeed."Starting Date" := Line."Start Rental Period"
+          ELSE
+            TmpPlantNeed."Starting Date" := Estimate."Reference Date (Rate)";
+          IF Line."End Rental Period" <> 0D THEN
+            TmpPlantNeed."Ending Date" := Line."End Rental Period";
+          TmpPlantNeed.Quantity := Line."Part Quantity" * Line.Quantity;
+          TmpPlantNeed."Unit of Measure" := Line."Unit of Measure";
+          TmpPlantNeed.INSERT;
+        UNTIL Line.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE FillPlantNeedFromRcpLns@1100525021(Estimate@1100525001 : Record 11012151;VAR LastLineNoTmpPlantNeed@1100525002 : Integer);
+    VAR
+      Line@1100525000 : Record 11072075;
+    BEGIN
+      IF NOT Line.SETCURRENTKEY("Estimate No.","Plant Type") THEN
+        Line.SETCURRENTKEY("Estimate No.");
+      Line.SETRANGE("Estimate No.",Estimate."No.");
+      Line.SETFILTER("Plant Type",'<>%1','');
+      IF Line.FINDSET THEN BEGIN
+        MaxCounter := Line.COUNT;
+        ResetCounters;
+        REPEAT
+          Counter := Counter + 1;
+          UpdateWindow(4);
+          TmpPlantNeed.INIT;
+          TmpPlantNeed.Location := Estimate."Plant Location";
+          TmpPlantNeed."Transf. from Estimate" := Estimate."No.";
+          LastLineNoTmpPlantNeed := LastLineNoTmpPlantNeed + 10000;
+          TmpPlantNeed."Line No." := LastLineNoTmpPlantNeed;
+          TmpPlantNeed."Plant Type" := Line."Plant Type";
+          IF Line."Start Rental Period" <> 0D THEN
+            TmpPlantNeed."Starting Date" := Line."Start Rental Period"
+          ELSE
+            TmpPlantNeed."Starting Date" := Estimate."Reference Date (Rate)";
+          IF Line."End Rental Period" <> 0D THEN
+            TmpPlantNeed."Ending Date" := Line."End Rental Period";
+          Line.CALCFIELDS("Estimate Quantity",Line."Estimate Part Quantity");
+          TmpPlantNeed.Quantity := Line."Estimate Part Quantity" * Line."Estimate Quantity" * Line.Quantity;
+          TmpPlantNeed."Unit of Measure" := Line."Unit of Measure";
+          TmpPlantNeed.INSERT;
+        UNTIL Line.NEXT = 0;
+      END
+    END;
+
+    PROCEDURE CalcNonIdxTotals@1100525019(EstimateNo@1100525000 : Code[20]);
+    VAR
+      EstPart@1100525001 : Record 11072073;
+      EstLine@1100525002 : Record 11072072;
+      Window@1100525003 : Dialog;
+    BEGIN
+      CASE STRMENU(Text012) OF
+        1:
+          EstLine.SETRANGE("Estimate No.",EstimateNo);
+        2:
+          BEGIN
+            EstPart.RESET;
+            EstPart.SETRANGE("Estimate No.",EstimateNo);
+            IF PAGE.RUNMODAL(PAGE::"Estimate Part List",EstPart) = ACTION::LookupOK THEN
+              EstPart.GetEstLineFilterFromEstPart(EstLine)
+            ELSE
+              EXIT;
+           END;
+        ELSE
+          EXIT;
+      END;
+
+      Window.OPEN(Text010);
+      EstLine.CalcNonIndexedTotals;
+      Window.CLOSE;
+      MESSAGE(
+        Text011 + Text008 + Text009,
+        EstLine.GETFILTERS,
+        ROUND(EstLine.GetTotalWeight),
+        ROUND(EstLine.GetTotalBuyBack));
+    END;
+
+    PROCEDURE ResetCounters@1100485027();
+    BEGIN
+      Counter := 0;
+      WindowLastUpdated := TIME;
+    END;
+
+    PROCEDURE UpdateWindow@1100485028(IndicatorNo@1100525000 : Integer);
+    BEGIN
+      IF (Counter = MaxCounter) OR (TIME - WindowLastUpdated > 300) THEN BEGIN
+        Window.UPDATE(IndicatorNo,ROUND(Counter / MaxCounter * 10000,1));
+        WindowLastUpdated := TIME;
+      END;
+    END;
+
+    PROCEDURE EstFieldIsEditable@1100528915(FieldNo2@1100525000 : Integer;Rec@1100525001 : Record 11072072) : Boolean;
+    BEGIN
+      EstLine := Rec;
+
+      WITH EstLine DO BEGIN
+        IF NOT ChkEstSurChgEdit(FieldNo2) THEN
+          EXIT(FALSE);
+
+        IF NOT ChkEstRecipeEdit(FieldNo2) THEN
+          EXIT(FALSE);
+
+        IF NOT ChkEstSetEdit(FieldNo2) THEN
+          EXIT(FALSE);
+
+        IF NOT ChkEstItemEdit(FieldNo2) THEN
+          EXIT(FALSE);
+
+        IF NOT ChkEstPlantTpEdit(FieldNo2) THEN
+          EXIT(FALSE);
+
+        IF NOT ChkEstConnectEdit(FieldNo2) THEN
+          EXIT(FALSE);
+
+        CASE FieldNo2 OF
+          FIELDNO("Surcharge %"): EXIT("Surcharge Type" <> "Surcharge Type"::" ");
+          FIELDNO(Norm):
+            EXIT(
+              (Recipe = '') AND ("Sub Operation Code" = '') AND
+              ("Surcharge Type" = "Surcharge Type"::" ") AND ("Rate Code" <> ''));  //db, 19-11-09: M17079
+          FIELDNO("Wage Component"):
+            EXIT(
+              (Recipe = '') AND
+              ("Surcharge Type" = "Surcharge Type"::" ") AND ("Rate Code" <> ''));  //DP00236
+        END;
+
+        EXIT(TRUE);
+      END;
+    END;
+
+    PROCEDURE EstRcpFieldIsEditable@1100528914(FieldNo2@1100525000 : Integer;Rec@1100525001 : Record 11072075) : Boolean;
+    BEGIN
+      EstRcpLine := Rec;
+
+      WITH EstRcpLine DO BEGIN
+        IF NOT ChkRcpSurChgEdit(FieldNo2) THEN
+          EXIT(FALSE);
+
+        IF NOT ChkRcpRecipeEdit(FieldNo2) THEN
+          EXIT(FALSE);
+
+        IF NOT ChkRcpSetEdit(FieldNo2) THEN
+          EXIT(FALSE);
+
+        IF NOT ChkRcpItemEdit(FieldNo2) THEN
+          EXIT(FALSE);
+
+        IF NOT ChkRcpPlantTpEdit(FieldNo2) THEN
+          EXIT(FALSE);
+
+        IF NOT ChkRcpConnectEdit(FieldNo2) THEN
+          EXIT(FALSE);
+
+        CASE FieldNo2 OF
+          FIELDNO("Surcharge %"): EXIT("Surcharge Type" <> "Surcharge Type"::" ");
+          FIELDNO("Rate Code"): EXIT("Cost Type (Hours)"="Cost Type (Hours)"::Labor);  //DP01047;
+          FIELDNO(Norm), FIELDNO("Norm (Sales)"):  //db, 12-05-15
+            EXIT(
+              ("Cost Type (Hours)"="Cost Type (Hours)"::Plant) OR  //DP01047
+              //("Recipe (Child)" = '') AND
+              ("Recipe Header" = FALSE) AND  //db, 28-03-14: C013896
+              ("Sub Operation Code" = '') AND
+              ("Surcharge Type" = "Surcharge Type"::" ") AND ("Rate Code" <> ''));  //db, 19-11-09: M17079
+          FIELDNO("Wage Component"):
+            EXIT(
+              //("Recipe (Child)" = '') AND
+              ("Recipe Header" = FALSE) AND  //db, 28-03-14: C013896
+              ("Surcharge Type" = "Surcharge Type"::" ") AND ("Rate Code" <> ''));  //DP00236
+        END;
+
+        EXIT(TRUE);
+      END;
+    END;
+
+    PROCEDURE BaseRcpFieldIsEditable@1100528916(FieldNo2@1100525000 : Integer;Rec@1100525001 : Record 11020582) : Boolean;
+    BEGIN
+      //DP00381
+      BaseRcpLine := Rec;
+      EstRcpLine.TRANSFERFIELDS(BaseRcpLine);  //db, 12-08-13
+      EstRcpLine."Recipe Header" := (BaseRcpLine."Recipe (Child)"<>''); //db, 28-03-14: C013896 (for ChkRcpRecipeEdit)
+
+      WITH BaseRcpLine DO BEGIN
+        IF NOT ChkRcpSurChgEdit(FieldNo2) THEN
+          EXIT(FALSE);
+
+        IF NOT ChkRcpRecipeEdit(FieldNo2) THEN
+          EXIT(FALSE);
+
+        IF NOT ChkRcpSetEdit(FieldNo2) THEN
+          EXIT(FALSE);
+
+        IF NOT ChkRcpItemEdit(FieldNo2) THEN
+          EXIT(FALSE);
+
+        IF NOT ChkRcpPlantTpEdit(FieldNo2) THEN
+          EXIT(FALSE);
+
+        IF NOT ChkRcpConnectEdit(FieldNo2) THEN
+          EXIT(FALSE);
+
+        CASE FieldNo2 OF
+          FIELDNO("Surcharge %"): EXIT("Surcharge Type" <> "Surcharge Type"::" ");
+          FIELDNO("Rate Code"): EXIT("Cost Type (Hours)"="Cost Type (Hours)"::Labor);  //DP01047;
+          FIELDNO(Norm):
+            EXIT(
+              ("Cost Type (Hours)"="Cost Type (Hours)"::Plant) OR  //DP01047
+              //("Recipe (Child)" = '') AND
+              ("Recipe Header" = FALSE) AND  //db, 28-03-14: C013896
+              ("Sub Operation Code" = '') AND
+              ("Surcharge Type" = "Surcharge Type"::" ") AND ("Rate Code" <> ''));  //db, 19-11-09: M17079
+          FIELDNO("Wage Component"):
+            EXIT(
+              //("Recipe (Child)" = '') AND
+              ("Recipe Header" = FALSE) AND  //db, 28-03-14: C013896
+              ("Surcharge Type" = "Surcharge Type"::" ") AND ("Rate Code" <> ''));  //DP00236
+        END;
+
+        EXIT(TRUE);
+      END;
+    END;
+
+    PROCEDURE SalesRcpFieldIsEditable@1100525037(FieldNo2@1100525000 : Integer;Rec@1100525001 : Record 11229789) : Boolean;
+    VAR
+      BaseRcpLine2@1100525002 : Record 11020582;
+    BEGIN
+      //DP00481
+      BaseRcpLine2.TRANSFERFIELDS(Rec);
+
+      EXIT(BaseRcpFieldIsEditable(FieldNo2,BaseRcpLine2));
+    END;
+
+    PROCEDURE ChkEstSurChgEdit@1100528913(FieldNo2@1100525000 : Integer) : Boolean;
+    BEGIN
+      WITH EstLine DO BEGIN
+        EXIT(
+          ("Surcharge Type" = "Surcharge Type"::" ") OR
+          (FieldNo2 IN [
+            FIELDNO("Surcharge Type"),
+            FIELDNO("Surcharge %"),
+            FIELDNO("Rate Code"),
+            FIELDNO(Code) ]));
+      END;
+    END;
+
+    PROCEDURE ChkRcpSurChgEdit@1100528912(FieldNo2@1100525000 : Integer) : Boolean;
+    BEGIN
+      WITH EstRcpLine DO BEGIN
+        EXIT(
+          ("Surcharge Type" = "Surcharge Type"::" ") OR
+          (FieldNo2 IN [
+            FIELDNO("Surcharge Type"),
+            FIELDNO("Surcharge %"),
+            FIELDNO("Rate Code"),
+            FIELDNO(Code) ]));
+      END;
+    END;
+
+    PROCEDURE ChkEstRecipeEdit@1100528911(FieldNo2@1100525000 : Integer) : Boolean;
+    BEGIN
+      WITH EstLine DO BEGIN
+        EXIT(
+          (Recipe = '') OR
+          (FieldNo2 IN [
+            FIELDNO(Recipe),
+            FIELDNO("Surcharge %"),
+            FIELDNO("Time Quantity"),
+            FIELDNO("Unit of Time"),
+            FIELDNO("Recipe Group") ]));
+      END;
+    END;
+
+    PROCEDURE ChkRcpRecipeEdit@1100528910(FieldNo2@1100525000 : Integer) : Boolean;
+    BEGIN
+      WITH EstRcpLine DO BEGIN
+        IF "Estimate No." <> '' THEN BEGIN
+          EXIT(
+            ("Recipe Header" = FALSE) OR  //db, 01-07-14: T005104
+            (FieldNo2 IN [
+              FIELDNO("Recipe (Child)"),
+              FIELDNO("Surcharge %"),
+              FIELDNO("Time Quantity"),
+              FIELDNO("Unit of Time"),
+              FIELDNO("Recipe Group (Child)") ]));
+        END ELSE BEGIN
+          EXIT(
+            ("Recipe (Child)" = '') OR
+            (FieldNo2 IN [
+              FIELDNO("Recipe (Child)"),
+              FIELDNO("Surcharge %"),
+              FIELDNO("Time Quantity"),
+              FIELDNO("Unit of Time"),
+              FIELDNO("Recipe Group (Child)") ]));
+        END;
+      END;
+    END;
+
+    PROCEDURE ChkEstSetEdit@1100528909(FieldNo2@1100525000 : Integer) : Boolean;
+    BEGIN
+      WITH EstLine DO BEGIN
+        EXIT(
+          ("Set Code" = '') OR
+          NOT (FieldNo2 IN [
+            FIELDNO(Recipe),
+            FIELDNO("Plant Type"),
+            FIELDNO("Surcharge %"),
+            FIELDNO("Item No."),
+            FIELDNO(Manufacturer),
+            FIELDNO("Basic Item"),
+            FIELDNO("Vendor (Trade Item)"),
+            FIELDNO("Trade Item") ]));
+      END;
+    END;
+
+    PROCEDURE ChkRcpSetEdit@1100528908(FieldNo2@1100525000 : Integer) : Boolean;
+    BEGIN
+      WITH EstRcpLine DO BEGIN
+        EXIT(
+          ("Set Code" = '') OR
+          NOT (FieldNo2 IN [
+            FIELDNO("Recipe (Child)"),
+            FIELDNO("Plant Type"),
+            FIELDNO("Surcharge %"),
+            FIELDNO("Item No."),
+            FIELDNO(Manufacturer),
+            FIELDNO("Basic Item"),
+            FIELDNO("Vendor (Trade Item)"),
+            FIELDNO("Trade Item") ]));
+      END;
+    END;
+
+    PROCEDURE ChkEstItemEdit@1100528907(FieldNo2@1100525000 : Integer) : Boolean;
+    BEGIN
+      WITH EstLine DO BEGIN
+        EXIT(
+          ("Item No." + "Basic Item" + "Trade Item" = '') OR
+          NOT (FieldNo2 IN [
+            FIELDNO(Recipe),
+            FIELDNO("Set Code"),
+            FIELDNO("Surcharge Type"),
+            FIELDNO("Plant Type") ]));
+      END;
+    END;
+
+    PROCEDURE ChkRcpItemEdit@1100528906(FieldNo2@1100525000 : Integer) : Boolean;
+    BEGIN
+      WITH EstRcpLine DO BEGIN
+        EXIT(
+          ("Item No." + "Basic Item" + "Trade Item" = '') OR
+          NOT (FieldNo2 IN [
+            FIELDNO("Recipe (Child)"),
+            FIELDNO("Set Code"),
+            FIELDNO("Surcharge Type"),
+            FIELDNO("Plant Type") ]));
+      END;
+    END;
+
+    PROCEDURE ChkEstPlantTpEdit@1100528905(FieldNo2@1100525000 : Integer) : Boolean;
+    BEGIN
+      WITH EstLine DO BEGIN
+        EXIT(
+          ("Plant Type" = '') OR
+          NOT (FieldNo2 IN [
+            FIELDNO(Recipe),
+            FIELDNO("Set Code"),
+            FIELDNO("Surcharge %"),
+            FIELDNO("Item No."),
+            FIELDNO(Manufacturer),
+            FIELDNO("Basic Item"),
+            FIELDNO("Vendor (Trade Item)"),
+            FIELDNO("Trade Item") ]));
+      END;
+    END;
+
+    PROCEDURE ChkRcpPlantTpEdit@1100528904(FieldNo2@1100525000 : Integer) : Boolean;
+    BEGIN
+      WITH EstRcpLine DO BEGIN
+        EXIT(
+          ("Plant Type" = '') OR
+          NOT (FieldNo2 IN [
+            FIELDNO("Recipe (Child)"),
+            FIELDNO("Set Code"),
+            FIELDNO("Surcharge %"),
+            FIELDNO("Item No."),
+            FIELDNO(Manufacturer),
+            FIELDNO("Basic Item"),
+            FIELDNO("Vendor (Trade Item)"),
+            FIELDNO("Trade Item") ]));
+      END;
+    END;
+
+    PROCEDURE ChkEstConnectEdit@1100528903(FieldNo2@1100525000 : Integer) : Boolean;
+    BEGIN
+      WITH EstLine DO BEGIN
+        EXIT(
+          ("Attached to Line No." = 0) OR
+          NOT (FieldNo2 IN [
+            FIELDNO("Start Rental Period"),
+            FIELDNO("End Rental Period"),
+            FIELDNO("Rental Period Formula"),
+            FIELDNO("Rental Time Units") ]));
+      END;
+    END;
+
+    PROCEDURE ChkRcpConnectEdit@1100528900(FieldNo2@1100525000 : Integer) : Boolean;
+    BEGIN
+      WITH EstRcpLine DO BEGIN
+        EXIT(
+          ("Attached to Line No." = 0) OR
+          NOT (FieldNo2 IN [
+            FIELDNO("Start Rental Period"),
+            FIELDNO("End Rental Period"),
+            FIELDNO("Rental Period Formula"),
+            FIELDNO("Rental Time Units") ]));
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

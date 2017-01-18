@@ -1,0 +1,168 @@
+OBJECT Codeunit 5406 Output Jnl.-Expl. Route
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00.00.45243,4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=83;
+    Permissions=TableData 83=imd,
+                TableData 5406=r,
+                TableData 5409=r;
+    OnRun=VAR
+            ProdOrderLine@1000 : Record 5406;
+            ProdOrderRtngLine@1001 : Record 5409;
+            ItemJnlLine@1002 : Record 83;
+            CostCalcMgt@1003 : Codeunit 5836;
+            ItemJnlLineReserve@1007 : Codeunit 99000835;
+            NextLineNo@1004 : Integer;
+            LineSpacing@1005 : Integer;
+            BaseQtyToPost@1006 : Decimal;
+          BEGIN
+            IF ("Order Type" <> "Order Type"::Production) OR ("Order No." = '') THEN
+              EXIT;
+
+            IF NOT ItemJnlLineReserve.DeleteLineConfirm(Rec) THEN
+              EXIT;
+
+            ProdOrderLine.RESET;
+            ProdOrderLine.SETRANGE(Status,ProdOrderLine.Status::Released);
+            ProdOrderLine.SETRANGE("Prod. Order No.","Order No.");
+            IF "Order Line No." <> 0 THEN
+              ProdOrderLine.SETRANGE("Line No.","Order Line No.");
+            IF "Item No." <> '' THEN
+              ProdOrderLine.SETRANGE("Item No.","Item No.");
+            IF "Routing Reference No." <> 0 THEN
+              ProdOrderLine.SETRANGE("Routing Reference No.","Routing Reference No.");
+            IF "Routing No." <> '' THEN
+              ProdOrderLine.SETRANGE("Routing No.","Routing No.");
+
+            ProdOrderRtngLine.SETRANGE(Status,ProdOrderRtngLine.Status::Released);
+            ProdOrderRtngLine.SETRANGE("Prod. Order No.","Order No.");
+            IF "Operation No." <> '' THEN
+              ProdOrderRtngLine.SETRANGE("Operation No.","Operation No.");
+            ProdOrderRtngLine.SETFILTER("Routing Status",'<> %1',ProdOrderRtngLine."Routing Status"::Finished);
+            //ProdOrderRtngLine.SETRANGE("Flushing Method",ProdOrderRtngLine."Flushing Method"::Manual); //**4PS.o , kzwerver, 110317, #24289
+
+            // Clear fields in xRec to ensure that validation code regarding dimensions is executed:
+            "Order Line No." := 0;
+            "Item No." := '';
+            "Routing Reference No." := 0;
+            "Routing No." := '';
+
+            ItemJnlLine := Rec;
+
+            ItemJnlLine.SETRANGE(
+              "Journal Template Name","Journal Template Name");
+            ItemJnlLine.SETRANGE(
+              "Journal Batch Name","Journal Batch Name");
+
+            IF ItemJnlLine.FIND('>') THEN BEGIN
+              LineSpacing :=
+                (ItemJnlLine."Line No." - "Line No.") DIV
+                (1 + ProdOrderLine.COUNT * ProdOrderRtngLine.COUNT);
+              IF LineSpacing = 0 THEN
+                ERROR(Text000);
+            END ELSE
+              LineSpacing := 10000;
+
+            NextLineNo := "Line No.";
+
+            IF NOT ProdOrderLine.FIND('-') THEN
+              ERROR(Text001);
+
+            REPEAT
+              ProdOrderRtngLine.SETRANGE("Routing No.",ProdOrderLine."Routing No.");
+              ProdOrderRtngLine.SETRANGE("Routing Reference No.",ProdOrderLine."Routing Reference No.");
+              IF ProdOrderRtngLine.FIND('-') THEN BEGIN
+                REPEAT
+                  BaseQtyToPost :=
+                    CostCalcMgt.CalcQtyAdjdForRoutingScrap(
+                      ProdOrderLine."Quantity (Base)",
+                      ProdOrderRtngLine."Scrap Factor % (Accumulated)",
+                      ProdOrderRtngLine."Fixed Scrap Qty. (Accum.)") -
+                    CostCalcMgt.CalcActOutputQtyBase(ProdOrderLine,ProdOrderRtngLine);
+                  IF BaseQtyToPost > 0 THEN BEGIN
+                    InsertOutputJnlLine(
+                      Rec,NextLineNo,LineSpacing,
+                      ProdOrderLine."Line No.",
+                      ProdOrderLine."Item No.",
+                      ProdOrderLine."Variant Code",
+                      ProdOrderLine."Location Code",
+                      ProdOrderLine."Bin Code",
+                      ProdOrderLine."Routing No.",ProdOrderLine."Routing Reference No.",
+                      ProdOrderRtngLine."Operation No.",
+                      ProdOrderLine."Unit of Measure Code",
+                      BaseQtyToPost / ProdOrderLine."Qty. per Unit of Measure",
+                      (ProdOrderRtngLine."Next Operation No." = ''));
+                    IF ProdOrderRtngLine."Next Operation No." = '' THEN
+                      ItemTrackingMgt.CopyItemTracking(ProdOrderLine.RowID1,LastItemJnlLine.RowID1,FALSE);
+                  END;
+                UNTIL ProdOrderRtngLine.NEXT = 0;
+              END ELSE
+                IF ProdOrderLine."Remaining Quantity" > 0 THEN BEGIN
+                  InsertOutputJnlLine(
+                    Rec,NextLineNo,LineSpacing,
+                    ProdOrderLine."Line No.",
+                    ProdOrderLine."Item No.",
+                    ProdOrderLine."Variant Code",
+                    ProdOrderLine."Location Code",
+                    ProdOrderLine."Bin Code",
+                    ProdOrderLine."Routing No.",ProdOrderLine."Routing Reference No.",'',
+                    ProdOrderLine."Unit of Measure Code",
+                    ProdOrderLine."Remaining Quantity",
+                    TRUE);
+                  ItemTrackingMgt.CopyItemTracking(ProdOrderLine.RowID1,LastItemJnlLine.RowID1,FALSE);
+                END;
+            UNTIL ProdOrderLine.NEXT = 0;
+
+            ItemJnlLineReserve.DeleteLine(Rec);
+            DELETE;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1000 : TextConst 'ENU=There are not enough free line numbers to explode the route.';
+      Text001@1001 : TextConst 'ENU=There is nothing to explode.';
+      LastItemJnlLine@1003 : Record 83;
+      ItemTrackingMgt@1002 : Codeunit 6500;
+
+    LOCAL PROCEDURE InsertOutputJnlLine@2(ItemJnlLine@1000 : Record 83;VAR NextLineNo@1001 : Integer;LineSpacing@1002 : Integer;ProdOrderLineNo@1003 : Integer;ItemNo@1004 : Code[20];VariantCode@1010 : Code[10];LocationCode@1011 : Code[10];BinCode@1012 : Code[20];RoutingNo@1005 : Code[20];RoutingRefNo@1006 : Integer;OperationNo@1007 : Code[10];UnitOfMeasureCode@1008 : Code[10];QtyToPost@1009 : Decimal;LastOperation@1013 : Boolean);
+    BEGIN
+      NextLineNo := NextLineNo + LineSpacing;
+
+      ItemJnlLine."Line No." := NextLineNo;
+      ItemJnlLine.VALIDATE("Entry Type",ItemJnlLine."Entry Type"::Output);
+      ItemJnlLine.VALIDATE("Order Line No.",ProdOrderLineNo);
+      ItemJnlLine.VALIDATE("Item No.",ItemNo);
+      ItemJnlLine.VALIDATE("Variant Code",VariantCode);
+      ItemJnlLine.VALIDATE("Location Code",LocationCode);
+      IF BinCode <> '' THEN
+        ItemJnlLine.VALIDATE("Bin Code",BinCode);
+      ItemJnlLine.VALIDATE("Routing No.",RoutingNo);
+      ItemJnlLine.VALIDATE("Routing Reference No.",RoutingRefNo);
+      ItemJnlLine.VALIDATE("Operation No.",OperationNo);
+      ItemJnlLine.VALIDATE("Unit of Measure Code",UnitOfMeasureCode);
+      ItemJnlLine.VALIDATE("Setup Time",0);
+      ItemJnlLine.VALIDATE("Run Time",0);
+      IF (LocationCode <> '') AND LastOperation THEN
+        ItemJnlLine.CheckWhse(LocationCode,QtyToPost);
+      IF ItemJnlLine.SubcontractingWorkCenterUsed THEN
+        ItemJnlLine.VALIDATE("Output Quantity",0)
+      ELSE
+        ItemJnlLine.VALIDATE("Output Quantity",QtyToPost);
+      ItemJnlLine.INSERT;
+
+      LastItemJnlLine := ItemJnlLine;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

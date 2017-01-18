@@ -1,0 +1,526 @@
+OBJECT Codeunit 5531 Calc. Inventory Page Data
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      TempInvtEventBuf@1003 : TEMPORARY Record 5530;
+      CalcItemAvailability@1001 : Codeunit 5530;
+      RecRef@1010 : RecordRef;
+      PageLineNo@1000 : Integer;
+      Text0000@1002 : TextConst 'ENU="Illegal Entity Source Type = %1, Source Subtype = %2."';
+      Text0032@1013 : TextConst 'ENU=Inventory at SKU';
+      Text0036@1012 : TextConst 'ENU=Sales %1';
+      Text0038@1011 : TextConst 'ENU=Purchase %1';
+      Text0246@1015 : TextConst 'ENU=Plan Reverted';
+      Text1003@1009 : TextConst 'ENU=Job %1';
+      Text5405@1008 : TextConst 'ENU=Production %1';
+      Text5407@1007 : TextConst 'ENU=Component %1';
+      Text5740@1006 : TextConst 'ENU=Transfer %1';
+      Text5900@1005 : TextConst 'ENU=Service %1';
+      Text9851@1004 : TextConst 'ENU=Forecast Sales';
+      Text9852@1014 : TextConst 'ENU=Forecast Component';
+      Text900@1017 : TextConst 'ENU=Assembly Order %1';
+      Text901@1018 : TextConst 'ENU=Assembly Component %1';
+
+    PROCEDURE Initialize@1(VAR Item@1004 : Record 27;ForecastName@1003 : Code[10];IncludeBlanketOrders@1002 : Boolean;ExcludeForecastBefore@1001 : Date;IncludePlan@1000 : Boolean);
+    BEGIN
+      TempInvtEventBuf.RESET;
+      TempInvtEventBuf.DELETEALL;
+
+      CalcItemAvailability.CalcNewInvtEventBuf(Item,ForecastName,IncludeBlanketOrders,ExcludeForecastBefore,IncludePlan);
+      CalcItemAvailability.GetInvEventBuffer(TempInvtEventBuf);
+    END;
+
+    PROCEDURE CreatePeriodEntries@18(VAR InvtPageData@1001 : Record 5531;PeriodType@1002 : 'Day,Week,Month,Quarter,Year');
+    VAR
+      Date@1000 : Record 2000000007;
+      LastDateInPeriod@1003 : Date;
+    BEGIN
+      TempInvtEventBuf.RESET;
+      TempInvtEventBuf.SETCURRENTKEY("Availability Date",Type);
+      IF TempInvtEventBuf.FIND('-') THEN
+        REPEAT
+          IF TempInvtEventBuf.Type = TempInvtEventBuf.Type::Inventory THEN BEGIN
+            InvtPageData.INIT;
+            InvtPageData.Code := '';
+            InvtPageData."Line No." := NextPageLineNo;
+            InvtPageData."Period Type" := Date."Period Type";
+            InvtPageData."Period Start" := TempInvtEventBuf."Availability Date";
+            InvtPageData.Description := FORMAT(TempInvtEventBuf.Type);
+            InvtPageData.Level := 0;
+            InvtPageData.INSERT;
+            LastDateInPeriod := TempInvtEventBuf."Availability Date";
+          END ELSE BEGIN
+            Date.SETRANGE("Period Type",PeriodType);
+            Date.SETFILTER("Period Start",'<=%1',TempInvtEventBuf."Availability Date");
+            IF Date.FINDLAST THEN BEGIN
+              InvtPageData.INIT;
+              InvtPageData.Code := FORMAT(Date."Period Start");
+              InvtPageData."Line No." := NextPageLineNo;
+              InvtPageData."Period Type" := Date."Period Type";
+              InvtPageData."Period Start" := Date."Period Start";
+              InvtPageData."Period End" := Date."Period End";
+              InvtPageData.Description := FormatPeriodDescription(Date);
+              InvtPageData.Level := 0;
+              InvtPageData.INSERT;
+              LastDateInPeriod := Date."Period End";
+            END;
+          END;
+          TempInvtEventBuf.SETFILTER("Availability Date",'<=%1',LastDateInPeriod);
+          TempInvtEventBuf.FIND('+');
+          TempInvtEventBuf.SETRANGE("Availability Date");
+        UNTIL TempInvtEventBuf.NEXT = 0;
+      TempInvtEventBuf.RESET;
+    END;
+
+    PROCEDURE DetailsForPeriodEntry@21(VAR InvtPageData@1000 : Record 5531;Positive@1002 : Boolean);
+    VAR
+      PeriodInvtPageData@1001 : Record 5531;
+    BEGIN
+      PeriodInvtPageData.COPY(InvtPageData);
+      TempInvtEventBuf.RESET;
+      TempInvtEventBuf.SETCURRENTKEY("Availability Date",Type);
+      TempInvtEventBuf.SETRANGE("Availability Date",InvtPageData."Period Start",InvtPageData."Period End");
+      TempInvtEventBuf.SETRANGE(Positive,Positive);
+      IF TempInvtEventBuf.FIND('-') THEN
+        REPEAT
+          TransferToPeriodDetails(InvtPageData,TempInvtEventBuf);
+          UpdateInventory(InvtPageData,TempInvtEventBuf);
+          InvtPageData."Line No." := NextPageLineNo;
+          InvtPageData.INSERT;
+          UpdatePeriodTotals(PeriodInvtPageData,InvtPageData);
+          UpdateInventory(PeriodInvtPageData,TempInvtEventBuf);
+        UNTIL TempInvtEventBuf.NEXT = 0;
+      InvtPageData.COPY(PeriodInvtPageData);
+      InvtPageData.MODIFY;
+    END;
+
+    LOCAL PROCEDURE TransferToPeriodDetails@20(VAR InventoryPageData@1001 : Record 5531;VAR FromInvtEventBuf@1000 : Record 5530);
+    VAR
+      SourceType@1007 : Integer;
+      SourceSubtype@1006 : '0,1,2,3,4,5,6,7,8,9,10';
+      SourceID@1005 : Code[20];
+      SourceBatchName@1004 : Code[10];
+      SourceProdOrderLine@1003 : Integer;
+      SourceRefNo@1002 : Integer;
+    BEGIN
+      InventoryPageData.INIT;
+
+      WITH FromInvtEventBuf DO BEGIN
+        InventoryPageData.Code := FORMAT("Availability Date");
+        InventoryPageData."Period Start" := "Availability Date";
+        InventoryPageData."Availability Date" := "Availability Date";
+        InventoryPageData.Level := 1;
+        InventoryPageData."Source Line ID" := "Source Line ID";
+        InventoryPageData."Item No." := "Item No.";
+        InventoryPageData."Variant Code" := "Variant Code";
+        InventoryPageData."Location Code" := "Location Code";
+        InventoryPageData."Remaining Quantity (Base)" := "Remaining Quantity (Base)";
+        InventoryPageData.Positive := Positive;
+        CalcItemAvailability.GetSourceReferences("Source Line ID","Transfer Direction",
+          SourceType,SourceSubtype,SourceID,SourceBatchName,SourceProdOrderLine,SourceRefNo);
+        CASE SourceType OF
+          DATABASE::"Item Ledger Entry":
+            TransferInventory(FromInvtEventBuf,InventoryPageData);
+          DATABASE::"Sales Line":
+            TransferSalesLine(FromInvtEventBuf,InventoryPageData,SourceType,SourceSubtype,SourceID);
+          DATABASE::"Purchase Line":
+            TransferPurchLine(FromInvtEventBuf,InventoryPageData,SourceType,SourceSubtype,SourceID);
+          DATABASE::"Transfer Line":
+            TransferTransLine(FromInvtEventBuf,InventoryPageData,SourceType,SourceSubtype,SourceID);
+          DATABASE::"Prod. Order Line":
+            TransferProdOrderLine(FromInvtEventBuf,InventoryPageData,SourceSubtype,SourceID);
+          DATABASE::"Prod. Order Component":
+            TransferProdOrderComp(FromInvtEventBuf,InventoryPageData,SourceSubtype,SourceID);
+          DATABASE::"Service Line":
+            TransferServiceLine(FromInvtEventBuf,InventoryPageData,SourceSubtype,SourceID);
+          DATABASE::"Job Planning Line":
+            TransferJobPlanningLine(FromInvtEventBuf,InventoryPageData,SourceID);
+          DATABASE::"Requisition Line":
+            TransferReqLine(FromInvtEventBuf,InventoryPageData,SourceID,SourceBatchName,SourceRefNo);
+          DATABASE::"Planning Component":
+            TransferPlanningComp(FromInvtEventBuf,InventoryPageData,SourceID,SourceBatchName,SourceProdOrderLine);
+          DATABASE::"Production Forecast Entry":
+            TransferProdForecastEntry(FromInvtEventBuf,InventoryPageData,SourceRefNo);
+          DATABASE::"Assembly Header":
+            TransferAssemblyHeader(FromInvtEventBuf,InventoryPageData,SourceSubtype,SourceID);
+          DATABASE::"Assembly Line":
+            TransferAssemblyLine(FromInvtEventBuf,InventoryPageData,SourceSubtype,SourceID,SourceRefNo);
+          ELSE
+            ERROR(Text0000,SourceType,SourceSubtype);
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE TransferInventory@4(InventoryEventBuffer@1000 : Record 5530;VAR InventoryPageData@1001 : Record 5531);
+    BEGIN
+      WITH InventoryEventBuffer DO BEGIN
+        InventoryPageData.Type := InventoryPageData.Type::" ";
+        InventoryPageData.Description := Text0032;
+        InventoryPageData.Source := "Location Code" + ' ' + "Variant Code";
+        InventoryPageData."Scheduled Receipt" := "Remaining Quantity (Base)";
+        InventoryPageData."Reserved Receipt" := "Reserved Quantity (Base)";
+      END;
+    END;
+
+    LOCAL PROCEDURE TransferSalesLine@7(InventoryEventBuffer@1001 : Record 5530;VAR InventoryPageData@1000 : Record 5531;SourceType@1005 : Integer;SourceSubtype@1004 : '0,1,2,3,4,5,6,7,8,9,10';SourceID@1003 : Code[20]);
+    VAR
+      SalesHeader@1002 : Record 36;
+    BEGIN
+      WITH InventoryEventBuffer DO BEGIN
+        SalesHeader.GET(SourceSubtype,SourceID);
+        RecRef.GETTABLE(SalesHeader);
+        InventoryPageData."Source Document ID" := RecRef.RECORDID;
+        InventoryPageData.Description := SalesHeader."Sell-to Customer Name";
+        InventoryPageData.Source := STRSUBSTNO(Text0036,FORMAT(SalesHeader."Document Type"));
+        InventoryPageData."Document No." := SalesHeader."No.";
+        CASE SourceSubtype OF
+          SourceSubtype::"1",
+          SourceSubtype::"2",
+          SourceSubtype::"3":
+            BEGIN
+              // Sales Order or similar to go into Gross Requirements
+              InventoryPageData.Type := InventoryPageData.Type::Sale;
+              InventoryPageData."Gross Requirement" := "Remaining Quantity (Base)";
+              InventoryPageData."Reserved Requirement" := "Reserved Quantity (Base)";
+            END;
+          SourceSubtype::"4":
+            BEGIN
+              // Blanket Order
+              InventoryPageData.Type := InventoryPageData.Type::"Blanket Sales Order";
+              InventoryPageData.Forecast := "Orig. Quantity (Base)";
+              InventoryPageData."Remaining Forecast" := "Remaining Quantity (Base)";
+            END;
+          SourceSubtype::"5":
+            BEGIN
+              // Sales Return Order
+              InventoryPageData.Type := InventoryPageData.Type::"Sales Return";
+              InventoryPageData."Scheduled Receipt" := "Remaining Quantity (Base)";
+              InventoryPageData."Reserved Receipt" := "Reserved Quantity (Base)";
+            END;
+          ELSE
+            ERROR(Text0000,SourceType,SourceSubtype);
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE TransferPurchLine@5(InventoryEventBuffer@1004 : Record 5530;VAR InventoryPageData@1003 : Record 5531;SourceType@1002 : Integer;SourceSubtype@1001 : '0,1,2,3,4,5,6,7,8,9,10';SourceID@1000 : Code[20]);
+    VAR
+      PurchHeader@1005 : Record 38;
+    BEGIN
+      WITH InventoryEventBuffer DO BEGIN
+        PurchHeader.GET(SourceSubtype,SourceID);
+        RecRef.GETTABLE(PurchHeader);
+        InventoryPageData."Source Document ID" := RecRef.RECORDID;
+        InventoryPageData.Description := PurchHeader."Buy-from Vendor Name";
+        InventoryPageData.Source := STRSUBSTNO(Text0038,FORMAT(PurchHeader."Document Type"));
+        InventoryPageData."Document No." := PurchHeader."No.";
+        CASE SourceSubtype OF
+          SourceSubtype::"1",
+          SourceSubtype::"2",
+          SourceSubtype::"3":
+            BEGIN
+              // Purchase Order or similar to go into Scheduled Receipts
+              InventoryPageData.Type := InventoryPageData.Type::Purchase;
+              InventoryPageData."Scheduled Receipt" := "Remaining Quantity (Base)";
+              InventoryPageData."Reserved Receipt" := "Reserved Quantity (Base)";
+            END;
+          SourceSubtype::"5":
+            BEGIN
+              // Purchase Return Order
+              InventoryPageData.Type := InventoryPageData.Type::"Purch. Return";
+              InventoryPageData."Gross Requirement" := "Remaining Quantity (Base)";
+              InventoryPageData."Reserved Requirement" := "Reserved Quantity (Base)";
+            END;
+          ELSE
+            ERROR(Text0000,SourceType,SourceSubtype);
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE TransferTransLine@8(InventoryEventBuffer@1004 : Record 5530;VAR InventoryPageData@1003 : Record 5531;SourceType@1002 : Integer;SourceSubtype@1001 : '0,1,2,3,4,5,6,7,8,9,10';SourceID@1000 : Code[20]);
+    VAR
+      TransHeader@1005 : Record 5740;
+    BEGIN
+      WITH InventoryEventBuffer DO BEGIN
+        TransHeader.GET(SourceID);
+        RecRef.GETTABLE(TransHeader);
+        InventoryPageData."Source Document ID" := RecRef.RECORDID;
+        InventoryPageData."Document No." := TransHeader."No.";
+        CASE SourceSubtype OF
+          SourceSubtype::"0":
+            CASE Type OF
+              Type::Transfer:
+                BEGIN
+                  // Outbound Transfer
+                  InventoryPageData.Type := InventoryPageData.Type::Transfer;
+                  InventoryPageData.Description := TransHeader."Transfer-to Name";
+                  InventoryPageData.Source := STRSUBSTNO(Text5740,FORMAT(TransHeader."Transfer-to Code"));
+                  InventoryPageData."Gross Requirement" := "Remaining Quantity (Base)";
+                  InventoryPageData."Reserved Requirement" := "Reserved Quantity (Base)";
+                END;
+              Type::"Plan Revert":
+                BEGIN
+                  InventoryPageData.Type := InventoryPageData.Type::"Plan Revert";
+                  InventoryPageData.Description := TransHeader."Transfer-to Name";
+                  InventoryPageData.Source := Text0246;
+                  InventoryPageData."Action Message Qty." := "Remaining Quantity (Base)";
+                  InventoryPageData."Action Message" := "Action Message";
+                END;
+            END;
+          SourceSubtype::"1":
+            BEGIN
+              // Inbound Transfer
+              InventoryPageData.Type := InventoryPageData.Type::Transfer;
+              InventoryPageData.Description := TransHeader."Transfer-from Name";
+              InventoryPageData.Source := STRSUBSTNO(Text5740,FORMAT(TransHeader."Transfer-from Code"));
+              InventoryPageData."Scheduled Receipt" := "Remaining Quantity (Base)";
+              InventoryPageData."Reserved Receipt" := "Reserved Quantity (Base)";
+            END;
+          ELSE
+            ERROR(Text0000,SourceType,SourceSubtype);
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE TransferProdOrderLine@6(InventoryEventBuffer@1004 : Record 5530;VAR InventoryPageData@1003 : Record 5531;SourceSubtype@1001 : '0,1,2,3,4,5,6,7,8,9,10';SourceID@1000 : Code[20]);
+    VAR
+      ProdOrder@1005 : Record 5405;
+    BEGIN
+      WITH InventoryEventBuffer DO BEGIN
+        ProdOrder.GET(SourceSubtype,SourceID);
+        RecRef.GETTABLE(ProdOrder);
+        InventoryPageData."Source Document ID" := RecRef.RECORDID;
+        InventoryPageData."Document No." := ProdOrder."No.";
+        InventoryPageData.Type := InventoryPageData.Type::Production;
+        InventoryPageData.Description := ProdOrder.Description;
+        InventoryPageData.Source := STRSUBSTNO(Text5405,FORMAT(ProdOrder.Status));
+        InventoryPageData."Scheduled Receipt" := "Remaining Quantity (Base)";
+        InventoryPageData."Reserved Receipt" := "Reserved Quantity (Base)";
+      END;
+    END;
+
+    LOCAL PROCEDURE TransferProdOrderComp@10(InventoryEventBuffer@1004 : Record 5530;VAR InventoryPageData@1003 : Record 5531;SourceSubtype@1001 : '0,1,2,3,4,5,6,7,8,9,10';SourceID@1000 : Code[20]);
+    VAR
+      ProdOrder@1005 : Record 5405;
+    BEGIN
+      WITH InventoryEventBuffer DO BEGIN
+        ProdOrder.GET(SourceSubtype,SourceID);
+        RecRef.GETTABLE(ProdOrder);
+        InventoryPageData."Source Document ID" := RecRef.RECORDID;
+        InventoryPageData."Document No." := ProdOrder."No.";
+        InventoryPageData.Description := ProdOrder.Description;
+        CASE Type OF
+          Type::Component:
+            BEGIN
+              InventoryPageData.Type := InventoryPageData.Type::Component;
+              InventoryPageData.Source := STRSUBSTNO(Text5407,FORMAT(ProdOrder.Status));
+              InventoryPageData."Gross Requirement" := "Remaining Quantity (Base)";
+              InventoryPageData."Reserved Requirement" := "Reserved Quantity (Base)";
+            END;
+          Type::"Plan Revert":
+            BEGIN
+              InventoryPageData.Type := InventoryPageData.Type::"Plan Revert";
+              InventoryPageData.Source := Text0246;
+              InventoryPageData."Action Message Qty." := "Remaining Quantity (Base)";
+              InventoryPageData."Action Message" := "Action Message";
+            END;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE TransferServiceLine@13(InventoryEventBuffer@1004 : Record 5530;VAR InventoryPageData@1003 : Record 5531;SourceSubtype@1001 : '0,1,2,3,4,5,6,7,8,9,10';SourceID@1000 : Code[20]);
+    VAR
+      ServHeader@1005 : Record 5900;
+    BEGIN
+      WITH InventoryEventBuffer DO BEGIN
+        ServHeader.GET(SourceSubtype,SourceID);
+        RecRef.GETTABLE(ServHeader);
+        InventoryPageData."Source Document ID" := RecRef.RECORDID;
+        InventoryPageData."Document No." := ServHeader."No.";
+        InventoryPageData.Type := InventoryPageData.Type::Service;
+        InventoryPageData.Description := ServHeader."Ship-to Name";
+        InventoryPageData.Source := STRSUBSTNO(Text5900,FORMAT(ServHeader."Document Type"));
+        InventoryPageData."Gross Requirement" := "Remaining Quantity (Base)";
+        InventoryPageData."Reserved Requirement" := "Reserved Quantity (Base)";
+      END;
+    END;
+
+    LOCAL PROCEDURE TransferJobPlanningLine@9(InventoryEventBuffer@1004 : Record 5530;VAR InventoryPageData@1003 : Record 5531;SourceID@1000 : Code[20]);
+    VAR
+      Job@1005 : Record 11072003;
+    BEGIN
+      WITH InventoryEventBuffer DO BEGIN
+        Job.GET(SourceID);
+        RecRef.GETTABLE(Job);
+        InventoryPageData."Source Document ID" := RecRef.RECORDID;
+        InventoryPageData."Document No." := Job."No.";
+        InventoryPageData.Type := InventoryPageData.Type::Job;
+        InventoryPageData.Description := Job."Bill-to Customer No.";
+        InventoryPageData.Source := STRSUBSTNO(Text1003,FORMAT(Job.Status));
+        InventoryPageData."Gross Requirement" := "Remaining Quantity (Base)";
+        InventoryPageData."Reserved Requirement" := "Reserved Quantity (Base)";
+      END;
+    END;
+
+    LOCAL PROCEDURE TransferReqLine@12(InventoryEventBuffer@1004 : Record 5530;VAR InventoryPageData@1003 : Record 5531;SourceID@1000 : Code[20];SourceBatchName@1001 : Code[10];SourceRefNo@1002 : Integer);
+    VAR
+      ReqLine@1005 : Record 246;
+    BEGIN
+      WITH InventoryEventBuffer DO BEGIN
+        ReqLine.GET(SourceID,SourceBatchName,SourceRefNo);
+        RecRef.GETTABLE(ReqLine);
+        InventoryPageData."Source Document ID" := RecRef.RECORDID;
+        InventoryPageData."Document No." := ReqLine."Ref. Order No.";
+        InventoryPageData.Type := InventoryPageData.Type::Plan;
+        InventoryPageData.Source := FORMAT("Ref. Order Type") + ' ' + FORMAT("Action Message");
+        InventoryPageData.Description := ReqLine.Description;
+        InventoryPageData."Action Message Qty." := "Remaining Quantity (Base)";
+        InventoryPageData."Action Message" := "Action Message";
+      END;
+    END;
+
+    LOCAL PROCEDURE TransferPlanningComp@15(InventoryEventBuffer@1004 : Record 5530;VAR InventoryPageData@1003 : Record 5531;SourceID@1002 : Code[20];SourceBatchName@1001 : Code[10];SourceProdOrderLine@1000 : Integer);
+    VAR
+      ReqLine@1005 : Record 246;
+    BEGIN
+      WITH InventoryEventBuffer DO BEGIN
+        ReqLine.GET(SourceID,SourceBatchName,SourceProdOrderLine);
+        RecRef.GETTABLE(ReqLine);
+        InventoryPageData."Source Document ID" := "Source Line ID";
+        InventoryPageData."Document No." := ReqLine."Ref. Order No.";
+        InventoryPageData.Type := InventoryPageData.Type::Plan;
+        InventoryPageData.Description := ReqLine.Description;
+        InventoryPageData.Source := STRSUBSTNO(Text5407,FORMAT("Action Message"));
+        InventoryPageData."Action Message Qty." := "Remaining Quantity (Base)";
+        InventoryPageData."Action Message" := "Action Message";
+      END;
+    END;
+
+    LOCAL PROCEDURE TransferProdForecastEntry@17(InventoryEventBuffer@1004 : Record 5530;VAR InventoryPageData@1003 : Record 5531;SourceRefNo@1000 : Integer);
+    VAR
+      ProdForecastName@1005 : Record 99000851;
+      ProdForecastEntry@1006 : Record 99000852;
+    BEGIN
+      WITH InventoryEventBuffer DO BEGIN
+        ProdForecastEntry.GET(SourceRefNo);
+        ProdForecastName.GET(ProdForecastEntry."Production Forecast Name");
+        RecRef.GETTABLE(ProdForecastName);
+        InventoryPageData."Source Document ID" := RecRef.RECORDID;
+        InventoryPageData."Document No." := ProdForecastName.Name;
+        InventoryPageData.Type := InventoryPageData.Type::Forecast;
+        InventoryPageData.Description := ProdForecastName.Description;
+        IF "Forecast Type" = "Forecast Type"::Sales THEN
+          InventoryPageData.Source := Text9851
+        ELSE
+          InventoryPageData.Source := Text9852;
+        InventoryPageData.Forecast := "Orig. Quantity (Base)";
+        InventoryPageData."Remaining Forecast" := "Remaining Quantity (Base)";
+      END;
+    END;
+
+    LOCAL PROCEDURE TransferAssemblyHeader@27(InventoryEventBuffer@1004 : Record 5530;VAR InventoryPageData@1003 : Record 5531;SourceSubtype@1006 : Option;SourceID@1002 : Code[20]);
+    VAR
+      AssemblyHeader@1005 : Record 900;
+    BEGIN
+      WITH InventoryEventBuffer DO BEGIN
+        AssemblyHeader.GET(SourceSubtype,SourceID);
+        RecRef.GETTABLE(AssemblyHeader);
+        InventoryPageData."Source Document ID" := RecRef.RECORDID;
+        InventoryPageData."Document No." := AssemblyHeader."No.";
+        InventoryPageData.Type := InventoryPageData.Type::"Assembly Order";
+        InventoryPageData.Description := AssemblyHeader.Description;
+        InventoryPageData.Source := STRSUBSTNO(Text900,FORMAT(AssemblyHeader."Document Type"));
+        InventoryPageData."Scheduled Receipt" := "Remaining Quantity (Base)";
+        InventoryPageData."Reserved Receipt" := "Reserved Quantity (Base)";
+      END;
+    END;
+
+    LOCAL PROCEDURE TransferAssemblyLine@30(InventoryEventBuffer@1003 : Record 5530;VAR InventoryPageData@1002 : Record 5531;SourceSubtype@1001 : Option;SourceID@1000 : Code[20];SourceRefNo@1005 : Integer);
+    VAR
+      AssemblyLine@1004 : Record 901;
+    BEGIN
+      WITH InventoryEventBuffer DO BEGIN
+        AssemblyLine.GET(SourceSubtype,SourceID,SourceRefNo);
+        RecRef.GETTABLE(AssemblyLine);
+        InventoryPageData."Source Document ID" := RecRef.RECORDID;
+        InventoryPageData."Document No." := AssemblyLine."Document No.";
+        InventoryPageData."Line No." := AssemblyLine."Line No.";
+        InventoryPageData.Type := InventoryPageData.Type::"Assembly Component";
+        InventoryPageData.Description := AssemblyLine.Description;
+        InventoryPageData.Source := STRSUBSTNO(Text901,FORMAT(AssemblyLine."Document Type"));
+        InventoryPageData."Gross Requirement" := "Remaining Quantity (Base)";
+        InventoryPageData."Reserved Requirement" := "Reserved Quantity (Base)";
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdatePeriodTotals@24(VAR PeriodInvtPageData@1000 : Record 5531;VAR DetailInvtPageData@1001 : Record 5531);
+    BEGIN
+      WITH DetailInvtPageData DO BEGIN
+        PeriodInvtPageData."Remaining Quantity (Base)" += "Remaining Quantity (Base)";
+        PeriodInvtPageData."Gross Requirement" += "Gross Requirement";
+        PeriodInvtPageData."Reserved Requirement" += "Reserved Requirement";
+        PeriodInvtPageData."Scheduled Receipt" += "Scheduled Receipt";
+        PeriodInvtPageData."Reserved Receipt" += "Reserved Receipt";
+        PeriodInvtPageData.Forecast += Forecast;
+        PeriodInvtPageData."Remaining Forecast" += "Remaining Forecast";
+        PeriodInvtPageData."Action Message Qty." += "Action Message Qty.";
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdateInventory@25(VAR InvtPageData@1001 : Record 5531;VAR InvtEventBuf@1000 : Record 5530);
+    BEGIN
+      WITH InvtEventBuf DO BEGIN
+        IF "Action Message" <> "Action Message"::" " THEN
+          InvtPageData."Suggested Projected Inventory" += "Remaining Quantity (Base)"
+        ELSE
+          IF Type = Type::Forecast THEN
+            InvtPageData."Forecasted Projected Inventory" += "Remaining Quantity (Base)"
+          ELSE
+            InvtPageData."Projected Inventory" += "Remaining Quantity (Base)";
+      END;
+    END;
+
+    LOCAL PROCEDURE NextPageLineNo@23() : Integer;
+    BEGIN
+      PageLineNo += 1;
+      EXIT(PageLineNo);
+    END;
+
+    PROCEDURE ShowDocument@2(RecID@1000 : RecordID);
+    BEGIN
+      CalcItemAvailability.ShowDocument(RecID);
+    END;
+
+    LOCAL PROCEDURE FormatPeriodDescription@3(Date@1000 : Record 2000000007) PeriodDescription : Text[50];
+    BEGIN
+      CASE Date."Period Type" OF
+        Date."Period Type"::Week,
+        Date."Period Type"::Quarter,
+        Date."Period Type"::Year:
+          PeriodDescription := STRSUBSTNO('%1 %2',FORMAT(Date."Period Type"),Date."Period Name");
+        ELSE
+          PeriodDescription := Date."Period Name";
+      END;
+    END;
+
+    BEGIN
+    {
+      4PS, Objects renumbered
+    }
+    END.
+  }
+}
+

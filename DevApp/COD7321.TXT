@@ -1,0 +1,784 @@
+OBJECT Codeunit 7321 Create Inventory Put-away
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00;
+  }
+  PROPERTIES
+  {
+    TableNo=5766;
+    OnRun=BEGIN
+            WhseActivHeader := Rec;
+            Code;
+            Rec := WhseActivHeader;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      WhseActivHeader@1000 : Record 5766;
+      WhseRequest@1011 : Record 5765;
+      TempTrackingSpecification@1010 : TEMPORARY Record 336;
+      Location@1012 : Record 14;
+      Item@1021 : Record 27;
+      PurchHeader@1013 : Record 38;
+      SalesHeader@1014 : Record 36;
+      TransferHeader@1015 : Record 5740;
+      ProdOrder@1018 : Record 5405;
+      PostingDate@1019 : Date;
+      VendorDocNo@1020 : Code[35];
+      QtyToPutAway@1003 : Decimal;
+      RemQtyToPutAway@1002 : Decimal;
+      NextLineNo@1008 : Integer;
+      LineCreated@1007 : Boolean;
+      SNRequired@1006 : Boolean;
+      LNRequired@1005 : Boolean;
+      ReservationFound@1004 : Boolean;
+      HideDialog@1001 : Boolean;
+      CheckLineExist@1016 : Boolean;
+      AutoCreation@1017 : Boolean;
+      Text000@1009 : TextConst 'ENU=Nothing to handle.';
+
+    LOCAL PROCEDURE Code@11();
+    BEGIN
+      WhseActivHeader.TESTFIELD("No.");
+      WhseActivHeader.TESTFIELD("Location Code");
+
+      IF NOT HideDialog THEN
+        IF NOT GetWhseRequest(WhseRequest) THEN
+          EXIT;
+
+      GetSourceDocHeader;
+      UpdateWhseActivHeader(WhseRequest);
+
+      CASE WhseRequest."Source Document" OF
+        WhseRequest."Source Document"::"Purchase Order":
+          CreatePutAwayLinesFromPurchase(PurchHeader);
+        WhseRequest."Source Document"::"Purchase Return Order":
+          CreatePutAwayLinesFromPurchase(PurchHeader);
+        WhseRequest."Source Document"::"Sales Order":
+          CreatePutAwayLinesFromSales(SalesHeader);
+        WhseRequest."Source Document"::"Sales Return Order":
+          CreatePutAwayLinesFromSales(SalesHeader);
+        WhseRequest."Source Document"::"Inbound Transfer":
+          CreatePutAwayLinesFromTransfer(TransferHeader);
+        WhseRequest."Source Document"::"Prod. Output":
+          CreatePutAwayLinesFromProd(ProdOrder);
+        WhseRequest."Source Document"::"Prod. Consumption":
+          CreatePutAwayLinesFromComp(ProdOrder);
+      END;
+
+      IF LineCreated THEN
+        WhseActivHeader.MODIFY
+      ELSE
+        IF NOT AutoCreation THEN
+          ERROR(Text000);
+    END;
+
+    LOCAL PROCEDURE GetWhseRequest@1(VAR WhseRequest@1000 : Record 5765) : Boolean;
+    BEGIN
+      WITH WhseRequest DO BEGIN
+        FILTERGROUP := 2;
+        SETRANGE(Type,Type::Inbound);
+        SETRANGE("Location Code",WhseActivHeader."Location Code");
+        SETRANGE("Document Status","Document Status"::Released);
+        IF WhseActivHeader."Source Document" <> 0 THEN
+          SETRANGE("Source Document",WhseActivHeader."Source Document");
+        IF WhseActivHeader."Source No." <> '' THEN
+          SETRANGE("Source No.",WhseActivHeader."Source No.");
+        SETRANGE("Completely Handled",FALSE);
+        FILTERGROUP := 0;
+        IF PAGE.RUNMODAL(
+             PAGE::"Source Documents",WhseRequest,"Source No.") = ACTION::LookupOK
+        THEN
+          EXIT(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE GetSourceDocHeader@12();
+    BEGIN
+      CASE WhseRequest."Source Document" OF
+        WhseRequest."Source Document"::"Purchase Order":
+          BEGIN
+            PurchHeader.GET(PurchHeader."Document Type"::Order,WhseRequest."Source No.");
+            PostingDate := PurchHeader."Posting Date";
+            VendorDocNo := PurchHeader."Vendor Invoice No.";
+          END;
+        WhseRequest."Source Document"::"Purchase Return Order":
+          BEGIN
+            PurchHeader.GET(PurchHeader."Document Type"::"Return Order",WhseRequest."Source No.");
+            PostingDate := PurchHeader."Posting Date";
+            VendorDocNo := PurchHeader."Vendor Cr. Memo No.";
+          END;
+        WhseRequest."Source Document"::"Sales Order":
+          BEGIN
+            SalesHeader.GET(SalesHeader."Document Type"::Order,WhseRequest."Source No.");
+            PostingDate := SalesHeader."Posting Date";
+          END;
+        WhseRequest."Source Document"::"Sales Return Order":
+          BEGIN
+            SalesHeader.GET(SalesHeader."Document Type"::"Return Order",WhseRequest."Source No.");
+            PostingDate := SalesHeader."Posting Date";
+          END;
+        WhseRequest."Source Document"::"Inbound Transfer":
+          BEGIN
+            TransferHeader.GET(WhseRequest."Source No.");
+            PostingDate := TransferHeader."Posting Date";
+          END;
+        WhseRequest."Source Document"::"Prod. Output":
+          BEGIN
+            ProdOrder.GET(ProdOrder.Status::Released,WhseRequest."Source No.");
+            PostingDate := WORKDATE;
+          END;
+        WhseRequest."Source Document"::"Prod. Consumption":
+          BEGIN
+            ProdOrder.GET(WhseRequest."Source Subtype",WhseRequest."Source No.");
+            PostingDate := WORKDATE;
+          END;
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdateWhseActivHeader@2(WhseRequest@1001 : Record 5765);
+    BEGIN
+      WITH WhseRequest DO BEGIN
+        IF WhseActivHeader."Source Document" = 0 THEN BEGIN
+          WhseActivHeader."Source Document" := "Source Document";
+          WhseActivHeader."Source Type" := "Source Type";
+          WhseActivHeader."Source Subtype" := "Source Subtype";
+        END ELSE
+          WhseActivHeader.TESTFIELD("Source Document","Source Document");
+        IF WhseActivHeader."Source No." = '' THEN BEGIN
+          WhseActivHeader."Source No." := "Source No.";
+        END ELSE
+          WhseActivHeader.TESTFIELD("Source No.","Source No.");
+
+        WhseActivHeader."Destination Type" := "Destination Type";
+        WhseActivHeader."Destination No." := "Destination No.";
+        WhseActivHeader."External Document No." := "External Document No.";
+        WhseActivHeader."Expected Receipt Date" := "Expected Receipt Date";
+        WhseActivHeader."Posting Date" := PostingDate;
+        WhseActivHeader."External Document No.2" := VendorDocNo;
+        GetLocation("Location Code");
+      END;
+    END;
+
+    LOCAL PROCEDURE CreatePutAwayLinesFromPurchase@7(PurchHeader@1000 : Record 38);
+    VAR
+      PurchLine@1001 : Record 39;
+      NewWhseActivLine@1005 : Record 5767;
+      ItemTrackingMgt@1009 : Codeunit 6500;
+    BEGIN
+      WITH PurchLine DO BEGIN
+        IF NOT SetFilterPurchLine(PurchLine,PurchHeader) THEN BEGIN
+          IF NOT HideDialog THEN
+            MESSAGE(Text000);
+          EXIT;
+        END;
+
+        FindNextLineNo;
+
+        REPEAT
+          IF NOT FindPutAwayLine(DATABASE::"Purchase Line","Document Type","Document No.","Line No.",0) THEN BEGIN
+            IF "Document Type" = "Document Type"::Order THEN
+              RemQtyToPutAway := "Qty. to Receive"
+            ELSE
+              RemQtyToPutAway := -"Return Qty. to Ship";
+
+            ItemTrackingMgt.CheckWhseItemTrkgSetup("No.",SNRequired,LNRequired,FALSE);
+            IF SNRequired THEN
+              QtyToPutAway := 1
+            ELSE
+              QtyToPutAway := RemQtyToPutAway;
+            IF SNRequired OR LNRequired THEN
+              ReservationFound :=
+                FindReservationEntry(DATABASE::"Purchase Line","Document Type","Document No.","Line No.",SNRequired,LNRequired);
+
+            REPEAT
+              NewWhseActivLine.INIT;
+              NewWhseActivLine."Activity Type" := WhseActivHeader.Type;
+              NewWhseActivLine."No." := WhseActivHeader."No.";
+              NewWhseActivLine."Line No." := NextLineNo;
+              NewWhseActivLine."Source Type" := DATABASE::"Purchase Line";
+              NewWhseActivLine."Source Subtype" := "Document Type";
+              NewWhseActivLine."Source No." := "Document No.";
+              NewWhseActivLine."Source Line No." := "Line No.";
+              NewWhseActivLine."Location Code" := "Location Code";
+              IF "Bin Code" = '' THEN
+                NewWhseActivLine."Bin Code" := GetDefaultBinCode("No.","Variant Code","Location Code")
+              ELSE
+                NewWhseActivLine."Bin Code" := "Bin Code";
+              IF NOT Location."Bin Mandatory" THEN
+                NewWhseActivLine."Shelf No." := GetShelfNo("No.");
+              NewWhseActivLine."Item No." := "No.";
+              NewWhseActivLine."Variant Code" := "Variant Code";
+              NewWhseActivLine."Unit of Measure Code" := "Unit of Measure Code";
+              NewWhseActivLine."Qty. per Unit of Measure" := "Qty. per Unit of Measure";
+              NewWhseActivLine.Description := Description;
+              NewWhseActivLine."Description 2" := "Description 2";
+              NewWhseActivLine."Due Date" := "Expected Receipt Date";
+              IF "Document Type" = "Document Type"::Order THEN
+                NewWhseActivLine."Source Document" := NewWhseActivLine."Source Document"::"Purchase Order"
+              ELSE
+                NewWhseActivLine."Source Document" := NewWhseActivLine."Source Document"::"Purchase Return Order";
+
+              IF NOT ReservationFound AND SNRequired THEN
+                REPEAT
+                  NewWhseActivLine."Line No." := NextLineNo;
+                  InsertWhseActivLine(NewWhseActivLine,1);
+                UNTIL RemQtyToPutAway <= 0
+              ELSE
+                InsertWhseActivLine(NewWhseActivLine,RemQtyToPutAway);
+            UNTIL RemQtyToPutAway <= 0;
+          END;
+        UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE SetFilterPurchLine@17(VAR PurchLine@1000 : Record 39;PurchHeader@1001 : Record 38) : Boolean;
+    BEGIN
+      WITH PurchLine DO BEGIN
+        SETCURRENTKEY("Document Type","Document No.","Location Code");
+        SETRANGE("Document Type",PurchHeader."Document Type");
+        SETRANGE("Document No.",PurchHeader."No.");
+        SETRANGE("Drop Shipment",FALSE);
+        IF NOT CheckLineExist THEN
+          SETRANGE("Location Code",WhseActivHeader."Location Code");
+        SETRANGE(Type,Type::Item);
+        IF PurchHeader."Document Type" = PurchHeader."Document Type"::Order THEN
+          SETFILTER("Qty. to Receive",'>%1',0)
+        ELSE
+          SETFILTER("Return Qty. to Ship",'<%1',0);
+        EXIT(FIND('-'));
+      END;
+    END;
+
+    LOCAL PROCEDURE CreatePutAwayLinesFromSales@8(SalesHeader@1000 : Record 36);
+    VAR
+      SalesLine@1006 : Record 37;
+      NewWhseActivLine@1003 : Record 5767;
+      ItemTrackingMgt@1011 : Codeunit 6500;
+    BEGIN
+      WITH SalesLine DO BEGIN
+        IF NOT SetFilterSalesLine(SalesLine,SalesHeader) THEN BEGIN
+          IF NOT HideDialog THEN
+            MESSAGE(Text000);
+          EXIT;
+        END;
+
+        FindNextLineNo;
+
+        REPEAT
+          IF NOT FindPutAwayLine(DATABASE::"Sales Line","Document Type","Document No.","Line No.",0) THEN BEGIN
+            IF "Document Type" = "Document Type"::Order THEN
+              RemQtyToPutAway := -"Qty. to Ship"
+            ELSE
+              RemQtyToPutAway := "Return Qty. to Receive";
+
+            ItemTrackingMgt.CheckWhseItemTrkgSetup("No.",SNRequired,LNRequired,FALSE);
+            IF SNRequired THEN
+              QtyToPutAway := 1
+            ELSE
+              QtyToPutAway := RemQtyToPutAway;
+            IF SNRequired OR LNRequired THEN
+              ReservationFound :=
+                FindReservationEntry(DATABASE::"Sales Line","Document Type","Document No.","Line No.",SNRequired,LNRequired);
+
+            REPEAT
+              NewWhseActivLine.INIT;
+              NewWhseActivLine."Activity Type" := WhseActivHeader.Type;
+              NewWhseActivLine."No." := WhseActivHeader."No.";
+              NewWhseActivLine."Line No." := NextLineNo;
+              NewWhseActivLine."Source Type" := DATABASE::"Sales Line";
+              NewWhseActivLine."Source Subtype" := "Document Type";
+              NewWhseActivLine."Source No." := "Document No.";
+              NewWhseActivLine."Source Line No." := "Line No.";
+              NewWhseActivLine."Location Code" := "Location Code";
+              IF "Bin Code" = '' THEN
+                NewWhseActivLine."Bin Code" := GetDefaultBinCode("No.","Variant Code","Location Code")
+              ELSE
+                NewWhseActivLine."Bin Code" := "Bin Code";
+              IF NOT Location."Bin Mandatory" THEN
+                NewWhseActivLine."Shelf No." := GetShelfNo("No.");
+              NewWhseActivLine."Item No." := "No.";
+              NewWhseActivLine."Variant Code" := "Variant Code";
+              NewWhseActivLine."Unit of Measure Code" := "Unit of Measure Code";
+              NewWhseActivLine."Qty. per Unit of Measure" := "Qty. per Unit of Measure";
+              NewWhseActivLine.Description := Description;
+              NewWhseActivLine."Description 2" := "Description 2";
+              NewWhseActivLine."Due Date" := "Planned Shipment Date";
+              IF "Document Type" = "Document Type"::Order THEN
+                NewWhseActivLine."Source Document" := NewWhseActivLine."Source Document"::"Sales Order"
+              ELSE
+                NewWhseActivLine."Source Document" := NewWhseActivLine."Source Document"::"Sales Return Order";
+
+              IF NOT ReservationFound AND SNRequired THEN
+                REPEAT
+                  NewWhseActivLine."Line No." := NextLineNo;
+                  InsertWhseActivLine(NewWhseActivLine,1);
+                UNTIL RemQtyToPutAway <= 0
+              ELSE
+                InsertWhseActivLine(NewWhseActivLine,RemQtyToPutAway);
+            UNTIL RemQtyToPutAway <= 0;
+          END;
+        UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE SetFilterSalesLine@21(VAR SalesLine@1000 : Record 37;SalesHeader@1001 : Record 36) : Boolean;
+    BEGIN
+      WITH SalesLine DO BEGIN
+        SETCURRENTKEY("Document Type","Document No.","Location Code");
+        SETRANGE("Document Type",SalesHeader."Document Type");
+        SETRANGE("Document No.",SalesHeader."No.");
+        SETRANGE("Drop Shipment",FALSE);
+        IF NOT CheckLineExist THEN
+          SETRANGE("Location Code",WhseActivHeader."Location Code");
+        SETRANGE(Type,Type::Item);
+        IF SalesHeader."Document Type" = SalesHeader."Document Type"::Order THEN
+          SETFILTER("Qty. to Ship",'<%1',0)
+        ELSE
+          SETFILTER("Return Qty. to Receive",'>%1',0);
+        EXIT(FIND('-'));
+      END;
+    END;
+
+    LOCAL PROCEDURE CreatePutAwayLinesFromTransfer@9(TransferHeader@1000 : Record 5740);
+    VAR
+      TransferLine@1006 : Record 5741;
+      NewWhseActivLine@1003 : Record 5767;
+      ItemTrackingMgt@1011 : Codeunit 6500;
+    BEGIN
+      WITH TransferLine DO BEGIN
+        IF NOT SetFilterTransferLine(TransferLine,TransferHeader) THEN BEGIN
+          IF NOT HideDialog THEN
+            MESSAGE(Text000);
+          EXIT;
+        END;
+
+        FindNextLineNo;
+
+        REPEAT
+          IF NOT FindPutAwayLine(DATABASE::"Transfer Line",1,"Document No.","Line No.",0) THEN BEGIN
+            RemQtyToPutAway := "Qty. to Receive";
+
+            ItemTrackingMgt.CheckWhseItemTrkgSetup("Item No.",SNRequired,LNRequired,FALSE);
+            IF SNRequired THEN
+              QtyToPutAway := 1
+            ELSE
+              QtyToPutAway := RemQtyToPutAway;
+            IF SNRequired OR LNRequired THEN
+              ReservationFound :=
+                FindReservationEntry(DATABASE::"Transfer Line",1,"Document No.","Line No.",SNRequired,LNRequired);
+
+            REPEAT
+              NewWhseActivLine.INIT;
+              NewWhseActivLine."Activity Type" := WhseActivHeader.Type;
+              NewWhseActivLine."No." := WhseActivHeader."No.";
+              NewWhseActivLine."Line No." := NextLineNo;
+              NewWhseActivLine."Source Type" := DATABASE::"Transfer Line";
+              NewWhseActivLine."Source Subtype" := 1;
+              NewWhseActivLine."Source No." := "Document No.";
+              NewWhseActivLine."Source Line No." := "Line No.";
+              NewWhseActivLine."Source Document" := NewWhseActivLine."Source Document"::"Inbound Transfer";
+              NewWhseActivLine."Location Code" := "Transfer-to Code";
+              IF "Transfer-To Bin Code" = '' THEN
+                NewWhseActivLine."Bin Code" := GetDefaultBinCode("Item No.","Variant Code","Transfer-to Code")
+              ELSE
+                NewWhseActivLine."Bin Code" := "Transfer-To Bin Code";
+              IF NOT Location."Bin Mandatory" THEN
+                NewWhseActivLine."Shelf No." := GetShelfNo("Item No.");
+              NewWhseActivLine."Item No." := "Item No.";
+              NewWhseActivLine."Variant Code" := "Variant Code";
+              NewWhseActivLine."Unit of Measure Code" := "Unit of Measure Code";
+              NewWhseActivLine."Qty. per Unit of Measure" := "Qty. per Unit of Measure";
+              NewWhseActivLine.Description := Description;
+              NewWhseActivLine."Description 2" := "Description 2";
+              NewWhseActivLine."Due Date" := "Receipt Date";
+              IF NOT ReservationFound AND SNRequired THEN
+                REPEAT
+                  NewWhseActivLine."Line No." := NextLineNo;
+                  InsertWhseActivLine(NewWhseActivLine,1);
+                UNTIL RemQtyToPutAway <= 0
+              ELSE
+                InsertWhseActivLine(NewWhseActivLine,RemQtyToPutAway);
+            UNTIL RemQtyToPutAway <= 0;
+          END;
+        UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE SetFilterTransferLine@22(VAR TransferLine@1000 : Record 5741;TransferHeader@1001 : Record 5740) : Boolean;
+    BEGIN
+      WITH TransferLine DO BEGIN
+        SETRANGE("Document No.",TransferHeader."No.");
+        SETRANGE("Derived From Line No.",0);
+        IF NOT CheckLineExist THEN
+          SETRANGE("Transfer-to Code",WhseActivHeader."Location Code");
+        SETFILTER("Qty. to Receive",'>%1',0);
+        EXIT(FIND('-'));
+      END;
+    END;
+
+    LOCAL PROCEDURE CreatePutAwayLinesFromProd@16(ProdOrder@1000 : Record 5405);
+    VAR
+      ProdOrderLine@1001 : Record 5406;
+      NewWhseActivLine@1005 : Record 5767;
+      ItemTrackingMgt@1009 : Codeunit 6500;
+    BEGIN
+      WITH ProdOrderLine DO BEGIN
+        IF NOT SetFilterProdOrderLine(ProdOrderLine,ProdOrder) THEN BEGIN
+          IF NOT HideDialog THEN
+            MESSAGE(Text000);
+          EXIT;
+        END;
+
+        FindNextLineNo;
+
+        REPEAT
+          IF NOT FindPutAwayLine(DATABASE::"Prod. Order Line",Status,"Prod. Order No.","Line No.",0) THEN BEGIN
+            RemQtyToPutAway := "Remaining Quantity";
+
+            ItemTrackingMgt.CheckWhseItemTrkgSetup("Item No.",SNRequired,LNRequired,FALSE);
+            IF SNRequired THEN
+              QtyToPutAway := 1
+            ELSE
+              QtyToPutAway := RemQtyToPutAway;
+            IF SNRequired OR LNRequired THEN
+              ReservationFound :=
+                FindReservationEntry(DATABASE::"Prod. Order Line",Status,"Prod. Order No.","Line No.",SNRequired,LNRequired);
+
+            REPEAT
+              NewWhseActivLine.INIT;
+              NewWhseActivLine."Activity Type" := WhseActivHeader.Type;
+              NewWhseActivLine."No." := WhseActivHeader."No.";
+              NewWhseActivLine."Line No." := NextLineNo;
+              NewWhseActivLine."Source Type" := DATABASE::"Prod. Order Line";
+              NewWhseActivLine."Source Subtype" := Status;
+              NewWhseActivLine."Source No." := "Prod. Order No.";
+              NewWhseActivLine."Source Line No." := "Line No.";
+              NewWhseActivLine."Location Code" := "Location Code";
+              IF "Bin Code" = '' THEN
+                NewWhseActivLine."Bin Code" := GetDefaultBinCode("Item No.","Variant Code","Location Code")
+              ELSE
+                NewWhseActivLine."Bin Code" := "Bin Code";
+              IF NOT Location."Bin Mandatory" THEN
+                NewWhseActivLine."Shelf No." := GetShelfNo("Item No.");
+              NewWhseActivLine."Item No." := "Item No.";
+              NewWhseActivLine."Variant Code" := "Variant Code";
+              NewWhseActivLine."Unit of Measure Code" := "Unit of Measure Code";
+              NewWhseActivLine."Qty. per Unit of Measure" := "Qty. per Unit of Measure";
+              NewWhseActivLine.Description := Description;
+              NewWhseActivLine."Description 2" := "Description 2";
+              NewWhseActivLine."Due Date" := "Due Date";
+              NewWhseActivLine."Source Document" := NewWhseActivLine."Source Document"::"Prod. Output";
+
+              IF NOT ReservationFound AND SNRequired THEN
+                REPEAT
+                  NewWhseActivLine."Line No." := NextLineNo;
+                  InsertWhseActivLine(NewWhseActivLine,1);
+                UNTIL RemQtyToPutAway <= 0
+              ELSE
+                InsertWhseActivLine(NewWhseActivLine,RemQtyToPutAway);
+            UNTIL RemQtyToPutAway <= 0;
+          END;
+        UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE SetFilterProdOrderLine@15(VAR ProdOrderLine@1000 : Record 5406;ProdOrder@1001 : Record 5405) : Boolean;
+    BEGIN
+      WITH ProdOrderLine DO BEGIN
+        SETRANGE(Status,ProdOrder.Status);
+        SETRANGE("Prod. Order No.",ProdOrder."No.");
+        IF NOT CheckLineExist THEN
+          SETRANGE("Location Code",WhseActivHeader."Location Code");
+        SETFILTER("Remaining Quantity",'>%1',0);
+        EXIT(FIND('-'));
+      END;
+    END;
+
+    LOCAL PROCEDURE CreatePutAwayLinesFromComp@25(ProdOrder@1000 : Record 5405);
+    VAR
+      ProdOrderComp@1001 : Record 5407;
+      NewWhseActivLine@1003 : Record 5767;
+      ItemTrackingMgt@1002 : Codeunit 6500;
+    BEGIN
+      WITH ProdOrderComp DO BEGIN
+        IF NOT SetFilterProdCompLine(ProdOrderComp,ProdOrder) THEN BEGIN
+          IF NOT HideDialog THEN
+            MESSAGE(Text000);
+          EXIT;
+        END;
+
+        FindNextLineNo;
+
+        REPEAT
+          IF NOT FindPutAwayLine(DATABASE::"Prod. Order Component",Status,"Prod. Order No.","Prod. Order Line No.","Line No.") THEN
+            BEGIN
+            RemQtyToPutAway := -"Remaining Quantity";
+
+            ItemTrackingMgt.CheckWhseItemTrkgSetup("Item No.",SNRequired,LNRequired,FALSE);
+            IF SNRequired THEN
+              QtyToPutAway := 1
+            ELSE
+              QtyToPutAway := RemQtyToPutAway;
+            IF SNRequired OR LNRequired THEN
+              ReservationFound :=
+                FindReservationEntry(DATABASE::"Prod. Order Component",Status,"Prod. Order No.","Line No.",SNRequired,LNRequired);
+
+            REPEAT
+              NewWhseActivLine.INIT;
+              NewWhseActivLine."Activity Type" := WhseActivHeader.Type;
+              NewWhseActivLine."No." := WhseActivHeader."No.";
+              NewWhseActivLine."Source Type" := DATABASE::"Prod. Order Component";
+              NewWhseActivLine."Source Subtype" := Status;
+              NewWhseActivLine."Source No." := "Prod. Order No.";
+              NewWhseActivLine."Source Line No." := "Prod. Order Line No.";
+              NewWhseActivLine."Source Subline No." := "Line No.";
+              NewWhseActivLine."Location Code" := "Location Code";
+              NewWhseActivLine."Item No." := "Item No.";
+              NewWhseActivLine."Variant Code" := "Variant Code";
+              IF "Bin Code" = '' THEN
+                NewWhseActivLine."Bin Code" := GetDefaultBinCode("Item No.","Variant Code","Location Code")
+              ELSE
+                NewWhseActivLine."Bin Code" := "Bin Code";
+              IF NOT Location."Bin Mandatory" THEN
+                NewWhseActivLine."Shelf No." := GetShelfNo("Item No.");
+              NewWhseActivLine."Unit of Measure Code" := "Unit of Measure Code";
+              NewWhseActivLine."Qty. per Unit of Measure" := "Qty. per Unit of Measure";
+              NewWhseActivLine.Description := Description;
+              NewWhseActivLine."Due Date" := "Due Date";
+              NewWhseActivLine."Source Document" := NewWhseActivLine."Source Document"::"Prod. Consumption";
+
+              IF NOT ReservationFound AND SNRequired THEN
+                REPEAT
+                  NewWhseActivLine."Line No." := NextLineNo;
+                  InsertWhseActivLine(NewWhseActivLine,1);
+                UNTIL RemQtyToPutAway <= 0
+              ELSE
+                InsertWhseActivLine(NewWhseActivLine,RemQtyToPutAway);
+            UNTIL RemQtyToPutAway <= 0;
+          END;
+        UNTIL NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE SetFilterProdCompLine@20(VAR ProdOrderComp@1000 : Record 5407;ProdOrder@1001 : Record 5405) : Boolean;
+    BEGIN
+      WITH ProdOrderComp DO BEGIN
+        SETRANGE(Status,ProdOrder.Status);
+        SETRANGE("Prod. Order No.",ProdOrder."No.");
+        IF NOT CheckLineExist THEN
+          SETRANGE("Location Code",WhseActivHeader."Location Code");
+        SETRANGE("Flushing Method","Flushing Method"::Manual);
+        SETRANGE("Planning Level Code",0);
+        SETFILTER("Remaining Quantity",'<0');
+        EXIT(FIND('-'));
+      END;
+    END;
+
+    LOCAL PROCEDURE FindPutAwayLine@23(SourceType@1000 : Option;SourceSubType@1001 : Option;SourceNo@1002 : Code[20];SourceLineNo@1003 : Integer;SourceSubLineNo@1005 : Integer) : Boolean;
+    VAR
+      WhseActivLine@1004 : Record 5767;
+    BEGIN
+      WITH WhseActivLine DO BEGIN
+        SETCURRENTKEY("Source Type","Source Subtype","Source No.","Source Line No.","Source Subline No.");
+        SETRANGE("Source Type",SourceType);
+        SETRANGE("Source Subtype",SourceSubType);
+        SETRANGE("Source No.",SourceNo);
+        SETRANGE("Source Line No.",SourceLineNo);
+        SETRANGE("Source Subline No.",SourceSubLineNo);
+        IF FINDFIRST THEN
+          EXIT(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE FindNextLineNo@24();
+    VAR
+      WhseActivLine@1000 : Record 5767;
+    BEGIN
+      WITH WhseActivHeader DO BEGIN
+        WhseActivLine.SETRANGE("Activity Type",WhseActivLine."Activity Type"::"Invt. Put-away");
+        WhseActivLine.SETRANGE("No.","No.");
+        IF WhseActivLine.FINDLAST THEN
+          NextLineNo := WhseActivLine."Line No." + 10000
+        ELSE
+          NextLineNo := 10000;
+      END;
+    END;
+
+    LOCAL PROCEDURE FindReservationEntry@3(SourceType@1001 : Integer;DocType@1002 : Integer;DocNo@1003 : Code[20];DocLineNo@1004 : Integer;SNRequired@1005 : Boolean;LNRequired@1006 : Boolean) : Boolean;
+    VAR
+      ReservEntry@1007 : Record 337;
+      ItemTrackMgt@1000 : Codeunit 6500;
+    BEGIN
+      WITH ReservEntry DO BEGIN
+        SETCURRENTKEY(
+          "Source ID","Source Ref. No.","Source Type","Source Subtype",
+          "Source Batch Name","Source Prod. Order Line");
+        SETRANGE("Source ID",DocNo);
+        SETRANGE("Source Type",SourceType);
+        SETRANGE("Source Subtype",DocType);
+        IF SourceType IN [DATABASE::"Prod. Order Line",DATABASE::"Transfer Line"] THEN
+          SETRANGE("Source Prod. Order Line",DocLineNo)
+        ELSE
+          SETRANGE("Source Ref. No.",DocLineNo);
+        IF SNRequired THEN
+          SETFILTER("Serial No.",'<>%1','');
+        IF LNRequired THEN
+          SETFILTER("Lot No.",'<>%1','');
+        IF FINDFIRST THEN
+          IF ItemTrackMgt.SumUpItemTracking(ReservEntry,TempTrackingSpecification,TRUE,TRUE) THEN
+            EXIT(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertWhseActivLine@4(VAR NewWhseActivLine@1000 : Record 5767;PutAwayQty@1001 : Decimal);
+    BEGIN
+      IF Location."Bin Mandatory" THEN
+        NewWhseActivLine."Action Type" := NewWhseActivLine."Action Type"::Place;
+
+      NewWhseActivLine."Serial No." := '';
+      NewWhseActivLine."Expiration Date" := 0D;
+      IF ReservationFound THEN BEGIN
+        NewWhseActivLine."Serial No." := TempTrackingSpecification."Serial No.";
+        NewWhseActivLine."Lot No." := TempTrackingSpecification."Lot No.";
+        NewWhseActivLine."Expiration Date" := TempTrackingSpecification."Expiration Date";
+        QtyToPutAway := TempTrackingSpecification."Qty. to Handle (Base)";
+        ReservationFound := FALSE;
+      END ELSE
+        IF (SNRequired OR LNRequired) AND (TempTrackingSpecification.NEXT <> 0) THEN BEGIN
+          NewWhseActivLine."Serial No." := TempTrackingSpecification."Serial No.";
+          NewWhseActivLine."Lot No." := TempTrackingSpecification."Lot No.";
+          NewWhseActivLine."Expiration Date" := TempTrackingSpecification."Expiration Date";
+          QtyToPutAway := TempTrackingSpecification."Qty. to Handle (Base)";
+        END ELSE
+          QtyToPutAway := PutAwayQty;
+
+      NewWhseActivLine.VALIDATE(Quantity,QtyToPutAway);
+      NewWhseActivLine.VALIDATE("Qty. to Handle",0);
+
+      IF AutoCreation AND NOT LineCreated THEN BEGIN
+        WhseActivHeader."No." := '';
+        WhseActivHeader.INSERT(TRUE);
+        UpdateWhseActivHeader(WhseRequest);
+        NextLineNo := 10000;
+        COMMIT;
+      END;
+      NewWhseActivLine."No." := WhseActivHeader."No.";
+      NewWhseActivLine."Line No." := NextLineNo;
+      NewWhseActivLine.INSERT;
+
+      LineCreated := TRUE;
+      NextLineNo := NextLineNo + 10000;
+      RemQtyToPutAway := RemQtyToPutAway - QtyToPutAway;
+    END;
+
+    LOCAL PROCEDURE GetDefaultBinCode@6(ItemNo@1004 : Code[20];VariantCode@1003 : Code[10];LocationCode@1001 : Code[10]) : Code[20];
+    VAR
+      WMSMgt@1000 : Codeunit 7302;
+      BinCode@1002 : Code[20];
+    BEGIN
+      GetLocation(LocationCode);
+      IF Location."Bin Mandatory" THEN
+        IF WMSMgt.GetDefaultBin(ItemNo,VariantCode,LocationCode,BinCode) THEN
+          EXIT(BinCode);
+    END;
+
+    LOCAL PROCEDURE GetLocation@10(LocationCode@1000 : Code[10]);
+    BEGIN
+      IF LocationCode = '' THEN
+        CLEAR(Location)
+      ELSE
+        IF LocationCode <> Location.Code THEN
+          Location.GET(LocationCode);
+    END;
+
+    LOCAL PROCEDURE GetShelfNo@18(ItemNo@1000 : Code[20]) : Code[20];
+    BEGIN
+      GetItem(ItemNo);
+      EXIT(Item."Shelf No.");
+    END;
+
+    LOCAL PROCEDURE GetItem@19(ItemNo@1000 : Code[20]);
+    BEGIN
+      IF ItemNo <> Item."No." THEN
+        Item.GET(ItemNo);
+    END;
+
+    PROCEDURE SetWhseRequest@5(NewWhseRequest@1000 : Record 5765;SetHideDialog@1001 : Boolean);
+    BEGIN
+      WhseRequest := NewWhseRequest;
+      HideDialog := SetHideDialog;
+      LineCreated := FALSE;
+    END;
+
+    PROCEDURE CheckSourceDoc@13(NewWhseRequest@1000 : Record 5765) : Boolean;
+    VAR
+      PurchLine@1001 : Record 39;
+      SalesLine@1002 : Record 37;
+      TransferLine@1003 : Record 5741;
+      ProdOrderLine@1004 : Record 5406;
+      ProdOrderComp@1005 : Record 5407;
+    BEGIN
+      WhseRequest := NewWhseRequest;
+      IF Location.RequireReceive(WhseRequest."Location Code") THEN
+        EXIT(FALSE);
+
+      GetSourceDocHeader;
+      CheckLineExist := TRUE;
+      CASE WhseRequest."Source Document" OF
+        WhseRequest."Source Document"::"Purchase Order":
+          EXIT(SetFilterPurchLine(PurchLine,PurchHeader));
+        WhseRequest."Source Document"::"Purchase Return Order":
+          EXIT(SetFilterPurchLine(PurchLine,PurchHeader));
+        WhseRequest."Source Document"::"Sales Order":
+          EXIT(SetFilterSalesLine(SalesLine,SalesHeader));
+        WhseRequest."Source Document"::"Sales Return Order":
+          EXIT(SetFilterSalesLine(SalesLine,SalesHeader));
+        WhseRequest."Source Document"::"Inbound Transfer":
+          EXIT(SetFilterTransferLine(TransferLine,TransferHeader));
+        WhseRequest."Source Document"::"Prod. Output":
+          EXIT(SetFilterProdOrderLine(ProdOrderLine,ProdOrder));
+        WhseRequest."Source Document"::"Prod. Consumption":
+          EXIT(SetFilterProdCompLine(ProdOrderComp,ProdOrder));
+      END;
+    END;
+
+    PROCEDURE AutoCreatePutAway@14(VAR WhseActivHeaderNew@1000 : Record 5766);
+    BEGIN
+      WhseActivHeader := WhseActivHeaderNew;
+      CheckLineExist := FALSE;
+      AutoCreation := TRUE;
+      GetLocation(WhseRequest."Location Code");
+
+      CASE WhseRequest."Source Document" OF
+        WhseRequest."Source Document"::"Purchase Order":
+          CreatePutAwayLinesFromPurchase(PurchHeader);
+        WhseRequest."Source Document"::"Purchase Return Order":
+          CreatePutAwayLinesFromPurchase(PurchHeader);
+        WhseRequest."Source Document"::"Sales Order":
+          CreatePutAwayLinesFromSales(SalesHeader);
+        WhseRequest."Source Document"::"Sales Return Order":
+          CreatePutAwayLinesFromSales(SalesHeader);
+        WhseRequest."Source Document"::"Inbound Transfer":
+          CreatePutAwayLinesFromTransfer(TransferHeader);
+        WhseRequest."Source Document"::"Prod. Output":
+          CreatePutAwayLinesFromProd(ProdOrder);
+        WhseRequest."Source Document"::"Prod. Consumption":
+          CreatePutAwayLinesFromComp(ProdOrder);
+      END;
+      IF LineCreated THEN BEGIN
+        WhseActivHeader.MODIFY;
+        WhseActivHeaderNew := WhseActivHeader;
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

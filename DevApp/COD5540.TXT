@@ -1,0 +1,667 @@
+OBJECT Codeunit 5540 Calc. Item Avail. Timeline
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      TempInventoryEventBuffer@1002 : TEMPORARY Record 5530;
+      TXT002@1001 : TextConst 'ENU=%1 not supported: %2.';
+      CalcItemAvailEventBuf@1007 : Codeunit 5530;
+      TXT004@1043 : TextConst 'ENU=One or more lines in the planning or requisition worksheet have been changed by another user. Click Reload, make the changes again, and then click Save Changes.';
+      TXT010@1003 : TextConst 'ENU=Inventory';
+      TXT011@1004 : TextConst 'ENU=Sales';
+      TXT012@1005 : TextConst 'ENU=Purchase';
+      TXT013@1006 : TextConst 'ENU=Transfer';
+      TXT014@1009 : TextConst 'ENU=Service';
+      TXT015@1023 : TextConst 'ENU=One or more lines in the planning or requisition worksheet have been deleted by another user. Click Reload, make the changes again, and then click Save Changes.';
+      TXT016@1008 : TextConst 'ENU=Assembly';
+      TXT017@1010 : TextConst 'ENU=Assembly Component';
+      TXT018@1000 : TextConst 'ENU=Planning Component';
+
+    PROCEDURE Initialize@1(VAR Item@1004 : Record 27;ForecastName@1003 : Code[10];IncludeBlanketOrders@1002 : Boolean;ExcludeForecastBefore@1001 : Date;IncludePlan@1000 : Boolean);
+    BEGIN
+      TempInventoryEventBuffer.RESET;
+      TempInventoryEventBuffer.DELETEALL;
+
+      CalcItemAvailEventBuf.CalcNewInvtEventBuf(Item,ForecastName,IncludeBlanketOrders,ExcludeForecastBefore,IncludePlan);
+      CalcItemAvailEventBuf.GetInvEventBuffer(TempInventoryEventBuffer);
+    END;
+
+    PROCEDURE CreateTimelineEvents@10(VAR TempTimelineEvent@1000 : TEMPORARY Record 5540);
+    VAR
+      TempInventoryEventBuffer2@1001 : TEMPORARY Record 5530;
+      InitialDate@1002 : Date;
+      FinalDate@1003 : Date;
+    BEGIN
+      InitialDate := WORKDATE;
+      FinalDate := WORKDATE;
+
+      WITH TempInventoryEventBuffer DO BEGIN
+        SETCURRENTKEY("Availability Date",Type);
+        SETFILTER("Availability Date",'<> %1',0D);
+        IF FINDFIRST THEN
+          InitialDate := "Availability Date";
+        IF FINDLAST THEN
+          FinalDate := "Availability Date";
+
+        // Initial Inventory
+        SETRANGE("Availability Date");
+        SETRANGE(Type,Type::Inventory);
+        IF NOT FINDSET THEN
+          InsertInitialEvent(TempTimelineEvent,InitialDate)
+        ELSE BEGIN // Sum up inventory
+          TempInventoryEventBuffer2 := TempInventoryEventBuffer;
+          TempInventoryEventBuffer2."Remaining Quantity (Base)" := 0;
+          TempInventoryEventBuffer2."Availability Date" := InitialDate;
+          REPEAT
+            TempInventoryEventBuffer2."Remaining Quantity (Base)" += "Remaining Quantity (Base)";
+          UNTIL NEXT = 0;
+          InsertTimelineEvent(TempTimelineEvent,TempInventoryEventBuffer2)
+        END;
+
+        // Supply and Demand Events
+        SETFILTER("Availability Date",'<> %1',0D);
+        SETFILTER(Type,
+          '%1..%2|%3|%4',
+          Type::Purchase,Type::"Blanket Sales Order",Type::"Assembly Order",Type::"Assembly Component");
+        IF FINDSET THEN
+          REPEAT
+            InsertTimelineEvent(TempTimelineEvent,TempInventoryEventBuffer);
+          UNTIL NEXT = 0;
+
+        // Planning Events - New supplies already planned
+        SETFILTER("Availability Date",'<> %1',0D);
+        SETRANGE(Type,Type::Plan);
+        SETRANGE("Action Message","Action Message"::New);
+        IF FINDSET THEN
+          REPEAT
+            InsertTimelineEvent(TempTimelineEvent,TempInventoryEventBuffer);
+          UNTIL NEXT = 0;
+
+        // Final Inventory
+        RESET;
+        IF FINDLAST THEN
+          InsertFinalEvent(TempTimelineEvent,"Entry No." + 1,FinalDate);
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertTimelineEvent@123(VAR TempToTimelineEvent@1000 : TEMPORARY Record 5540;TempFromInventoryEventBuffer@1001 : TEMPORARY Record 5530);
+    BEGIN
+      TempToTimelineEvent.INIT;
+      TempToTimelineEvent.ID := TempFromInventoryEventBuffer."Entry No.";
+      TempToTimelineEvent."Source Line ID" := TempFromInventoryEventBuffer."Source Line ID";
+      TempToTimelineEvent."Original Date" := TempFromInventoryEventBuffer."Availability Date";
+      TempToTimelineEvent."New Date" := TempToTimelineEvent."Original Date";
+      TempToTimelineEvent."Original Quantity" := TempFromInventoryEventBuffer."Remaining Quantity (Base)";
+      TempToTimelineEvent."New Quantity" := TempToTimelineEvent."Original Quantity";
+
+      UpdateTimelineEventDetails(TempToTimelineEvent,TempFromInventoryEventBuffer);
+      MapToTimelineTransactionType(TempToTimelineEvent,TempFromInventoryEventBuffer);
+
+      IF TempToTimelineEvent."Transaction Type" = TempToTimelineEvent."Transaction Type"::"Adjustable Supply" THEN
+        UpdateEventFromPlanning(TempToTimelineEvent,TempFromInventoryEventBuffer);
+
+      IF TempToTimelineEvent."Transaction Type" = TempToTimelineEvent."Transaction Type"::"New Supply" THEN BEGIN
+        TempToTimelineEvent.ChangeRefNo := FORMAT(TempFromInventoryEventBuffer."Source Line ID");
+        TempToTimelineEvent."Original Date" := 0D;
+        TempToTimelineEvent."Original Quantity" := 0;
+      END;
+
+      TempToTimelineEvent.INSERT;
+    END;
+
+    LOCAL PROCEDURE MapToTimelineTransactionType@22(VAR TempToTimelineEvent@1001 : TEMPORARY Record 5540;TempInventoryEventBuffer@1000 : TEMPORARY Record 5530);
+    BEGIN
+      WITH TempInventoryEventBuffer DO BEGIN
+        IF Type = Type::Inventory THEN BEGIN
+          TempToTimelineEvent."Transaction Type" := TempToTimelineEvent."Transaction Type"::Initial;
+          EXIT;
+        END;
+
+        IF ("Remaining Quantity (Base)" < 0) AND
+           (Type <> Type::Forecast) AND
+           (Type <> Type::"Blanket Sales Order")
+        THEN BEGIN
+          TempToTimelineEvent."Transaction Type" := TempToTimelineEvent."Transaction Type"::"Fixed Demand";
+          EXIT;
+        END;
+
+        CASE Type OF
+          Type::Purchase,Type::Production,Type::Transfer,Type::"Assembly Order":
+            TempToTimelineEvent."Transaction Type" := TempToTimelineEvent."Transaction Type"::"Adjustable Supply";
+          Type::Sale,Type::Service,Type::Job,Type::Component,Type::"Assembly Component":
+            TempToTimelineEvent."Transaction Type" := TempToTimelineEvent."Transaction Type"::"Fixed Supply";
+          Type::Forecast,Type::"Blanket Sales Order":
+            TempToTimelineEvent."Transaction Type" := TempToTimelineEvent."Transaction Type"::"Expected Demand";
+          Type::Plan:
+            IF "Action Message" = "Action Message"::New THEN
+              TempToTimelineEvent."Transaction Type" := TempToTimelineEvent."Transaction Type"::"New Supply";
+          ELSE
+            ERROR(TXT002,TempToTimelineEvent.FIELDCAPTION("Transaction Type"),Type);
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdateTimelineEventDetails@20(VAR TempToTimelineEvent@1001 : TEMPORARY Record 5540;TempFromInventoryEventBuffer@1000 : TEMPORARY Record 5530);
+    VAR
+      SalesHeader@1008 : Record 36;
+      PurchHeader@1010 : Record 38;
+      ReqLine@1015 : Record 246;
+      TransHeader@1011 : Record 5740;
+      ServHeader@1013 : Record 5900;
+      Job@1014 : Record 11072003;
+      ProdOrder@1012 : Record 5405;
+      ProdForecastName@1016 : Record 99000851;
+      ProdForecastEntry@1017 : Record 99000852;
+      AsmHeader@1018 : Record 900;
+      RecRef@1009 : RecordRef;
+      SourceType@1007 : Integer;
+      SourceSubtype@1006 : '0,1,2,3,4,5,6,7,8,9,10';
+      SourceID@1005 : Code[20];
+      SourceBatchName@1004 : Code[10];
+      SourceProdOrderLine@1003 : Integer;
+      SourceRefNo@1002 : Integer;
+    BEGIN
+      WITH TempFromInventoryEventBuffer DO BEGIN
+        CalcItemAvailEventBuf.GetSourceReferences("Source Line ID","Transfer Direction",
+          SourceType,SourceSubtype,SourceID,SourceBatchName,SourceProdOrderLine,SourceRefNo);
+        CASE SourceType OF
+          DATABASE::"Item Ledger Entry":
+            TempToTimelineEvent.Description := TXT010;
+          DATABASE::"Sales Line":
+            BEGIN
+              SalesHeader.GET(SourceSubtype,SourceID);
+              RecRef.GETTABLE(SalesHeader);
+              TempToTimelineEvent."Source Document ID" := RecRef.RECORDID;
+              TempToTimelineEvent.Description :=
+                STRSUBSTNO('%1 %2 %3 %4',TXT011,SalesHeader."Document Type",SalesHeader."No.",SalesHeader."Sell-to Customer Name");
+            END;
+          DATABASE::"Purchase Line":
+            BEGIN
+              PurchHeader.GET(SourceSubtype,SourceID);
+              RecRef.GETTABLE(PurchHeader);
+              TempToTimelineEvent."Source Document ID" := RecRef.RECORDID;
+              TempToTimelineEvent.Description :=
+                STRSUBSTNO('%1 %2 %3 %4',TXT012,PurchHeader."Document Type",PurchHeader."No.",PurchHeader."Buy-from Vendor Name");
+            END;
+          DATABASE::"Transfer Line":
+            BEGIN
+              TransHeader.GET(SourceID);
+              RecRef.GETTABLE(TransHeader);
+              TempToTimelineEvent."Source Document ID" := RecRef.RECORDID;
+              TempToTimelineEvent.Description :=
+                STRSUBSTNO('%1 %2',TXT013,TransHeader."No.");
+            END;
+          DATABASE::"Prod. Order Line":
+            BEGIN
+              ProdOrder.GET(SourceSubtype,SourceID);
+              RecRef.GETTABLE(ProdOrder);
+              TempToTimelineEvent."Source Document ID" := RecRef.RECORDID;
+              TempToTimelineEvent.Description :=
+                STRSUBSTNO('%1 %2 %3',ProdOrder.TABLECAPTION,ProdOrder."No.",ProdOrder.Description);
+            END;
+          DATABASE::"Prod. Order Component":
+            BEGIN
+              ProdOrder.GET(SourceSubtype,SourceID);
+              RecRef.GETTABLE(ProdOrder);
+              TempToTimelineEvent."Source Document ID" := RecRef.RECORDID;
+              TempToTimelineEvent.Description :=
+                STRSUBSTNO('%1 %2 %3',ProdOrder.TABLECAPTION,ProdOrder."No.",ProdOrder.Description);
+            END;
+          DATABASE::"Service Line":
+            BEGIN
+              ServHeader.GET(SourceSubtype,SourceID);
+              RecRef.GETTABLE(ServHeader);
+              TempToTimelineEvent."Source Document ID" := RecRef.RECORDID;
+              TempToTimelineEvent.Description :=
+                STRSUBSTNO('%1 %2 %3',TXT014,ServHeader."No.",ServHeader."Ship-to Name");
+            END;
+          DATABASE::"Job Planning Line":
+            BEGIN
+              Job.GET(SourceID);
+              RecRef.GETTABLE(Job);
+              TempToTimelineEvent."Source Document ID" := RecRef.RECORDID;
+              TempToTimelineEvent.Description :=
+                STRSUBSTNO('%1 %2 %3',Job.TABLECAPTION,Job."No.",Job."Bill-to Customer No.");
+            END;
+          DATABASE::"Requisition Line":
+            BEGIN
+              ReqLine.GET(SourceID,SourceBatchName,SourceRefNo);
+              RecRef.GETTABLE(ReqLine);
+              TempToTimelineEvent."Source Document ID" := RecRef.RECORDID;
+              TempToTimelineEvent.Description :=
+                STRSUBSTNO(
+                  '%1 %2 %3 %4',ReqLine.TABLECAPTION,ReqLine."Worksheet Template Name",
+                  ReqLine."Journal Batch Name",ReqLine.Description);
+            END;
+          DATABASE::"Planning Component":
+            BEGIN
+              ReqLine.GET(SourceID,SourceBatchName,SourceProdOrderLine);
+              RecRef.GETTABLE(ReqLine);
+              TempToTimelineEvent."Source Document ID" := "Source Line ID";
+              TempToTimelineEvent.Description :=
+                STRSUBSTNO(
+                  '%1 - %2 %3 %4 %5',TXT018,RecRef.NAME,ReqLine."Worksheet Template Name",
+                  ReqLine."Journal Batch Name",ReqLine.Description);
+            END;
+          DATABASE::"Production Forecast Entry":
+            BEGIN
+              ProdForecastEntry.GET(SourceRefNo);
+              ProdForecastName.GET(ProdForecastEntry."Production Forecast Name");
+              RecRef.GETTABLE(ProdForecastName);
+              TempToTimelineEvent."Source Document ID" := RecRef.RECORDID;
+              TempToTimelineEvent.Description :=
+                STRSUBSTNO(
+                  '%1 %2 %3',
+                  ProdForecastName.TABLECAPTION,ProdForecastName.Name,
+                  ProdForecastName.Description);
+            END;
+          DATABASE::"Assembly Header":
+            BEGIN
+              AsmHeader.GET(SourceSubtype,SourceID);
+              RecRef.GETTABLE(AsmHeader);
+              TempToTimelineEvent."Source Document ID" := RecRef.RECORDID;
+              TempToTimelineEvent.Description :=
+                STRSUBSTNO('%1 %2 %3 %4',TXT016,AsmHeader."Document Type",AsmHeader."No.",AsmHeader.Description);
+            END;
+          DATABASE::"Assembly Line":
+            BEGIN
+              AsmHeader.GET(SourceSubtype,SourceID);
+              RecRef.GETTABLE(AsmHeader);
+              TempToTimelineEvent."Source Document ID" := RecRef.RECORDID;
+              TempToTimelineEvent.Description :=
+                STRSUBSTNO('%1 %2 %3 %4',TXT017,AsmHeader."Document Type",AsmHeader."No.",AsmHeader.Description);
+            END;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdateEventFromPlanning@5(VAR TempToTimelineEvent@1001 : TEMPORARY Record 5540;TempFromInventoryEventBuffer@1000 : TEMPORARY Record 5530);
+    VAR
+      ReqLine@1074 : Record 246;
+      RecRef@1492 : RecordRef;
+      SourceType@1011 : Integer;
+      SourceSubtype@1010 : '0,1,2,3,4,5,6,7,8,9,10';
+      SourceID@1009 : Code[20];
+      SourceBatchName@1008 : Code[10];
+      SourceProdOrderLine@1007 : Integer;
+      SourceRefNo@1006 : Integer;
+    BEGIN
+      CalcItemAvailEventBuf.GetSourceReferences(
+        TempFromInventoryEventBuffer."Source Line ID",0,SourceType,SourceSubtype,SourceID,SourceBatchName,SourceProdOrderLine,
+        SourceRefNo);
+
+      ReqLine.RESET;
+      ReqLine.SETCURRENTKEY("Ref. Order Type","Ref. Order Status","Ref. Order No.","Ref. Line No.");
+      ReqLine.SETRANGE("Ref. Order Type",MapToRefOrderType(SourceType));
+      ReqLine.SETRANGE("Ref. Order No.",SourceID);
+      IF SourceProdOrderLine > 0 THEN
+        ReqLine.SETRANGE("Ref. Line No.",SourceProdOrderLine)
+      ELSE
+        ReqLine.SETRANGE("Ref. Line No.",SourceRefNo);
+
+      IF NOT ReqLine.FINDFIRST THEN
+        // An existing supply can only be changed if it's linked to an existing planning line
+        TempToTimelineEvent."Transaction Type" := TempToTimelineEvent."Transaction Type"::"Fixed Supply"
+      ELSE BEGIN
+        RecRef.GETTABLE(ReqLine);
+        TempToTimelineEvent.ChangeRefNo := FORMAT(RecRef.RECORDID);
+
+        CASE ReqLine."Action Message" OF
+          ReqLine."Action Message"::"Change Qty.":
+            TempToTimelineEvent."New Quantity" := ReqLine."Quantity (Base)";
+          ReqLine."Action Message"::Reschedule:
+            TempToTimelineEvent."New Date" := ReqLine."Due Date";
+          ReqLine."Action Message"::"Resched. & Chg. Qty.":
+            BEGIN
+              TempToTimelineEvent."New Quantity" := ReqLine."Quantity (Base)";
+              TempToTimelineEvent."New Date" := ReqLine."Due Date";
+            END;
+          ReqLine."Action Message"::Cancel:
+            TempToTimelineEvent."New Quantity" := 0;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE MapToRefOrderType@11(SourceType@1000 : Integer) : Integer;
+    VAR
+      ReqLine@1001 : Record 246;
+    BEGIN
+      CASE SourceType OF
+        DATABASE::"Purchase Line":
+          EXIT(ReqLine."Ref. Order Type"::Purchase);
+        DATABASE::"Prod. Order Line":
+          EXIT(ReqLine."Ref. Order Type"::"Prod. Order");
+        DATABASE::"Transfer Line":
+          EXIT(ReqLine."Ref. Order Type"::Transfer);
+        DATABASE::"Assembly Header":
+          EXIT(ReqLine."Ref. Order Type"::Assembly);
+        ELSE
+          EXIT(0);
+      END;
+    END;
+
+    LOCAL PROCEDURE TransferChangeToPlanningLine@4(TempTimelineEventChange@1000 : TEMPORARY Record 5541;ItemNo@1010 : Code[20];VAR CurrTemplateName@1014 : Code[10];VAR CurrWorksheetName@1016 : Code[10];CurrLocationCode@1017 : Code[10];CurrVariantCode@1019 : Code[10]);
+    VAR
+      ReqLine@1001 : Record 246;
+      xReqLine@1005 : Record 246;
+      UOMMgt@1003 : Codeunit 5402;
+      RecRef@1002 : RecordRef;
+      TemplateNameFieldRef@1100 : FieldRef;
+      WorksheetNameFieldRef@1101 : FieldRef;
+      LineNoFieldRef@1103 : FieldRef;
+      Qty@1004 : Decimal;
+    BEGIN
+      RecRef.OPEN(DATABASE::"Requisition Line");
+
+      IF NOT GetSourcePlanningLine(TempTimelineEventChange,RecRef) THEN BEGIN
+        IF TempTimelineEventChange.NewSupply THEN
+          InsertNewPlanningLine(
+            TempTimelineEventChange,ItemNo,CurrTemplateName,CurrWorksheetName,CurrLocationCode,CurrVariantCode)
+        ELSE
+          ERROR(TXT015) // New Supply is the only type that can be inserted in a planning line
+      END ELSE BEGIN
+        TemplateNameFieldRef := RecRef.FIELD(1);
+        WorksheetNameFieldRef := RecRef.FIELD(2);
+        LineNoFieldRef := RecRef.FIELD(3);
+
+        WITH ReqLine DO BEGIN
+          GET(TemplateNameFieldRef.VALUE,WorksheetNameFieldRef.VALUE,LineNoFieldRef.VALUE);
+
+          IF SourcePlanningLineChanged(ReqLine,ItemNo) THEN
+            ERROR(TXT004);
+
+          xReqLine := ReqLine;
+
+          IF TempTimelineEventChange."Due Date" <> "Due Date" THEN BEGIN
+            SetCurrFieldNo(FIELDNO("Due Date"));
+            VALIDATE("Due Date",TempTimelineEventChange."Due Date");
+          END;
+
+          IF TempTimelineEventChange.Quantity <> "Quantity (Base)" THEN BEGIN
+            Qty := UOMMgt.CalcQtyFromBase(TempTimelineEventChange.Quantity,"Qty. per Unit of Measure");
+            SetCurrFieldNo(FIELDNO(Quantity));
+            VALIDATE(Quantity,Qty);
+          END;
+
+          IF ("Due Date" <> xReqLine."Due Date") OR (Quantity <> xReqLine.Quantity) THEN
+            MODIFY(TRUE);
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE SourcePlanningLineChanged@714(ReqLine@1001 : Record 246;ItemNo@1002 : Code[20]) : Boolean;
+    BEGIN
+      WITH ReqLine DO
+        EXIT((Type <> Type::Item) OR ("No." <> ItemNo));
+    END;
+
+    LOCAL PROCEDURE InsertNewPlanningLine@125(TempTimelineEventChange@1000 : TEMPORARY Record 5541;ItemNo@1100 : Code[20];VAR CurrTemplateName@1104 : Code[10];VAR CurrWorksheetName@1105 : Code[10];CurrLocationCode@1106 : Code[10];CurrVariantCode@1107 : Code[10]);
+    VAR
+      ReqLine@1001 : Record 246;
+      LicensePermission@1003 : Record 2000000043;
+      UOMMgt@1002 : Codeunit 5402;
+    BEGIN
+      WITH ReqLine DO BEGIN
+        IF (CurrTemplateName = '') OR (CurrWorksheetName = '') THEN
+          GetPlanningWorksheetName(ItemNo,CurrTemplateName,CurrWorksheetName);
+
+        INIT;
+        "Worksheet Template Name" := CurrTemplateName;
+        "Journal Batch Name" := CurrWorksheetName;
+        "Line No." := GetNextLineNo("Worksheet Template Name","Journal Batch Name");
+        Type := Type::Item;
+        SetCurrFieldNo(FIELDNO("No."));
+        VALIDATE("No.",ItemNo);
+        SetCurrFieldNo(FIELDNO("Action Message"));
+        VALIDATE("Action Message","Action Message"::New);
+        IF CurrVariantCode <> '' THEN BEGIN
+          SetCurrFieldNo(FIELDNO("Variant Code"));
+          VALIDATE("Variant Code",CurrVariantCode);
+        END;
+        IF CurrLocationCode <> '' THEN BEGIN
+          SetCurrFieldNo(FIELDNO("Location Code"));
+          VALIDATE("Location Code",CurrLocationCode);
+        END;
+        SetCurrFieldNo(FIELDNO("Due Date"));
+        VALIDATE("Due Date",TempTimelineEventChange."Due Date");
+        SetCurrFieldNo(FIELDNO(Quantity));
+        VALIDATE(Quantity,UOMMgt.CalcQtyFromBase(TempTimelineEventChange.Quantity,"Qty. per Unit of Measure"));
+        IF "Ref. Order Type" = "Ref. Order Type"::"Prod. Order" THEN
+          VALIDATE("Ref. Order Status","Ref. Order Status"::"Firm Planned");
+        INSERT(TRUE);
+
+        IF HasLicensePermission(LicensePermission."Object Type"::Report,REPORT::"Refresh Planning Demand") THEN
+          RefreshReqLine(ReqLine);
+      END;
+    END;
+
+    LOCAL PROCEDURE GetPlanningWorksheetName@324(ItemNo@1000 : Code[20];VAR CurrTemplateName@1004 : Code[10];VAR CurrWorksheetName@1005 : Code[10]);
+    VAR
+      ReqLine@1100 : Record 246;
+      ReqWkshTemplate@1101 : Record 244;
+      ReqWkshName@1102 : Record 245;
+      LicensePermission@1001 : Record 2000000043;
+    BEGIN
+      WITH ReqLine DO BEGIN
+        SETCURRENTKEY(Type,"No.","Variant Code","Location Code");
+        SETRANGE(Type,Type::Item);
+        SETRANGE("No.",ItemNo);
+        IF FINDFIRST THEN BEGIN
+          CurrTemplateName := "Worksheet Template Name";
+          CurrWorksheetName := "Journal Batch Name";
+        END ELSE BEGIN
+          ReqWkshTemplate.RESET;
+          IF HasLicensePermission(LicensePermission."Object Type"::Page,PAGE::"Planning Worksheet") THEN
+            ReqWkshTemplate.SETRANGE(Type,ReqWkshTemplate.Type::Planning)
+          ELSE
+            ReqWkshTemplate.SETRANGE(Type,ReqWkshTemplate.Type::"Req.");
+          ReqWkshTemplate.SETRANGE(Recurring,FALSE);
+          IF ReqWkshTemplate.COUNT = 1 THEN BEGIN
+            ReqWkshTemplate.FINDFIRST;
+            CurrTemplateName := ReqWkshTemplate.Name
+          END ELSE
+            IF PAGE.RUNMODAL(0,ReqWkshTemplate) = ACTION::LookupOK THEN
+              CurrTemplateName := ReqWkshTemplate.Name
+            ELSE
+              ERROR('');
+
+          ReqWkshName.FILTERGROUP(2);
+          ReqWkshName.SETRANGE("Worksheet Template Name",CurrTemplateName);
+          ReqWkshName.FILTERGROUP(0);
+          IF ReqWkshName.COUNT = 1 THEN BEGIN
+            ReqWkshName.FINDFIRST;
+            CurrWorksheetName := ReqWkshName.Name
+          END ELSE
+            IF PAGE.RUNMODAL(0,ReqWkshName) = ACTION::LookupOK THEN
+              CurrWorksheetName := ReqWkshName.Name
+            ELSE
+              ERROR('');
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE GetNextLineNo@643(CurrTemplateName@1000 : Code[10];CurrWorksheetName@1001 : Code[10]) NextLineNo : Integer;
+    VAR
+      ReqLine@1003 : Record 246;
+    BEGIN
+      WITH ReqLine DO BEGIN
+        RESET;
+        SETRANGE("Worksheet Template Name",CurrTemplateName);
+        SETRANGE("Journal Batch Name",CurrWorksheetName);
+        IF FINDLAST THEN
+          NextLineNo := "Line No." + 10000
+        ELSE
+          NextLineNo := 10000;
+      END;
+    END;
+
+    LOCAL PROCEDURE RefreshReqLine@3(ReqLine@1000 : Record 246);
+    VAR
+      ReqLine2@1001 : Record 246;
+      RefreshPlanningDemand@1002 : Report 99001021;
+    BEGIN
+      WITH ReqLine DO BEGIN
+        ReqLine2.SETRANGE("Worksheet Template Name","Worksheet Template Name");
+        ReqLine2.SETRANGE("Journal Batch Name","Journal Batch Name");
+        ReqLine2.SETRANGE("Line No.","Line No.");
+
+        RefreshPlanningDemand.USEREQUESTPAGE := FALSE;
+        RefreshPlanningDemand.InitializeRequest(1,TRUE,TRUE); // Refresh Backward from Due Date
+        RefreshPlanningDemand.SETTABLEVIEW(ReqLine2);
+        RefreshPlanningDemand.RUN;
+      END;
+    END;
+
+    PROCEDURE FindLocationWithinFilter@157(LocationFilter@1000 : Code[250]) : Code[10];
+    VAR
+      Location@1001 : Record 14;
+      TempEmptyLocation@1002 : TEMPORARY Record 14;
+    BEGIN
+      TempEmptyLocation.INIT;
+      TempEmptyLocation.INSERT;
+      TempEmptyLocation.SETFILTER(Code,LocationFilter);
+      IF NOT TempEmptyLocation.ISEMPTY THEN
+        EXIT('');
+
+      IF BlankFilterStr(LocationFilter) THEN
+        EXIT('');
+
+      Location.SETFILTER(Code,LocationFilter);
+      Location.FINDFIRST;
+      EXIT(Location.Code);
+    END;
+
+    PROCEDURE FindVariantWithinFilter@158(ItemNo@1002 : Code[20];VariantFilter@1000 : Code[250]) : Code[10];
+    VAR
+      ItemVariant@1001 : Record 5401;
+      TempEmptyItemVariant@1003 : TEMPORARY Record 5401;
+    BEGIN
+      TempEmptyItemVariant.INIT;
+      TempEmptyItemVariant."Item No." := ItemNo;
+      TempEmptyItemVariant.INSERT;
+      TempEmptyItemVariant.SETRANGE("Item No.",ItemNo);
+      TempEmptyItemVariant.SETFILTER(Code,VariantFilter);
+      IF NOT TempEmptyItemVariant.ISEMPTY THEN
+        EXIT('');
+
+      IF BlankFilterStr(VariantFilter) THEN
+        EXIT('');
+
+      ItemVariant.SETRANGE("Item No.",ItemNo);
+      ItemVariant.SETFILTER(Code,VariantFilter);
+      ItemVariant.FINDFIRST;
+      EXIT(ItemVariant.Code);
+    END;
+
+    LOCAL PROCEDURE BlankFilterStr@156(FilterStr@1000 : Text[250]) : Boolean;
+    BEGIN
+      EXIT((FilterStr = '') OR (DELCHR(FilterStr,'=') = BlankValue))
+    END;
+
+    PROCEDURE BlankValue@166() : Text[2];
+    BEGIN
+      EXIT('''''');
+    END;
+
+    PROCEDURE ShowDocument@2(RecordID@1000 : RecordID);
+    BEGIN
+      CalcItemAvailEventBuf.ShowDocument(RecordID);
+    END;
+
+    LOCAL PROCEDURE InsertInitialEvent@8(VAR TempTimelineEvent@1000 : TEMPORARY Record 5540;InitialDate@1001 : Date);
+    BEGIN
+      InsertInventoryEvent(TempTimelineEvent,0,TempTimelineEvent."Transaction Type"::Initial,InitialDate);
+    END;
+
+    PROCEDURE InitialTimespanDays@7() : Integer;
+    BEGIN
+      EXIT(2);
+    END;
+
+    LOCAL PROCEDURE InsertFinalEvent@15(VAR TempTimelineEvent@1000 : TEMPORARY Record 5540;ID@1001 : Integer;FinalDate@1002 : Date);
+    BEGIN
+      InsertInventoryEvent(TempTimelineEvent,ID,FinalTransactionType,FinalDate);
+    END;
+
+    PROCEDURE FinalTimespanDays@16() : Integer;
+    BEGIN
+      EXIT(7);
+    END;
+
+    PROCEDURE FinalTransactionType@9() : Integer;
+    BEGIN
+      EXIT(99);
+    END;
+
+    LOCAL PROCEDURE InsertInventoryEvent@13(VAR TempTimelineEvent@1000 : TEMPORARY Record 5540;ID@1001 : Integer;TransactionType@1003 : Integer;InventoryDate@1002 : Date);
+    BEGIN
+      TempTimelineEvent.INIT;
+      TempTimelineEvent.ID := ID;
+      TempTimelineEvent."Transaction Type" := TransactionType;
+      TempTimelineEvent."Original Date" := InventoryDate;
+      TempTimelineEvent."New Date" := TempTimelineEvent."Original Date";
+      TempTimelineEvent.Description := TXT010;
+      TempTimelineEvent.INSERT;
+    END;
+
+    LOCAL PROCEDURE GetSourcePlanningLine@1324(TempTimelineEventChange@1111 : TEMPORARY Record 5541;VAR RecRef@1065 : RecordRef) : Boolean;
+    VAR
+      RecID@1070 : RecordID;
+    BEGIN
+      IF TempTimelineEventChange.NewSupply THEN
+        EXIT(FALSE);
+
+      EVALUATE(RecID,TempTimelineEventChange.ChangeRefNo);
+      EXIT(RecRef.GET(RecID));
+    END;
+
+    PROCEDURE TransferChangesToPlanningWksh@1170(VAR TimelineEventChange@1111 : Record 5541;ItemNo@1003 : Code[20];LocationFilter@1004 : Code[250];VariantFilter@1005 : Code[250];TemplateNameNewSupply@1006 : Code[10];WorksheetNameNewSupply@1007 : Code[10]) NewSupplyTransfer : Boolean;
+    VAR
+      LocationCodeNewSupply@1002 : Code[10];
+      VariantCodeNewSupply@1001 : Code[10];
+    BEGIN
+      LocationCodeNewSupply := FindLocationWithinFilter(LocationFilter);
+      VariantCodeNewSupply := FindVariantWithinFilter(ItemNo,VariantFilter);
+      NewSupplyTransfer := FALSE;
+
+      IF TimelineEventChange.FINDSET THEN
+        REPEAT
+          TransferChangeToPlanningLine(
+            TimelineEventChange,ItemNo,TemplateNameNewSupply,WorksheetNameNewSupply,LocationCodeNewSupply,VariantCodeNewSupply);
+
+          IF NOT NewSupplyTransfer THEN
+            NewSupplyTransfer := TimelineEventChange.NewSupply;
+
+        UNTIL TimelineEventChange.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE HasLicensePermission@6(ObjectType@1000 : Option;ObjectID@1001 : Integer) : Boolean;
+    VAR
+      LicensePermission@1002 : Record 2000000043;
+    BEGIN
+      IF LicensePermission.GET(ObjectType,ObjectID) THEN
+        EXIT(LicensePermission."Execute Permission" = LicensePermission."Execute Permission"::Yes);
+
+      EXIT(FALSE);
+    END;
+
+    BEGIN
+    {
+      4PS, Objects renumbered
+    }
+    END.
+  }
+}
+

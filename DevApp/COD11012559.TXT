@@ -1,0 +1,1362 @@
+OBJECT Codeunit 11012559 Post Exit Order
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=11012559;
+    OnRun=BEGIN
+            OrderRec.COPY(Rec);
+            Code;
+            Rec := OrderRec;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@11012007 : TextConst 'ENU=There are no %1 present. Do you want to post %2 anyway ?';
+      Text001@11012008 : TextConst 'ENU=Quantity must be 1 for Plant No. %1 %2.';
+      Text002@11012009 : TextConst 'ENU=Quantity could not be 0 for Plant %1';
+      Text003@11012010 : TextConst 'ENU=There is unsufficient stock available for Plant No. %1 %2.';
+      Text004@11012011 : TextConst 'ENU=There is unsufficient stock available for Plant No. %1-%2 per %3.';
+      Text005@1210190009 : TextConst 'ENU=The first entry must be %2 for %2 ''%3''.';
+      Text006@1210190008 : TextConst 'ENU=%1 ''%2'' is disposed.';
+      Text007@1210190007 : TextConst 'ENU=%1 must be the last date for %2 ''%3''.';
+      Text008@1100485000 : TextConst 'ENU=(%1) may not be greater than Fixed Asset Quantity (%2)';
+      Text008b@1210190001 : TextConst 'ENU=(%1) plus quantity on other lines (%2) may not be greater than Fixed Asset Quantity (%3), same Plant No./FA is used on multiple lines ans total quantity is too large';
+      Text009@1100485004 : TextConst 'ENU=(%1) may not be greater than external rented quantity (%2) on %3 of vendor ''%4''';
+      Text010@1100485005 : TextConst 'ENU=There is unsufficient stock available for Plant No. ''%1 %2'', Rate Code ''%4'' per %3.';
+      Text011@1100485006 : TextConst 'ENU=There is unsufficient stock available for Plant No. ''%1 %2'', Rate Code ''3''.';
+      PlantSetup@11012000 : Record 11012550;
+      FASetup@1210190000 : Record 5603;
+      FAJnlSetup@1210190002 : Record 5605;
+      PlantRec@1100485001 : Record 11012551;
+      PlantNoRec@1100485002 : Record 11012552;
+      OrderRec@11012001 : Record 11012559;
+      OrderLineRec@11012002 : Record 11012560;
+      InventoryRec@11012003 : Record 11012555;
+      InspectionRec@11012004 : Record 11012564;
+      CostRec@11012005 : Record 11012561;
+      DeprBook@1210190003 : Record 5611;
+      FADeprBook@1100530001 : Record 5612;
+      GenJnlLineTmp@1210190005 : TEMPORARY Record 81;
+      FAJnlLineTmp@1210190004 : TEMPORARY Record 5621;
+      TmpFAJnlLineReclass@1100409000 : TEMPORARY Record 5621;
+      ItemJnlLine@1100485009 : Record 83;
+      TmpFAProcessed@1210190006 : TEMPORARY Record 5600;
+      TmpGenJnlBatchWithLines@1100525001 : TEMPORARY Record 232;
+      InventoryMngmnt@11012006 : Codeunit 11012566;
+      DoExternal@1100485003 : Boolean;
+      FirstItemJnlLine@1100485007 : Integer;
+      LastItemJnLine@1100485008 : Integer;
+      MainDeprBookCode@1100530000 : Code[10];
+      Text012@1100409002 : TextConst 'ENU=%1 is %2, no FA founded for posted plant numbers, in %3 ''%4'', %5 ''%6'', %7 ''%8''.';
+      Text013@1100409003 : TextConst 'ENU=%1 is %2, founded FA quantity %3 not enough, in %4 ''%5'', %6 ''%7'', %8 ''%9''.';
+      Text014@1100525000 : TextConst 'ENU=Do you agree with this?';
+      Text015@1100525002 : TextConst 'ENU="Posting %1 ''%2'' not allowed/blocked, alredy lines present in FA G/L Journal  ''%3-%4'' "';
+
+    PROCEDURE Code@1();
+    BEGIN
+      PlantSetup.GET;
+      IF (PlantSetup."Integration Fixed Assets") THEN BEGIN
+        FASetup.GET;
+        //*FA.so
+        //FASetup.TESTFIELD("Default Depr. Book");
+        //DeprBook.GET(FASetup."Default Depr. Book");
+        //DeprBook.TESTFIELD("G/L Integration - Acq. Cost", TRUE);
+        //DeprBook.TESTFIELD("G/L Integration - Depreciation", TRUE);
+        //DeprBook.TESTFIELD("G/L Integration - Disposal", TRUE);
+        //*FA.eo
+        //PlantSetup.TESTFIELD("Cost Component Gain/Loss");  //* Ivm PostPlantGainLoss in CU 5600  //*23853.o
+        IF PlantSetup."Plant Entry Book Val. Disposal" THEN  //C002804
+          PlantSetup.TESTFIELD("Cost Comp. Book Value Disposal");  //* Ivm PostPlantBookValueOnDisposal in CU 5600  //*23853.n
+      END;
+
+      TmpFAProcessed.RESET;      //29996.n
+      TmpFAProcessed.DELETEALL;  //29996.n
+      TmpFAJnlLineReclass.RESET;  //*C000883.n
+      TmpFAJnlLineReclass.DELETEALL;  //*C000883.n
+
+      IF PlantSetup."Negative Bulk Stock Location" OR PlantSetup."Negative Bulk Stock Depot" THEN BEGIN  //C024227
+        IF NOT ConfirmNegStock(OrderRec) THEN
+          EXIT;
+      END;
+
+      WITH OrderRec DO BEGIN
+
+        LOCKTABLE;
+
+        TESTFIELD(Posted,FALSE);
+        IF Location <> '' THEN
+          TESTFIELD(Location)
+        ELSE
+          TESTFIELD("Customer No.");
+        IF Type = Type::External THEN
+          TESTFIELD("Vendor No.");
+
+        CheckBlock(TRUE);;
+        //CheckLinkWithPlantOrder();  //DP00183.o
+
+        CostRec.SETRANGE("Exit-order No.","No.");
+        CostRec.SETFILTER(Type,'<>%1',CostRec.Type::Text);
+        IF CostRec.FINDSET(FALSE, FALSE) THEN
+          REPEAT
+            CheckLineCost;
+          UNTIL CostRec.NEXT = 0;
+
+        OrderLineRec.SETRANGE("Exit-order No.","No.");
+        OrderLineRec.SETRANGE(Type,OrderLineRec.Type::Plant);
+        IF OrderLineRec.FINDSET(FALSE, FALSE) THEN BEGIN
+          FillTmpTemplateBatchWithLines;
+          InventoryRec.LOCKTABLE;
+          InventoryMngmnt.InitializeNegStockProcess();
+          REPEAT
+            ProcessOrderLine;
+          UNTIL OrderLineRec.NEXT = 0;
+          InventoryMngmnt.ProcessNegStockProcess();
+        END ELSE BEGIN
+          IF NOT CONFIRM(STRSUBSTNO(Text000, OrderLineRec.TABLECAPTION,OrderRec.TABLECAPTION), FALSE) THEN
+            EXIT;
+        END;
+
+        Posted := TRUE;
+        "Posting Date" := WORKDATE;  //*32792.c (old: TODAY)
+        "Posted by" := USERID;  //DP00241.n (16484)
+        MODIFY;
+
+        PostFixedAssets;
+        PostItemJnl;
+
+        COMMIT;
+
+      END;
+    END;
+
+    LOCAL PROCEDURE ProcessOrderLine@3();
+    VAR
+      PlantRateCodeRec@1100525000 : Record 11020502;
+      OrderType@11012000 : 'Receipt,Plant Order,Exit Order';
+    BEGIN
+      WITH OrderLineRec DO BEGIN
+        TESTFIELD("From Location");
+        TESTFIELD("Exit-date");
+        TESTFIELD("Plant Type");
+        TESTFIELD("No.");
+        TESTFIELD(Description);  //*33268
+        CALCFIELDS(Bulk);
+        IF NOT Bulk AND (ABS(Quantity) <> 1) THEN
+          ERROR(Text001,"Plant Type","No.");
+        IF Bulk AND (Quantity = 0) THEN
+          ERROR(Text002,"Plant Type");
+        IF (OrderRec.Type = OrderRec.Type::External) OR (OrderRec."Vendor No." <> '') THEN
+          TESTFIELD("Vendor No.", OrderRec."Vendor No.");
+        IF PlantSetup."Rate Codes" AND ("From Rate Code" <> '') THEN  //* Rate code not mandatory, so als not when setup is on.
+          PlantRateCodeRec.CheckPlantRateCode("From Location", "From Rate Code", TRUE, '');
+        CheckLinkWithPlantOrderLine(OrderLineRec);  //DP00183.n
+        IF NOT PlantSetup.CheckElementMandatory(OrderRec.Location, Element, '') THEN //*C005404
+          TESTFIELD(Element);
+
+        SETFILTER("Date Filter",'..%1',"Exit-date");
+        //OLD IF NOT Bulk OR NOT PlantSetup."Negative Bulk Stock" THEN BEGIN
+        IF NOT CheckNegativeStockAllowed() THEN BEGIN
+          IF PlantSetup."Rate Codes" OR ("From Rate Code" <> '') THEN BEGIN
+            CALCFIELDS("Stock Rate Code on Location");
+            IF Quantity > "Stock Rate Code on Location" THEN
+              ERROR(Text011, "Plant Type", "No.", "From Rate Code");
+          END ELSE BEGIN
+            CALCFIELDS("Stock Plant No. on Location");
+            IF Quantity > "Stock Plant No. on Location" THEN
+              ERROR(Text003, "Plant Type", "No.");
+          END;
+        END;
+
+        PlantRec.GET("Plant Type");
+        DoExternal := FALSE;
+        IF Bulk AND ("No." = '0')THEN BEGIN
+          IF PlantRec.External THEN
+            DoExternal := TRUE
+          ELSE BEGIN
+            IF (OrderRec.Type = OrderRec.Type::External) OR (OrderRec."Vendor No." <> '') THEN
+              PlantRec.TESTFIELD(External, TRUE);
+          END;
+        END ELSE BEGIN
+          PlantNoRec.GET("Plant Type", "No.");
+          PlantNoRec.TESTFIELD(Posted, TRUE);
+          IF PlantNoRec.External THEN
+            DoExternal := TRUE
+          ELSE BEGIN
+            IF (OrderRec.Type = OrderRec.Type::External) OR (OrderRec."Vendor No." <> '') THEN
+              PlantNoRec.TESTFIELD(External, TRUE);
+            IF Bulk THEN
+              TESTFIELD("No.", '0');  //* If not External then Plant No. filled not allowed for Bulk
+          END;
+        END;
+        IF DoExternal THEN
+          TESTFIELD("Vendor No.")
+        ELSE
+          TESTFIELD("Vendor No.", '');
+
+        IF NOT InventoryMngmnt.PostInventory(
+          OrderType::"Exit Order","Exit-order No.","Line No.","From Location",'',
+          "Plant Type","No.","Exit-date",Quantity,FALSE,0,"From Rate Code", '', '', '',"Original Arrival Order No.")
+        THEN BEGIN
+          IF (NOT PlantSetup."Rate Codes") AND ("From Rate Code" = '') THEN
+            ERROR(Text004,"Plant Type","No.","Exit-date")
+          ELSE
+            ERROR(Text010,"Plant Type","No.","Exit-date","From Rate Code");
+        END;
+        IF NOT Bulk THEN  //DP00331.n
+          CloseVehicle(OrderLineRec);  //DP00331.n
+        IF Quantity > 0 THEN
+          CloseInspection
+        ELSE
+          OpenInspection(OrderLineRec);  //*C006223.c
+        IF (NOT DoExternal) THEN
+          PostFixedAssetToBuffer
+        ELSE
+          PostRemovalExternalRentedPlant();
+
+        IF "To Item Inventory" THEN
+          CreateItemJnlLine;
+      END;
+    END;
+
+    PROCEDURE CheckNegativeStockAllowed@1100485004() : Boolean;
+    VAR
+      lvFromLocRec@1100485000 : Record 11012554;
+    BEGIN
+      WITH OrderLineRec DO BEGIN
+        IF (NOT Bulk) OR ("No." <> '0') THEN  //* Bij uniek materieel en bij bulk materieel met volgnr.(extern mat.)
+          EXIT(FALSE);                        //* geen neg. voorraad toegestaan. Alleen voor bulk met volgnr. '0'.
+      //* 31-05-2006 Geen neg. voorraad toestaan bij (extern) bulk mat. met volgnr. nu ook van belang voor VJP en
+      //* ophalen inhuurposten (bij inkoopfact.). Dat nu op basis van materieelvoorraad-tabel waar alleen records
+      //* met aantal groter dan nul worden gelezen. Anders worden er daar teveel geteld.
+
+        //*24451.o
+        //IF NOT PlantSetup."Negative Bulk Stock" THEN BEGIN
+        //  IF NOT PlantSetup."Negative Bulk Stock Depot" THEN
+        //    EXIT(FALSE);
+        //  lvFromLocRec.GET("From Location");
+        //  IF NOT lvFromLocRec.Depot THEN
+        //    EXIT(FALSE);
+        //END;
+        //EXIT(TRUE);
+
+        //*24451.n
+        IF PlantSetup."Negative Bulk Stock Location" OR PlantSetup."Negative Bulk Stock Depot" THEN BEGIN
+          lvFromLocRec.GET("From Location");
+          IF lvFromLocRec.Depot THEN
+            EXIT(PlantSetup."Negative Bulk Stock Depot")
+          ELSE
+            EXIT(PlantSetup."Negative Bulk Stock Location");
+        END;
+        EXIT(FALSE);
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckLineCost@4();
+    VAR
+      PlantType@1100529000 : Record 11012551;
+      PlantNumber@1100529001 : Record 11012552;
+    BEGIN
+      WITH CostRec DO BEGIN
+        TESTFIELD("No.");
+        TESTFIELD(Description);  //*33268
+        //DP00241.sn (19918)
+        IF "Plant Type" <> '' THEN BEGIN
+          PlantType.GET("Plant Type");
+          IF NOT PlantType.Bulk THEN
+            TESTFIELD("Plant No.");
+          IF "Plant No." <> '' THEN
+            PlantNumber.GET("Plant Type", "Plant No.");
+        END;
+        //DP00241.en
+        IF NOT PlantSetup.CheckElementMandatory(OrderRec.Location, Element, '') THEN //*C005404
+          TESTFIELD(Element);
+      END;
+    END;
+
+    LOCAL PROCEDURE CloseInspection@6();
+    BEGIN
+      WITH InspectionRec DO BEGIN
+        SETRANGE("Plant Type",OrderLineRec."Plant Type");
+        SETRANGE("Plant No.",OrderLineRec."No.");
+        SETRANGE("Inspection Result","Inspection Result"::" ");
+        IF FINDSET(TRUE, FALSE) THEN
+          REPEAT
+            "Inspection Result" := "Inspection Result"::"Exit Order";
+            Comment := OrderRec.TABLECAPTION + ' ' + OrderRec."No.";
+            MODIFY;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE OpenInspection@7(ExitOrderLine@1100529000 : Record 11012560);
+    BEGIN
+      //*C006223.c  Function now global and input argument ExitorderLine is added. Function now also use in Post Returned Loss
+      WITH InspectionRec DO BEGIN
+        SETRANGE("Plant Type", ExitOrderLine."Plant Type");
+        SETRANGE("Plant No.", ExitOrderLine."No.");
+        SETRANGE("Inspection Result", "Inspection Result"::"Exit Order");
+        SETFILTER(Comment, '*' + ExitOrderLine."Exit-order No." + '*');
+        IF FINDSET(TRUE, FALSE) THEN
+          REPEAT
+            "Inspection Result" := "Inspection Result"::" ";
+            Comment := '';
+            MODIFY;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE PostFixedAssetToBuffer@1210190000();
+    VAR
+      lRecFixedAsset@1210190004 : Record 5600;
+      lRecPlantNumber@1210190000 : Record 11012552;
+      lRecExitBulkPlant@1100485002 : Record 11012592;
+      FA2@1210190002 : Record 5600;
+      FADeprBook@1100525000 : Record 5612;
+      lDoPreparedBulkPlant@1100485000 : Boolean;
+      lNexLineNo@1100485003 : Integer;
+      lDecFA_Quantity@1210190003 : Decimal;
+      lDecRequiredQuantity@1210190001 : Decimal;
+      lDecPostQuantity@1210190005 : Decimal;
+      lOrgFA_Quantity@1100525001 : Decimal;
+      QtyOtherLines@1210190006 : Decimal;
+      lCodFA_Dispose@1100485001 : Code[20];
+    BEGIN
+      WITH OrderLineRec DO BEGIN
+        IF (NOT PlantSetup."Integration Fixed Assets") OR (NOT PlantRec."Integration Fixed Assets") THEN
+          EXIT;
+        IF (NOT Bulk) AND (PlantNoRec."Fixed Asset" <> '') THEN BEGIN  //*23563  Again exit of unique plant that was a returned loss
+          IF FADeprBook.GET(PlantNoRec."Fixed Asset", FA2.GetFA_MainDeprBook(PlantNoRec."Fixed Asset", FALSE)) THEN BEGIN
+            IF (FADeprBook."Disposal Date" > 0D) AND (FADeprBook."Depreciation Book Code" <> '') THEN
+              EXIT;
+          END;
+        END;
+        IF (Amount < 0) THEN
+          FIELDERROR(Amount);
+
+        IF (NOT Bulk) OR (PlantSetup."Manual Disposal Method Bulk" = PlantSetup."Manual Disposal Method Bulk"::No) THEN
+          OrderLineRec.DeleteExitOrderBulkPlant();
+
+        IF (NOT Bulk) THEN BEGIN
+          lRecPlantNumber.GET("Plant Type", "No.");
+          IF lRecPlantNumber."Fixed Asset" = '' THEN
+            EXIT;
+          ProcesAddFixedAssetBufferLines(lRecPlantNumber, Quantity)
+        END ELSE BEGIN
+          lRecExitBulkPlant.SETRANGE("Exit-order No.", "Exit-order No.");
+          lRecExitBulkPlant.SETRANGE("Exit-order Line No.", "Line No.");
+
+          lDoPreparedBulkPlant := FALSE;
+          CASE PlantSetup."Manual Disposal Method Bulk" OF
+            PlantSetup."Manual Disposal Method Bulk"::Yes:
+              BEGIN
+                IF NOT lRecExitBulkPlant.FINDFIRST THEN BEGIN
+                  lRecPlantNumber.SETRANGE("Plant Type", "Plant Type");
+                  lRecPlantNumber.SETFILTER("Fixed Asset", '<>%1', '');
+                  IF NOT lRecPlantNumber.FINDFIRST THEN
+                    EXIT;
+                END;
+                lDoPreparedBulkPlant := TRUE;
+              END;
+            PlantSetup."Manual Disposal Method Bulk"::Allowed:
+              BEGIN
+                IF lRecExitBulkPlant.FINDFIRST THEN
+                  lDoPreparedBulkPlant := TRUE;
+              END;
+          END;
+
+          IF (NOT lDoPreparedBulkPlant) THEN BEGIN
+            lRecPlantNumber.RESET;
+            lRecPlantNumber.SETCURRENTKEY("Plant Type", "Receipt Date", "No.");
+            IF PlantSetup."Disposal Method Bulk" = PlantSetup."Disposal Method Bulk"::LIFO THEN
+              lRecPlantNumber.ASCENDING(FALSE);
+            lRecPlantNumber.SETRANGE("Plant Type", "Plant Type");
+            lRecPlantNumber.SETRANGE(Posted, TRUE);
+            lRecPlantNumber.SETFILTER("Fixed Asset", '<>%1', '');
+            IF NOT lRecPlantNumber.FINDFIRST THEN BEGIN
+              //EXIT;  //*29994.o
+              //Ook error als niet genoeg gevonden?  Volgens Peter niet, volgens Frans nu (20-08-2012) wel  //*29994.c
+              //*29994.sn
+              ERROR(Text012,
+                FIELDCAPTION(Quantity), Quantity, FIELDCAPTION("Exit-order No."), "Exit-order No.",
+                FIELDCAPTION("Line No."), "Line No.", FIELDCAPTION("Plant Type"), "Plant Type");
+              //*29994.en
+            END;
+            //
+            lNexLineNo := 10000;
+            lDecRequiredQuantity := Quantity;
+            REPEAT
+              lRecFixedAsset.GET(lRecPlantNumber."Fixed Asset");
+              lDecFA_Quantity := lRecFixedAsset.GetQuantity('', FALSE); //ps 13795, 29-12-08 arg changed from TRUE to FALSE
+                                                                        // So original quantity whithout (negative) exit quantity
+              //29130.so
+              //IF lDecFA_Quantity <> 0 THEN BEGIN
+              //  lDecPostQuantity := lDecFA_Quantity;
+              //  IF (lDecRequiredQuantity < lDecFA_Quantity) THEN BEGIN
+              //    //* Partial disposal: Split required, new FA will be disposed of
+              //    lDecPostQuantity := lDecRequiredQuantity;
+              //    ProcessSplitFixedAsset(lRecPlantNumber, lDecPostQuantity, lDecFA_Quantity, lCodFA_Dispose);
+              //    lRecPlantNumber."Fixed Asset" := lCodFA_Dispose;
+              //  END ELSE BEGIN
+              //    lOrgFA_Quantity := lRecFixedAsset.GetQuantity('', TRUE);  //22876
+              //    IF (lOrgFA_Quantity < lRecPlantNumber.Quantity) THEN BEGIN  //22876 Not all invoiced yet, so split
+              //      ProcessSplitFixedAsset(lRecPlantNumber, lDecPostQuantity, lDecFA_Quantity, lCodFA_Dispose);
+              //      lRecPlantNumber."Fixed Asset" := lCodFA_Dispose;
+              //    END;
+              //  END;
+              //  ProcesAddFixedAssetBufferLines(lRecPlantNumber, lDecPostQuantity);
+              //  lDecRequiredQuantity := lDecRequiredQuantity - lDecFA_Quantity;
+              //29130.eo
+              //29130.sn
+              lDecPostQuantity := lDecFA_Quantity;
+              QtyOtherLines := 0;
+              IF lDecPostQuantity > 0 THEN
+                QtyOtherLines := BulkPlantNoQtyOnOtherExitLines("Exit-order No.","Line No.","Plant Type",lRecPlantNumber."No.");
+              IF QtyOtherLines > 0 THEN
+                lDecPostQuantity := lDecPostQuantity - QtyOtherLines;
+              IF (lDecRequiredQuantity < lDecPostQuantity) THEN
+                lDecPostQuantity := lDecRequiredQuantity;
+              IF lDecPostQuantity > 0 THEN BEGIN
+                IF (lDecPostQuantity < lDecFA_Quantity) THEN BEGIN
+                  //* Partial disposal: Split required, new FA will be disposed of
+                  ProcessSplitFixedAsset(lRecPlantNumber, lDecPostQuantity, lDecFA_Quantity, lCodFA_Dispose);
+                  lRecPlantNumber."Fixed Asset" := lCodFA_Dispose;
+                END ELSE BEGIN
+                  lOrgFA_Quantity := lRecFixedAsset.GetQuantity('', TRUE);  //22876
+                  IF (lOrgFA_Quantity < lRecPlantNumber.Quantity) THEN BEGIN  //22876 Not all invoiced yet, so split
+                    ProcessSplitFixedAsset(lRecPlantNumber, lDecPostQuantity, lDecFA_Quantity, lCodFA_Dispose);
+                    lRecPlantNumber."Fixed Asset" := lCodFA_Dispose;
+                  END;
+                END;
+                ProcesAddFixedAssetBufferLines(lRecPlantNumber, lDecPostQuantity);
+                lDecRequiredQuantity := lDecRequiredQuantity - lDecPostQuantity;
+              //29130.en
+                //
+                lRecExitBulkPlant.INIT;
+                lRecExitBulkPlant."Exit-order No." := "Exit-order No.";
+                lRecExitBulkPlant."Exit-order Line No." := "Line No.";
+                lRecExitBulkPlant."Line No." := lNexLineNo;
+                lRecExitBulkPlant."Plant Type" := lRecPlantNumber."Plant Type";
+                lRecExitBulkPlant."Plant No." := lRecPlantNumber."No.";
+                lRecExitBulkPlant.Quantity := lDecPostQuantity;
+                lRecExitBulkPlant."Disposed Fixed Asset" := lRecPlantNumber."Fixed Asset";
+                lRecExitBulkPlant.INSERT;
+                lNexLineNo := lNexLineNo + 10000;
+              END;
+            UNTIL ((lRecPlantNumber.NEXT = 0) OR (lDecRequiredQuantity <= 0.0));
+            //*29994.sn
+            IF lDecRequiredQuantity > 0 THEN
+              ERROR(Text013,
+                FIELDCAPTION(Quantity), Quantity, Quantity-lDecRequiredQuantity, FIELDCAPTION("Exit-order No."), "Exit-order No.",
+                FIELDCAPTION("Line No."), "Line No.", FIELDCAPTION("Plant Type"), "Plant Type");
+            //*29994.en
+          END ELSE BEGIN
+            CALCFIELDS("Quantity Bulk Plant");
+            TESTFIELD("Quantity Bulk Plant", Quantity);
+            lRecExitBulkPlant.FINDSET(TRUE, FALSE);
+            REPEAT
+              lRecExitBulkPlant.TESTFIELD("Plant Type", "Plant Type");
+              lRecExitBulkPlant.TESTFIELD("Plant No.");
+              lRecExitBulkPlant.TESTFIELD(Quantity);
+              lRecPlantNumber.GET(lRecExitBulkPlant."Plant Type", lRecExitBulkPlant."Plant No.");
+              lRecPlantNumber.TESTFIELD(Posted, TRUE);
+              lRecPlantNumber.TESTFIELD("Fixed Asset");
+              lRecFixedAsset.GET(lRecPlantNumber."Fixed Asset");
+              lDecFA_Quantity := lRecFixedAsset.GetQuantity('', FALSE); //ps 13795, 29-12-08 arg changed from TRUE to FALSE
+              IF (lRecExitBulkPlant.Quantity > lDecFA_Quantity) THEN    // So original quantity whithout (negative) exit quantity
+                lRecExitBulkPlant.FIELDERROR(Quantity, STRSUBSTNO(Text008, lRecExitBulkPlant.Quantity, lDecFA_Quantity));
+              //29130.sn
+              QtyOtherLines := BulkPlantNoQtyOnOtherExitLines("Exit-order No.","Line No.","Plant Type",lRecExitBulkPlant."Plant No.");
+              IF (lRecExitBulkPlant.Quantity > (lDecFA_Quantity - QtyOtherLines)) THEN
+                lRecExitBulkPlant.FIELDERROR(Quantity, STRSUBSTNO(Text008b,lRecExitBulkPlant.Quantity,QtyOtherLines,lDecFA_Quantity));
+              //29130.en
+              //
+              lDecPostQuantity := lRecExitBulkPlant.Quantity;
+              //22876.o
+              //IF (lDecPostQuantity < lDecFA_Quantity) THEN BEGIN //* Partial disposal: Split required, new FA will be disposed of
+              //22876.sn
+              lOrgFA_Quantity := lRecFixedAsset.GetQuantity('', TRUE);
+              IF (lDecPostQuantity < lDecFA_Quantity) OR       //* Partial disposal: Split required, new FA will be disposed of
+                 (lOrgFA_Quantity < lRecPlantNumber.Quantity)  //* Not all invoiced yet, so split
+              THEN BEGIN
+              //22876.en
+                ProcessSplitFixedAsset(lRecPlantNumber, lDecPostQuantity, lDecFA_Quantity, lCodFA_Dispose);
+                lRecPlantNumber."Fixed Asset" := lCodFA_Dispose;
+              END;
+              ProcesAddFixedAssetBufferLines(lRecPlantNumber, lDecPostQuantity);
+              lRecExitBulkPlant."Disposed Fixed Asset" := lRecPlantNumber."Fixed Asset";
+              lRecExitBulkPlant.MODIFY;
+            UNTIL lRecExitBulkPlant.NEXT = 0;
+          END;
+        END;
+      END;
+    END;
+
+    PROCEDURE BulkPlantNoQtyOnOtherExitLines@1210190002(CurrOrder@1210190001 : Code[20];CurrLineNo@1210190002 : Integer;CurrPlantType@1210190003 : Code[20];CurrPlantNo@1210190004 : Code[10]) RetQuantity : Decimal;
+    VAR
+      ExitOrderBulkPlant@1210190000 : Record 11012592;
+    BEGIN
+      //*29130   Count quantity of bulk Plant No. on other lines of the exit order
+      ExitOrderBulkPlant.SETRANGE("Exit-order No.", CurrOrder);
+      ExitOrderBulkPlant.SETFILTER("Exit-order Line No.", '<>%1', CurrLineNo);
+      ExitOrderBulkPlant.SETRANGE("Plant Type", CurrPlantType);
+      ExitOrderBulkPlant.SETRANGE("Plant No.", CurrPlantNo);  // Same PlantNo is same FA
+      ExitOrderBulkPlant.SETFILTER(Quantity, '>%1', 0);       // Count only positive, so RetQuantity is never negative
+      IF ExitOrderBulkPlant.FINDSET THEN BEGIN
+        REPEAT
+          RetQuantity := RetQuantity + ExitOrderBulkPlant.Quantity;
+        UNTIL ExitOrderBulkPlant.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE ProcesAddFixedAssetBufferLines@1100530000(iRecPlantNumber@1210190000 : Record 11012552;iDecQuantity@1210190001 : Decimal);
+    BEGIN
+      DetermineMainFADeprBook(iRecPlantNumber."Fixed Asset");
+
+      FADeprBook.RESET;
+      FADeprBook.SETRANGE("FA No.", iRecPlantNumber."Fixed Asset");
+      FADeprBook.SETRANGE("Depreciation Book Code", MainDeprBookCode);
+      FADeprBook.FINDFIRST;  // 'Main' must exist, and must be handled first
+      DeprBook.GET(FADeprBook."Depreciation Book Code");
+      FADeprBook.TESTFIELD("FA Posting Group");
+      AddFixedAssetBufferLine(iRecPlantNumber, iDecQuantity, FADeprBook."Depreciation Book Code");
+
+      FADeprBook.SETFILTER("Depreciation Book Code", '<>%1', MainDeprBookCode);
+      FADeprBook.SETRANGE("Disposal Date", 0D);
+      IF FADeprBook.FINDFIRST THEN BEGIN
+        REPEAT
+          DeprBook.GET(FADeprBook."Depreciation Book Code");
+          FADeprBook.TESTFIELD("FA Posting Group");
+          AddFixedAssetBufferLine(iRecPlantNumber, iDecQuantity, FADeprBook."Depreciation Book Code");
+        UNTIL FADeprBook.NEXT = 0;
+      END;
+
+      //29996.sn
+      IF OrderLineRec.Bulk THEN BEGIN
+        // Determine FA-No. Note: iRecPlantNumber."Fixed Asset" (can) contain new FA-No, so can not be used here
+        PlantNoRec.GET(iRecPlantNumber."Plant Type", iRecPlantNumber."No.");
+        IF NOT TmpFAProcessed.GET(PlantNoRec."Fixed Asset") THEN BEGIN
+          TmpFAProcessed."No." := PlantNoRec."Fixed Asset";
+          TmpFAProcessed."Budgeted Asset" := FALSE;
+          TmpFAProcessed."Warranty Date" := OrderLineRec."Exit-date";
+          TmpFAProcessed.INSERT;
+        END ELSE BEGIN
+          TmpFAProcessed."Budgeted Asset" := TRUE;  // Used more than once
+          IF OrderLineRec."Exit-date" > TmpFAProcessed."Warranty Date" THEN
+            TmpFAProcessed."Warranty Date" := OrderLineRec."Exit-date";
+          TmpFAProcessed.MODIFY;
+        END;
+      END;
+      //29996.en
+    END;
+
+    LOCAL PROCEDURE AddFixedAssetBufferLine@1210190004(iRecPlantNumber@1210190000 : Record 11012552;iDecQuantity@1210190001 : Decimal;iDeprBookCode@1100530000 : Code[10]);
+    VAR
+      FAPostingDate@1100409000 : Date;
+      NewAmount@1100525001 : Decimal;
+    BEGIN
+      //*C002176.sn
+      // Determine FA-No. Note: iRecPlantNumber."Fixed Asset" (can) contain new FA-No, so can not be used here.
+      // If a bulk plant number is spitted then then on disposed (new) part not FA-entries yet (so check on org. plant no.).
+      PlantNoRec.GET(iRecPlantNumber."Plant Type", iRecPlantNumber."No.");
+      FAPostingDate := DetermineFAPostingDate(PlantNoRec."Fixed Asset", iDeprBookCode, OrderLineRec."Exit-date");
+      //*C002176.en
+      CheckFAPostingAllowed(PlantNoRec."Fixed Asset", iDeprBookCode, FAPostingDate);  //*C002176.c  Also DeprBook and date
+
+      //*22171.sn
+      NewAmount := - OrderLineRec.Amount;
+      //DP00241.sn (27020)
+      OrderLineRec.CALCFIELDS(Bulk);
+      IF (NOT OrderLineRec.Bulk) AND (OrderLineRec."BPM Amount" > 0) THEN
+        NewAmount := NewAmount - OrderLineRec."BPM Amount";
+      //DP00241.en (27020)
+      IF OrderLineRec.Quantity <> iDecQuantity THEN
+        NewAmount := (iDecQuantity / OrderLineRec.Quantity) * NewAmount;
+      NewAmount := ROUND(NewAmount);
+      //*22171.en
+
+      WITH OrderLineRec DO
+        IF (NOT DeprBook."G/L Integration - Disposal") THEN BEGIN
+          //FAJnlLineTmp."Posting Date" := OrderLineRec."Exit-date";    //*C002176.o
+          //FAJnlLineTmp."FA Posting Date" := OrderLineRec."Exit-date"; //*C002176.o
+          FAJnlLineTmp."Posting Date" := FAPostingDate;    //*C002176.n
+          FAJnlLineTmp."FA Posting Date" := FAPostingDate; //*C002176.n
+          FAJnlLineTmp.Description := COPYSTR(STRSUBSTNO('%1 %2',
+            STRSUBSTNO('%1',OrderRec.Type), OrderLineRec.Description), 1, MAXSTRLEN(FAJnlLineTmp.Description));
+          FAJnlLineTmp."FA No." := iRecPlantNumber."Fixed Asset";
+          FAJnlLineTmp."Depreciation Book Code" := iDeprBookCode;  //*FA.n
+          FAJnlLineTmp."FA Posting Group" := FADeprBook."FA Posting Group";  //*FA.n
+          FAJnlLineTmp."FA Posting Type" := FAJnlLineTmp."FA Posting Type"::Disposal;
+          FAJnlLineTmp.Quantity := iDecQuantity;
+          //FAJnlLineTmp.Amount := - Amount; //*22171.o
+          FAJnlLineTmp.Amount := NewAmount;  //*22171.n
+          FAJnlLineTmp."Line No." := FAJnlLineTmp."Line No." + 1;
+          FAJnlLineTmp."Reason Code" := "Reason Code";  //DP00241
+          FAJnlLineTmp.INSERT;
+        END ELSE BEGIN
+          //GenJnlLineTmp."Posting Date" := OrderLineRec."Exit-date";    //*C002176.o
+          //GenJnlLineTmp."FA Posting Date" := OrderLineRec."Exit-date"; //*C002176.o
+          GenJnlLineTmp."Posting Date" := FAPostingDate;    //*C002176.n
+          GenJnlLineTmp."FA Posting Date" := FAPostingDate; //*C002176.n
+          GenJnlLineTmp.Description := COPYSTR(STRSUBSTNO('%1 %2',
+            STRSUBSTNO('%1',OrderRec.Type), OrderLineRec.Description), 1, MAXSTRLEN(GenJnlLineTmp.Description));
+          GenJnlLineTmp."Account No." := iRecPlantNumber."Fixed Asset";
+          GenJnlLineTmp."Depreciation Book Code" := iDeprBookCode;  //*FA.n
+          GenJnlLineTmp."Posting Group" := FADeprBook."FA Posting Group";  //*FA.n
+          GenJnlLineTmp."FA Posting Type" := GenJnlLineTmp."FA Posting Type"::Disposal;
+          GenJnlLineTmp.Quantity := iDecQuantity;
+          //GenJnlLineTmp.Amount := - Amount; //*22171.o
+          GenJnlLineTmp.Amount := NewAmount;  //*22171.n
+          GenJnlLineTmp."Line No." := GenJnlLineTmp."Line No." + 1;
+          GenJnlLineTmp."Reason Code" := "Reason Code";  //DP00241
+          GenJnlLineTmp.INSERT;
+        END;
+    END;
+
+    LOCAL PROCEDURE ProcessSplitFixedAsset@1100530002(iRecPlantNumber@1210190003 : Record 11012552;iDecTransferQuantity@1210190004 : Decimal;iDecTotalQuantity@1210190002 : Decimal;VAR vCodFA_Dispose@1210190005 : Code[20]);
+    VAR
+      FA@1100530003 : Record 5600;
+      AcquisitionCost@1210190007 : Decimal;
+      Factor@1100530000 : Decimal;
+      TransferQuantity2@1100530001 : Decimal;
+      FA_QtyOther@1100530002 : Decimal;
+    BEGIN
+      IF (iDecTotalQuantity = 0) THEN
+        EXIT;
+
+      DetermineMainFADeprBook(iRecPlantNumber."Fixed Asset");
+      DeprBook.GET(MainDeprBookCode);
+
+      AcquisitionCost := CopyFixedAsset(iRecPlantNumber."Fixed Asset", vCodFA_Dispose,
+        iRecPlantNumber."Plant Type", iRecPlantNumber."No.");
+      Factor := iDecTransferQuantity / iDecTotalQuantity;  // For main and other Depr. Books the same factor (of main)
+      SplitFixedAsset(iRecPlantNumber."Fixed Asset", iDecTransferQuantity, Factor, vCodFA_Dispose, AcquisitionCost);
+
+      FADeprBook.RESET;
+      FADeprBook.SETRANGE("FA No.", iRecPlantNumber."Fixed Asset");
+      FADeprBook.SETFILTER("Depreciation Book Code", '<>%1', MainDeprBookCode);
+      FADeprBook.SETRANGE("Disposal Date", 0D);
+      IF FADeprBook.FINDFIRST THEN BEGIN
+        REPEAT
+          DeprBook.GET(FADeprBook."Depreciation Book Code");
+          FADeprBook.CALCFIELDS("Acquisition Cost");
+          AcquisitionCost := FADeprBook."Acquisition Cost";
+          TransferQuantity2 := iDecTransferQuantity;
+          FA."No." := iRecPlantNumber."Fixed Asset";
+          FA_QtyOther := FA.GetQuantity(FADeprBook."Depreciation Book Code", FALSE);
+          IF TransferQuantity2 > FA_QtyOther THEN
+            TransferQuantity2 := FA_QtyOther;
+          IF TransferQuantity2 < 0 THEN
+            TransferQuantity2 := 0;
+          SplitFixedAsset(iRecPlantNumber."Fixed Asset", TransferQuantity2, Factor, vCodFA_Dispose, AcquisitionCost);
+        UNTIL FADeprBook.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE SplitFixedAsset@1210190001(FA_No@1210190003 : Code[20];TransferQuantity@1210190004 : Decimal;Factor@1210190002 : Decimal;NewFA_NoDispose@1210190005 : Code[20];AcquisitionCost@1100530000 : Decimal);
+    VAR
+      lRecFA_ReclassJournalLine@1210190000 : Record 11072084;
+      lRecFA_JournalSetup@1210190006 : Record 5605;
+      lvNextLineNo@1210190001 : Integer;
+      lCduFA_ReclassJnlTransfer@1210190008 : Codeunit 11072038;
+    BEGIN
+      WITH lRecFA_ReclassJournalLine DO BEGIN
+        //*FA.so
+        //IF (iDecTotalQuantity = 0) THEN
+        //  EXIT;
+        //*FA.eo
+
+        IF (NOT lRecFA_JournalSetup.GET(DeprBook.Code, USERID)) THEN
+          lRecFA_JournalSetup.GET(DeprBook.Code, '');
+
+        lRecFA_JournalSetup.TESTFIELD("Reclass Jnl. Template Name");
+        lRecFA_JournalSetup.TESTFIELD("Reclass Jnl. Batch Name");
+        //*FA.so
+        //lDecAcquisitionCost := CopyFixedAsset(iRecPlantNumber."Fixed Asset", vCodFA_Dispose,
+        //  iRecPlantNumber."Plant Type", iRecPlantNumber."No.");
+        //*FA.eo
+        SETRANGE("Journal Template Name", lRecFA_JournalSetup."Reclass Jnl. Template Name");
+        SETRANGE("Journal Batch Name", lRecFA_JournalSetup."Reclass Jnl. Batch Name");
+        IF FINDLAST THEN
+          lvNextLineNo := "Line No.";
+        lvNextLineNo := lvNextLineNo + 10000;
+
+        INIT;
+        "Journal Template Name" := lRecFA_JournalSetup."Reclass Jnl. Template Name";
+        "Journal Batch Name" := lRecFA_JournalSetup."Reclass Jnl. Batch Name";
+        "Line No." := lvNextLineNo;
+        INSERT(TRUE);
+
+        VALIDATE("FA No.", FA_No);
+        Quantity := TransferQuantity;
+
+        VALIDATE("New FA No.", NewFA_NoDispose);
+        //"FA Posting Date" := OrderLineRec."Exit-date";  //*C002176.o
+        //"Posting Date" := OrderLineRec."Exit-date";  //*C002176.o
+        "FA Posting Date" := DetermineFAPostingDate(FA_No, DeprBook.Code, OrderLineRec."Exit-date"); //*C002176.n
+        "Posting Date" := "FA Posting Date";  //*C002176.n
+        "Depreciation Book Code" := DeprBook.Code;  // Must be done after Validate of FA
+        "Reclassify Acq. Cost Amount" := ROUND(AcquisitionCost * Factor);
+        "Reclassify Acquisition Cost" := DeprBook."G/L Integration - Acq. Cost";
+        "Reclassify Depreciation" := DeprBook."G/L Integration - Depreciation";
+        "Reclassify Write-Down" := DeprBook."G/L Integration - Write-Down";
+        "Reclassify Appreciation" := DeprBook."G/L Integration - Appreciation";
+        "Reclassify Custom 1" := DeprBook."G/L Integration - Custom 1";
+        "Reclassify Custom 2" := DeprBook."G/L Integration - Custom 2";
+        "Reclassify Salvage Value" := DeprBook."G/L Integration - Disposal";
+        "Insert Bal. Account" := TRUE;
+
+        //* Eerste deel omschrijving is trigger 'Correctie exitorder', zie ook CU 5616+5642(is nu 11072036)+13 (melding 7037)
+        Description := '<PLANT-EXITORDER>' + OrderLineRec."Exit-order No.";
+        "Document No." := GetDocumentNo;
+        MODIFY;
+        SETRANGE("Document No.", "Document No.");
+        lCduFA_ReclassJnlTransfer.Background(TRUE);
+        lCduFA_ReclassJnlTransfer.SetFillTmpFAJnlLine();  //*C000883.n
+        lCduFA_ReclassJnlTransfer.RUN(lRecFA_ReclassJournalLine);
+        lCduFA_ReclassJnlTransfer.GetTmpFAJnlLine(TmpFAJnlLineReclass);  //*C000883.n
+      END;
+    END;
+
+    LOCAL PROCEDURE CopyFixedAsset@1210190005(iCodFA_Source@1210190000 : Code[20];VAR vCodFA_Destination@1210190001 : Code[20];iCodPlantType@1210190007 : Code[20];iCodPlantNo@1210190008 : Code[20]) : Decimal;
+    VAR
+      lRecPlantSetup@1210190006 : Record 11012550;
+      lRecFixedAsset@1210190002 : Record 5600;
+      lRecFixedAssetCopy@1210190004 : Record 5600;
+      lRecFA_DepreciationBook@1210190003 : Record 5612;
+      lRecFA_DepreciationBookCopy@1210190005 : Record 5612;
+      lRecDefaultDim@1100485000 : Record 352;
+      lRecDefaultDimCopy@1100485001 : Record 352;
+    BEGIN
+      // Copy FA to new FA code, return with book value of source
+
+      // Fixed asset
+      lRecFixedAsset.GET(iCodFA_Source);
+      lRecFixedAssetCopy := lRecFixedAsset;
+
+      lRecPlantSetup.GET;
+      IF (lRecPlantSetup."Fixed FA Nos." = FALSE) THEN
+        lRecFixedAssetCopy."No." := ''
+      ELSE
+        lRecFixedAssetCopy."No." := lRecFixedAsset.GetFA_Number(iCodPlantType, iCodPlantNo);
+      lRecFixedAssetCopy.SetSkipCreateDefFADeprBooks(TRUE); //**4PS.n FA Depr. Books are copied, so not insert default Depr. Books
+      lRecFixedAssetCopy.INSERT(TRUE);
+      vCodFA_Destination := lRecFixedAssetCopy."No.";
+      lRecFixedAssetCopy."Original Asset" := iCodFA_Source;
+      lRecFixedAssetCopy."Global Dimension 1 Code" := lRecFixedAsset."Global Dimension 1 Code";
+      lRecFixedAssetCopy."Global Dimension 2 Code" := lRecFixedAsset."Global Dimension 2 Code";
+      lRecFixedAssetCopy.MODIFY(FALSE);
+
+      lRecDefaultDimCopy.SETRANGE("Table ID", DATABASE::"Fixed Asset");
+      lRecDefaultDimCopy.SETRANGE("No.", lRecFixedAssetCopy."No.");
+      lRecDefaultDimCopy.DELETEALL;
+      //
+      lRecDefaultDim.SETRANGE("Table ID", DATABASE::"Fixed Asset");
+      lRecDefaultDim.SETRANGE("No.", lRecFixedAsset."No.");
+      IF lRecDefaultDim.FIND('-') THEN BEGIN
+        REPEAT
+          lRecDefaultDimCopy := lRecDefaultDim;
+          lRecDefaultDimCopy."No." := lRecFixedAssetCopy."No.";
+          lRecDefaultDimCopy.INSERT;
+        UNTIL lRecDefaultDim.NEXT = 0;
+      END;
+
+      // FA depreciation book
+      lRecFA_DepreciationBook.SETRANGE("FA No.", iCodFA_Source);
+      lRecFA_DepreciationBook.SETRANGE("Disposal Date", 0D);
+
+      IF (lRecFA_DepreciationBook.FINDSET(FALSE, FALSE)) THEN
+        REPEAT
+          lRecFA_DepreciationBookCopy := lRecFA_DepreciationBook;
+          lRecFA_DepreciationBookCopy."FA No." := vCodFA_Destination;
+          lRecFA_DepreciationBookCopy.INSERT;
+        UNTIL (lRecFA_DepreciationBook.NEXT = 0);
+
+      // Return with b
+      lRecFA_DepreciationBook.SETRANGE("Depreciation Book Code", DeprBook.Code);
+      IF (NOT lRecFA_DepreciationBook.GET(iCodFA_Source, DeprBook.Code)) THEN
+        EXIT(0.0);
+      lRecFA_DepreciationBook.CALCFIELDS("Acquisition Cost");
+      EXIT(lRecFA_DepreciationBook."Acquisition Cost");
+    END;
+
+    LOCAL PROCEDURE GetDocumentNo@1210190014() : Code[20];
+    VAR
+      lRecFA_JournalSetup@1210190001 : Record 5605;
+      lRecFA_JournalLine@1210190003 : Record 5621;
+      lRecGenJournalLine@1210190000 : Record 81;
+      lIntTemp@1210190002 : Integer;
+    BEGIN
+      //*FA.so
+      //FASetup.GET;
+      //FASetup.TESTFIELD("Default Depr. Book");
+      //DeprBook.GET(FASetup."Default Depr. Book");
+      //*FA.eo
+
+      IF (DeprBook."G/L Integration - Disposal") THEN
+        WITH lRecGenJournalLine DO BEGIN
+          LOCKTABLE;
+          lRecFA_JournalSetup.GenJnlName(DeprBook, lRecGenJournalLine, lIntTemp);
+           IF (FIND('=><')) THEN
+            EXIT("Document No.");
+          EXIT(lRecFA_JournalSetup.GetGenJnlDocumentNo(lRecGenJournalLine, WORKDATE, TRUE));  //*32792.c (old: TODAY)
+        END;
+
+      WITH lRecFA_JournalLine DO BEGIN
+        LOCKTABLE;
+        lRecFA_JournalSetup.FAJnlName(DeprBook, lRecFA_JournalLine, lIntTemp);
+        IF (FIND('=><')) THEN
+          EXIT("Document No.");
+        EXIT(lRecFA_JournalSetup.GetFAJnlDocumentNo(lRecFA_JournalLine, WORKDATE, TRUE));  //*32792.c (old: TODAY)
+      END;
+    END;
+
+    LOCAL PROCEDURE PostFixedAssets@1210190008();
+    VAR
+      GenJnlLine@1210190008 : Record 81;
+      FAJnlLine@1210190006 : Record 5621;
+      FAJnlLine2@1100409002 : Record 5621;
+      lRecFixedAsset@1210190007 : Record 5600;
+      lRecFA_PostingGroup@1210190005 : Record 5606;
+      lCduGenJnlPost@1210190009 : Codeunit 231;
+      FAJnlPostBatch@1100409000 : Codeunit 5633;
+      NoSeries@1210190001 : Code[10];
+      DocumentNo@1210190000 : Code[20];
+      FAJnlNextLineNo@1210190004 : Integer;
+      GenJnlNextLineNo@1210190003 : Integer;
+      LineNo@1210190002 : Integer;
+    BEGIN
+      //*C000883.sn
+      TmpFAJnlLineReclass.RESET;
+      IF TmpFAJnlLineReclass.FINDSET THEN BEGIN
+        REPEAT
+          FAJnlLine2 := TmpFAJnlLineReclass;
+          LineNo := TmpFAJnlLineReclass."Line No.";
+          TmpFAJnlLineReclass.SETRANGE("Journal Template Name", TmpFAJnlLineReclass."Journal Template Name");
+          TmpFAJnlLineReclass.SETRANGE("Journal Batch Name", TmpFAJnlLineReclass."Journal Batch Name");
+          TmpFAJnlLineReclass.FINDLAST;
+          TmpFAJnlLineReclass.SETRANGE("Journal Template Name");  // Reset filters
+          TmpFAJnlLineReclass.SETRANGE("Journal Batch Name");
+          //
+          //* Must be posted by Template/Batch. FIlter is set on min/max LineNo by batch
+          //* Note: In range min/max LineNo there are only lines that are created during posting Reclass, because
+          //*       there (CU11072036) a table lock is done on the FA Journal Line before the first FAJnlLine is added.
+          FAJnlLine2.SETRANGE("Journal Template Name", TmpFAJnlLineReclass."Journal Template Name");
+          FAJnlLine2.SETRANGE("Journal Batch Name", TmpFAJnlLineReclass."Journal Batch Name");
+          FAJnlLine2.SETRANGE("Line No.", LineNo, TmpFAJnlLineReclass."Line No.");
+          //
+          CLEAR(FAJnlPostBatch);
+          FAJnlPostBatch.DoNotCommit();
+          FAJnlPostBatch.RUN(FAJnlLine2);
+        UNTIL TmpFAJnlLineReclass.NEXT = 0;  // Next Batch (pointer is on last record of batch)
+        LineNo := 0;
+      END;
+      //*C000883.sn
+
+      WITH FAJnlLine DO BEGIN
+        IF FAJnlLineTmp.FIND('-') THEN BEGIN
+          LOCKTABLE;
+          DeprBook.GET(FAJnlLineTmp."Depreciation Book Code");  //*FA.n
+          FAJnlSetup.FAJnlName(DeprBook, FAJnlLine, FAJnlNextLineNo);
+          NoSeries := FAJnlSetup.GetFANoSeries(FAJnlLine);
+          IF FIND('=><') THEN
+            DocumentNo := "Document No."
+          ELSE
+            DocumentNo := FAJnlSetup.GetFAJnlDocumentNo(FAJnlLine, WORKDATE, TRUE);  //*32792.c (old: TODAY)
+        END;
+        IF FAJnlLineTmp.FIND('-') THEN
+          REPEAT
+            INIT;
+            "Line No." := 0;
+            FAJnlSetup.SetFAJnlTrailCodes(FAJnlLine);
+            LineNo := LineNo + 1;
+            "Posting Date" := FAJnlLineTmp."Posting Date";
+            "FA Posting Date" := FAJnlLineTmp."FA Posting Date";
+            "FA Posting Type" := FAJnlLineTmp."FA Posting Type";
+            VALIDATE("FA No.", FAJnlLineTmp."FA No.");
+            "Document No." := DocumentNo;
+            "Posting No. Series" := NoSeries;
+            Description := FAJnlLineTmp.Description;
+            //VALIDATE("Depreciation Book Code", FASetup."Default Depr. Book");  //*FA.o
+            VALIDATE("Depreciation Book Code", FAJnlLineTmp."Depreciation Book Code");  //*FA.n
+            VALIDATE(Amount, FAJnlLineTmp.Amount);
+            FAJnlNextLineNo := FAJnlNextLineNo + 10000;
+            "Line No." := FAJnlNextLineNo;
+            INSERT(TRUE);
+            IF FAJnlLineTmp."Reason Code" <> '' THEN BEGIN  //DP00241
+              "Reason Code" := FAJnlLineTmp."Reason Code";
+              MODIFY;
+            END;
+          UNTIL (FAJnlLineTmp.NEXT = 0);
+      END;
+
+      WITH GenJnlLine DO BEGIN
+        IF GenJnlLineTmp.FIND('-') THEN BEGIN
+          LOCKTABLE;
+          DeprBook.GET(GenJnlLineTmp."Depreciation Book Code");  //*FA.n
+          FAJnlSetup.GenJnlName(DeprBook,GenJnlLine,GenJnlNextLineNo);
+          IF TmpGenJnlBatchWithLines.GET(GenJnlLine."Journal Template Name", GenJnlLine."Journal Batch Name") THEN  //C026143
+            ERROR(Text015, OrderRec.TABLECAPTION, OrderRec."No.", GenJnlLine."Journal Template Name", GenJnlLine."Journal Batch Name");
+          NoSeries := FAJnlSetup.GetGenNoSeries(GenJnlLine);
+          IF FIND('=><') THEN
+            DocumentNo := "Document No."
+          ELSE
+            DocumentNo := FAJnlSetup.GetGenJnlDocumentNo(GenJnlLine, WORKDATE, TRUE);  //*32792.c (old: TODAY)
+        END;
+        IF GenJnlLineTmp.FIND('-') THEN BEGIN
+          REPEAT
+            INIT;
+            "Line No." := 0;
+            FAJnlSetup.SetGenJnlTrailCodes(GenJnlLine);
+            LineNo := LineNo + 1;
+
+            "System-Created Entry" := TRUE;  //29276
+            "Posting Date" := GenJnlLineTmp."Posting Date";
+            "FA Posting Date" := GenJnlLineTmp."FA Posting Date";
+            "FA Posting Type" := GenJnlLineTmp."FA Posting Type";
+            "Account Type" := "Account Type"::"Fixed Asset";
+            VALIDATE("Account No.",GenJnlLineTmp."Account No.");
+            Description := GenJnlLineTmp.Description;
+            "Document No." := DocumentNo;
+            "Posting No. Series" := NoSeries;
+            //VALIDATE("Depreciation Book Code", FASetup."Default Depr. Book");  //*FA.o
+            VALIDATE("Depreciation Book Code", GenJnlLineTmp."Depreciation Book Code");  //*FA.n
+            VALIDATE(Amount, GenJnlLineTmp.Amount);
+            "No. of Depreciation Days" := GenJnlLineTmp."No. of Depreciation Days";
+            "FA Error Entry No." := GenJnlLineTmp."FA Error Entry No.";
+            GenJnlNextLineNo := GenJnlNextLineNo + 10000;
+            "Line No." := GenJnlNextLineNo;
+
+            // Balance account
+            lRecFixedAsset.GET(GenJnlLineTmp."Account No.");
+            //lRecFixedAsset.TESTFIELD("FA Posting Group");  //*FA.o
+            //lRecFA_PostingGroup.GET(lRecFixedAsset."FA Posting Group");  //*FA.o
+            lRecFA_PostingGroup.GET(GenJnlLineTmp."Posting Group");  //*FA.n
+            lRecFA_PostingGroup.TESTFIELD(lRecFA_PostingGroup."Write-Down Bal. Acc. on Disp.");
+            "Bal. Account Type" := "Bal. Account Type"::"G/L Account";
+            VALIDATE("Bal. Account No.", lRecFA_PostingGroup."Write-Down Bal. Acc. on Disp.");
+            GenJnlLine."Cost Component Plant" := lRecFixedAsset."Global Dimension 2 Code";
+            INSERT(TRUE);
+            IF GenJnlLineTmp."Reason Code" <> '' THEN BEGIN  //DP00241
+              "Reason Code" := GenJnlLineTmp."Reason Code";
+              MODIFY;
+            END;
+          UNTIL (GenJnlLineTmp.NEXT = 0);
+          lCduGenJnlPost.Background(TRUE);
+          GenJnlLine.SETRANGE("Document No.", DocumentNo);
+          lCduGenJnlPost.RUN(GenJnlLine);
+        END;
+      END;
+
+      //29996.sn
+      TmpFAProcessed.RESET;
+      TmpFAProcessed.SETRANGE("Budgeted Asset", TRUE);  // Used more than once
+      IF TmpFAProcessed.FINDSET THEN BEGIN
+        FADeprBook.RESET;
+        REPEAT
+          FADeprBook.SETRANGE("FA No.", TmpFAProcessed."No.");
+          FADeprBook.SETRANGE("Disposal Date", 0D);
+          IF FADeprBook.FINDSET(TRUE,FALSE) THEN BEGIN
+            REPEAT
+              FADeprBook.CALCFIELDS("Book Value");
+              IF (FADeprBook."Book Value" = 0) THEN BEGIN
+                IF TmpFAProcessed.GetQuantity(FADeprBook."Depreciation Book Code", FALSE) = 0 THEN BEGIN
+                  FADeprBook."Disposal Date" := TmpFAProcessed."Warranty Date";
+                  FADeprBook.MODIFY;
+                END;
+              END;
+            UNTIL FADeprBook.NEXT = 0;
+          END;
+        UNTIL TmpFAProcessed.NEXT = 0;
+      END;
+      TmpFAProcessed.RESET;
+      TmpFAProcessed.DELETEALL;
+      //29996.en
+    END;
+
+    PROCEDURE DetermineFAPostingDate@1100409001(FANo@1210190003 : Code[20];DeprBookCde@1100409000 : Code[10];ExitDate@1100409001 : Date) FAPostingDate : Date;
+    VAR
+      FALedgEntry@1210190000 : Record 5601;
+      MonthNo@1100409002 : Integer;
+      YearNo@1100409003 : Integer;
+    BEGIN
+      //*C002176.n
+      FAPostingDate := ExitDate;
+      WITH FALedgEntry DO BEGIN
+        SETCURRENTKEY("FA No.","Depreciation Book Code","Part of Book Value","FA Posting Date");
+        SETRANGE("FA No.", FANo);
+        SETRANGE("Depreciation Book Code", DeprBookCde);
+        SETRANGE("Part of Book Value", TRUE);
+        SETFILTER("FA Posting Date", '%1..',  FAPostingDate + 1);
+        SETRANGE("Reclassification Entry", FALSE);
+        IF FINDLAST THEN
+          FAPostingDate := "FA Posting Date";
+        SETRANGE("Part of Book Value");  // Reset filter
+
+        SETCURRENTKEY("FA No.","Depreciation Book Code","Part of Depreciable Basis","FA Posting Date");
+        SETFILTER("FA Posting Date", '%1..',  FAPostingDate + 1);  // Must be set again, FAPostingDate can be changed
+        SETRANGE("Part of Depreciable Basis", TRUE);
+        IF FINDLAST THEN
+          FAPostingDate := "FA Posting Date";
+      END;
+
+      YearNo := DATE2DMY(TODAY, 3);
+      MonthNo := DATE2DMY(TODAY, 2) + 1;
+      IF MonthNo > 12 THEN BEGIN
+        MonthNo := 1;
+        YearNo := YearNo + 1;
+      END;
+      IF (FAPostingDate > ExitDate) AND (FAPostingDate > DMY2DATE(1, MonthNo, YearNo) - 1) THEN BEGIN
+        // Increase FA Posting Date maximal to the end of the current month
+        FAPostingDate := DMY2DATE(1, MonthNo, YearNo) - 1;
+        IF FAPostingDate < ExitDate THEN
+          FAPostingDate := ExitDate;
+      END;
+    END;
+
+    PROCEDURE CheckFAPostingAllowed@1210190003(IFANo@1210190003 : Code[20];DeprBookCde@1100409000 : Code[10];FAPostingDate@1100409001 : Date);
+    VAR
+      lvFALedgEntryRec@1210190000 : Record 5601;
+      lvFADeprBookRec@1210190002 : Record 5612;
+    BEGIN
+      //IF NOT PlantSetup."Exit-order Special Check FA" THEN  //C002176.o
+      //  EXIT;
+
+      WITH lvFADeprBookRec DO BEGIN
+        SETRANGE("FA No.", IFANo);
+        //SETRANGE("Depreciation Book Code", FASetup."Default Depr. Book");  //*C002176.o
+        SETRANGE("Depreciation Book Code", DeprBookCde);  //*C002176.n
+        IF FINDFIRST THEN BEGIN
+          lvFALedgEntryRec."FA Posting Type" := lvFALedgEntryRec."FA Posting Type"::"Acquisition Cost";
+          IF ("Acquisition Date" = 0D) THEN
+            ERROR(Text005, lvFALedgEntryRec."FA Posting Type", FIELDCAPTION("FA No."),"FA No.");
+          IF ("Disposal Date" > 0D) THEN
+            ERROR(Text006, FIELDCAPTION("FA No."),"FA No.");
+        END;
+      END;
+
+      WITH lvFALedgEntryRec DO BEGIN
+        SETCURRENTKEY("FA No.","Depreciation Book Code","FA Posting Date");
+        SETRANGE("FA No.",IFANo);
+        //SETRANGE("Depreciation Book Code", FASetup."Default Depr. Book");  //*C002176.o
+        SETRANGE("Depreciation Book Code", DeprBookCde);  //*C002176.n
+        IF FINDFIRST THEN
+          IF "FA Posting Type" <> "FA Posting Type"::"Acquisition Cost" THEN BEGIN
+            "FA Posting Type" := "FA Posting Type"::"Acquisition Cost";
+            ERROR(Text005, "FA Posting Type", FIELDCAPTION("FA No."),"FA No.");
+          END;
+
+        SETCURRENTKEY("FA No.","Depreciation Book Code","Part of Book Value","FA Posting Date");
+        SETRANGE("Part of Book Value",TRUE);
+        //SETFILTER("FA Posting Date", '%1..', OrderLineRec."Exit-date" + 1);  //*C002176.o
+        SETFILTER("FA Posting Date", '%1..', FAPostingDate + 1);  //*C002176.n
+        SETRANGE("Reclassification Entry", FALSE);   //*M29584
+        IF FINDFIRST THEN
+          ERROR(Text007, lvFADeprBookRec.FIELDCAPTION("Disposal Date"), FIELDCAPTION("FA No."),"FA No.");
+
+        SETRANGE("Part of Book Value");
+        SETCURRENTKEY("FA No.","Depreciation Book Code","Part of Depreciable Basis","FA Posting Date");
+        SETRANGE("Part of Depreciable Basis",TRUE);
+        IF FINDFIRST THEN
+          ERROR(Text007, lvFADeprBookRec.FIELDCAPTION("Disposal Date"), FIELDCAPTION("FA No."),"FA No.");
+      END;
+    END;
+
+    LOCAL PROCEDURE DetermineMainFADeprBook@1100530001(FA_No@1100530001 : Code[20]);
+    VAR
+      FA@1100530000 : Record 5600;
+      DeprBook2@1100530002 : Record 5611;
+    BEGIN
+      MainDeprBookCode := FA.GetFA_MainDeprBook(FA_No, TRUE);
+
+      DeprBook2.GET(MainDeprBookCode);
+      DeprBook2.TESTFIELD("G/L Integration - Acq. Cost", TRUE);
+      DeprBook2.TESTFIELD("G/L Integration - Depreciation", TRUE);
+      DeprBook2.TESTFIELD("G/L Integration - Disposal", TRUE);
+    END;
+
+    PROCEDURE PostRemovalExternalRentedPlant@1100485002();
+    VAR
+      lvExitBulkPlantRec@1100485001 : Record 11012592;
+      lvPlantNoRec@1100485004 : Record 11012552;
+      lvRentEntryRec@1100485003 : Record 11012535;
+      lvExternalRentMgtCU@1100485000 : Codeunit 11012578;
+      lvQuantity@1100485002 : Decimal;
+    BEGIN
+      WITH OrderLineRec DO BEGIN
+        IF (NOT Bulk) THEN BEGIN
+          lvRentEntryRec.SETRANGE(Removed, FALSE);
+          lvRentEntryRec.SETRANGE("Vendor No.", OrderLineRec."Vendor No.");
+          lvRentEntryRec.SETRANGE("Plant Type", "Plant Type");
+          lvRentEntryRec.SETRANGE("Plant No.", "No.");
+          IF NOT lvRentEntryRec.FINDFIRST THEN
+            lvQuantity := 0
+          ELSE BEGIN
+            lvRentEntryRec.SETFILTER("Date Filter", '..%1', "Exit-date");
+            lvRentEntryRec.CALCFIELDS("Cum. Qty. Vendor-Plant No.");
+            lvQuantity := lvRentEntryRec."Cum. Qty. Vendor-Plant No.";
+          END;
+          OrderLineRec.DeleteExitOrderBulkPlant();
+          lvExternalRentMgtCU.ProcessExitOrderExternal(
+            OrderLineRec."Vendor No.", "Plant Type", "No.", "Exit-order No.", "Line No.", Quantity, "Exit-date");
+        END ELSE BEGIN
+          IF ("No." > '0') THEN BEGIN
+            //* Automatisch opvoeren bij extern bulk materieel met 'No.' gevuld (kan ook niet handmatig ingegeven worden bij
+            //* de exitorder). Eerst evt. aanwezige regels verwijderen.
+            OrderLineRec.DeleteExitOrderBulkPlant();
+            lvExitBulkPlantRec.INIT;
+            lvExitBulkPlantRec."Exit-order No." := "Exit-order No.";
+            lvExitBulkPlantRec."Exit-order Line No." := "Line No.";
+            lvExitBulkPlantRec."Line No." := 10000;
+            lvExitBulkPlantRec."Plant Type" := "Plant Type";
+            lvExitBulkPlantRec.External := TRUE;
+            lvExitBulkPlantRec."Plant No." := "No.";
+            lvExitBulkPlantRec.Quantity := Quantity;
+            lvExitBulkPlantRec."Disposed Fixed Asset" := '';
+            lvExitBulkPlantRec.INSERT;
+          END;
+          CALCFIELDS("Quantity Bulk Plant");
+          TESTFIELD("Quantity Bulk Plant", Quantity);
+          lvExitBulkPlantRec.RESET;
+          lvExitBulkPlantRec.SETRANGE("Exit-order No.", "Exit-order No.");
+          lvExitBulkPlantRec.SETRANGE("Exit-order Line No.", "Line No.");
+          lvExitBulkPlantRec.FINDSET(FALSE, FALSE);
+          REPEAT
+            lvExitBulkPlantRec.TESTFIELD("Plant Type", "Plant Type");
+            lvExitBulkPlantRec.TESTFIELD("Plant No.");
+            lvExitBulkPlantRec.TESTFIELD(Quantity);
+            lvPlantNoRec.GET(lvExitBulkPlantRec."Plant Type", lvExitBulkPlantRec."Plant No.");
+            lvPlantNoRec.TESTFIELD(Posted, TRUE);
+            lvQuantity := lvExitBulkPlantRec.GetExternalRentQuantity();
+            IF lvExitBulkPlantRec.Quantity > lvQuantity THEN
+              lvExitBulkPlantRec.FIELDERROR(Quantity,
+               STRSUBSTNO(Text009, lvExitBulkPlantRec.Quantity, lvQuantity, "Exit-date", OrderLineRec."Vendor No."));
+            lvExternalRentMgtCU.ProcessExitOrderExternal(OrderLineRec."Vendor No.", "Plant Type",
+              lvExitBulkPlantRec."Plant No.", "Exit-order No.", "Line No.", lvExitBulkPlantRec.Quantity, "Exit-date");
+          UNTIL lvExitBulkPlantRec.NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE CreateItemJnlLine@1100485000();
+    VAR
+      ItemJnlTemplate@1100485001 : Record 82;
+      ItemJnlBatch@1100485002 : Record 233;
+      ItemRec@1100485003 : Record 27;
+      ItemCostMgt@1100485005 : Codeunit 5804;
+      NextLineNo@1100485000 : Integer;
+      AverageCostLCY@1100485004 : Decimal;
+      DummyDec@1100485006 : Decimal;
+    BEGIN
+      WITH OrderLineRec DO BEGIN
+        TESTFIELD("Item No.");
+        OrderRec.TESTFIELD(Type, OrderRec.Type::Sales);
+
+        PlantSetup.TESTFIELD("Item Journal Template");
+        PlantSetup.TESTFIELD("Item Journal Batch");
+
+        ItemJnlTemplate.GET(PlantSetup."Item Journal Template");
+        ItemJnlBatch.GET(PlantSetup."Item Journal Template", PlantSetup."Item Journal Batch");
+        ItemRec.GET("Item No.");
+
+        ItemJnlLine.LOCKTABLE;
+        ItemJnlLine.RESET;
+        ItemJnlLine.SETRANGE("Journal Template Name",PlantSetup."Item Journal Template");
+        ItemJnlLine.SETRANGE("Journal Batch Name",PlantSetup."Item Journal Batch");
+        IF ItemJnlLine.FINDLAST THEN
+          NextLineNo := ItemJnlLine."Line No." + 1
+        ELSE
+          NextLineNo := 1;
+        IF FirstItemJnlLine = 0 THEN
+          FirstItemJnlLine := NextLineNo;
+        LastItemJnLine := NextLineNo;
+
+        ItemJnlLine.INIT;
+        ItemJnlLine."Journal Template Name" := PlantSetup."Item Journal Template";
+        ItemJnlLine."Journal Batch Name" := PlantSetup."Item Journal Batch";
+        ItemJnlLine."Line No." := NextLineNo;
+        ItemJnlLine."Document No." := "Exit-order No.";
+        ItemJnlLine."Document Date" := WORKDATE;  //*32792.c (old: TODAY)
+        ItemJnlLine."Posting Date" := "Exit-date";
+        ItemJnlLine."Entry Type" := ItemJnlLine."Entry Type"::Purchase;
+        ItemJnlLine."Location Code" := "Location Code";
+        ItemJnlLine."Source Code" := ItemJnlTemplate."Source Code";
+        ItemJnlLine."Reason Code" := ItemJnlBatch."Reason Code";
+        ItemJnlLine."Posting No. Series" := ItemJnlBatch."Posting No. Series";
+
+        ItemJnlLine.VALIDATE("Item No.","Item No.");
+        ItemJnlLine.VALIDATE("Unit of Measure Code","Unit of Measure");
+        ItemJnlLine.VALIDATE(Quantity,Quantity);
+
+        CASE PlantSetup."Value Items" OF
+          PlantSetup."Value Items"::Default:;
+          PlantSetup."Value Items"::"Unit Cost":
+            ItemJnlLine.VALIDATE("Unit Amount",ItemRec."Unit Cost");
+          PlantSetup."Value Items"::"Standard Cost":
+            ItemJnlLine.VALIDATE("Unit Amount",ItemRec."Standard Cost");
+          PlantSetup."Value Items"::"Average Cost":
+            BEGIN
+              ItemCostMgt.CalculateAverageCost(ItemRec,AverageCostLCY,DummyDec);
+              ItemJnlLine.VALIDATE("Unit Amount",AverageCostLCY);
+            END;
+          PlantSetup."Value Items"::"Last Direct Cost":
+            ItemJnlLine.VALIDATE("Unit Amount",ItemRec."Last Direct Cost");
+        END;
+
+        ItemJnlLine.Description := Description;
+        ItemJnlLine.INSERT;
+
+      END;
+    END;
+
+    PROCEDURE PostItemJnl@1100485001();
+    VAR
+      lCduItemJnlPostBatch@1100485000 : Codeunit 23;
+    BEGIN
+      IF FirstItemJnlLine = 0 THEN
+        EXIT;
+
+      ItemJnlLine.RESET;
+      ItemJnlLine.SETRANGE("Journal Template Name",PlantSetup."Item Journal Template");
+      ItemJnlLine.SETRANGE("Journal Batch Name",PlantSetup."Item Journal Batch");
+      ItemJnlLine.SETRANGE("Line No.", FirstItemJnlLine, LastItemJnLine);
+
+      lCduItemJnlPostBatch.RUN(ItemJnlLine);
+
+      FirstItemJnlLine := 0;
+      LastItemJnLine := 0;
+    END;
+
+    PROCEDURE CheckLinkWithPlantOrderLine@1100485003(ExitOrderLine@1100529001 : Record 11012560);
+    VAR
+      lvText000@1100485001 : TextConst 'ENU=Exit-order ''%1'' is linkt to Plant Order ''%2'', this Plant Order is not posted yet.';
+      PlantOrderLine@1100529000 : Record 11012557;
+    BEGIN
+      //DP00183.so
+      //lvPlantOrderRec.SETCURRENTKEY(Posted);
+      //lvPlantOrderRec.SETRANGE(Posted, FALSE);
+      //lvPlantOrderRec.SETRANGE("Exit Order No.", OrderRec."No.");
+      //IF lvPlantOrderRec.FINDFIRST THEN  //* Exit-ordernummer mag niet meer aanwezig zijn bij niet-geboekte materieelorders.
+      //  ERROR(lvText000, OrderRec."No.", lvPlantOrderRec."No.");
+      //DP00183.eo
+
+      //DP00183.sn  Relation Exit Order / Plant Order now on line level
+      PlantOrderLine.SETCURRENTKEY("Exit Order No.", "Exit Order Line No.");
+      PlantOrderLine.SETRANGE("Exit Order No.", ExitOrderLine."Exit-order No.");
+      PlantOrderLine.SETRANGE("Exit Order Line No.", ExitOrderLine."Line No.");
+      PlantOrderLine.SETRANGE(Posted, FALSE);
+      IF PlantOrderLine.FINDFIRST THEN
+        ERROR(lvText000, ExitOrderLine."Exit-order No.", PlantOrderLine."Plant Order No.");
+      //DP00183.en
+    END;
+
+    PROCEDURE CloseVehicle@1100529000(ExitOrderLine@1100529000 : Record 11012560);
+    VAR
+      Vehicle@1100529001 : Record 11072667;
+      VehicleDriver@1100529002 : Record 11072668;
+      LeaseContract@1100529003 : Record 11012540;
+    BEGIN
+      //DP00331
+      IF NOT Vehicle.GET(OrderLineRec."Plant Type", OrderLineRec."No.") THEN
+        EXIT;
+      VehicleDriver.SETRANGE("Plant Type", OrderLineRec."Plant Type");
+      VehicleDriver.SETRANGE("Plant No.", OrderLineRec."No.");
+      IF VehicleDriver.FINDLAST THEN BEGIN
+        IF VehicleDriver."Ending Date" = 0D THEN BEGIN
+          VehicleDriver."Ending Date" := OrderLineRec."Exit-date";
+          IF VehicleDriver."Ending Date" < VehicleDriver."Starting Date" THEN
+            VehicleDriver."Ending Date" := VehicleDriver."Starting Date";
+          VehicleDriver.MODIFY;
+        END;
+      END;
+      LeaseContract.SETRANGE("Plant Type", OrderLineRec."Plant Type");
+      LeaseContract.SETRANGE("Plant No.", OrderLineRec."No.");
+      IF LeaseContract.FINDLAST THEN BEGIN
+        IF LeaseContract."Contract End" = 0D THEN BEGIN
+          LeaseContract."Contract End" := OrderLineRec."Exit-date";
+          IF LeaseContract."Contract End" < LeaseContract."Contract Start" THEN
+            LeaseContract."Contract End" := LeaseContract."Contract Start";
+          LeaseContract.MODIFY;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE ConfirmNegStock@1100525000(ExitOrder@1100525001 : Record 11012559) : Boolean;
+    VAR
+      ExitOrderLine@1100525000 : Record 11012560;
+    BEGIN
+      //C024227
+      WITH ExitOrderLine DO BEGIN
+        SETRANGE("Exit-order No.", ExitOrder."No.");
+        SETRANGE(Type, OrderLineRec.Type::Plant);
+        IF FINDSET() THEN BEGIN
+          REPEAT
+            CALCFIELDS(Bulk);
+            OrderLineRec := ExitOrderLine;
+            IF CheckNegativeStockAllowed() THEN BEGIN
+              IF PlantSetup."Rate Codes" OR ("From Rate Code" <> '') THEN BEGIN
+                CALCFIELDS("Stock Rate Code on Location");
+                IF Quantity > "Stock Rate Code on Location" THEN BEGIN
+                  IF NOT CONFIRM(STRSUBSTNO(Text011, "Plant Type", "No.", "From Rate Code") + ' \' + Text014) THEN
+                    EXIT(FALSE);
+                END;
+              END ELSE BEGIN
+                CALCFIELDS("Stock Plant No. on Location");
+                IF Quantity > "Stock Plant No. on Location" THEN BEGIN
+                  IF NOT CONFIRM(STRSUBSTNO(Text003, "Plant Type", "No.") + ' \' + Text014) THEN
+                    EXIT(FALSE);
+                END;
+              END;
+            END;
+          UNTIL NEXT = 0;
+        END;
+      END;
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE FillTmpTemplateBatchWithLines@1100525001();
+    VAR
+      FAJnlSetup@1100525000 : Record 5605;
+      GenJournalLine@1100525002 : Record 81;
+    BEGIN
+      //C026143
+      TmpGenJnlBatchWithLines.RESET;
+      TmpGenJnlBatchWithLines.DELETEALL;
+      IF (NOT PlantSetup."Integration Fixed Assets") OR (NOT PlantSetup."Block Post Exit if FA G/L Jnl.") THEN
+        EXIT;
+
+      FAJnlSetup.SETFILTER("Depreciation Book Code", '<>%1', '');
+      FAJnlSetup.SETFILTER("Gen. Jnl. Template Name", '<>%1', '');
+      FAJnlSetup.SETFILTER("Gen. Jnl. Batch Name", '<>%1', '');
+      IF FAJnlSetup.FINDSET THEN BEGIN
+        REPEAT
+          IF NOT TmpGenJnlBatchWithLines.GET(FAJnlSetup."Gen. Jnl. Template Name", FAJnlSetup."Gen. Jnl. Batch Name") THEN BEGIN
+            TmpGenJnlBatchWithLines."Journal Template Name" := FAJnlSetup."Gen. Jnl. Template Name";
+            TmpGenJnlBatchWithLines.Name := FAJnlSetup."Gen. Jnl. Batch Name";
+            TmpGenJnlBatchWithLines.INSERT;
+          END;
+        UNTIL FAJnlSetup.NEXT = 0;
+      END;
+
+      IF TmpGenJnlBatchWithLines.FINDSET THEN BEGIN
+        REPEAT
+          GenJournalLine.SETRANGE("Journal Template Name", TmpGenJnlBatchWithLines."Journal Template Name");
+          GenJournalLine.SETRANGE("Journal Batch Name", TmpGenJnlBatchWithLines.Name);
+          IF GenJournalLine.ISEMPTY THEN
+            TmpGenJnlBatchWithLines.DELETE;
+        UNTIL TmpGenJnlBatchWithLines.NEXT = 0;
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

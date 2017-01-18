@@ -1,0 +1,732 @@
+OBJECT Codeunit 11012156 Target Amount Management
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Hours@1210190007 : Decimal;
+      Labor@1210190006 : Decimal;
+      Material@1210190005 : Decimal;
+      Subcontracting@1210190004 : Decimal;
+      Plant@1210190003 : Decimal;
+      Total@1210190002 : Decimal;
+      SubLevelTargetHours@1210190001 : Decimal;
+      SubLevelTargetAmtLabor@1210190015 : Decimal;
+      SubLevelTargetAmtMaterial@1210190014 : Decimal;
+      SubLevelTargetAmtSubcontr@1210190013 : Decimal;
+      SubLevelTargetAmtPlant@1210190012 : Decimal;
+      FactorHours@1210190009 : Decimal;
+      FactorMaterial@1210190000 : Decimal;
+      FactorSubcontr@1210190010 : Decimal;
+      FactorPlant@1210190011 : Decimal;
+      Text000@1210190008 : TextConst 'ENU=and ''%1'' may not be filled both';
+      Text001@1210190016 : TextConst 'ENU=can not be calculatited, new Adjusment Factor ''%1'' not allowed';
+      Text002@1210190017 : TextConst 'ENU=can not be calculated, remaining amount (%1) can not be divided';
+      Text003@1210190018 : TextConst 'ENU=can not be calculated, remaining hours (%1) can not be divided';
+
+    PROCEDURE CalculateAdjustmentFactor@1210190003(IEstNo@1210190000 : Code[20]);
+    VAR
+      lvSubEstRec@1210190009 : Record 11012152;
+      lvEstPartRec@1210190008 : Record 11012153;
+      lvTargetAmtRec@1210190001 : Record 11012199;
+      lvCounterType@1210190011 : Integer;
+      lvCounterLevel@1210190012 : Integer;
+      lvMaxLevel@1210190013 : Integer;
+      lvHours@1210190006 : Decimal;
+      lvLabor@1210190005 : Decimal;
+      lvMaterial@1210190004 : Decimal;
+      lvSubcontracting@1210190003 : Decimal;
+      lvPlant@1210190002 : Decimal;
+      lvTotal@1210190007 : Decimal;
+      lvAdjFactHours@1210190010 : Decimal;
+      lvAdjFactMaterial@1210190015 : Decimal;
+      lvAdjFactSubcontr@1210190016 : Decimal;
+      lvAdjFactPlant@1210190017 : Decimal;
+    BEGIN
+      //* Bereken de correctiefactoren van een calculatie op basis van de streefbedragen. Begin op het laagste niveau (onderdelen,
+      //* op niveau 3).
+      //* Opmerking:
+      //*   Doordat de bedragen in de calculatieregel worden afgerond ontstaan er vaak afrondingsverschillen tussen het ingegeven
+      //*   streefbedrag en het berekende streefbedrag. Dit is geen probleem (volgens JH) want streefbedragen worden gebruikt
+      //*   als methode om voor een bepaald niveau op een bepaald bedrag uit te komen, waarbij het verschil evenredig over
+      //*   over de bijbehorende calculatieregels wordt verdeeld. Het is niet bedoeld om op mooi afgeronde bedragen uit te komen.
+
+      WITH lvTargetAmtRec DO BEGIN
+        SETRANGE("Estimate No.", IEstNo);
+        FOR lvCounterType := 2 DOWNTO 1 DO BEGIN
+          CASE lvCounterType OF
+            1:
+              BEGIN
+                lvMaxLevel := 1;
+                SETRANGE(Type, Type::"Sub-Estimate");
+              END;
+            2:
+              BEGIN
+                lvMaxLevel := 3;
+                SETRANGE(Type, Type::Part);
+              END;
+          END;
+          SETRANGE("Level (Sub-Estimate)");  //* Reset filter
+          SETRANGE("Level (Part)");  //* Reset filter
+          FOR lvCounterLevel := lvMaxLevel DOWNTO 0 DO BEGIN
+            CASE lvCounterType OF
+              1: SETRANGE("Level (Sub-Estimate)", lvCounterLevel);
+              2: SETRANGE("Level (Part)", lvCounterLevel);
+            END;
+            IF FIND('-') THEN BEGIN
+              REPEAT
+                IF ("Target Hours" <> 0) AND ("Target Amount Labor" <> 0) THEN
+                  FIELDERROR("Target Hours", STRSUBSTNO(Text000, FIELDCAPTION("Target Amount Labor")));
+                IF ("Target Hours" <> 0) OR ("Target Amount Labor" <> 0) OR
+                   ("Target Amount Material" <> 0) OR ("Target Amount Subcontracting" <> 0) OR ("Target Amount Plant" <> 0)
+                THEN BEGIN
+                  CalcFieldsAmounts(lvTargetAmtRec, lvHours, lvLabor, lvMaterial, lvSubcontracting, lvPlant, lvTotal,FALSE);
+                  CASE Type OF
+                    Type::"Sub-Estimate":
+                      BEGIN
+                        lvSubEstRec.GET("Estimate No.", "Sub-Estimate No.");
+                        lvAdjFactHours := lvSubEstRec."Adjustment Factor Hours";
+                        lvAdjFactMaterial := lvSubEstRec."Adjustment Factor Material";
+                        lvAdjFactSubcontr := lvSubEstRec."Adjustment Factor Subcontr.";
+                        lvAdjFactPlant := lvSubEstRec."Adjustment Factor Plant";
+                      END;
+                    Type::Part:
+                      BEGIN
+                        lvEstPartRec.GET("Estimate No.", "Sub-Estimate No.", "Part Group", Part);
+                        lvAdjFactHours := lvEstPartRec."Adjustment Factor Hours";
+                        lvAdjFactMaterial := lvEstPartRec."Adjustment Factor Material";
+                        lvAdjFactSubcontr := lvEstPartRec."Adjustment Factor Subcontr.";
+                        lvAdjFactPlant := lvEstPartRec."Adjustment Factor Plant";
+                      END;
+                  END;
+
+                  //* Eerst streefbedragen op onderligende niveaus bepalen. Daarna de nieuwe correctiefactor berekenen voor het
+                  //* resterende deel. De correctiefactor op het huidige niveau wordt vermenigvuldigd met de factor, daarom
+                  //* moeten op de onderliggende niveaus met een streefbedrag de correctiefactoren gedeeld worden door dezelfde
+                  //* factor, zodat het reeds berekende (streef)bedrag op het onderliggende niveau gelijk blijft.
+                  DetermineTargetAmtSubLevels(lvTargetAmtRec);
+                  IF ("Target Hours" <> 0) THEN
+                    FactorHours := CheckAndCalculateNewFactor(
+                      lvTargetAmtRec, 0, "Target Hours", lvHours, SubLevelTargetHours, lvAdjFactHours)
+                  ELSE
+                    FactorHours := CheckAndCalculateNewFactor(
+                      lvTargetAmtRec, 0, "Target Amount Labor", lvLabor, SubLevelTargetAmtLabor, lvAdjFactHours);
+                  FactorMaterial := CheckAndCalculateNewFactor(
+                    lvTargetAmtRec, 0, "Target Amount Material", lvMaterial, SubLevelTargetAmtMaterial, lvAdjFactMaterial);
+                  FactorSubcontr := CheckAndCalculateNewFactor(
+                    lvTargetAmtRec, 0, "Target Amount Subcontracting",lvSubcontracting,SubLevelTargetAmtSubcontr,lvAdjFactSubcontr);
+                  FactorPlant := CheckAndCalculateNewFactor(
+                    lvTargetAmtRec, 0, "Target Amount Plant", lvPlant, SubLevelTargetAmtPlant, lvAdjFactPlant);
+
+                  IF (FactorHours <> 0) OR (FactorMaterial <> 0) OR (FactorSubcontr <> 0) OR (FactorPlant <> 0) THEN BEGIN
+                    UpdateSubLevelsWithTarget(lvTargetAmtRec);
+                    CASE Type OF
+                      Type::"Sub-Estimate":
+                        BEGIN
+                          lvSubEstRec."Adjustment Factor Hours" := lvAdjFactHours;
+                          lvSubEstRec."Adjustment Factor Material" := lvAdjFactMaterial;
+                          lvSubEstRec."Adjustment Factor Subcontr." := lvAdjFactSubcontr;
+                          lvSubEstRec."Adjustment Factor Plant" := lvAdjFactPlant;
+                          lvSubEstRec.ProcessAdjustmentFactor(0);  //* In de functie zit ook de 'MODIFY' van deze tabel
+                        END;
+                      Type::Part:
+                        BEGIN
+                          lvEstPartRec."Adjustment Factor Hours" := lvAdjFactHours;
+                          lvEstPartRec."Adjustment Factor Material" := lvAdjFactMaterial;
+                          lvEstPartRec."Adjustment Factor Subcontr." := lvAdjFactSubcontr;
+                          lvEstPartRec."Adjustment Factor Plant" := lvAdjFactPlant;
+                          lvEstPartRec.ProcessAdjustmentFactor(0);  //* In de functie zit ook de 'MODIFY' van deze tabel
+                        END;
+                    END;
+                  END;
+
+                END;
+              UNTIL NEXT = 0;
+            END;
+          END;
+        END;
+      END;
+    END;
+
+    PROCEDURE DetermineTargetAmtSubLevels@1210190004(ITargetAmtRec@1210190000 : Record 11012199);
+    VAR
+      lvDoHours@1210190002 : Boolean;
+      lvDoLabor@1210190003 : Boolean;
+      lvDoMaterial@1210190004 : Boolean;
+      lvDoSubcontr@1210190005 : Boolean;
+      lvDoPlant@1210190006 : Boolean;
+    BEGIN
+      //* Bepalen totaal van de streefbedragen op de onderliggende niveaus. Hiervoor de hele onderliggende structuur doorlopen, maar
+      //* als er een streefbedrag is gevonden dan niet meer de daar onderliggende structuur.
+      //* NB: Hier worden niet de streefbedragen geteld maar de berekende streefbedragen (totaal van de bedragen uit de calculatie-
+      //*     regels) dit heeft twee redenen:
+      //*     - Afrondingsverschillen, het berekende streefbedrag wijkt vaak iets af van het ingegeven streefbedrag
+      //*     - Bij arbeid/uren kunnen de streefuren of 'streefbedragen arbeid' ingegeven worden. Het hoeft niet zo te zijn dat
+      //*       op alle niveaus alleen maar streefuren of alleen maar 'streefbedragen arbeid' zijn ingegeven.
+
+      WITH ITargetAmtRec DO BEGIN
+        SubLevelTargetHours := 0;
+        SubLevelTargetAmtLabor := 0;
+        SubLevelTargetAmtMaterial := 0;
+        SubLevelTargetAmtSubcontr := 0;
+        SubLevelTargetAmtPlant := 0;
+        IF "Target Hours" <> 0 THEN lvDoHours := TRUE;
+        IF "Target Amount Labor" <> 0 THEN lvDoLabor := TRUE;
+        IF "Target Amount Material" <> 0 THEN lvDoMaterial := TRUE;
+        IF "Target Amount Subcontracting" <> 0 THEN lvDoSubcontr := TRUE;
+        IF "Target Amount Plant" <> 0 THEN lvDoPlant := TRUE;
+
+        CASE Type OF
+          Type::"Sub-Estimate":
+            BEGIN
+              CASE "Level (Sub-Estimate)" OF
+                0:
+                  BEGIN
+                    DoPartLevel0(FALSE, ITargetAmtRec, lvDoHours, lvDoLabor, lvDoMaterial, lvDoSubcontr, lvDoPlant);
+                    DoSubEstLevel1(FALSE, ITargetAmtRec, lvDoHours, lvDoLabor, lvDoMaterial, lvDoSubcontr, lvDoPlant);
+                  END;
+                1: DoPartLevel0(FALSE, ITargetAmtRec, lvDoHours, lvDoLabor, lvDoMaterial, lvDoSubcontr, lvDoPlant);
+              END;
+            END;
+          Type::Part:
+            BEGIN
+              CASE "Level (Part)" OF
+                0: DoPartLevel1(FALSE, ITargetAmtRec, lvDoHours, lvDoLabor, lvDoMaterial, lvDoSubcontr, lvDoPlant);
+                1: DoPartLevel2(FALSE, ITargetAmtRec, lvDoHours, lvDoLabor, lvDoMaterial, lvDoSubcontr, lvDoPlant);
+                2: DoPartLevel3(FALSE, ITargetAmtRec, lvDoHours, lvDoLabor, lvDoMaterial, lvDoSubcontr, lvDoPlant);
+                3: EXIT;
+              END;
+            END;
+        END;
+      END;
+    END;
+
+    PROCEDURE UpdateSubLevelsWithTarget@1210190000(ITargetAmtRec@1210190000 : Record 11012199);
+    VAR
+      lvDoHours@1210190009 : Boolean;
+      lvDoMaterial@1210190007 : Boolean;
+      lvDoSubcontr@1210190006 : Boolean;
+      lvDoPlant@1210190005 : Boolean;
+    BEGIN
+      //* Bijwerken correctiefactoren op de onderliggende niveaus met een streefbedrag. Hiervoor de hele onderliggende
+      //* structuur doorlopen, maar als er een streefbedrag is gevonden dan niet meer de daar onderliggende structuur.
+      //* NB: Delen door factor omdat op hoger niveau vermenigvuldigd met factor, reeds toegekend streefbedrag blijft
+      //* hierdoor gelijk.
+
+      WITH ITargetAmtRec DO BEGIN
+        IF (FactorHours <> 0) THEN lvDoHours := TRUE;
+        IF (FactorMaterial <> 0) THEN lvDoMaterial := TRUE;
+        IF (FactorSubcontr <> 0) THEN lvDoSubcontr := TRUE;
+        IF (FactorPlant <> 0) THEN lvDoPlant := TRUE;
+
+        CASE Type OF
+          Type::"Sub-Estimate":
+            BEGIN
+              CASE "Level (Sub-Estimate)" OF
+                0:
+                  BEGIN
+                    DoPartLevel0(TRUE, ITargetAmtRec, lvDoHours, FALSE, lvDoMaterial, lvDoSubcontr, lvDoPlant);
+                    DoSubEstLevel1(TRUE, ITargetAmtRec, lvDoHours, FALSE, lvDoMaterial, lvDoSubcontr, lvDoPlant);
+                  END;
+                1: DoPartLevel0(TRUE, ITargetAmtRec, lvDoHours, FALSE, lvDoMaterial, lvDoSubcontr, lvDoPlant);
+              END;
+            END;
+          Type::Part:
+            BEGIN
+              CASE "Level (Part)" OF
+                0: DoPartLevel1(TRUE, ITargetAmtRec, lvDoHours, FALSE, lvDoMaterial, lvDoSubcontr, lvDoPlant);
+                1: DoPartLevel2(TRUE, ITargetAmtRec, lvDoHours, FALSE, lvDoMaterial, lvDoSubcontr, lvDoPlant);
+                2: DoPartLevel3(TRUE, ITargetAmtRec, lvDoHours, FALSE, lvDoMaterial, lvDoSubcontr, lvDoPlant);
+                3: EXIT;
+              END;
+            END;
+        END;
+      END;
+    END;
+
+    PROCEDURE DoSubEstLevel1@1210190006(IUpdateMode@1210190012 : Boolean;ITargetAmtRec@1210190000 : Record 11012199;IDoHours@1210190002 : Boolean;IDoLabor@1210190004 : Boolean;IDoMaterial@1210190005 : Boolean;IDoSubcontr@1210190006 : Boolean;IDoPlant@1210190007 : Boolean);
+    VAR
+      lvTargetAmtRec@1210190001 : Record 11012199;
+      lvSubEstRec@1210190013 : Record 11012152;
+      lvDoHours@1210190003 : Boolean;
+      lvDoLabor@1210190008 : Boolean;
+      lvDoMaterial@1210190009 : Boolean;
+      lvDoSubcontr@1210190010 : Boolean;
+      lvDoPlant@1210190011 : Boolean;
+      lvDoModify@1210190014 : Boolean;
+    BEGIN
+      WITH lvTargetAmtRec DO BEGIN
+        SETRANGE("Estimate No.", ITargetAmtRec."Estimate No.");
+        SETRANGE("Chapter (Sub-Estimate)", ITargetAmtRec."Chapter (Sub-Estimate)");
+        SETRANGE("Level (Sub-Estimate)", 1);
+        SETRANGE(Type, Type::"Sub-Estimate");
+        IF FIND('-') THEN BEGIN
+          REPEAT
+            lvDoModify := FALSE;
+            lvDoHours := FALSE;
+            lvDoLabor := FALSE;
+            lvDoMaterial := FALSE;
+            lvDoSubcontr := FALSE;
+            lvDoPlant := FALSE;
+            IF (IDoHours AND (("Target Hours" <> 0) OR ("Target Amount Labor" <> 0)) ) OR
+               (IDoLabor AND (("Target Hours" <> 0) OR ("Target Amount Labor" <> 0)) ) OR
+               (IDoMaterial AND ("Target Amount Material" <> 0)) OR
+               (IDoSubcontr AND ("Target Amount Subcontracting" <> 0)) OR
+               (IDoPlant AND ("Target Amount Plant" <> 0))
+            THEN BEGIN
+              IF NOT IUpdateMode THEN BEGIN
+                CalcFieldsAmounts(lvTargetAmtRec, Hours, Labor, Material, Subcontracting, Plant, Total, FALSE);
+              END ELSE BEGIN
+                lvSubEstRec.GET("Estimate No.", "Sub-Estimate No.");
+                lvDoModify := TRUE;
+              END;
+            END;
+
+            IF IDoHours THEN BEGIN
+              IF ("Target Hours" <> 0) OR ("Target Amount Labor" <> 0) THEN BEGIN
+                IF NOT IUpdateMode THEN
+                  SubLevelTargetHours := SubLevelTargetHours + Hours
+                ELSE
+                  lvSubEstRec."Adjustment Factor Hours" := lvSubEstRec."Adjustment Factor Hours" / FactorHours;
+              END ELSE
+                lvDoHours := TRUE;
+            END;
+            IF IDoLabor THEN BEGIN  //* Bij UpdateMode is IDoLabor altijd FALSE.
+              IF ("Target Hours" <> 0) OR ("Target Amount Labor" <> 0) THEN
+                SubLevelTargetAmtLabor := SubLevelTargetAmtLabor + Labor
+              ELSE
+                lvDoLabor := TRUE;
+            END;
+            IF IDoMaterial THEN BEGIN
+              IF ("Target Amount Material" <> 0) THEN BEGIN
+                IF NOT IUpdateMode THEN
+                  SubLevelTargetAmtMaterial := SubLevelTargetAmtMaterial + Material
+                ELSE
+                  lvSubEstRec."Adjustment Factor Material" := lvSubEstRec."Adjustment Factor Material" / FactorMaterial;
+              END ELSE
+                lvDoMaterial := TRUE;
+            END;
+            IF IDoSubcontr THEN BEGIN
+              IF ("Target Amount Subcontracting" <> 0) THEN BEGIN
+                IF NOT IUpdateMode THEN
+                  SubLevelTargetAmtSubcontr := SubLevelTargetAmtSubcontr + Subcontracting
+                ELSE
+                  lvSubEstRec."Adjustment Factor Subcontr." := lvSubEstRec."Adjustment Factor Subcontr." / FactorSubcontr;
+              END ELSE
+                lvDoSubcontr := TRUE;
+            END;
+            IF IDoPlant THEN BEGIN
+              IF ("Target Amount Plant" <> 0) THEN BEGIN
+                IF NOT IUpdateMode THEN
+                  SubLevelTargetAmtPlant := SubLevelTargetAmtPlant + Plant
+                ELSE
+                  lvSubEstRec."Adjustment Factor Plant" := lvSubEstRec."Adjustment Factor Plant" / FactorPlant;
+              END ELSE
+                lvDoPlant := TRUE;
+            END;
+
+            IF lvDoModify THEN
+              lvSubEstRec.MODIFY;
+            IF lvDoHours OR lvDoLabor OR lvDoMaterial OR lvDoSubcontr OR lvDoPlant THEN
+              DoPartLevel0(IUpdateMode, lvTargetAmtRec, lvDoHours, lvDoLabor, lvDoMaterial, lvDoSubcontr, lvDoPlant);
+          UNTIL NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE DoPartLevel0@1210190005(IUpdateMode@1210190013 : Boolean;ITargetAmtRec@1210190000 : Record 11012199;IDoHours@1210190006 : Boolean;IDoLabor@1210190005 : Boolean;IDoMaterial@1210190004 : Boolean;IDoSubcontr@1210190003 : Boolean;IDoPlant@1210190002 : Boolean);
+    VAR
+      lvTargetAmtRec@1210190001 : Record 11012199;
+      lvEstPartRec@1210190014 : Record 11012153;
+      lvDoHours@1210190011 : Boolean;
+      lvDoLabor@1210190010 : Boolean;
+      lvDoMaterial@1210190009 : Boolean;
+      lvDoSubcontr@1210190008 : Boolean;
+      lvDoPlant@1210190007 : Boolean;
+      lvDoModify@1210190012 : Boolean;
+    BEGIN
+      WITH lvTargetAmtRec DO BEGIN
+        SETRANGE("Estimate No.", ITargetAmtRec."Estimate No.");
+        SETRANGE("Sub-Estimate No.", ITargetAmtRec."Sub-Estimate No.");
+        SETRANGE("Level (Part)", 0);
+        SETRANGE(Type, Type::Part);
+        IF FIND('-') THEN BEGIN
+          REPEAT
+            lvDoModify := FALSE;
+            lvDoHours := FALSE;
+            lvDoLabor := FALSE;
+            lvDoMaterial := FALSE;
+            lvDoSubcontr := FALSE;
+            lvDoPlant := FALSE;
+            IF (IDoHours AND (("Target Hours" <> 0) OR ("Target Amount Labor" <> 0)) ) OR
+               (IDoLabor AND (("Target Hours" <> 0) OR ("Target Amount Labor" <> 0)) ) OR
+               (IDoMaterial AND ("Target Amount Material" <> 0)) OR
+               (IDoSubcontr AND ("Target Amount Subcontracting" <> 0)) OR
+               (IDoPlant AND ("Target Amount Plant" <> 0))
+            THEN BEGIN
+              IF NOT IUpdateMode THEN BEGIN
+                CalcFieldsAmounts(lvTargetAmtRec, Hours, Labor, Material, Subcontracting, Plant, Total, FALSE);
+              END ELSE BEGIN
+                lvEstPartRec.GET("Estimate No.", "Sub-Estimate No.", "Part Group", Part);
+                lvDoModify := TRUE;
+              END;
+            END;
+
+            IF IDoHours THEN BEGIN
+              IF ("Target Hours" <> 0) OR ("Target Amount Labor" <> 0) THEN BEGIN
+                IF NOT IUpdateMode THEN
+                  SubLevelTargetHours := SubLevelTargetHours + Hours
+                ELSE
+                  lvEstPartRec."Adjustment Factor Hours" := lvEstPartRec."Adjustment Factor Hours" / FactorHours;
+              END ELSE
+                lvDoHours := TRUE;
+            END;
+            IF IDoLabor THEN BEGIN  //* Bij UpdateMode is IDoLabor altijd FALSE.
+              IF ("Target Hours" <> 0) OR ("Target Amount Labor" <> 0) THEN
+                SubLevelTargetAmtLabor := SubLevelTargetAmtLabor + Labor
+              ELSE
+                lvDoLabor := TRUE;
+            END;
+            IF IDoMaterial THEN BEGIN
+              IF ("Target Amount Material" <> 0) THEN BEGIN
+                IF NOT IUpdateMode THEN
+                  SubLevelTargetAmtMaterial := SubLevelTargetAmtMaterial + Material
+                ELSE
+                  lvEstPartRec."Adjustment Factor Material" := lvEstPartRec."Adjustment Factor Material" / FactorMaterial;
+              END ELSE
+                lvDoMaterial := TRUE;
+            END;
+            IF IDoSubcontr THEN BEGIN
+              IF ("Target Amount Subcontracting" <> 0) THEN BEGIN
+                IF NOT IUpdateMode THEN
+                  SubLevelTargetAmtSubcontr := SubLevelTargetAmtSubcontr + Subcontracting
+                ELSE
+                  lvEstPartRec."Adjustment Factor Subcontr." := lvEstPartRec."Adjustment Factor Subcontr." / FactorSubcontr;
+              END ELSE
+                lvDoSubcontr := TRUE;
+            END;
+            IF IDoPlant THEN BEGIN
+              IF ("Target Amount Plant" <> 0) THEN BEGIN
+                IF NOT IUpdateMode THEN
+                  SubLevelTargetAmtPlant := SubLevelTargetAmtPlant + Plant
+                ELSE
+                  lvEstPartRec."Adjustment Factor Plant" := lvEstPartRec."Adjustment Factor Plant" / FactorPlant;
+              END ELSE
+                lvDoPlant := TRUE;
+            END;
+
+            IF lvDoModify THEN
+              lvEstPartRec.MODIFY;
+            IF lvDoHours OR lvDoLabor OR lvDoMaterial OR lvDoSubcontr OR lvDoPlant THEN
+              DoPartLevel1(IUpdateMode, lvTargetAmtRec, lvDoHours, lvDoLabor, lvDoMaterial, lvDoSubcontr, lvDoPlant);
+          UNTIL NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE DoPartLevel1@1210190002(IUpdateMode@1210190013 : Boolean;ITargetAmtRec@1210190000 : Record 11012199;IDoHours@1210190006 : Boolean;IDoLabor@1210190005 : Boolean;IDoMaterial@1210190004 : Boolean;IDoSubcontr@1210190003 : Boolean;IDoPlant@1210190002 : Boolean);
+    VAR
+      lvTargetAmtRec@1210190001 : Record 11012199;
+      lvEstPartRec@1210190014 : Record 11012153;
+      lvDoHours@1210190011 : Boolean;
+      lvDoLabor@1210190010 : Boolean;
+      lvDoMaterial@1210190009 : Boolean;
+      lvDoSubcontr@1210190008 : Boolean;
+      lvDoPlant@1210190007 : Boolean;
+      lvDoModify@1210190012 : Boolean;
+    BEGIN
+      WITH lvTargetAmtRec DO BEGIN
+        SETRANGE("Estimate No.", ITargetAmtRec."Estimate No.");
+        SETRANGE("Sub-Estimate No.", ITargetAmtRec."Sub-Estimate No.");
+        SETRANGE("Part Group", ITargetAmtRec."Part Group");
+        SETRANGE("Level (Part)", 1);
+        SETRANGE(Type, Type::Part);
+        IF FIND('-') THEN BEGIN
+          REPEAT
+            lvDoModify := FALSE;
+            lvDoHours := FALSE;
+            lvDoLabor := FALSE;
+            lvDoMaterial := FALSE;
+            lvDoSubcontr := FALSE;
+            lvDoPlant := FALSE;
+            IF (IDoHours AND (("Target Hours" <> 0) OR ("Target Amount Labor" <> 0)) ) OR
+               (IDoLabor AND (("Target Hours" <> 0) OR ("Target Amount Labor" <> 0)) ) OR
+               (IDoMaterial AND ("Target Amount Material" <> 0)) OR
+               (IDoSubcontr AND ("Target Amount Subcontracting" <> 0)) OR
+               (IDoPlant AND ("Target Amount Plant" <> 0))
+            THEN BEGIN
+              IF NOT IUpdateMode THEN BEGIN
+                CalcFieldsAmounts(lvTargetAmtRec, Hours, Labor, Material, Subcontracting, Plant, Total, FALSE);
+              END ELSE BEGIN
+                lvEstPartRec.GET("Estimate No.", "Sub-Estimate No.", "Part Group", Part);
+                lvDoModify := TRUE;
+              END;
+            END;
+
+            IF IDoHours THEN BEGIN
+              IF ("Target Hours" <> 0) OR ("Target Amount Labor" <> 0) THEN BEGIN
+                IF NOT IUpdateMode THEN
+                  SubLevelTargetHours := SubLevelTargetHours + Hours
+                ELSE
+                  lvEstPartRec."Adjustment Factor Hours" := lvEstPartRec."Adjustment Factor Hours" / FactorHours;
+              END ELSE
+                lvDoHours := TRUE;
+            END;
+            IF IDoLabor THEN BEGIN  //* Bij UpdateMode is IDoLabor altijd FALSE.
+              IF ("Target Hours" <> 0) OR ("Target Amount Labor" <> 0) THEN
+                SubLevelTargetAmtLabor := SubLevelTargetAmtLabor + Labor
+              ELSE
+                lvDoLabor := TRUE;
+            END;
+            IF IDoMaterial THEN BEGIN
+              IF ("Target Amount Material" <> 0) THEN BEGIN
+                IF NOT IUpdateMode THEN
+                  SubLevelTargetAmtMaterial := SubLevelTargetAmtMaterial + Material
+                ELSE
+                  lvEstPartRec."Adjustment Factor Material" := lvEstPartRec."Adjustment Factor Material" / FactorMaterial;
+              END ELSE
+                lvDoMaterial := TRUE;
+            END;
+            IF IDoSubcontr THEN BEGIN
+              IF ("Target Amount Subcontracting" <> 0) THEN BEGIN
+                IF NOT IUpdateMode THEN
+                  SubLevelTargetAmtSubcontr := SubLevelTargetAmtSubcontr + Subcontracting
+                ELSE
+                  lvEstPartRec."Adjustment Factor Subcontr." := lvEstPartRec."Adjustment Factor Subcontr." / FactorSubcontr;
+              END ELSE
+                lvDoSubcontr := TRUE;
+            END;
+            IF IDoPlant THEN BEGIN
+              IF ("Target Amount Plant" <> 0) THEN BEGIN
+                IF NOT IUpdateMode THEN
+                  SubLevelTargetAmtPlant := SubLevelTargetAmtPlant + Plant
+                ELSE
+                  lvEstPartRec."Adjustment Factor Plant" := lvEstPartRec."Adjustment Factor Plant" / FactorPlant;
+              END ELSE
+                lvDoPlant := TRUE;
+            END;
+
+            IF lvDoModify THEN
+              lvEstPartRec.MODIFY;
+            IF lvDoHours OR lvDoLabor OR lvDoMaterial OR lvDoSubcontr OR lvDoPlant THEN
+              DoPartLevel2(IUpdateMode, lvTargetAmtRec, lvDoHours, lvDoLabor, lvDoMaterial, lvDoSubcontr, lvDoPlant);
+          UNTIL NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE DoPartLevel2@1210190001(IUpdateMode@1210190013 : Boolean;ITargetAmtRec@1210190000 : Record 11012199;IDoHours@1210190006 : Boolean;IDoLabor@1210190005 : Boolean;IDoMaterial@1210190004 : Boolean;IDoSubcontr@1210190003 : Boolean;IDoPlant@1210190002 : Boolean);
+    VAR
+      lvTargetAmtRec@1210190001 : Record 11012199;
+      lvEstPartRec@1210190014 : Record 11012153;
+      lvDoHours@1210190011 : Boolean;
+      lvDoLabor@1210190010 : Boolean;
+      lvDoMaterial@1210190009 : Boolean;
+      lvDoSubcontr@1210190008 : Boolean;
+      lvDoPlant@1210190007 : Boolean;
+      lvDoModify@1210190012 : Boolean;
+    BEGIN
+      WITH lvTargetAmtRec DO BEGIN
+        SETRANGE("Estimate No.", ITargetAmtRec."Estimate No.");
+        SETRANGE("Sub-Estimate No.", ITargetAmtRec."Sub-Estimate No.");
+        SETRANGE("Part Group", ITargetAmtRec."Part Group");
+        SETRANGE("Chapter (Part)", ITargetAmtRec."Chapter (Part)");
+        SETRANGE("Level (Part)", 2);
+        SETRANGE(Type, Type::Part);
+        IF FIND('-') THEN BEGIN
+            lvDoModify := FALSE;
+            lvDoHours := FALSE;
+            lvDoLabor := FALSE;
+            lvDoMaterial := FALSE;
+            lvDoSubcontr := FALSE;
+            lvDoPlant := FALSE;
+          REPEAT
+            IF (IDoHours AND (("Target Hours" <> 0) OR ("Target Amount Labor" <> 0)) ) OR
+               (IDoLabor AND (("Target Hours" <> 0) OR ("Target Amount Labor" <> 0)) ) OR
+               (IDoMaterial AND ("Target Amount Material" <> 0)) OR
+               (IDoSubcontr AND ("Target Amount Subcontracting" <> 0)) OR
+               (IDoPlant AND ("Target Amount Plant" <> 0))
+            THEN BEGIN
+              IF NOT IUpdateMode THEN BEGIN
+                CalcFieldsAmounts(lvTargetAmtRec, Hours, Labor, Material, Subcontracting, Plant, Total, FALSE);
+              END ELSE BEGIN
+                lvEstPartRec.GET("Estimate No.", "Sub-Estimate No.", "Part Group", Part);
+                lvDoModify := TRUE;
+              END;
+            END;
+
+            IF IDoHours THEN BEGIN
+              IF ("Target Hours" <> 0) OR ("Target Amount Labor" <> 0) THEN BEGIN
+                IF NOT IUpdateMode THEN
+                  SubLevelTargetHours := SubLevelTargetHours + Hours
+                ELSE
+                  lvEstPartRec."Adjustment Factor Hours" := lvEstPartRec."Adjustment Factor Hours" / FactorHours;
+              END ELSE
+                lvDoHours := TRUE;
+            END;
+            IF IDoLabor THEN BEGIN  //* Bij UpdateMode is IDoLabor altijd FALSE.
+              IF ("Target Hours" <> 0) OR ("Target Amount Labor" <> 0) THEN
+                SubLevelTargetAmtLabor := SubLevelTargetAmtLabor + Labor
+              ELSE
+                lvDoLabor := TRUE;
+            END;
+            IF IDoMaterial THEN BEGIN
+              IF ("Target Amount Material" <> 0) THEN BEGIN
+                IF NOT IUpdateMode THEN
+                  SubLevelTargetAmtMaterial := SubLevelTargetAmtMaterial + Material
+                ELSE
+                  lvEstPartRec."Adjustment Factor Material" := lvEstPartRec."Adjustment Factor Material" / FactorMaterial;
+              END ELSE
+                lvDoMaterial := TRUE;
+            END;
+            IF IDoSubcontr THEN BEGIN
+              IF ("Target Amount Subcontracting" <> 0) THEN BEGIN
+                IF NOT IUpdateMode THEN
+                  SubLevelTargetAmtSubcontr := SubLevelTargetAmtSubcontr + Subcontracting
+                ELSE
+                  lvEstPartRec."Adjustment Factor Subcontr." := lvEstPartRec."Adjustment Factor Subcontr." / FactorSubcontr;
+              END ELSE
+                lvDoSubcontr := TRUE;
+            END;
+            IF IDoPlant THEN BEGIN
+              IF ("Target Amount Plant" <> 0) THEN BEGIN
+                IF NOT IUpdateMode THEN
+                  SubLevelTargetAmtPlant := SubLevelTargetAmtPlant + Plant
+                ELSE
+                  lvEstPartRec."Adjustment Factor Plant" := lvEstPartRec."Adjustment Factor Plant" / FactorPlant;
+              END ELSE
+                lvDoPlant := TRUE;
+            END;
+
+            IF lvDoModify THEN
+              lvEstPartRec.MODIFY;
+            IF lvDoHours OR lvDoLabor OR lvDoMaterial OR lvDoSubcontr OR lvDoPlant THEN
+              DoPartLevel3(IUpdateMode, lvTargetAmtRec, lvDoHours, lvDoLabor, lvDoMaterial, lvDoSubcontr, lvDoPlant);
+          UNTIL NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE DoPartLevel3@1210190008(IUpdateMode@1210190008 : Boolean;ITargetAmtRec@1210190000 : Record 11012199;IDoHours@1210190006 : Boolean;IDoLabor@1210190005 : Boolean;IDoMaterial@1210190004 : Boolean;IDoSubcontr@1210190003 : Boolean;IDoPlant@1210190002 : Boolean);
+    VAR
+      lvTargetAmtRec@1210190001 : Record 11012199;
+      lvEstPartRec@1210190009 : Record 11012153;
+      lvDoModify@1210190007 : Boolean;
+    BEGIN
+      WITH lvTargetAmtRec DO BEGIN
+        SETRANGE("Estimate No.", ITargetAmtRec."Estimate No.");
+        SETRANGE("Sub-Estimate No.", ITargetAmtRec."Sub-Estimate No.");
+        SETRANGE("Part Group", ITargetAmtRec."Part Group");
+        SETRANGE("Paragraph (Part)", ITargetAmtRec."Paragraph (Part)");
+        SETRANGE("Level (Part)", 3);
+        SETRANGE(Type, Type::Part);
+        IF FIND('-') THEN BEGIN
+          REPEAT
+            lvDoModify := FALSE;
+            IF (IDoHours AND (("Target Hours" <> 0) OR ("Target Amount Labor" <> 0)) ) OR
+               (IDoLabor AND (("Target Hours" <> 0) OR ("Target Amount Labor" <> 0)) ) OR
+               (IDoMaterial AND ("Target Amount Material" <> 0)) OR
+               (IDoSubcontr AND ("Target Amount Subcontracting" <> 0)) OR
+               (IDoPlant AND ("Target Amount Plant" <> 0))
+            THEN BEGIN
+              IF NOT IUpdateMode THEN BEGIN
+                CalcFieldsAmounts(lvTargetAmtRec, Hours, Labor, Material, Subcontracting, Plant, Total, FALSE);
+              END ELSE BEGIN
+                lvEstPartRec.GET("Estimate No.", "Sub-Estimate No.", "Part Group", Part);
+                lvDoModify := TRUE;
+              END;
+            END;
+
+            IF IDoHours AND (("Target Hours" <> 0) OR ("Target Amount Labor" <> 0)) THEN BEGIN
+              IF NOT IUpdateMode THEN
+                SubLevelTargetHours := SubLevelTargetHours + Hours
+              ELSE
+                lvEstPartRec."Adjustment Factor Hours" := lvEstPartRec."Adjustment Factor Hours" / FactorHours;
+            END;
+            IF IDoLabor AND (("Target Hours" <> 0) OR ("Target Amount Labor" <> 0)) THEN //* Bij UpdateMode is IDoLabor altijd FALSE.
+                SubLevelTargetAmtLabor := SubLevelTargetAmtLabor + Labor;
+            IF IDoMaterial AND ("Target Amount Material" <> 0) THEN BEGIN
+              IF NOT IUpdateMode THEN
+                SubLevelTargetAmtMaterial := SubLevelTargetAmtMaterial + Material
+              ELSE
+                lvEstPartRec."Adjustment Factor Material" := lvEstPartRec."Adjustment Factor Material" / FactorMaterial;
+            END;
+            IF IDoSubcontr AND ("Target Amount Subcontracting" <> 0) THEN BEGIN
+              IF NOT IUpdateMode THEN
+                SubLevelTargetAmtSubcontr := SubLevelTargetAmtSubcontr + Subcontracting
+              ELSE
+                lvEstPartRec."Adjustment Factor Subcontr." := lvEstPartRec."Adjustment Factor Subcontr." / FactorSubcontr;
+            END;
+            IF IDoPlant AND ("Target Amount Plant" <> 0) THEN BEGIN
+              IF NOT IUpdateMode THEN
+                SubLevelTargetAmtPlant := SubLevelTargetAmtPlant + Plant
+              ELSE
+                lvEstPartRec."Adjustment Factor Plant" := lvEstPartRec."Adjustment Factor Plant" / FactorPlant;
+            END;
+
+            IF lvDoModify THEN
+              lvEstPartRec.MODIFY;
+          UNTIL NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE CheckAndCalculateNewFactor@1210190013(ITargetAmtRec@1210190000 : Record 11012199;IType@1210190001 : Integer;ITargetAmt@1210190002 : Decimal;IAmount@1210190003 : Decimal;ISubLevelTargetAmt@1210190004 : Decimal;VAR IOAdjFactor@1210190007 : Decimal) RetFactor : Decimal;
+    VAR
+      lvRemainAmount@1210190005 : Decimal;
+      lvRemainTarget@1210190006 : Decimal;
+      lvFactor@1210190008 : Decimal;
+    BEGIN
+      //* Type: 0=Hours, 1=Labor, 2=Material, 3=Subcontracting, 4=Plant
+
+      WITH ITargetAmtRec DO BEGIN
+        RetFactor := 0;
+        IF (ITargetAmt <> 0) THEN BEGIN
+          lvRemainAmount := IAmount - ISubLevelTargetAmt;
+          lvRemainTarget := ITargetAmt - ISubLevelTargetAmt;
+          IF (lvRemainTarget = lvRemainAmount) THEN
+            EXIT;
+          IF (lvRemainAmount <> 0) THEN BEGIN
+            lvFactor := lvRemainTarget / lvRemainAmount;
+            IF (lvFactor <= 0) THEN BEGIN
+              CASE IType OF
+                0: FIELDERROR("Target Hours", STRSUBSTNO(Text001, (IOAdjFactor * lvFactor)));
+                1: FIELDERROR("Target Amount Labor", STRSUBSTNO(Text001, (IOAdjFactor * lvFactor)));
+                2: FIELDERROR("Target Amount Material", STRSUBSTNO(Text001, (IOAdjFactor * lvFactor)));
+                3: FIELDERROR("Target Amount Subcontracting", STRSUBSTNO(Text001, (IOAdjFactor * lvFactor)));
+                4: FIELDERROR("Target Amount Plant", STRSUBSTNO(Text001, (IOAdjFactor * lvFactor)));
+              END;
+            END;
+            RetFactor := lvFactor;
+            IOAdjFactor := IOAdjFactor * RetFactor;
+          END ELSE BEGIN
+            IF (lvRemainTarget <> 0) THEN BEGIN
+              CASE IType OF
+                0: FIELDERROR("Target Hours", STRSUBSTNO(Text003, lvRemainTarget));
+                1: FIELDERROR("Target Amount Labor", STRSUBSTNO(Text002, lvRemainTarget));
+                2: FIELDERROR("Target Amount Material", STRSUBSTNO(Text002, lvRemainTarget));
+                3: FIELDERROR("Target Amount Subcontracting", STRSUBSTNO(Text002, lvRemainTarget));
+                4: FIELDERROR("Target Amount Plant", STRSUBSTNO(Text002, lvRemainTarget));
+              END;
+            END;
+          END;
+        END;
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

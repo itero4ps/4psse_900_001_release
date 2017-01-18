@@ -1,0 +1,115 @@
+OBJECT Codeunit 451 Job Queue User Session
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00;
+  }
+  PROPERTIES
+  {
+    TableNo=472;
+    OnRun=BEGIN
+            IF WaitForJobReady(Rec) THEN
+              Process(Rec)
+            ELSE BEGIN
+              LOCKTABLE;
+              IF NOT GET(ID) THEN
+                EXIT;
+              IF ("Expiration Date/Time" > 0DT) AND (CURRENTDATETIME > "Expiration Date/Time") THEN
+                SetError(Text001);
+            END;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text001@1000 : TextConst 'ENU=The job queue entry has expired.';
+
+    LOCAL PROCEDURE WaitForJobReady@2(VAR JobQueueEntry@1001 : Record 472) : Boolean;
+    VAR
+      Status@1003 : 'Not Ready,Ready,Deleted,Restarted';
+    BEGIN
+      Status := CheckCurrJobReady(JobQueueEntry);
+      WHILE (Status = Status::"Not Ready") AND
+            ((JobQueueEntry."Expiration Date/Time" = 0DT) OR (JobQueueEntry."Expiration Date/Time" > CURRENTDATETIME))
+      DO BEGIN
+        COMMIT;
+        SLEEP(NoOfMilliSecondsToWait(JobQueueEntry));
+        Status := CheckCurrJobReady(JobQueueEntry);
+      END;
+      EXIT(Status = Status::Ready);
+    END;
+
+    LOCAL PROCEDURE CheckCurrJobReady@1(VAR JobQueueEntry@1000 : Record 472) : Integer;
+    VAR
+      Status@1001 : 'Not Ready,Ready,Deleted,Restarted';
+    BEGIN
+      JobQueueEntry.LOCKTABLE;
+      IF JobQueueEntry.GET(JobQueueEntry.ID) THEN BEGIN
+        IF JobQueueEntry."User Service Instance ID" = 0 THEN BEGIN
+          JobQueueEntry."User Service Instance ID" := SERVICEINSTANCEID;
+          JobQueueEntry."User Session Started" := CURRENTDATETIME;
+          JobQueueEntry.MODIFY;
+        END;
+        IF JobQueueEntry."User Session ID" <> SESSIONID THEN
+          EXIT(Status::Restarted);
+        IF JobQueueEntry.Status = JobQueueEntry.Status::"In Process" THEN
+          EXIT(Status::Ready);
+        EXIT(Status::"Not Ready");
+      END;
+      EXIT(Status::Deleted);
+    END;
+
+    LOCAL PROCEDURE Process@9(VAR JobQueueEntry@1000 : Record 472);
+    VAR
+      Success@1001 : Boolean;
+      AttemptToRun@1002 : Boolean;
+      NoOfAttempts@1003 : Integer;
+    BEGIN
+      COMMIT;
+      AttemptToRun := TRUE;
+      WHILE NOT Success AND AttemptToRun DO BEGIN
+        IF (NoOfAttempts > 0) AND (JobQueueEntry."Rerun Delay (sec.)" > 0) THEN BEGIN
+          JobQueueEntry.LOCKTABLE;
+          JobQueueEntry.GET(JobQueueEntry.ID);
+          JobQueueEntry.SetErrorMessage(GETLASTERRORTEXT);
+          JobQueueEntry.MODIFY(TRUE);
+          COMMIT;
+          SLEEP(JobQueueEntry."Rerun Delay (sec.)" * 1000);
+        END;
+
+        Success := CODEUNIT.RUN(CODEUNIT::"Job Queue Start Codeunit",JobQueueEntry);
+        IF NOT Success THEN BEGIN
+          NoOfAttempts := NoOfAttempts + 1;
+          AttemptToRun := NoOfAttempts < JobQueueEntry."Maximum No. of Attempts to Run";
+        END;
+      END;
+      JobQueueEntry.LOCKTABLE;
+      IF JobQueueEntry.GET(JobQueueEntry.ID) THEN
+        JobQueueEntry.TESTFIELD(Status,JobQueueEntry.Status::"In Process")
+      ELSE
+        ERROR(Text001);
+      COMMIT;
+      IF Success THEN
+        JobQueueEntry.SetStatus(JobQueueEntry.Status::Finished)
+      ELSE
+        JobQueueEntry.SetError(GETLASTERRORTEXT);
+      COMMIT;
+    END;
+
+    LOCAL PROCEDURE NoOfMilliSecondsToWait@3(VAR JobQueueEntry@1000 : Record 472) : Integer;
+    BEGIN
+      IF JobQueueEntry."Earliest Start Date/Time" > CURRENTDATETIME + 600000 THEN
+        EXIT(600000);
+      IF JobQueueEntry."Earliest Start Date/Time" > CURRENTDATETIME + 60000 THEN
+        EXIT(JobQueueEntry."Earliest Start Date/Time" - CURRENTDATETIME - 10000);
+      EXIT(1000);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

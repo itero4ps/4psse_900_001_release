@@ -1,0 +1,1090 @@
+OBJECT Codeunit 11012005 Hours Post Batch
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=11012038;
+    Permissions=TableData 17=rimd;
+    OnRun=BEGIN
+            HourAccountingFilters.COPYFILTERS(Rec);
+            Selection(Rec, DoPrint, DoFilterData);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@11012024 : TextConst 'ENU=Nothing to Post.';
+      Text001@11012025 : TextConst 'ENU=Do you really want to post and print?';
+      Text002@11012026 : TextConst 'ENU=Do you really want to post?';
+      Text004@11012029 : TextConst 'ENU=Check Lines                #1#########  @2@@@@@@@@@@@@@\';
+      Text005@11012030 : TextConst 'ENU=Post Internal Hours        #3#########  @4@@@@@@@@@@@@@\';
+      Text006@11012035 : TextConst 'ENU=Post External Hours        #5#########  @6@@@@@@@@@@@@@\';
+      Text007@1210190009 : TextConst 'ENU=Process Posted Hours       #7#########  @8@@@@@@@@@@@@@\';
+      Text008@1210190014 : TextConst 'ENU=Post Purchase Orders       #9#########  @10@@@@@@@@@@@@';
+      Text009@1210190013 : TextConst 'ENU=Purchase Order %1 could not be posted';
+      Text012@11012036 : TextConst 'ENU=Finished !';
+      HourHeader@1210190004 : Record 11012038;
+      HourLine@11012000 : Record 11012039;
+      HourProjHeader@1210190015 : Record 11020224;
+      HourProjLine@1210190012 : Record 11020225;
+      GLEntry@11012002 : Record 17;
+      JobSetup@11012005 : Record 315;
+      PurchHeaderRec@11012007 : Record 38;
+      PostedHourHeader@1210190006 : Record 11012084;
+      PostedHourLine@1210190007 : Record 11012085;
+      WageCompRec@1210190011 : Record 11012014;
+      TmpPurchHeader@1210190002 : TEMPORARY Record 38;
+      EmployeeRec@1100485000 : Record 5200;
+      GenLedgerSetup@1100525001 : Record 98;
+      PurchSetup@1100525002 : Record 312;
+      TaggedTempHourLine@1100528500 : TEMPORARY Record 11012039;
+      CheckHourLine@11012010 : Codeunit 11012003;
+      PurchPost@11012012 : Codeunit 90;
+      PostHourLine@1210190003 : Codeunit 11012004;
+      PrintDoc@1210190008 : Codeunit 229;
+      GenerateDays@1210190010 : Codeunit 11012028;
+      PostPlantHourRev@1100485010 : Codeunit 11012570;
+      Window@11012013 : Dialog;
+      LineCounter@11012014 : Integer;
+      NoOfLines@11012015 : Integer;
+      LastJnlServ@1210190000 : Integer;
+      LastJnlProj@11012019 : Integer;
+      ConfirmTxt@11012021 : Text[50];
+      LineNo@11012022 : Integer;
+      DocNo@11012023 : Code[20];
+      HourAccountingFilters@1100485001 : Record 11012038;
+      DoPrint@1100485002 : Boolean;
+      DoFilterData@1100485003 : Boolean;
+      Text013@1100485004 : TextConst 'ENU=Posting cancelled, there are still open %1s.';
+      PlantHourRevPosted@1210190001 : Boolean;
+      LastTagNo@1100528501 : Code[20];
+
+    PROCEDURE SetPostOptions@1100485001(Print@1100485000 : Boolean;FilterData@1100485001 : Boolean);
+    BEGIN
+      DoPrint := Print;
+      DoFilterData := FilterData;
+    END;
+
+    PROCEDURE Selection@3(HourRec@11012000 : Record 11012038;Print@11012001 : Boolean;FilterData@1210190000 : Boolean);
+    BEGIN
+      DocNo := HourRec."Document No.";
+
+      JobSetup.GET;
+
+      HourHeader := HourRec;
+      HourHeader.RESET;
+      HourHeader.SETRANGE("Document No.", DocNo);
+      IF FilterData THEN BEGIN
+        HourHeader.SETRANGE("Employee No.", HourRec."Employee No.");
+        HourHeader.SETRANGE(Year, HourRec.Year);
+        HourHeader.SETRANGE(Week, HourRec.Week);
+      END ELSE BEGIN
+        HourHeader.COPYFILTERS(HourAccountingFilters);
+      END;
+      IF JobSetup."Release Hours Mandatory" THEN
+        IF FilterData THEN
+          HourHeader.TESTFIELD(Status, HourHeader.Status::Released)
+        ELSE
+          HourHeader.SETRANGE(Status, HourHeader.Status::Released);
+      IF NOT HourHeader.FINDFIRST THEN
+        ERROR(Text000);
+
+      IF GUIALLOWED THEN BEGIN
+        IF Print THEN
+          ConfirmTxt := Text001
+        ELSE
+          ConfirmTxt := Text002;
+        IF NOT CONFIRM(ConfirmTxt) THEN
+          EXIT;
+      END;
+
+      HandleHoursConsentLines(HourHeader);
+
+      HandlePriorityHours;
+
+      Post;
+
+      COMMIT;
+      IF Print THEN BEGIN
+        PostedHourHeader.MARKEDONLY(TRUE);
+        PrintDoc.PrintPostedHoursList(PostedHourHeader);
+      END ELSE
+        IF GUIALLOWED THEN
+          MESSAGE(Text012);
+    END;
+
+    PROCEDURE Post@4();
+    VAR
+      HourLinePerDay@1210190002 : Record 11012039;
+      HourLine2@1100525002 : Record 11012039;
+      lvPostedHourHeader@1100485002 : Record 11012084;
+      lvDayNo@1210190001 : Integer;
+      lvAddToICTag@1100485004 : Integer;
+      lvPlantLineNo@1100525000 : Integer;
+      lvOriginalAmount@1100485000 : Decimal;
+      lvRestAmount@1100485001 : Decimal;
+      lvTempPlantHoursCostRec@1100525001 : TEMPORARY Record 11012578;
+      HumanResourcesSetup@1100528300 : Record 5218;
+      PurchaseLineCreated@1100528400 : Boolean;
+      Vendor@1100525003 : Record 23;
+      NewOrder@1100525004 : Boolean;
+    BEGIN
+      CLEAR(PostHourLine);
+      TmpPurchHeader.DELETEALL;
+      PlantHourRevPosted := FALSE;
+
+      IF GUIALLOWED THEN
+        Window.OPEN(
+          Text004 +
+          Text005 +
+          Text006 +
+          Text007 +
+          Text008);
+
+      GenLedgerSetup.GET;
+
+      WITH HourLine DO BEGIN
+
+        //Mark Hourlines to post
+        IF HourHeader.FINDSET THEN BEGIN
+          RESET;
+          REPEAT
+            SETRANGE(Year, HourHeader.Year);
+            SETRANGE(Week, HourHeader.Week);
+            SETRANGE("Employee No.", HourHeader."Employee No.");
+            IF FINDSET THEN
+              REPEAT
+                MARK(TRUE);
+              UNTIL NEXT = 0;
+          UNTIL HourHeader.NEXT = 0;
+          SETRANGE(Year);
+          SETRANGE(Week);
+          SETRANGE("Employee No.");
+        END;
+        MARKEDONLY(TRUE);
+
+        //Manipulate Kilometer Expenses, Nett Amount no original line, Gross amount on new line.
+        SETRANGE("Component Type", "Component Type"::Expenses);
+        SETFILTER("Amount (LCY)",   '<>%1', 0);
+        SETFILTER(Quantity, '<>%1', 0);
+
+        NoOfLines := COUNT;
+        LineCounter := 0;
+        IF FINDSET(TRUE, FALSE) THEN
+          REPEAT
+            LineCounter := LineCounter + 1;
+            IF GUIALLOWED THEN BEGIN
+              Window.UPDATE(1, LineCounter);
+              Window.UPDATE(2, ROUND(LineCounter/NoOfLines*10000,1));
+            END;
+
+            WageCompRec.RESET;
+            WageCompRec.SETRANGE(Code, "Wage Component");
+            WageCompRec.SETFILTER("Max. Amount to Post", '<>%1', 0);
+            WageCompRec.SETFILTER("Wage Component to Post Rest", '<>%1', '');
+            IF WageCompRec.FINDFIRST THEN BEGIN
+              IF ABS("Amount (LCY)") > ABS(Quantity * WageCompRec."Max. Amount to Post") THEN BEGIN
+                //Rewrite original line
+                lvOriginalAmount := "Amount (LCY)";
+                "Amount (LCY)" := Quantity * WageCompRec."Max. Amount to Post";
+                IF lvOriginalAmount * "Amount (LCY)" < 0 THEN
+                  "Amount (LCY)" := -"Amount (LCY)";
+                VALIDATE("Amount (LCY)");
+                MODIFY;
+                //
+                //Add New Line with Rest Amount
+                "Line No." := "Line No." + 1;
+                IF HourLine2.GET(Year,Week,"Employee No.","Line No.") THEN
+                  REPEAT
+                    "Line No." := "Line No." + 1;
+                  UNTIL NOT HourLine2.GET(Year,Week,"Employee No.","Line No.");
+                lvRestAmount := lvOriginalAmount - "Amount (LCY)";
+                VALIDATE("Wage Component", WageCompRec."Wage Component to Post Rest");
+                VALIDATE("Amount (LCY)", lvRestAmount);
+                INSERT;
+                MARK(TRUE);
+                NoOfLines := NoOfLines + 1;
+                //
+              END;
+            END;
+
+          UNTIL NEXT = 0;
+        //reset filter
+        SETRANGE("Component Type");
+        SETRANGE("Amount (LCY)");
+        SETRANGE(Quantity);
+
+        //Check Lines
+        NoOfLines := COUNT;
+        LineCounter := 0;
+
+        IF GUIALLOWED THEN
+          CheckHourLine.SetGiveMessage;
+
+        IF NOT FINDSET THEN
+          EXIT;
+        REPEAT
+          LineCounter := LineCounter + 1;
+          IF GUIALLOWED THEN BEGIN
+            Window.UPDATE(1, LineCounter);
+            Window.UPDATE(2, ROUND(LineCounter/NoOfLines*10000,1));
+          END;
+          CheckHourLine.RunCheck(HourLine);
+        UNTIL NEXT = 0;
+        FINDSET;
+
+        //Lock Tables
+        GLEntry.LOCKTABLE;
+        IF GLEntry.FINDLAST THEN;
+
+        //Post Internal Employees and depending on setup external Employees
+        //IF JobSetup."Charge Costs Extern. Employees" = JobSetup."Charge Costs Extern. Employees"::"Posting Invoices" THEN //C004448.o
+        //  SETRANGE(External, FALSE); //C004448.o
+
+        NoOfLines := COUNT;
+        LineCounter := 0;
+
+        IF FINDSET THEN
+          REPEAT
+            LineCounter := LineCounter + 1;
+            IF GUIALLOWED THEN BEGIN
+              Window.UPDATE(3, LineCounter);
+              Window.UPDATE(4, ROUND(LineCounter/NoOfLines*10000,1));
+            END;
+
+            //IF NOT EmptyLine THEN BEGIN //C004448.o
+            IF (NOT EmptyLine) AND (NOT SkipPostLine(HourLine)) THEN BEGIN //C004448.n
+              CALCFIELDS("Component Type");
+              IF "Component Type" = "Component Type"::Hours THEN BEGIN
+                CalcRateAndAmount;
+                MODIFY;
+              END;
+              //IF Type = Type::Plant THEN BEGIN
+              IF (Type = Type::Plant) AND (NOT External) THEN BEGIN  //* C-019499 External employee is processed below
+                //Revenues
+                lvPlantLineNo := InsertPlantHourRevLine();
+                IF (lvPlantLineNo > 0) AND ("Receiving Company" = '') THEN BEGIN
+                  IF NOT PlantHourRevPosted THEN BEGIN
+                    PostPlantHourRev.ClearTmpPurchOrder();  //* Only first time
+                    PlantHourRevPosted := TRUE;
+                  END;
+                  PostPlantHourRev.PostHourAcc(Year, Week, "Plant Type", "Plant No.", lvPlantLineNo);
+                END;
+
+                //Cost
+                IF (GenLedgerSetup."Direct Plant Hour Cost To IC") AND
+                   ("Receiving Company" <> '') AND
+                   ("Receiving Company" <> COMPANYNAME) THEN
+                BEGIN
+                  //Do not create a plant cost line
+                  //directly create posting on supplying side (employee)
+                  //and create an IC posting for plant no.
+                  lvTempPlantHoursCostRec.RESET;
+                  lvTempPlantHoursCostRec.DELETEALL;
+                  IF CreateTempPlantHourCostLine(lvTempPlantHoursCostRec) > 0 THEN BEGIN
+                    PostHourLine.PostTempPlantCostHours(lvTempPlantHoursCostRec, Year,
+                                                        Week, "Receiving Company",
+                                                        "Employee No.",
+                                                        lvTempPlantHoursCostRec."Line No.", "Document No.");
+                  END;
+                END ELSE BEGIN
+                  lvPlantLineNo := InsertPlantHourCostLine();
+                  IF (lvPlantLineNo > 0) AND ("Receiving Company" = '') THEN
+                    PostHourLine.PostPlantCostHours(Year, Week, "Supplying Company",
+                                                    "Employee No.", lvPlantLineNo, "Document No.");
+
+                END;
+              END;
+
+              //C000370 Leave Hours are posted independent of Calculate Wage Costs
+              IF NOT PostPerDay THEN BEGIN
+                IF (NOT External) THEN  //*19441 For external employees 'leave' is processed below
+                  PostHourLine.PostLeaveHours(HourLine);
+                IF "Calculate Wage Costs" = "Calculate Wage Costs"::"Fixed Rate" THEN BEGIN
+                  IF "Service Order No." <> '' THEN
+                    PostHourLine.PostServiceHours(HourLine,LastJnlServ,LastJnlProj);
+                  IF "Project No." <> '' THEN
+                    PostHourLine.PostProjectHours(HourLine,LastJnlProj);
+                  IF "Cost Code" <> '' THEN
+                    PostHourLine.PostIndirectHours(HourLine);
+                END;
+              END ELSE BEGIN
+                FOR lvDayNo := 1 TO 7 DO BEGIN
+                  //C023078.sn reconstruction
+                  MakeHourLinePerDay(lvDayNo,HourLine,HourLinePerDay);
+                  IF HourLinePerDay."Total Line" <> 0 THEN BEGIN
+                  //C023078.en
+                    IF (NOT External) THEN  //*19441 For external employees 'leave' is processed below
+                      PostHourLine.PostLeaveHours(HourLinePerDay);
+                    IF "Calculate Wage Costs" = "Calculate Wage Costs"::"Fixed Rate" THEN BEGIN
+                      //C019571.sn
+                      IF HourLinePerDay."Posting Date" <> HourLine."Posting Date" THEN
+                        HourLinePerDay.CalcRateAndAmount;
+                      //C019571.en
+                      IF "Service Order No." <> '' THEN
+                        PostHourLine.PostServiceHours(HourLinePerDay,LastJnlServ,LastJnlProj);
+                      IF "Project No." <> '' THEN
+                        PostHourLine.PostProjectHours(HourLinePerDay,LastJnlProj);
+                      IF "Cost Code" <> '' THEN
+                        PostHourLine.PostIndirectHours(HourLinePerDay);
+                    END;
+                  END;
+                END;
+              END;
+            END;
+          UNTIL NEXT = 0;
+
+        //Post External Employees: Create Purchase Orders
+        SETCURRENTKEY(Employer, "Project No.", "Service Order No.", "Plant Type", "Cost Code");  //DP00824
+        SETRANGE(External,TRUE);
+
+        NoOfLines := COUNT;
+        LineCounter := 0;
+        CLEAR(PurchHeaderRec);
+
+        IF FINDSET THEN
+          REPEAT
+            LineCounter := LineCounter + 1;
+            IF GUIALLOWED THEN BEGIN
+              Window.UPDATE(5, LineCounter);
+              Window.UPDATE(6, ROUND(LineCounter/NoOfLines*10000,1));
+            END;
+
+            //IF NOT EmptyLine THEN BEGIN //C004448.o
+            IF (NOT EmptyLine)
+      //        AND (NOT ((Type IN [Type::Project, Type::Service]) AND ("Cost Type" = "Cost Type"::Plant))) C022483 old
+            THEN BEGIN //C004448.n
+              CALCFIELDS("Component Type");
+
+              IF JobSetup."Charge Costs Extern. Employees" = JobSetup."Charge Costs Extern. Employees"::"Posting Invoices" THEN
+                IF "Component Type" = "Component Type"::Hours THEN BEGIN
+                  CalcRateAndAmount;
+                  MODIFY;
+                END;
+
+              IF Type = Type::Plant THEN BEGIN
+                lvPlantLineNo := InsertPlantHourRevLine();
+                IF (lvPlantLineNo > 0) AND ("Receiving Company" = '') THEN BEGIN
+                  IF NOT PlantHourRevPosted THEN BEGIN
+                    PostPlantHourRev.ClearTmpPurchOrder();  //* Only first time
+                    PlantHourRevPosted := TRUE;
+                  END;
+                  PostPlantHourRev.PostHourAcc(Year, Week, "Plant Type", "Plant No.", lvPlantLineNo);
+                END;
+
+                IF JobSetup."Charge Costs Extern. Employees" <> JobSetup."Charge Costs Extern. Employees"::"Posting Invoices" THEN BEGIN
+                  // IF "Posting Invoices" then external employee cost on Plant via Purchase Invoice of a 'Hours Hire Order Employee',
+                  // because then the plant fields are filled on the Purchase Line.
+                  IF (GenLedgerSetup."Direct Plant Hour Cost To IC") AND
+                     ("Receiving Company" <> '') AND
+                     ("Receiving Company" <> COMPANYNAME) THEN
+                  BEGIN
+                    lvTempPlantHoursCostRec.RESET;
+                    lvTempPlantHoursCostRec.DELETEALL;
+                    IF CreateTempPlantHourCostLine(lvTempPlantHoursCostRec) > 0 THEN BEGIN
+                      PostHourLine.PostTempPlantCostHours(lvTempPlantHoursCostRec, Year,
+                                                          Week, "Receiving Company",
+                                                          "Employee No.",
+                                                          lvTempPlantHoursCostRec."Line No.", "Document No.");
+                    END;
+                  END ELSE BEGIN
+                    lvPlantLineNo := InsertPlantHourCostLine();
+                    IF (lvPlantLineNo > 0) AND ("Receiving Company" = '') THEN
+                      PostHourLine.PostPlantCostHours(Year, Week, "Supplying Company",
+                                                      "Employee No.", lvPlantLineNo, "Document No.");
+                  END;
+                END;
+              END;
+
+              //DP00824.sn
+              NewOrder := (PurchHeaderRec."Buy-from Vendor No." <> Employer);
+              IF NOT Vendor.GET(HourLine.Employer) THEN Vendor.INIT;
+              IF Vendor."Hours Hire Order by Project" THEN
+                IF PurchHeaderRec."Job No." <> "Project No." THEN
+                  NewOrder := TRUE;
+              IF NewOrder THEN
+                CreatePurchHeader;
+              //DP00824.en
+
+              LineNo := LineNo + 10000;
+              IF NOT PostPerDay OR Correction THEN BEGIN
+                PostHourLine.PostLeaveHours(HourLine);  //*19441
+                PostHourLine.PostExternalHours(HourLine,PurchHeaderRec,LineNo,PurchaseLineCreated);
+                IF PurchaseLineCreated THEN BEGIN
+                  HourLine."Purchase Order No." := PurchHeaderRec."No.";
+                  HourLine."Purchase Order Line No." := LineNo;
+                END;
+              END ELSE
+                FOR lvDayNo := 1 TO 7 DO BEGIN
+                  //C023078.sn reconstruction
+                  MakeHourLinePerDay(lvDayNo,HourLine,HourLinePerDay);
+                  IF HourLinePerDay."Total Line" <> 0 THEN BEGIN
+                  //C023078.en
+                    //C019571.sn
+                    IF HourLinePerDay."Posting Date" <> HourLine."Posting Date" THEN
+                      HourLinePerDay.CalcRateAndAmount;
+                    //C019571.en
+                    PostHourLine.PostLeaveHours(HourLinePerDay);  //*19441
+                    PostHourLine.PostExternalHours(HourLinePerDay,PurchHeaderRec,LineNo,PurchaseLineCreated);
+                    IF PurchaseLineCreated THEN BEGIN
+                      HourLine."Purchase Order No." := PurchHeaderRec."No.";
+                      HourLine."Purchase Order Line No." := LineNo;
+                    END;
+                    LineNo := LineNo + 10000;
+                  END;
+                END;
+              MODIFY;
+            END;
+          UNTIL NEXT = 0;
+
+      END;
+
+      //Move To Posted Hours, Generate Days and Post Mercash
+
+      //HourHeader filters are set in function Selection
+      NoOfLines := HourHeader.COUNT;
+      LineCounter := 0;
+
+      IF HourHeader.FINDSET(TRUE, FALSE) THEN BEGIN
+        REPEAT
+          LineCounter := LineCounter + 1;
+          IF GUIALLOWED THEN BEGIN
+            Window.UPDATE(7, LineCounter);
+            Window.UPDATE(8, ROUND(LineCounter/NoOfLines*10000,1));
+          END;
+          HourLine.RESET;
+          HourLine.SETRANGE(Year, HourHeader.Year);
+          HourLine.SETRANGE(Week, HourHeader.Week);
+          HourLine.SETRANGE("Employee No.", HourHeader."Employee No.");
+          IF HourLine.FINDSET(TRUE, FALSE)THEN BEGIN
+            PostedHourHeader.INIT;
+            PostedHourHeader.TRANSFERFIELDS(HourHeader);
+            IF PostedHourHeader.INSERT THEN;
+            PostedHourHeader.MARK(TRUE);
+            HourLine.CALCFIELDS("Norm Hours", "Norm Days");
+            PostedHourHeader."Norm Hours" := HourLine."Norm Hours";
+            PostedHourHeader."Norm Days" := HourLine."Norm Days";
+            PostedHourHeader.MODIFY;
+            REPEAT
+              IF NOT HourLine.EmptyLine THEN BEGIN
+                HourLine.CALCFIELDS("Component Type", "Department Code Employee");
+                //IF (HourLine."Receiving Company" <> '') OR (HourLine."Service Order No." <> '') THEN //call 31204
+                //  HourLine."Department Code" := HourLine.GetDimensionCodeServiceProject;
+                IF HourLine."Supplying Company" <> '' THEN BEGIN
+                  EmployeeRec.CHANGECOMPANY(HourLine."Supplying Company");
+                  IF EmployeeRec.GET(HourLine."Employee No.") THEN
+                    HourLine."Department Code Employee" := EmployeeRec."Global Dimension 1 Code";
+                  EmployeeRec.CHANGECOMPANY(COMPANYNAME);
+                END;
+
+                IF NOT PostPerDay THEN BEGIN
+                  PostedHourLine.RESET;
+                  PostedHourLine.SETRANGE(Year, HourLine.Year);
+                  PostedHourLine.SETRANGE(Week, HourLine.Week);
+                  PostedHourLine.SETRANGE("Employee No.", HourLine."Employee No.");
+                  IF PostedHourLine.FINDLAST THEN
+                    LineNo := PostedHourLine."Line No." + 10000
+                  ELSE
+                    LineNo := 10000;
+
+                  PostedHourLine.INIT;
+                  PostedHourLine.TRANSFERFIELDS(HourLine);
+                  PostedHourLine."Line No." := LineNo;
+                  PostedHourLine.Status := PostedHourLine.Status::Open;
+                  //The following source fields are FLOWFIELDS which must be set 'hard' cause TRANSFERFIELD doesn't do it
+                  PostedHourLine."Component Type" := HourLine."Component Type";
+                  PostedHourLine."Department Code Employee" := HourLine."Department Code Employee";
+                  IF NOT PostedHourLine."Cost Plus Entry Created" THEN
+                    CheckSetCostPlusCreated();
+                  PostedHourLine.INSERT;
+                END ELSE BEGIN
+                  PostedHourLine.RESET;
+                  PostedHourLine.SETRANGE(Year, HourLine.Year);
+                  PostedHourLine.SETRANGE(Week, HourLine.Week);
+                  PostedHourLine.SETRANGE("Employee No.", HourLine."Employee No.");
+                  IF PostedHourLine.FINDLAST THEN
+                    LineNo := PostedHourLine."Line No." + 10000
+                  ELSE
+                    LineNo := 10000;
+
+                  lvAddToICTag := 0;
+                  FOR lvDayNo := 1 TO 7 DO BEGIN
+                    //C023078.sn reconstruction
+                    MakeHourLinePerDay(lvDayNo,HourLine,HourLinePerDay);
+                    IF HourLinePerDay."Total Line" <> 0 THEN BEGIN
+                    //C023078.en
+                      //C019571.sn
+                      IF HourLinePerDay."Posting Date" <> HourLine."Posting Date" THEN
+                        HourLinePerDay.CalcRateAndAmount;
+                      //C019571.en
+                      PostedHourLine.INIT;
+                      PostedHourLine.TRANSFERFIELDS(HourLinePerDay);
+                      PostedHourLine."IC Tag No." := PostedHourLine."IC Tag No." + lvAddToICTag;
+                      PostedHourLine."Line No." := LineNo;
+                      PostedHourLine.Status := PostedHourLine.Status::Open;
+                      HourLinePerDay.CALCFIELDS("Component Type");
+                      PostedHourLine."Component Type" := HourLinePerDay."Component Type";
+                      PostedHourLine."Department Code Employee" := HourLine."Department Code Employee";
+                      IF NOT PostedHourLine."Cost Plus Entry Created" THEN
+                        CheckSetCostPlusCreated();
+                      PostedHourLine.INSERT;
+
+                      IF PostedHourLine."IC Tag No." > 0 THEN
+                        lvAddToICTag := lvAddToICTag + 1;
+                      LineNo := LineNo + 10000;
+
+                    END;
+                  END;
+                END;
+
+              END;
+
+              IF HourLine."Connection No." > 0 THEN BEGIN
+                HourProjLine.RESET;
+                HourProjLine.SETCURRENTKEY("Connection No.");
+                HourProjLine.SETRANGE("Connection No.", HourLine."Connection No.");
+                IF HourProjLine.FINDFIRST THEN BEGIN
+                  HourProjLine.DELETE;
+                  HourProjLine.RESET;
+                  HourProjLine.SETRANGE(Year, HourProjLine.Year);
+                  HourProjLine.SETRANGE(Week, HourProjLine.Week);
+                  HourProjLine.SETRANGE("Project No.", HourProjLine."Header Project No.");
+                  IF NOT HourProjLine.FINDFIRST THEN BEGIN
+                    HourProjHeader.SETRANGE(Year, HourProjLine.Year);
+                    HourProjHeader.SETRANGE(Week, HourProjLine.Week);
+                    HourProjHeader.SETRANGE("Project No.", HourProjLine."Header Project No.");
+                    HourProjHeader.DELETEALL;
+                  END;
+                END;
+              END;
+              HourLine.DeleteSurcharge;  //db, 12-06-07
+              HourLine.UpdateServHoursGanttChart(4); //16-07-09
+            UNTIL HourLine.NEXT = 0;
+
+            IF (HourLine."Employee No." <> '') AND
+               (HourLine."Supplying Company" = '') AND
+               (JobSetup."Posting Days Mandatory") THEN
+            BEGIN
+              lvPostedHourHeader.SETRANGE(Year, HourHeader.Year);
+              lvPostedHourHeader.SETRANGE(Week, HourHeader.Week);
+              lvPostedHourHeader.SETRANGE("Employee No.", HourHeader."Employee No.");
+              lvPostedHourHeader.SETRANGE("Document No.", HourHeader."Document No.");
+              GenerateDays.SetDialog;
+              GenerateDays.RUN(lvPostedHourHeader);
+            END;
+
+            IF JobSetup."Salary Application" = JobSetup."Salary Application"::Mercash THEN BEGIN
+              HourLine.TESTFIELD("Supplying Company",''); //No Employee IC supported for Mercash.
+              PostedHourLine.RESET;
+              PostedHourLine.SETRANGE(Year, HourHeader.Year);
+              PostedHourLine.SETRANGE(Week, HourHeader.Week);
+              PostedHourLine.SETRANGE("Employee No.", HourHeader."Employee No.");
+              PostedHourLine.SETRANGE("Component Type", PostedHourLine."Component Type"::Days);
+            END;
+            HourHeader.DELETE;
+          END;
+          HourLine.DELETEALL;
+        UNTIL HourHeader.NEXT = 0;
+      END;
+
+      COMMIT; //Very important because PurchPost may cause an Error
+
+      //C009165.sn
+      PurchSetup.GET;
+      IF NOT PurchSetup."Do Not Post Purch. Orders" THEN BEGIN
+      //C009165.en
+      //Post External Employees step 2 Post Purchase Orders
+        IF TmpPurchHeader.FIND('-') THEN BEGIN
+          NoOfLines := TmpPurchHeader.COUNT;
+          LineCounter := 0;
+
+          REPEAT
+            LineCounter := LineCounter + 1;
+            IF GUIALLOWED THEN BEGIN
+              Window.UPDATE(9, LineCounter);
+              Window.UPDATE(10, ROUND(LineCounter/NoOfLines*10000,1));
+            END;
+
+            PurchHeaderRec := TmpPurchHeader;
+            PurchHeaderRec.FIND;                     //**4PS01.n
+            PurchHeaderRec.Receive := TRUE;
+            PurchHeaderRec.Invoice := FALSE;
+            IF NOT PurchPost.RUN(PurchHeaderRec) THEN
+              MESSAGE(Text009, TmpPurchHeader."No.");
+          UNTIL TmpPurchHeader.NEXT = 0;
+        END;
+
+        IF PlantHourRevPosted THEN BEGIN
+          PurchHeaderRec."Hours Hire Order Type" := PurchHeaderRec."Hours Hire Order Type"::Plant;
+          IF GUIALLOWED THEN BEGIN
+            Window.UPDATE(9, PurchHeaderRec."Hours Hire Order Type");
+            Window.UPDATE(10, 0);
+          END;
+          PostPlantHourRev.PostPurchaseOrders();
+        END;
+      END; //C009165.n
+
+      IF GUIALLOWED THEN
+        Window.CLOSE;
+    END;
+
+    PROCEDURE CreatePurchHeader@6();
+    BEGIN
+      CLEAR(PurchHeaderRec);
+      PurchHeaderRec."Document Type" := PurchHeaderRec."Document Type"::Order;
+      //PurchHeaderRec."Borrow from" := TRUE;
+      PurchHeaderRec."Hours Hire Order Type" := PurchHeaderRec."Hours Hire Order Type"::Employee;
+      PurchHeaderRec.INSERT(TRUE);
+      PurchHeaderRec."Buy-from Vendor No." := HourLine.Employer;
+      PurchHeaderRec.VALIDATE("Buy-from Vendor No.");
+      IF HourLine."Currency Code" <> '' THEN BEGIN  //M25797 n
+        PurchHeaderRec."Job No." := HourLine."Project No.";  // for Validate Currency
+        PurchHeaderRec.VALIDATE("Currency Code",HourLine."Currency Code");
+        PurchHeaderRec."Job No." := '';  // Ivm Validate Currency
+      END ELSE BEGIN
+        //M25797 sn
+        IF PurchHeaderRec."Currency Code" <> '' THEN BEGIN
+          PurchHeaderRec."Job No." := HourLine."Project No.";  // for Validate Currency
+          PurchHeaderRec.VALIDATE("Currency Code",PurchHeaderRec."Currency Code");
+          PurchHeaderRec."Job No." := '';                      // for Validate Currency
+        END;
+        //M25797 en
+      END;
+      PurchHeaderRec."Posting Date":= WORKDATE; //C020332
+      PurchHeaderRec."Document Date" := HourLine."Posting Date";
+      PurchHeaderRec."Amounts only" := FALSE;
+      PurchHeaderRec."Invoice Conduction Note" := FALSE;
+      IF JobSetup."Charge Costs Extern. Employees" <> JobSetup."Charge Costs Extern. Employees"::"Posting Hours" THEN //C-025716
+        PurchHeaderRec."Job No." := HourLine."Project No.";  //** 4PS01.n
+      PurchHeaderRec.MODIFY;
+
+      TmpPurchHeader := PurchHeaderRec;
+      TmpPurchHeader.INSERT;
+
+      LineNo := 0;
+    END;
+
+    PROCEDURE PostPerDay@1210190001() : Boolean;
+    BEGIN
+      IF HourLine."Component Type" <> HourLine."Component Type"::Hours THEN
+        EXIT(FALSE);
+
+      IF NOT JobSetup."Post Hours Per Day" THEN
+        EXIT(FALSE);
+
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE HandlePriorityHours@1100525004();
+    VAR
+      lPrioBalanceDec@1100485000 : Decimal;
+      lTotalPostedPrio@1100485002 : Decimal;
+      lTotalGeneratedPrio@1100485004 : Decimal;
+      lHourLine@1100525000 : Record 11012039;
+      lHourLine2@1100525001 : Record 11012039;
+      lTotalPrioHoursWeek@1100525003 : Decimal;
+      lTotalPayedHoursWeek@1100525002 : Decimal;
+      lTotalCorrectionWeek@1100525004 : Decimal;
+    BEGIN
+      // Only start this code when a value has been assigned to "Wage Comp. Travel Hours" in Job Setup.
+      IF JobSetup."Wage Comp. Travel Hours" = '' THEN
+        EXIT;
+
+      JobSetup.TESTFIELD("Maximum Balance Priority Hours");
+      JobSetup.TESTFIELD("Maximum Priority Hours per Day");
+      JobSetup.TESTFIELD("Wage Comp. Travel Hours Work");
+      JobSetup.TESTFIELD("Wage Comp. Pr.Hours Plus");
+      JobSetup.TESTFIELD("Wage Comp. Pr.Hours Min");
+      JobSetup.TESTFIELD("Wage Comp. Paym. Travel Hours");
+
+      IF HourHeader.FINDSET THEN BEGIN
+        REPEAT
+          IF (HourHeader."Employee No." <> '') AND (HourHeader."Supplying Company" = '') THEN BEGIN
+            EmployeeRec.GET(HourHeader."Employee No.");
+            lPrioBalanceDec := DeterminePrioHoursBalance(HourHeader."Employee No.");
+            lTotalPostedPrio := 0;
+            lTotalGeneratedPrio := 0;
+            lTotalPrioHoursWeek := 0;
+            lTotalPayedHoursWeek := 0;
+            lTotalCorrectionWeek := 0;
+            WITH HourLine DO BEGIN
+              SETCURRENTKEY("Document No.","Employee No.",Year,Week,"Wage Component");
+              SETRANGE("Document No.", HourHeader."Document No.");
+              SETRANGE("Employee No.", HourHeader."Employee No.");
+              SETRANGE(Year, HourHeader.Year);
+              SETRANGE(Week, HourHeader.Week);
+              SETRANGE("Wage Component", JobSetup."Wage Comp. Travel Hours");
+              IF NOT FINDFIRST THEN
+                SETRANGE("Wage Component", JobSetup."Wage Comp. Travel Hours Work");
+              IF FINDFIRST THEN BEGIN
+                SETRANGE("Wage Component", JobSetup."Wage Comp. Travel Hours");
+                CALCSUMS(Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday);
+                lHourLine.COPY(HourLine);
+                lHourLine.SETRANGE("Wage Component", JobSetup."Wage Comp. Pr.Hours Min");
+                lHourLine.CALCSUMS(Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday);
+                lHourLine2.COPY(HourLine);
+                lHourLine2.SETRANGE("Wage Component", JobSetup."Wage Comp. Travel Hours Work");
+                lHourLine2.CALCSUMS(Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday);
+                HandlePrioLine(
+                  Monday,DeterminePostedPrioHours(lTotalPostedPrio,1),1,lTotalPostedPrio,
+                  lTotalGeneratedPrio,lPrioBalanceDec,lHourLine.Monday,lHourLine2.Monday,
+                  lTotalPrioHoursWeek,lTotalPayedHoursWeek);
+                HandlePrioLine(
+                  Tuesday,DeterminePostedPrioHours(lTotalPostedPrio,2),2,lTotalPostedPrio,
+                  lTotalGeneratedPrio,lPrioBalanceDec,lHourLine.Tuesday,lHourLine2.Tuesday,
+                  lTotalPrioHoursWeek,lTotalPayedHoursWeek);
+                HandlePrioLine(
+                  Wednesday,DeterminePostedPrioHours(lTotalPostedPrio,3),3,lTotalPostedPrio,
+                  lTotalGeneratedPrio,lPrioBalanceDec,lHourLine.Wednesday,lHourLine2.Wednesday,
+                  lTotalPrioHoursWeek,lTotalPayedHoursWeek);
+                HandlePrioLine(
+                  Thursday,DeterminePostedPrioHours(lTotalPostedPrio,4),4,lTotalPostedPrio,
+                  lTotalGeneratedPrio,lPrioBalanceDec,lHourLine.Thursday,lHourLine2.Thursday,
+                  lTotalPrioHoursWeek,lTotalPayedHoursWeek);
+                HandlePrioLine(
+                  Friday,DeterminePostedPrioHours(lTotalPostedPrio,5),5,lTotalPostedPrio,
+                  lTotalGeneratedPrio,lPrioBalanceDec,lHourLine.Friday,lHourLine2.Friday,
+                  lTotalPrioHoursWeek,lTotalPayedHoursWeek);
+                HandlePrioLine(
+                  Saturday,DeterminePostedPrioHours(lTotalPostedPrio,6),6,lTotalPostedPrio,
+                  lTotalGeneratedPrio,lPrioBalanceDec,lHourLine.Saturday,lHourLine2.Saturday,
+                  lTotalPrioHoursWeek,lTotalPayedHoursWeek);
+                HandlePrioLine(
+                  Sunday,DeterminePostedPrioHours(lTotalPostedPrio,7),7,lTotalPostedPrio,
+                  lTotalGeneratedPrio,lPrioBalanceDec,lHourLine.Sunday,lHourLine2.Sunday,
+                  lTotalPrioHoursWeek,lTotalPayedHoursWeek);
+                //weekly balance
+                IF (lTotalPrioHoursWeek < 0) AND (lTotalPayedHoursWeek > 0) THEN BEGIN
+                  IF ABS(lTotalPrioHoursWeek) > lTotalPayedHoursWeek THEN
+                    lTotalCorrectionWeek := lTotalPayedHoursWeek
+                  ELSE
+                    lTotalCorrectionWeek := ABS(lTotalPrioHoursWeek);
+                  lTotalPrioHoursWeek := lTotalPrioHoursWeek + lTotalCorrectionWeek;
+                  lTotalPayedHoursWeek := lTotalPayedHoursWeek - lTotalCorrectionWeek;
+                END;
+                //Total Balance
+                lPrioBalanceDec := lPrioBalanceDec + lTotalPrioHoursWeek;
+                IF (lPrioBalanceDec < 0) AND (lTotalPayedHoursWeek > 0) THEN BEGIN
+                  IF ABS(lPrioBalanceDec) > lTotalPayedHoursWeek THEN
+                    lTotalCorrectionWeek := lTotalCorrectionWeek + lTotalPayedHoursWeek
+                  ELSE
+                    lTotalCorrectionWeek := lTotalCorrectionWeek + ABS(lPrioBalanceDec);
+                END;
+                IF lTotalCorrectionWeek <> 0 THEN BEGIN
+                  InsertHourLine(lTotalCorrectionWeek, JobSetup."Wage Comp. Pr.Hours Plus",5);
+                  InsertHourLine(-lTotalCorrectionWeek, JobSetup."Wage Comp. Paym. Travel Hours",5);
+                END;
+                //
+              END;
+            END;
+          END;
+        UNTIL HourHeader.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE HandlePrioLine@1100525003(lTravelHours@1100485000 : Decimal;lPostedPrioDayDec@1100485003 : Decimal;DayInt@1100485001 : Integer;lTotalPostedPrio@1100485004 : Decimal;VAR lTotalGeneratedPrio@1100485009 : Decimal;lPriobalanceDec@1100485002 : Decimal;lDayMinDec@1100525000 : Decimal;lTravelHoursWorkTime@1100525001 : Decimal;VAR lTotalPrioHoursWeek@1100525002 : Decimal;VAR lTotalPayedHoursWeek@1100525003 : Decimal);
+    VAR
+      lRemainingTravelHoursDec@1100485005 : Decimal;
+      lPrioHoursGapDec@1100485006 : Decimal;
+      lTravelHoursPayDec@1100485007 : Decimal;
+      lTravelHoursPrioDec@1100485008 : Decimal;
+    BEGIN
+      //Calculate remaining hours to Max. Prio Hours
+      lPrioHoursGapDec := JobSetup."Maximum Balance Priority Hours" - (lPriobalanceDec + lTotalPostedPrio + lTotalGeneratedPrio);
+      IF lPrioHoursGapDec < 0 THEN
+        lPrioHoursGapDec := 0;
+
+      //Extract Hours During Work Time
+      lRemainingTravelHoursDec := lTravelHours - lTravelHoursWorkTime;
+      IF lRemainingTravelHoursDec > 0 THEN BEGIN
+        //Extract Employees Commuter Time
+        lRemainingTravelHoursDec := lRemainingTravelHoursDec - EmployeeRec."Commuter Time";
+        IF lRemainingTravelHoursDec < 0 THEN
+          lRemainingTravelHoursDec := 0;
+      END;
+
+      //Calculate Prio Hours and Pay Hours
+      lTravelHoursPrioDec := lRemainingTravelHoursDec;
+      IF lTravelHoursPrioDec > JobSetup."Maximum Priority Hours per Day" THEN BEGIN
+        lTravelHoursPayDec := lTravelHoursPrioDec - JobSetup."Maximum Priority Hours per Day";
+        lTravelHoursPrioDec := JobSetup."Maximum Priority Hours per Day";
+      END;
+      IF lTravelHoursPrioDec > lPrioHoursGapDec THEN BEGIN
+        lTravelHoursPayDec := lTravelHoursPayDec + lTravelHoursPrioDec - lPrioHoursGapDec;
+        lTravelHoursPrioDec := lPrioHoursGapDec;
+      END;
+
+      //Add Hour Lines
+      IF lTravelHoursPrioDec < 0 THEN BEGIN
+        InsertHourLine(lTravelHoursPrioDec, JobSetup."Wage Comp. Pr.Hours Plus",DayInt);
+        InsertHourLine(-lTravelHours, JobSetup."Wage Comp. Travel Hours",DayInt)
+      END ELSE BEGIN
+        InsertHourLine(lTravelHoursPrioDec, JobSetup."Wage Comp. Pr.Hours Plus",DayInt);
+        InsertHourLine(lTravelHoursPayDec, JobSetup."Wage Comp. Paym. Travel Hours",DayInt);
+        InsertHourLine(-lTravelHoursWorkTime-lTravelHoursPrioDec-lTravelHoursPayDec, JobSetup."Wage Comp. Travel Hours",DayInt);
+      END;
+
+      //Calc Totals
+      lTotalGeneratedPrio := lTotalGeneratedPrio + lTravelHoursPrioDec;
+      lTotalPrioHoursWeek := lTotalPrioHoursWeek + lTravelHoursPrioDec - lDayMinDec;
+      lTotalPayedHoursWeek := lTotalPayedHoursWeek + lTravelHoursPayDec;
+    END;
+
+    PROCEDURE InsertHourLine@1100485036(HoursDec@1100485002 : Decimal;WageCompCde@1100485003 : Code[10];DayInt@1100485004 : Integer);
+    VAR
+      lHourLine@1100485000 : Record 11012039;
+      lHourLine2@1100525000 : Record 11012039;
+      LastLineNo@1100485001 : Integer;
+    BEGIN
+      IF HoursDec = 0 THEN
+        EXIT;
+
+      lHourLine.SETRANGE(Year,HourHeader.Year);
+      lHourLine.SETRANGE(Week,HourHeader.Week);
+      lHourLine.SETRANGE("Employee No.",HourHeader."Employee No.");
+      IF lHourLine.FINDLAST THEN
+        LastLineNo := lHourLine."Line No." + 10000
+      ELSE
+        LastLineNo := 10000;
+
+      WITH lHourLine DO BEGIN
+        INIT;
+        Year := HourHeader.Year;
+        Week := HourHeader.Week;
+        "Employee No." := HourHeader."Employee No.";
+        "Line No." := LastLineNo;
+        InitRecord;
+        "Document No." := HourHeader."Document No.";
+        "Posting Date" := HourHeader."Posting Date";
+        Type := Type::Indirect;
+        "Cost Code" := JobSetup."Cost Code Piority Hours Post";
+        lHourLine2.COPY(HourLine);
+        IF lHourLine2.COUNT > 1 THEN BEGIN
+          CASE DayInt OF
+            1 : lHourLine2.SETFILTER(Monday, '<>0');
+            2 : lHourLine2.SETFILTER(Tuesday, '<>0');
+            3 : lHourLine2.SETFILTER(Wednesday, '<>0');
+            4 : lHourLine2.SETFILTER(Thursday, '<>0');
+            5 : lHourLine2.SETFILTER(Friday, '<>0');
+            6 : lHourLine2.SETFILTER(Saturday, '<>0');
+            7 : lHourLine2.SETFILTER(Sunday, '<>0');
+          END;
+          IF lHourLine2.FINDFIRST THEN;
+        END;
+        "Source Code" := lHourLine2."Source Code";
+        "Reason Code" := lHourLine2."Reason Code";
+        VALIDATE("Wage Component",WageCompCde);
+        CASE DayInt OF
+          1 : VALIDATE(Monday, HoursDec);
+          2 : VALIDATE(Tuesday, HoursDec);
+          3 : VALIDATE(Wednesday, HoursDec);
+          4 : VALIDATE(Thursday, HoursDec);
+          5 : VALIDATE(Friday, HoursDec);
+          6 : VALIDATE(Saturday, HoursDec);
+          7 : VALIDATE(Sunday, HoursDec);
+        END;
+        INSERT;
+      END;
+    END;
+
+    PROCEDURE DeterminePrioHoursBalance@1100485013(EmplCde@1100485000 : Code[20]) PrioBalance : Decimal;
+    VAR
+      LeaveLedgEntry@1100485001 : Record 11020235;
+    BEGIN
+      LeaveLedgEntry.RESET;
+      LeaveLedgEntry.SETCURRENTKEY("Employee No.", "Leave Type");
+      LeaveLedgEntry.SETRANGE("Employee No.", EmplCde);
+      WageCompRec.GET(JobSetup."Wage Comp. Pr.Hours Plus");
+      LeaveLedgEntry.SETRANGE("Leave Type", WageCompRec."Leave Type");
+      LeaveLedgEntry.CALCSUMS("No. of Hours");
+      EXIT(LeaveLedgEntry."No. of Hours");
+    END;
+
+    PROCEDURE DeterminePostedPrioHours@1100485024(VAR lTotalPostedPrio@1100485002 : Decimal;DayInt@1100485001 : Integer) : Decimal;
+    VAR
+      lHourLineRec@1100485000 : Record 11012039;
+    BEGIN
+      WITH lHourLineRec DO BEGIN
+        SETCURRENTKEY("Document No.","Employee No.",Year,Week,"Wage Component");
+        SETRANGE(Year, HourHeader.Year);
+        SETRANGE(Week, HourHeader.Week);
+        SETRANGE("Employee No.", HourHeader."Employee No.");
+        SETRANGE("Wage Component", JobSetup."Wage Comp. Pr.Hours Min");
+
+        WageCompRec.GET(JobSetup."Wage Comp. Pr.Hours Min");
+        WageCompRec.TESTFIELD("Leave Factor");
+        CASE DayInt OF
+          1:BEGIN
+              CALCSUMS(Monday);
+              lTotalPostedPrio := lTotalPostedPrio + (Monday * WageCompRec."Leave Factor");
+              EXIT(Monday);
+            END;
+          2:BEGIN
+              CALCSUMS(Tuesday);
+              lTotalPostedPrio := lTotalPostedPrio + (Tuesday * WageCompRec."Leave Factor");
+              EXIT(Tuesday);
+            END;
+          3:BEGIN
+              CALCSUMS(Wednesday);
+              lTotalPostedPrio := lTotalPostedPrio + (Wednesday * WageCompRec."Leave Factor");
+              EXIT(Wednesday);
+            END;
+          4:BEGIN
+              CALCSUMS(Thursday);
+              lTotalPostedPrio := lTotalPostedPrio + (Thursday * WageCompRec."Leave Factor");
+              EXIT(Thursday);
+            END;
+          5:BEGIN
+              CALCSUMS(Friday);
+              lTotalPostedPrio := lTotalPostedPrio + (Friday * WageCompRec."Leave Factor");
+              EXIT(Friday);
+            END;
+          6:BEGIN
+              CALCSUMS(Saturday);
+              lTotalPostedPrio := lTotalPostedPrio + (Saturday * WageCompRec."Leave Factor");
+              EXIT(Saturday);
+            END;
+          7:BEGIN
+              CALCSUMS(Sunday);
+              lTotalPostedPrio := lTotalPostedPrio + (Sunday * WageCompRec."Leave Factor");
+              EXIT(Sunday);
+            END;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE HandleHoursConsentLines@1100528400(VAR HourAccounting@1100528400 : Record 11012038);
+    VAR
+      HumanResourcesSetup@1100528401 : Record 5218;
+      HoursConsentLine@1100528402 : Record 11020437;
+    BEGIN
+      HumanResourcesSetup.GET;
+      IF NOT HumanResourcesSetup."Consent Hours" THEN
+        EXIT;
+
+      IF CurrentUserIsSuperConsenter THEN
+        SuperConsentHoursConsentLines(HourAccounting)
+      ELSE
+        IF OpenHrsConsentLinesArePresent(HourAccounting) THEN
+          ERROR(Text013, HoursConsentLine.TABLECAPTION);
+    END;
+
+    LOCAL PROCEDURE CurrentUserIsSuperConsenter@1100528401() : Boolean;
+    VAR
+      UserSetup@1100528402 : Record 91;
+    BEGIN
+      EXIT(UserSetup.CurrentUserIsSuperConsenter);
+    END;
+
+    LOCAL PROCEDURE SuperConsentHoursConsentLines@1100528404(VAR HourAccounting@1100528401 : Record 11012038);
+    BEGIN
+      IF HourAccounting.FINDSET THEN
+        REPEAT
+          HourAccounting.SuperConsentHoursConsentLines;
+        UNTIL HourAccounting.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE OpenHrsConsentLinesArePresent@1100485002(VAR HourAccounting@1100528401 : Record 11012038) : Boolean;
+    BEGIN
+      IF HourAccounting.FINDSET THEN
+        REPEAT
+          IF HourAccounting.HasOpenHoursConsentLines THEN
+            EXIT(TRUE);
+        UNTIL HourAccounting.NEXT = 0;
+    END;
+
+    PROCEDURE CheckSetCostPlusCreated@1100525000();
+    VAR
+      lvProjRec@1100525000 : Record 11072003;
+    BEGIN
+      //* If cost plus is generated from the project ledger entry then set 'Cost Plus Entry Created' in the posted hour line.
+      WITH PostedHourLine DO BEGIN
+        IF (NOT Chargeable) OR (NOT ("Component Type" IN ["Component Type"::Hours, "Component Type"::Expenses])) THEN
+          EXIT;
+        IF (JobSetup."Small Project Cost Plus Hours" <> JobSetup."Small Project Cost Plus Hours"::"Job Ledger Entries") AND
+           (JobSetup."Project Cost Plus Hours from" <> JobSetup."Project Cost Plus Hours from"::"Job Ledger Entries")
+        THEN
+          EXIT;
+
+        IF (JobSetup."Small Project Cost Plus Hours" = JobSetup."Small Project Cost Plus Hours"::"Job Ledger Entries") AND
+           (JobSetup."Project Cost Plus Hours from" = JobSetup."Project Cost Plus Hours from"::"Job Ledger Entries")
+        THEN BEGIN
+          "Cost Plus Entry Created" := TRUE;
+          EXIT;
+        END;
+
+        IF PostedHourLine."Receiving Company" <> '' THEN
+          lvProjRec.CHANGECOMPANY(PostedHourLine."Receiving Company");
+        IF NOT lvProjRec.GET(PostedHourLine."Project No.") THEN
+          EXIT;
+
+        IF (lvProjRec."Small Project" AND
+            (JobSetup."Small Project Cost Plus Hours" = JobSetup."Small Project Cost Plus Hours"::"Job Ledger Entries"))
+          OR
+           (NOT lvProjRec."Small Project" AND
+            (JobSetup."Project Cost Plus Hours from" = JobSetup."Project Cost Plus Hours from"::"Job Ledger Entries"))
+        THEN
+          "Cost Plus Entry Created" := TRUE;
+      END;
+    END;
+
+    LOCAL PROCEDURE SkipPostLine@1100525001(HourAccLine@1100525000 : Record 11012039) : Boolean;
+    BEGIN
+      //C004448
+      WITH HourAccLine DO BEGIN
+        IF External THEN BEGIN
+          IF JobSetup."Charge Costs Extern. Employees" = JobSetup."Charge Costs Extern. Employees"::"Posting Invoices" THEN BEGIN
+            // IF NOT ((Type IN [Type::Project, Type::Service]) AND ("Cost Type" = "Cost Type"::Plant)) THEN  C022483 old
+              EXIT(TRUE);
+          END;
+        END;
+      END;
+      EXIT(FALSE);
+    END;
+
+    LOCAL PROCEDURE MakeHourLinePerDay@1100525010(DayNo@1100525000 : Integer;HourLine@1100525001 : Record 11012039;VAR HourLinePerDay@1100525002 : Record 11012039);
+    BEGIN
+      //C023078
+      HourLinePerDay := HourLine;
+      HourLinePerDay.Monday := 0;
+      HourLinePerDay.Tuesday := 0;
+      HourLinePerDay.Wednesday := 0;
+      HourLinePerDay.Thursday := 0;
+      HourLinePerDay.Friday := 0;
+      HourLinePerDay.Saturday := 0;
+      HourLinePerDay.Sunday := 0;
+      CASE DayNo OF
+        1: HourLinePerDay.Monday := HourLine.Monday;
+        2: HourLinePerDay.Tuesday := HourLine.Tuesday;
+        3: HourLinePerDay.Wednesday := HourLine.Wednesday;
+        4: HourLinePerDay.Thursday := HourLine.Thursday;
+        5: HourLinePerDay.Friday := HourLine.Friday;
+        6: HourLinePerDay.Saturday := HourLine.Saturday;
+        7: HourLinePerDay.Sunday := HourLine.Sunday;
+      END;
+      HourLinePerDay."Total Line" :=
+        HourLinePerDay.Monday + HourLinePerDay.Tuesday + HourLinePerDay.Wednesday +
+        HourLinePerDay.Thursday + HourLinePerDay.Friday + HourLinePerDay.Saturday + HourLinePerDay.Sunday;
+      IF HourLinePerDay."Total Line" <> 0 THEN BEGIN
+        HourLinePerDay."Amount (LCY)" := ROUND(HourLinePerDay."Total Line" * HourLinePerDay."Unit Cost (LCY)");
+        HourLinePerDay.CheckPostingDate;
+      END;
+    END;
+
+    BEGIN
+    {
+      D. Borkent, 31-10-2001: post per document no. instead of year/week; changed interface (hourheader instead of hourline);
+                              skip delete-trigger hourheader (based on year/week); posting external hours at actual rate
+      4PS, 04-02-2014, C012827, Mercash Support for Actual Cost added
+      4PS, 06-02-2014..14-04-2014, C012827, Mercash Support for Indirect Hours added
+    }
+    END.
+  }
+}
+

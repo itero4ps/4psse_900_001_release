@@ -1,0 +1,132 @@
+OBJECT Codeunit 88 Sales Post via Job Queue
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW17.10,4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=472;
+    OnRun=VAR
+            SalesHeader@1000 : Record 36;
+            SalesPostPrint@1002 : Codeunit 82;
+            RecRef@1001 : RecordRef;
+            SalesPost@1100525000 : Codeunit 80;
+          BEGIN
+            TESTFIELD("Record ID to Process");
+            RecRef.GET("Record ID to Process");
+            RecRef.SETTABLE(SalesHeader);
+            SalesHeader.FIND;
+
+            SetJobQueueStatus(SalesHeader,SalesHeader."Job Queue Status"::Posting);
+            //**4PS.sn
+            IF SalesHeader.PostPlantInvoiceProposalViaIC THEN BEGIN
+              IF NOT SalesPost.PostInvoiceProposalviaIC(SalesHeader) THEN BEGIN
+                SetJobQueueStatus(SalesHeader,SalesHeader."Job Queue Status"::Error);
+                ERROR(GETLASTERRORTEXT);
+              END;
+            END ELSE
+            //**4PS.en
+              IF NOT CODEUNIT.RUN(CODEUNIT::"Sales-Post",SalesHeader) THEN BEGIN
+                SetJobQueueStatus(SalesHeader,SalesHeader."Job Queue Status"::Error);
+                ERROR(GETLASTERRORTEXT);
+              END;
+            IF SalesHeader."Print Posted Documents" THEN
+              SalesPostPrint.GetReport(SalesHeader);
+
+            SetJobQueueStatus(SalesHeader,SalesHeader."Job Queue Status"::" ");
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      PostDescription@1000 : TextConst '@@@="%1 = document type, %2 = document number. Example: Post Sales Order 1234.";ENU=Post Sales %1 %2.';
+      PostAndPrintDescription@1002 : TextConst '@@@="%1 = document type, %2 = document number. Example: Post Sales Order 1234.";ENU=Post and Print Sales %1 %2.';
+      Confirmation@1001 : TextConst '@@@="%1=document type, %2=number, e.g. Order 123  or Invoice 234.";ENU=%1 %2 has been scheduled for posting.';
+      WrongJobQueueStatus@1003 : TextConst '@@@="%1 = document type, %2 = document number. Example: Sales Order 1234 or Invoice 1234.";ENU=%1 %2 cannot be posted because it has already been scheduled for posting. Choose the Remove from Job Queue action to reset the job queue status and then post again.';
+
+    LOCAL PROCEDURE SetJobQueueStatus@5(VAR SalesHeader@1001 : Record 36;NewStatus@1000 : Option);
+    BEGIN
+      SalesHeader.LOCKTABLE;
+      IF SalesHeader.FIND THEN BEGIN
+        SalesHeader."Job Queue Status" := NewStatus;
+        SalesHeader.MODIFY;
+        COMMIT;
+      END;
+    END;
+
+    PROCEDURE EnqueueSalesDoc@1(VAR SalesHeader@1000 : Record 36);
+    VAR
+      SalesSetup@1003 : Record 311;
+      JobQueueEntry@1002 : Record 472;
+      RecRef@1001 : RecordRef;
+      TempInvoice@1006 : Boolean;
+      TempRcpt@1005 : Boolean;
+      TempShip@1004 : Boolean;
+    BEGIN
+      SalesSetup.GET;
+      WITH SalesHeader DO BEGIN
+        IF NOT ("Job Queue Status" IN ["Job Queue Status"::" ","Job Queue Status"::Error]) THEN
+          ERROR(WrongJobQueueStatus,"Document Type","No.");
+        TempInvoice := Invoice;
+        TempRcpt := Receive;
+        TempShip := Ship;
+        IF Status = Status::Open THEN
+          CODEUNIT.RUN(CODEUNIT::"Release Sales Document",SalesHeader);
+        Invoice := TempInvoice;
+        Receive := TempRcpt;
+        Ship := TempShip;
+        "Job Queue Status" := "Job Queue Status"::"Scheduled for Posting";
+        "Job Queue Entry ID" := CREATEGUID;
+        MODIFY;
+        RecRef.GETTABLE(SalesHeader);
+        JobQueueEntry.ID := "Job Queue Entry ID";
+        JobQueueEntry."Object Type to Run" := JobQueueEntry."Object Type to Run"::Codeunit;
+        JobQueueEntry."Object ID to Run" := CODEUNIT::"Sales Post via Job Queue";
+        JobQueueEntry."Record ID to Process" := RecRef.RECORDID;
+        JobQueueEntry."Job Queue Category Code" := SalesSetup."Job Queue Category Code";
+        // Set Timeout to prevent the Job Queue from hanging (eg. as a result of a printer dialog).
+        JobQueueEntry."Timeout (sec.)" := 7200;
+        JobQueueEntry."Run in User Session" := TRUE;
+        IF "Print Posted Documents" THEN BEGIN
+          JobQueueEntry.Priority := SalesSetup."Job Q. Prio. for Post & Print";
+          JobQueueEntry.Description :=
+            COPYSTR(STRSUBSTNO(PostAndPrintDescription,"Document Type","No."),1,MAXSTRLEN(JobQueueEntry.Description));
+        END ELSE BEGIN
+          JobQueueEntry.Priority := SalesSetup."Job Queue Priority for Post";
+          JobQueueEntry.Description :=
+            COPYSTR(STRSUBSTNO(PostDescription,"Document Type","No."),1,MAXSTRLEN(JobQueueEntry.Description));
+        END;
+        JobQueueEntry."Notify On Success" := SalesSetup."Notify On Success";
+        CODEUNIT.RUN(CODEUNIT::"Job Queue - Enqueue",JobQueueEntry);
+        MESSAGE(Confirmation,"Document Type","No.");
+      END;
+    END;
+
+    PROCEDURE CancelQueueEntry@2(VAR SalesHeader@1000 : Record 36);
+    VAR
+      JobQueueEntry@1002 : Record 472;
+      RecRef@1001 : RecordRef;
+    BEGIN
+      WITH SalesHeader DO BEGIN
+        IF "Job Queue Status" = "Job Queue Status"::" " THEN
+          EXIT;
+        RecRef.GETTABLE(SalesHeader);
+        IF NOT ISNULLGUID("Job Queue Entry ID") THEN
+          JobQueueEntry.SETRANGE(ID,"Job Queue Entry ID");
+        JobQueueEntry.SETRANGE("Record ID to Process",RecRef.RECORDID);
+        IF NOT JobQueueEntry.ISEMPTY THEN
+          JobQueueEntry.DELETEALL;
+        "Job Queue Status" := "Job Queue Status"::" ";
+        MODIFY;
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

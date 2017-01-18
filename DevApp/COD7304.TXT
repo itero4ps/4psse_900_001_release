@@ -1,0 +1,559 @@
+OBJECT Codeunit 7304 Whse. Jnl.-Register Batch
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00.00.45243;
+  }
+  PROPERTIES
+  {
+    TableNo=7311;
+    Permissions=TableData 7310=imd,
+                TableData 7312=imd,
+                TableData 7313=imd;
+    OnRun=BEGIN
+            WhseJnlLine.COPY(Rec);
+            Code;
+            Rec := WhseJnlLine;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1000 : TextConst 'ENU=cannot exceed %1 characters';
+      Text001@1001 : TextConst 'ENU=Journal Batch Name    #1##########\\';
+      Text002@1002 : TextConst 'ENU=Checking lines        #2######\';
+      Text003@1005 : TextConst 'ENU=Registering lines     #3###### @4@@@@@@@@@@@@@';
+      Text004@1006 : TextConst 'ENU=A maximum of %1 registering number series can be used in each journal.';
+      Text007@1009 : TextConst '@@@="One or more reservation entries exist for the item with Item No. = 1000, Location Code = BLUE, Variant Code = NEW which may be disrupted if you post this negative adjustment. Do you want to continue?";ENU="One or more reservation entries exist for the item with %1 = %2, %3 = %4, %5 = %6 which may be disrupted if you post this negative adjustment. Do you want to continue?"';
+      WhseJnlTemplate@1010 : Record 7309;
+      WhseJnlBatch@1011 : Record 7310;
+      WhseJnlLine@1012 : Record 7311;
+      WhseJnlLine2@1013 : Record 7311;
+      WhseJnlLine3@1014 : Record 7311;
+      WhseEntry@1015 : Record 7312;
+      WhseReg@1016 : Record 7313;
+      TempBinContentBuffer@1007 : TEMPORARY Record 7330;
+      NoSeries@1019 : TEMPORARY Record 308;
+      NoSeriesMgt@1023 : Codeunit 396;
+      NoSeriesMgt2@1024 : ARRAY [10] OF Codeunit 396;
+      WMSMgt@1046 : Codeunit 7302;
+      ItemJnlPostLine@1008 : Codeunit 22;
+      Window@1027 : Dialog;
+      WhseRegNo@1028 : Integer;
+      StartLineNo@1029 : Integer;
+      NoOfRecords@1034 : Integer;
+      LineCount@1035 : Integer;
+      LastDocNo@1036 : Code[20];
+      LastDocNo2@1037 : Code[20];
+      LastRegisteredDocNo@1038 : Code[20];
+      NoOfRegisteringNoSeries@1039 : Integer;
+      RegisteringNoSeriesNo@1040 : Integer;
+      Text005@1003 : TextConst 'ENU=Item tracking lines defined for the source line must account for the same quantity as you have entered.';
+      Text006@1004 : TextConst 'ENU=Item tracking lines do not match the bin content.';
+      PhysInvtCount@1018 : Boolean;
+
+    LOCAL PROCEDURE Code@3();
+    VAR
+      TempHandlingSpecification@1000 : TEMPORARY Record 336;
+      TempWhseJnlLine2@1001 : TEMPORARY Record 7311;
+      ItemJnlLine@1006 : Record 83;
+      ItemTrackingMgt@1002 : Codeunit 6500;
+      WhseJnlRegisterLine@1005 : Codeunit 7301;
+      PhysInvtCountMgt@1007 : Codeunit 7380;
+      WhseSNRequired@1003 : Boolean;
+      WhseLNRequired@1004 : Boolean;
+    BEGIN
+      WITH WhseJnlLine DO BEGIN
+        LOCKTABLE;
+        SETRANGE("Journal Template Name","Journal Template Name");
+        SETRANGE("Journal Batch Name","Journal Batch Name");
+        SETRANGE("Location Code","Location Code");
+        WhseJnlTemplate.GET("Journal Template Name");
+        WhseJnlBatch.GET("Journal Template Name","Journal Batch Name","Location Code");
+        IF STRLEN(INCSTR(WhseJnlBatch.Name)) > MAXSTRLEN(WhseJnlBatch.Name) THEN
+          WhseJnlBatch.FIELDERROR(
+            Name,
+            STRSUBSTNO(
+              Text000,
+              MAXSTRLEN(WhseJnlBatch.Name)));
+
+        IF NOT FIND('=><') THEN BEGIN
+          "Line No." := 0;
+          COMMIT;
+          EXIT;
+        END;
+
+        Window.OPEN(
+          Text001 +
+          Text002 +
+          Text003);
+
+        Window.UPDATE(1,"Journal Batch Name");
+        CheckItemAvailability(WhseJnlLine);
+
+        // Check Lines
+        LineCount := 0;
+        StartLineNo := "Line No.";
+        ItemTrackingMgt.InitCollectItemTrkgInformation;
+        REPEAT
+          LineCount := LineCount + 1;
+          Window.UPDATE(2,LineCount);
+          WMSMgt.CheckWhseJnlLine(WhseJnlLine,4,"Qty. (Absolute, Base)",FALSE);
+          IF "Entry Type" IN ["Entry Type"::"Positive Adjmt.","Entry Type"::Movement] THEN
+            UpdateTempBinContentBuffer(WhseJnlLine,"To Bin Code",TRUE);
+          IF "Entry Type" IN ["Entry Type"::"Negative Adjmt.","Entry Type"::Movement] THEN
+            UpdateTempBinContentBuffer(WhseJnlLine,"From Bin Code",FALSE);
+
+          ItemTrackingMgt.CheckWhseItemTrkgSetup("Item No.",WhseSNRequired,WhseLNRequired,FALSE);
+          IF WhseSNRequired OR WhseLNRequired THEN BEGIN
+            IF WhseSNRequired THEN
+              TESTFIELD("Qty. per Unit of Measure",1);
+            IF WhseJnlTemplate.Type <> WhseJnlTemplate.Type::"Physical Inventory" THEN
+              CreateTrackingSpecification(WhseJnlLine,TempHandlingSpecification)
+            ELSE BEGIN
+              IF WhseSNRequired THEN
+                TESTFIELD("Serial No.");
+              IF WhseLNRequired THEN
+                TESTFIELD("Lot No.");
+            END;
+          END;
+          ItemTrackingMgt.CollectItemTrkgInfWhseJnlLine(WhseJnlLine);
+          IF NEXT = 0 THEN
+            FIND('-');
+        UNTIL "Line No." = StartLineNo;
+        ItemTrackingMgt.CheckItemTrkgInfBeforePost;
+        CheckBin;
+        NoOfRecords := LineCount;
+
+        // Find next register no.
+        WhseEntry.LOCKTABLE;
+        IF WhseEntry.FINDLAST THEN;
+        WhseReg.LOCKTABLE;
+        IF WhseReg.FINDLAST THEN
+          WhseRegNo := WhseReg."No." + 1
+        ELSE
+          WhseRegNo := 1;
+
+        PhysInvtCount := FALSE;
+
+        // Register lines
+        LineCount := 0;
+        LastDocNo := '';
+        LastDocNo2 := '';
+        LastRegisteredDocNo := '';
+        FIND('-');
+        REPEAT
+          IF NOT EmptyLine AND
+             (WhseJnlBatch."No. Series" <> '') AND
+             ("Whse. Document No." <> LastDocNo2)
+          THEN
+            TESTFIELD("Whse. Document No.",
+              NoSeriesMgt.GetNextNo(WhseJnlBatch."No. Series","Registering Date",FALSE));
+          IF NOT EmptyLine THEN
+            LastDocNo2 := "Whse. Document No.";
+          IF "Registering No. Series" = '' THEN
+            "Registering No. Series" := WhseJnlBatch."No. Series"
+          ELSE
+            IF NOT EmptyLine THEN
+              IF "Whse. Document No." = LastDocNo THEN
+                "Whse. Document No." := LastRegisteredDocNo
+              ELSE BEGIN
+                IF NOT NoSeries.GET("Registering No. Series") THEN BEGIN
+                  NoOfRegisteringNoSeries := NoOfRegisteringNoSeries + 1;
+                  IF NoOfRegisteringNoSeries > ARRAYLEN(NoSeriesMgt2) THEN
+                    ERROR(
+                      Text004,
+                      ARRAYLEN(NoSeriesMgt2));
+                  NoSeries.Code := "Registering No. Series";
+                  NoSeries.Description := FORMAT(NoOfRegisteringNoSeries);
+                  NoSeries.INSERT;
+                END;
+                LastDocNo := "Whse. Document No.";
+                EVALUATE(RegisteringNoSeriesNo,NoSeries.Description);
+                "Whse. Document No." :=
+                  NoSeriesMgt2[RegisteringNoSeriesNo].GetNextNo(
+                    "Registering No. Series","Registering Date",FALSE);
+                LastRegisteredDocNo := "Whse. Document No.";
+              END;
+
+          LineCount := LineCount + 1;
+          Window.UPDATE(3,LineCount);
+          Window.UPDATE(4,ROUND(LineCount / NoOfRecords * 10000,1));
+
+          IF Quantity < 0 THEN
+            WMSMgt.CalcCubageAndWeight(
+              "Item No.","Unit of Measure Code","Qty. (Absolute)",Cubage,Weight);
+
+          ItemTrackingMgt.SplitWhseJnlLine(WhseJnlLine,TempWhseJnlLine2,TempHandlingSpecification,FALSE);
+          IF TempWhseJnlLine2.FIND('-') THEN
+            REPEAT
+              WhseJnlRegisterLine.RUN(TempWhseJnlLine2);
+            UNTIL TempWhseJnlLine2.NEXT = 0;
+
+          IF IsReclass("Journal Template Name") THEN
+            IF CreateItemJnlLine(WhseJnlLine,ItemJnlLine) THEN
+              ItemJnlPostLine.RunWithCheck(ItemJnlLine);
+
+          IF IsPhysInvtCount(WhseJnlTemplate,"Phys Invt Counting Period Code","Phys Invt Counting Period Type") THEN BEGIN
+            IF NOT PhysInvtCount THEN BEGIN
+              PhysInvtCountMgt.InitTempItemSKUList;
+              PhysInvtCount := TRUE;
+            END;
+            PhysInvtCountMgt.AddToTempItemSKUList("Item No.","Location Code","Variant Code","Phys Invt Counting Period Type");
+          END;
+        UNTIL NEXT = 0;
+
+        // Copy register no. and current journal batch name to Whse journal
+        IF NOT WhseReg.FINDLAST OR (WhseReg."No." <> WhseRegNo) THEN
+          WhseRegNo := 0;
+
+        INIT;
+        "Line No." := WhseRegNo;
+
+        // Update/delete lines
+        IF WhseRegNo <> 0 THEN BEGIN
+          // Not a recurring journal
+          WhseJnlLine2.COPYFILTERS(WhseJnlLine);
+          WhseJnlLine2.SETFILTER("Item No.",'<>%1','');
+          IF WhseJnlLine2.FINDLAST THEN; // Remember the last line
+
+          IF FIND('-') THEN BEGIN
+            REPEAT
+              ItemTrackingMgt.DeleteWhseItemTrkgLines(
+                DATABASE::"Warehouse Journal Line",0,"Journal Batch Name",
+                "Journal Template Name",0,"Line No.","Location Code",TRUE);
+            UNTIL NEXT = 0;
+            DELETEALL;
+          END;
+
+          WhseJnlLine3.SETRANGE("Journal Template Name","Journal Template Name");
+          WhseJnlLine3.SETRANGE("Journal Batch Name","Journal Batch Name");
+          WhseJnlLine3.SETRANGE("Location Code","Location Code");
+          IF NOT WhseJnlLine3.FINDLAST THEN
+            IF INCSTR("Journal Batch Name") <> '' THEN BEGIN
+              WhseJnlBatch.DELETE;
+              WhseJnlBatch.Name := INCSTR("Journal Batch Name");
+              IF WhseJnlBatch.INSERT THEN;
+              "Journal Batch Name" := WhseJnlBatch.Name;
+            END;
+
+          WhseJnlLine3.SETRANGE("Journal Batch Name","Journal Batch Name");
+          IF (WhseJnlBatch."No. Series" = '') AND NOT WhseJnlLine3.FINDLAST THEN BEGIN
+            WhseJnlLine3.INIT;
+            WhseJnlLine3."Journal Template Name" := "Journal Template Name";
+            WhseJnlLine3."Journal Batch Name" := "Journal Batch Name";
+            WhseJnlLine3."Location Code" := "Location Code";
+            WhseJnlLine3."Line No." := 10000;
+            WhseJnlLine3.INSERT;
+            WhseJnlLine3.SetUpNewLine(WhseJnlLine2);
+            WhseJnlLine3.MODIFY;
+          END;
+        END;
+        IF WhseJnlBatch."No. Series" <> '' THEN
+          NoSeriesMgt.SaveNoSeries;
+        IF NoSeries.FIND('-') THEN
+          REPEAT
+            EVALUATE(RegisteringNoSeriesNo,NoSeries.Description);
+            NoSeriesMgt2[RegisteringNoSeriesNo].SaveNoSeries;
+          UNTIL NoSeries.NEXT = 0;
+
+        IF PhysInvtCount THEN
+          PhysInvtCountMgt.UpdateItemSKUListPhysInvtCount;
+
+        Window.CLOSE;
+        COMMIT;
+        CLEAR(WhseJnlRegisterLine);
+      END;
+    END;
+
+    LOCAL PROCEDURE CreateTrackingSpecification@1(WhseJnlLine@1000 : Record 7311;VAR TempHandlingSpecification@1001 : TEMPORARY Record 336);
+    VAR
+      WhseItemTrkgLine@1002 : Record 6550;
+      BinContent@1003 : Record 7302;
+      Location@1007 : Record 14;
+      ItemTrackingMgt@1004 : Codeunit 6500;
+      WhseSNRequired@1005 : Boolean;
+      WhseLNRequired@1006 : Boolean;
+    BEGIN
+      IF (WhseJnlLine."Entry Type" = WhseJnlLine."Entry Type"::Movement) OR
+         (WhseJnlLine.Quantity < 0)
+      THEN
+        BinContent.GET(WhseJnlLine."Location Code",WhseJnlLine."From Bin Code",WhseJnlLine."Item No.",
+          WhseJnlLine."Variant Code",WhseJnlLine."Unit of Measure Code");
+
+      WhseItemTrkgLine.SETCURRENTKEY(
+        "Source ID","Source Type","Source Subtype","Source Batch Name",
+        "Source Prod. Order Line","Source Ref. No.","Location Code");
+      WhseItemTrkgLine.SETRANGE("Source Type",DATABASE::"Warehouse Journal Line");
+      WhseItemTrkgLine.SETRANGE("Source ID",WhseJnlLine."Journal Batch Name");
+      WhseItemTrkgLine.SETRANGE("Source Batch Name",WhseJnlLine."Journal Template Name");
+      WhseItemTrkgLine.SETRANGE("Source Ref. No.",WhseJnlLine."Line No.");
+      WhseItemTrkgLine.SETRANGE("Location Code",WhseJnlLine."Location Code");
+      WhseItemTrkgLine.CALCSUMS("Qty. to Handle (Base)");
+
+      IF WhseItemTrkgLine."Qty. to Handle (Base)" <> ABS(WhseJnlLine."Qty. (Absolute, Base)") THEN
+        ERROR(Text005);
+
+      IF WhseItemTrkgLine.FIND('-') THEN
+        REPEAT
+          ItemTrackingMgt.CheckWhseItemTrkgSetup(WhseJnlLine."Item No.",WhseSNRequired,WhseLNRequired,FALSE);
+          IF WhseSNRequired THEN
+            WhseItemTrkgLine.TESTFIELD("Serial No.");
+          IF WhseLNRequired THEN
+            WhseItemTrkgLine.TESTFIELD("Lot No.");
+        UNTIL WhseItemTrkgLine.NEXT = 0;
+
+      IF (WhseJnlLine."Entry Type" = WhseJnlLine."Entry Type"::Movement) OR
+         (WhseJnlLine.Quantity < 0)
+      THEN
+        IF WhseItemTrkgLine.FIND('-') THEN
+          REPEAT
+            BinContent.SETRANGE("Lot No. Filter",WhseItemTrkgLine."Lot No.");
+            BinContent.SETRANGE("Serial No. Filter",WhseItemTrkgLine."Serial No.");
+            BinContent.CALCFIELDS("Quantity (Base)");
+            IF WhseItemTrkgLine."Quantity (Base)" > BinContent."Quantity (Base)" THEN
+              ERROR(Text006);
+          UNTIL WhseItemTrkgLine.NEXT = 0;
+
+      IF WhseItemTrkgLine.FIND('-') THEN
+        REPEAT
+          TempHandlingSpecification.INIT;
+          TempHandlingSpecification.TRANSFERFIELDS(WhseItemTrkgLine);
+          TempHandlingSpecification."Quantity actual Handled (Base)" := WhseItemTrkgLine."Qty. to Handle (Base)";
+          TempHandlingSpecification.INSERT;
+
+          WITH WhseJnlLine DO BEGIN
+            Location.GET("Location Code");
+            IF ("From Bin Code" <> '') AND
+               ("From Bin Code" <> Location."Adjustment Bin Code") AND
+               Location."Directed Put-away and Pick"
+            THEN BEGIN
+              BinContent.GET(
+                "Location Code","From Bin Code",
+                "Item No.","Variant Code","Unit of Measure Code");
+              BinContent.SETFILTER("Lot No. Filter",TempHandlingSpecification."Lot No.");
+              BinContent.SETFILTER("Serial No. Filter",TempHandlingSpecification."Serial No.");
+              BinContent.CheckDecreaseBinContent("Qty. (Absolute)","Qty. (Absolute, Base)","Qty. (Absolute, Base)");
+            END;
+          END;
+        UNTIL WhseItemTrkgLine.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE UpdateTempBinContentBuffer@2(WhseJnlLine@1000 : Record 7311;BinCode@1001 : Code[20];Increase@1002 : Boolean);
+    BEGIN
+      // Calculate cubage and weight per bin
+      WITH WhseJnlLine DO BEGIN
+        IF NOT TempBinContentBuffer.GET(
+             "Location Code",BinCode,'','','','','')
+        THEN BEGIN
+          TempBinContentBuffer.INIT;
+          TempBinContentBuffer."Location Code" := "Location Code";
+          TempBinContentBuffer."Bin Code" := BinCode;
+          TempBinContentBuffer.INSERT;
+        END;
+        IF Increase THEN BEGIN
+          TempBinContentBuffer."Qty. to Handle (Base)" := TempBinContentBuffer."Qty. to Handle (Base)" + "Qty. (Absolute, Base)";
+          TempBinContentBuffer.Cubage := TempBinContentBuffer.Cubage + Cubage;
+          TempBinContentBuffer.Weight := TempBinContentBuffer.Weight + Weight;
+        END ELSE BEGIN
+          WMSMgt.CalcCubageAndWeight(
+            "Item No.","Unit of Measure Code","Qty. (Absolute)",Cubage,Weight);
+          TempBinContentBuffer."Qty. to Handle (Base)" := TempBinContentBuffer."Qty. to Handle (Base)" - "Qty. (Absolute, Base)";
+          TempBinContentBuffer.Cubage := TempBinContentBuffer.Cubage - Cubage;
+          TempBinContentBuffer.Weight := TempBinContentBuffer.Weight - Weight;
+        END;
+        TempBinContentBuffer.MODIFY;
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckBin@18();
+    VAR
+      Bin@1000 : Record 7354;
+    BEGIN
+      WITH TempBinContentBuffer DO BEGIN
+        SETFILTER("Qty. to Handle (Base)",'>0');
+        IF FIND('-') THEN
+          REPEAT
+            Bin.GET("Location Code","Bin Code");
+            Bin.CheckIncreaseBin(
+              "Bin Code",'',"Qty. to Handle (Base)",Cubage,Weight,Cubage,Weight,TRUE,FALSE);
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE GetWhseRegNo@6() : Integer;
+    BEGIN
+      EXIT(WhseRegNo);
+    END;
+
+    LOCAL PROCEDURE CreateItemJnlLine@9(WhseJnlLine2@1000 : Record 7311;VAR ItemJnlLine@1002 : Record 83) : Boolean;
+    VAR
+      ReservEntry@1005 : Record 337;
+      WhseItemTrkgLine@1006 : Record 6550;
+      CreateReservEntry@1004 : Codeunit 99000830;
+      QtyToHandleBase@1003 : Decimal;
+    BEGIN
+      WhseItemTrkgLine.SETCURRENTKEY(
+        "Source ID","Source Type","Source Subtype","Source Batch Name",
+        "Source Prod. Order Line","Source Ref. No.","Location Code");
+      WhseItemTrkgLine.SETRANGE("Source Type",DATABASE::"Warehouse Journal Line");
+      WhseItemTrkgLine.SETRANGE("Source ID",WhseJnlLine2."Journal Batch Name");
+      WhseItemTrkgLine.SETRANGE("Source Batch Name",WhseJnlLine2."Journal Template Name");
+      WhseItemTrkgLine.SETRANGE("Source Ref. No.",WhseJnlLine2."Line No.");
+      WhseItemTrkgLine.SETRANGE("Location Code",WhseJnlLine2."Location Code");
+
+      IF WhseItemTrkgLine.FINDSET THEN BEGIN
+        ItemJnlLine.INIT;
+        ItemJnlLine."Line No." := 0;
+        ItemJnlLine.VALIDATE("Entry Type",ItemJnlLine."Entry Type"::Transfer);
+        WITH WhseJnlLine2 DO BEGIN
+          REPEAT
+            IF ((WhseItemTrkgLine."New Serial No." <> WhseItemTrkgLine."Serial No.") OR
+                (WhseItemTrkgLine."New Lot No." <> WhseItemTrkgLine."Lot No.") OR
+                (WhseItemTrkgLine."New Expiration Date" <> WhseItemTrkgLine."Expiration Date"))
+            THEN BEGIN
+              CreateReservEntry.CreateReservEntryFor(
+                DATABASE::"Item Journal Line",
+                ItemJnlLine."Entry Type",
+                '',
+                '',
+                0,
+                "Line No.",
+                WhseItemTrkgLine."Qty. per Unit of Measure",
+                ABS(WhseItemTrkgLine."Qty. to Handle"),
+                ABS(WhseItemTrkgLine."Qty. to Handle (Base)"),
+                WhseItemTrkgLine."Serial No.",
+                WhseItemTrkgLine."Lot No.");
+              CreateReservEntry.SetNewSerialLotNo(WhseItemTrkgLine."New Serial No.",WhseItemTrkgLine."New Lot No.");
+              CreateReservEntry.SetDates(WhseItemTrkgLine."Warranty Date",WhseItemTrkgLine."Expiration Date");
+              CreateReservEntry.SetNewExpirationDate(WhseItemTrkgLine."New Expiration Date");
+              CreateReservEntry.CreateEntry(
+                "Item No.",
+                "Variant Code",
+                "Location Code",
+                Description,
+                0D,
+                0D,
+                0,
+                ReservEntry."Reservation Status"::Prospect);
+              QtyToHandleBase += ABS(WhseItemTrkgLine."Qty. to Handle (Base)");
+            END;
+          UNTIL WhseItemTrkgLine.NEXT = 0;
+
+          IF QtyToHandleBase <> 0 THEN BEGIN
+            ItemJnlLine."Document No." := "Whse. Document No.";
+            ItemJnlLine.VALIDATE("Posting Date","Registering Date");
+            ItemJnlLine.VALIDATE("Item No.","Item No.");
+            ItemJnlLine.VALIDATE("Variant Code","Variant Code");
+            ItemJnlLine.VALIDATE("Location Code","Location Code");
+            ItemJnlLine.VALIDATE("Unit of Measure Code","Unit of Measure Code");
+            ItemJnlLine.VALIDATE(Quantity,ROUND(QtyToHandleBase / "Qty. per Unit of Measure",0.00001));
+            ItemJnlLine.Description := Description;
+            ItemJnlLine."Source Type" := ItemJnlLine."Source Type"::Item;
+            ItemJnlLine."Source No." := "Item No.";
+            ItemJnlLine."Source Code" := "Source Code";
+            ItemJnlLine."Reason Code" := "Reason Code";
+            ItemJnlLine."Line No." := "Line No.";
+          END;
+        END;
+      END;
+
+      EXIT(QtyToHandleBase <> 0);
+    END;
+
+    LOCAL PROCEDURE IsPhysInvtCount@10(WhseJnlTemplate2@1000 : Record 7309;PhysInvtCountingPeriodCode@1002 : Code[10];PhysInvtCountingPeriodType@1003 : ' ,Item,SKU') : Boolean;
+    BEGIN
+      EXIT(
+        (WhseJnlTemplate2.Type = WhseJnlTemplate2.Type::"Physical Inventory") AND
+        (PhysInvtCountingPeriodType <> PhysInvtCountingPeriodType::" ") AND
+        (PhysInvtCountingPeriodCode <> ''));
+    END;
+
+    LOCAL PROCEDURE CheckItemAvailability@11(VAR WhseJnlLine@1000 : Record 7311);
+    VAR
+      TempSKU@1002 : TEMPORARY Record 5700;
+      WhseJnlLineToPost@1005 : Record 7311;
+      WhseJnlLineQty@1003 : Decimal;
+      ReservedQtyOnInventory@1004 : Decimal;
+      QtyOnWarehouseEntries@1001 : Decimal;
+    BEGIN
+      WhseJnlLineToPost.COPYFILTERS(WhseJnlLine);
+      IF WhseJnlLineToPost.FINDSET THEN
+        REPEAT
+          IF NOT TempSKU.GET(WhseJnlLineToPost."Location Code",WhseJnlLineToPost."Item No.",WhseJnlLineToPost."Variant Code") THEN BEGIN
+            InsertTempSKU(TempSKU,WhseJnlLineToPost);
+
+            WhseJnlLineQty := CalcRequiredQty(TempSKU,WhseJnlLine);
+            IF WhseJnlLineQty < 0 THEN BEGIN
+              ReservedQtyOnInventory := CalcReservedQtyOnInventory(TempSKU."Item No.",TempSKU."Location Code",TempSKU."Variant Code");
+              QtyOnWarehouseEntries := CalcQtyOnWarehouseEntry(TempSKU."Item No.",TempSKU."Location Code",TempSKU."Variant Code");
+              IF (ReservedQtyOnInventory > 0) AND ((QtyOnWarehouseEntries - ReservedQtyOnInventory) < ABS(WhseJnlLineQty)) THEN
+                IF NOT CONFIRM(
+                     Text007,FALSE,TempSKU.FIELDCAPTION("Item No."),TempSKU."Item No.",TempSKU.FIELDCAPTION("Location Code"),
+                     TempSKU."Location Code",TempSKU.FIELDCAPTION("Variant Code"),TempSKU."Variant Code")
+                THEN
+                  ERROR('');
+            END;
+          END;
+        UNTIL WhseJnlLineToPost.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE CalcReservedQtyOnInventory@12(ItemNo@1000 : Code[20];LocationCode@1001 : Code[20];VariantCode@1002 : Code[20]) : Decimal;
+    VAR
+      Item@1004 : Record 27;
+    BEGIN
+      WITH Item DO BEGIN
+        GET(ItemNo);
+        SETFILTER("Location Filter",LocationCode);
+        SETFILTER("Variant Filter",VariantCode);
+        CALCFIELDS("Reserved Qty. on Inventory");
+        EXIT("Reserved Qty. on Inventory")
+      END;
+    END;
+
+    LOCAL PROCEDURE CalcQtyOnWarehouseEntry@4(ItemNo@1000 : Code[20];LocationCode@1001 : Code[20];VariantCode@1002 : Code[20]) : Decimal;
+    VAR
+      WarehouseEntry@1004 : Record 7312;
+    BEGIN
+      WITH WarehouseEntry DO BEGIN
+        RESET;
+        SETCURRENTKEY("Item No.","Location Code","Variant Code","Bin Type Code","Unit of Measure Code","Lot No.","Serial No.");
+        SETRANGE("Item No.",ItemNo);
+        SETRANGE("Location Code",LocationCode);
+        SETRANGE("Variant Code",VariantCode);
+        CALCSUMS("Qty. (Base)");
+        EXIT("Qty. (Base)");
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertTempSKU@13(VAR TempSKU@1000 : TEMPORARY Record 5700;WhseJnlLine@1001 : Record 7311);
+    BEGIN
+      WITH TempSKU DO BEGIN
+        INIT;
+        "Location Code" := WhseJnlLine."Location Code";
+        "Item No." := WhseJnlLine."Item No.";
+        "Variant Code" := WhseJnlLine."Variant Code";
+        INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE CalcRequiredQty@14(TempSKU@1000 : TEMPORARY Record 5700;VAR WhseJnlLineFiltered@1001 : Record 7311) : Decimal;
+    VAR
+      WhseJnlLine@1002 : Record 7311;
+    BEGIN
+      WhseJnlLine.COPYFILTERS(WhseJnlLineFiltered);
+      WhseJnlLine.SETRANGE("Item No.",TempSKU."Item No.");
+      WhseJnlLine.SETRANGE("Location Code",TempSKU."Location Code");
+      WhseJnlLine.SETRANGE("Variant Code",TempSKU."Variant Code");
+      WhseJnlLine.CALCSUMS("Qty. (Base)");
+      EXIT(WhseJnlLine."Qty. (Base)");
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

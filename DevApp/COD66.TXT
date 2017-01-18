@@ -1,0 +1,203 @@
+OBJECT Codeunit 66 Purch - Calc Disc. By Type
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00.00.43897;
+  }
+  PROPERTIES
+  {
+    TableNo=39;
+    OnRun=VAR
+            PurchHeader@1000 : Record 38;
+            PurchLine@1001 : Record 39;
+          BEGIN
+            PurchLine.COPY(Rec);
+
+            IF PurchHeader.GET("Document Type","Document No.") THEN BEGIN
+              ApplyDefaultInvoiceDiscount(0,PurchHeader);
+              // on new order might be no line
+              IF GET(PurchLine."Document Type",PurchLine."Document No.",PurchLine."Line No.") THEN;
+            END;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      InvDiscBaseAmountIsZeroErr@1000 : TextConst 'ENU=There is no amount that you can apply an invoice discount to.';
+      InvDiscSetToZeroMsg@1001 : TextConst '@@@=%1 - Invoice discount amount, %2 Previous value of Invoice discount amount;ENU=The previous %1 was %2.\\The value is now set to zero because the total has changed. Review the new total and then re-enter the %1.';
+      AmountInvDiscErr@1002 : TextConst 'ENU=Manual %1 is not allowed.';
+
+    PROCEDURE ApplyDefaultInvoiceDiscount@5(InvoiceDiscountAmount@1000 : Decimal;VAR PurchHeader@1001 : Record 38);
+    VAR
+      AutoFormatManagement@1004 : Codeunit 45;
+      PreviousInvoiceDiscountAmount@1003 : Decimal;
+      ShowSetToZeroMessage@1002 : Boolean;
+    BEGIN
+      IF NOT ShouldRedistributeInvoiceDiscountAmount(PurchHeader) THEN
+        EXIT;
+
+      IF PurchHeader."Invoice Discount Calculation" = PurchHeader."Invoice Discount Calculation"::Amount THEN BEGIN
+        PreviousInvoiceDiscountAmount := PurchHeader."Invoice Discount Value";
+        ShowSetToZeroMessage := (InvoiceDiscountAmount = 0) AND (PurchHeader."Invoice Discount Value" <> 0);
+        ApplyInvDiscBasedOnAmt(InvoiceDiscountAmount,PurchHeader);
+        IF ShowSetToZeroMessage THEN
+          MESSAGE(
+            STRSUBSTNO(
+              InvDiscSetToZeroMsg,
+              PurchHeader.FIELDCAPTION("Invoice Discount Amount"),
+              FORMAT(PreviousInvoiceDiscountAmount,0,AutoFormatManagement.AutoFormatTranslate(1,PurchHeader."Currency Code"))));
+      END ELSE
+        ApplyInvDiscBasedOnPct(PurchHeader);
+
+      ResetRecalculateInvoiceDisc(PurchHeader);
+    END;
+
+    PROCEDURE ApplyInvDiscBasedOnAmt@1(InvoiceDiscountAmount@1000 : Decimal;VAR PurchHeader@1004 : Record 38);
+    VAR
+      TempVATAmountLine@1001 : TEMPORARY Record 290;
+      PurchLine@1002 : Record 39;
+      InvDiscBaseAmount@1003 : Decimal;
+    BEGIN
+      WITH PurchHeader DO BEGIN
+        IF NOT InvoiceDiscIsAllowed("Invoice Disc. Code") THEN
+          ERROR(STRSUBSTNO(AmountInvDiscErr,FIELDCAPTION("Invoice Discount Amount")));
+
+        PurchLine.SETRANGE("Document No.","No.");
+        PurchLine.SETRANGE("Document Type","Document Type");
+
+        PurchLine.CalcVATAmountLines(0,PurchHeader,PurchLine,TempVATAmountLine);
+
+        InvDiscBaseAmount := TempVATAmountLine.GetTotalInvDiscBaseAmount(FALSE,"Currency Code");
+
+        IF (InvDiscBaseAmount = 0) AND (InvoiceDiscountAmount > 0) THEN
+          ERROR(InvDiscBaseAmountIsZeroErr);
+
+        TempVATAmountLine.SetInvoiceDiscountAmount(InvoiceDiscountAmount,"Currency Code",
+          "Prices Including VAT","VAT Base Discount %");
+
+        PurchLine.UpdateVATOnLines(0,PurchHeader,PurchLine,TempVATAmountLine);
+
+        "Invoice Discount Calculation" := "Invoice Discount Calculation"::Amount;
+        "Invoice Discount Value" := InvoiceDiscountAmount;
+
+        MODIFY;
+
+        ResetRecalculateInvoiceDisc(PurchHeader);
+      END;
+    END;
+
+    LOCAL PROCEDURE ApplyInvDiscBasedOnPct@6(VAR PurchHeader@1002 : Record 38);
+    VAR
+      PurchLine@1000 : Record 39;
+    BEGIN
+      WITH PurchHeader DO BEGIN
+        PurchLine.SETRANGE("Document No.","No.");
+        PurchLine.SETRANGE("Document Type","Document Type");
+        IF PurchLine.FINDFIRST THEN BEGIN
+          CODEUNIT.RUN(CODEUNIT::"Purch.-Calc.Discount",PurchLine);
+          GET("Document Type","No.");
+        END;
+      END;
+    END;
+
+    PROCEDURE GetVendInvoiceDiscountPct@7(PurchLine@1001 : Record 39) : Decimal;
+    VAR
+      PurchHeader@1000 : Record 38;
+      InvoiceDiscountValue@1002 : Decimal;
+    BEGIN
+      WITH PurchHeader DO BEGIN
+        IF NOT GET(PurchLine."Document Type",PurchLine."Document No.") THEN
+          EXIT(0);
+
+        CALCFIELDS("Invoice Discount Amount");
+        IF "Invoice Discount Amount" = 0 THEN
+          EXIT(0);
+
+        CASE "Invoice Discount Calculation" OF
+          "Invoice Discount Calculation"::"%":
+            BEGIN
+              // Only if VendorInvDisc table is empty header is not updated
+              IF NOT VendorInvDiscRecExists("Invoice Disc. Code") THEN
+                EXIT(0);
+
+              EXIT("Invoice Discount Value");
+            END;
+          "Invoice Discount Calculation"::None,
+          "Invoice Discount Calculation"::Amount:
+            BEGIN
+              CALCFIELDS("Amount Including VAT",Amount);
+              IF Amount = 0 THEN
+                EXIT(0);
+
+              IF "Invoice Discount Calculation" = "Invoice Discount Calculation"::None THEN
+                InvoiceDiscountValue := "Invoice Discount Amount"
+              ELSE
+                InvoiceDiscountValue := "Invoice Discount Value";
+
+              IF "Prices Including VAT" THEN
+                EXIT(ROUND(InvoiceDiscountValue / ("Amount Including VAT" + InvoiceDiscountValue) * 100,0.01));
+
+              EXIT(ROUND(InvoiceDiscountValue / (Amount + InvoiceDiscountValue) * 100,0.01));
+            END;
+        END;
+      END;
+
+      EXIT(0);
+    END;
+
+    PROCEDURE ShouldRedistributeInvoiceDiscountAmount@101(PurchHeader@1001 : Record 38) : Boolean;
+    VAR
+      PurchPayablesSetup@1000 : Record 312;
+    BEGIN
+      PurchHeader.CALCFIELDS("Recalculate Invoice Disc.");
+
+      IF NOT PurchHeader."Recalculate Invoice Disc." THEN
+        EXIT(FALSE);
+
+      IF (PurchHeader."Invoice Discount Calculation" = PurchHeader."Invoice Discount Calculation"::Amount) AND
+         (PurchHeader."Invoice Discount Value" = 0)
+      THEN
+        EXIT(FALSE);
+
+      PurchPayablesSetup.GET;
+      IF (NOT PurchPayablesSetup."Calc. Inv. Discount") AND
+         (PurchHeader."Invoice Discount Calculation" = PurchHeader."Invoice Discount Calculation"::None)
+      THEN
+        EXIT(FALSE);
+
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE ResetRecalculateInvoiceDisc@8(PurchHeader@1000 : Record 38);
+    VAR
+      PurchLine@1001 : Record 39;
+    BEGIN
+      PurchLine.SETRANGE("Document Type",PurchHeader."Document Type");
+      PurchLine.SETRANGE("Document No.",PurchHeader."No.");
+      PurchLine.MODIFYALL("Recalculate Invoice Disc.",FALSE);
+    END;
+
+    LOCAL PROCEDURE VendorInvDiscRecExists@4(InvDiscCode@1000 : Code[20]) : Boolean;
+    VAR
+      VendorInvoiceDisc@1001 : Record 24;
+    BEGIN
+      VendorInvoiceDisc.SETRANGE(Code,InvDiscCode);
+      EXIT(NOT VendorInvoiceDisc.ISEMPTY);
+    END;
+
+    PROCEDURE InvoiceDiscIsAllowed@2(InvDiscCode@1001 : Code[20]) : Boolean;
+    VAR
+      PurchasesPayablesSetup@1000 : Record 312;
+    BEGIN
+      PurchasesPayablesSetup.GET;
+      EXIT(NOT (PurchasesPayablesSetup."Calc. Inv. Discount" AND VendorInvDiscRecExists(InvDiscCode)));
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

@@ -1,0 +1,188 @@
+OBJECT Codeunit 1224 Map Incoming Doc to Gen. Line
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00.00.43402;
+  }
+  PROPERTIES
+  {
+    TableNo=130;
+    OnRun=BEGIN
+            IncomingDocument := Rec;
+            ErrorMessage.SetContext(IncomingDocument);
+            CreateGeneralJournalLineFromIncomingDocument;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      NoBalanceAccountMappingErr@1003 : TextConst '@@@=%1 - vendor name;ENU=Could not fill the Bal. Account No. field for vendor ''''%1''''. Choose the Map Text to Account button to map ''''%1'''' to the relevant G/L account.';
+      NoDebitAccountMappingErr@1002 : TextConst '@@@=%1 - Debit Acc. No. or Credit Acc. No. field caption, %2 - vendor name;ENU=Could not fill the %1 field for vendor ''''%2''''. Choose the Map Text to Account button to map ''''%2'''' to the relevant G/L account.';
+      VatAmountMismatchErr@1001 : TextConst '@@@=%1 - General Journal Line VAT amount, %2 - Incoming Document VAT  amount;ENU=VAT amount %1 on the general journal line does not match VAT amount %2 in the incoming document.';
+      TemplateBatchNameMissingErr@1000 : TextConst 'ENU="You must fill the General Journal Template Name and General Journal Batch Name fields in the Incoming Document Setup window. "';
+      IncomingDocument@1004 : Record 130;
+      ErrorMessage@1005 : Record 700;
+
+    LOCAL PROCEDURE CreateGeneralJournalLineFromIncomingDocument@83();
+    VAR
+      GenJournalLine@1006 : Record 81;
+      IncomingDocumentsSetup@1005 : Record 131;
+      LastGenJournalLine@1004 : Record 81;
+      TextToAccountMapping@1002 : Record 1251;
+      GenJournalTemplate@1003 : Record 80;
+      GenJournalBatch@1007 : Record 232;
+      GeneralLedgerSetup@1009 : Record 98;
+      TextToAccountMappingFound@1000 : Boolean;
+    BEGIN
+      IncomingDocumentsSetup.GET;
+      IF (IncomingDocumentsSetup."General Journal Template Name" = '') OR
+         (IncomingDocumentsSetup."General Journal Batch Name" = '')
+      THEN
+        ErrorMessage.LogMessage(
+          IncomingDocumentsSetup,IncomingDocumentsSetup.FIELDNO("General Journal Template Name"),
+          ErrorMessage."Message Type"::Error,TemplateBatchNameMissingErr)
+      ELSE BEGIN
+        GenJournalTemplate.GET(IncomingDocumentsSetup."General Journal Template Name");
+        GenJournalBatch.GET(
+          IncomingDocumentsSetup."General Journal Template Name",IncomingDocumentsSetup."General Journal Batch Name");
+        LastGenJournalLine.SETRANGE("Journal Template Name",IncomingDocumentsSetup."General Journal Template Name");
+        LastGenJournalLine.SETRANGE("Journal Batch Name",IncomingDocumentsSetup."General Journal Batch Name");
+        IF NOT LastGenJournalLine.FINDLAST THEN BEGIN
+          LastGenJournalLine.VALIDATE("Journal Template Name",IncomingDocumentsSetup."General Journal Template Name");
+          LastGenJournalLine.VALIDATE("Journal Batch Name",IncomingDocumentsSetup."General Journal Batch Name");
+          LastGenJournalLine."Line No." := LastGenJournalLine."Line No." + 10000;
+          LastGenJournalLine.INSERT;
+        END;
+
+        // Create the gen jnl line out of the inc doc and text-to-account mapping
+        GenJournalLine.INIT;
+        GenJournalLine.VALIDATE("Journal Template Name",IncomingDocumentsSetup."General Journal Template Name");
+        GenJournalLine.VALIDATE("Journal Batch Name",IncomingDocumentsSetup."General Journal Batch Name");
+        GenJournalLine."Line No." := LastGenJournalLine."Line No." + 10000;
+        GenJournalLine.SetUpNewLine(LastGenJournalLine,LastGenJournalLine.Amount,TRUE);
+
+        GenJournalLine."Document Type" := GetAttachedDocumentType;
+
+        TextToAccountMapping.SETFILTER("Mapping Text",STRSUBSTNO('@%1',IncomingDocument."Vendor Name"));
+        TextToAccountMappingFound := TextToAccountMapping.FINDFIRST;
+
+        CASE GenJournalLine."Document Type" OF
+          GenJournalLine."Document Type"::Invoice:
+            IF TextToAccountMappingFound THEN BEGIN
+              GenJournalLine.VALIDATE("Account Type",GenJournalLine."Account Type"::"G/L Account");
+              IF IncomingDocument."Amount Incl. VAT" >= 0 THEN
+                GenJournalLine.VALIDATE("Account No.",TextToAccountMapping."Debit Acc. No.")
+              ELSE
+                GenJournalLine.VALIDATE("Account No.",TextToAccountMapping."Credit Acc. No.");
+            END ELSE
+              UseDefaultGLAccount(GenJournalLine,GenJournalLine.FIELDCAPTION("Account No."),IncomingDocument."Vendor Name");
+          GenJournalLine."Document Type"::"Credit Memo":
+            IF TextToAccountMappingFound THEN BEGIN
+              GenJournalLine.VALIDATE("Account Type",GenJournalLine."Account Type"::"G/L Account");
+              IF IncomingDocument."Amount Incl. VAT" >= 0 THEN
+                GenJournalLine.VALIDATE("Account No.",TextToAccountMapping."Credit Acc. No.")
+              ELSE
+                GenJournalLine.VALIDATE("Account No.",TextToAccountMapping."Debit Acc. No.");
+            END ELSE
+              UseDefaultGLAccount(GenJournalLine,GenJournalLine.FIELDCAPTION("Account No."),IncomingDocument."Vendor Name");
+        END;
+
+        IF IncomingDocument."Vendor No." <> '' THEN BEGIN
+          GenJournalLine.VALIDATE("Bal. Account Type",GenJournalLine."Bal. Account Type"::Vendor);
+          GenJournalLine.VALIDATE("Bal. Account No.",IncomingDocument."Vendor No.");
+        END ELSE
+          IF TextToAccountMapping."Bal. Source No." <> '' THEN BEGIN
+            GenJournalLine.VALIDATE("Bal. Account Type",TextToAccountMapping."Bal. Source Type");
+            GenJournalLine.VALIDATE("Bal. Account No.",TextToAccountMapping."Bal. Source No.");
+          END ELSE
+            IF GenJournalBatch."Bal. Account No." <> '' THEN BEGIN
+              GenJournalLine.VALIDATE("Bal. Account Type",GenJournalBatch."Bal. Account Type");
+              GenJournalLine.VALIDATE("Bal. Account No.",GenJournalBatch."Bal. Account No.");
+            END ELSE
+              ErrorMessage.LogMessage(
+                TextToAccountMapping,TextToAccountMapping.FIELDNO("Mapping Text"),
+                ErrorMessage."Message Type"::Error,STRSUBSTNO(NoBalanceAccountMappingErr,IncomingDocument."Vendor Name"));
+
+        GenJournalLine.VALIDATE("Due Date",IncomingDocument."Due Date");
+        GenJournalLine.VALIDATE("Posting Date",IncomingDocument."Document Date");
+        GenJournalLine.VALIDATE("Document Date",IncomingDocument."Document Date");
+        GenJournalLine.VALIDATE("External Document No.",IncomingDocument."Vendor Invoice No.");
+        GeneralLedgerSetup.GET;
+        IF IncomingDocument."Currency Code" <> GeneralLedgerSetup."LCY Code" THEN
+          GenJournalLine.VALIDATE("Currency Code",IncomingDocument."Currency Code");
+        GenJournalLine.VALIDATE(Amount,IncomingDocument."Amount Incl. VAT");
+        GenJournalLine.VALIDATE("Incoming Document Entry No.",IncomingDocument."Entry No.");
+        GenJournalLine.VALIDATE(Description,IncomingDocument."Vendor Name");
+
+        IF NOT ErrorMessage.HasErrors(FALSE) THEN
+          GenJournalLine.INSERT(TRUE);
+
+        IF IncomingDocument."Amount Incl. VAT" - IncomingDocument."Amount Excl. VAT" <> GenJournalLine."VAT Amount" THEN
+          ErrorMessage.LogMessage(GenJournalLine,GenJournalLine.FIELDNO("Account No."),
+            ErrorMessage."Message Type"::Warning,
+            STRSUBSTNO(VatAmountMismatchErr,GenJournalLine."VAT Amount",
+              IncomingDocument."Amount Incl. VAT" - IncomingDocument."Amount Excl. VAT"));
+      END;
+    END;
+
+    LOCAL PROCEDURE GetAttachedDocumentType@46() : Integer;
+    VAR
+      DataExch@1002 : Record 1220;
+      IntermediateDataImport@1001 : Record 1214;
+      PurchaseHeader@1000 : Record 38;
+      GenJournalLine@1005 : Record 81;
+      PreMapIncomingPurchDoc@1004 : Codeunit 1217;
+      Value@1003 : Text;
+      DocumentType@1007 : Integer;
+    BEGIN
+      DataExch.SETRANGE("Incoming Entry No.",IncomingDocument."Entry No.");
+      IF NOT DataExch.FINDLAST THEN
+        ErrorMessage.LogMessage(GenJournalLine,GenJournalLine.FIELDNO("Document Type"),
+          ErrorMessage."Message Type"::Error,PreMapIncomingPurchDoc.ConstructDocumenttypeUnknownErr);
+      Value :=
+        IntermediateDataImport.GetEntryValue(
+          DataExch."Entry No.",DATABASE::"Purchase Header",PurchaseHeader.FIELDNO("Document Type"),0,1);
+      EVALUATE(DocumentType,Value);
+      CASE DocumentType OF
+        PurchaseHeader."Document Type"::Invoice:
+          EXIT(GenJournalLine."Document Type"::Invoice);
+        PurchaseHeader."Document Type"::"Credit Memo":
+          EXIT(GenJournalLine."Document Type"::"Credit Memo");
+        ELSE
+          ErrorMessage.LogMessage(GenJournalLine,GenJournalLine.FIELDNO("Document Type"),
+            ErrorMessage."Message Type"::Error,PreMapIncomingPurchDoc.ConstructDocumenttypeUnknownErr);
+      END;
+      EXIT(0);
+    END;
+
+    LOCAL PROCEDURE UseDefaultGLAccount@47(VAR GenJournalLine@1000 : Record 81;FieldName@1001 : Text;VendorName@1002 : Text);
+    VAR
+      PurchasesPayablesSetup@1003 : Record 312;
+      TextToAccountMapping@1005 : Record 1251;
+      DefaultGLAccount@1006 : Code[20];
+    BEGIN
+      PurchasesPayablesSetup.GET;
+
+      IF GenJournalLine."Document Type" = GenJournalLine."Document Type"::Invoice THEN
+        DefaultGLAccount := PurchasesPayablesSetup."Debit Acc. for Non-Item Lines";
+      IF GenJournalLine."Document Type" = GenJournalLine."Document Type"::"Credit Memo" THEN
+        DefaultGLAccount := PurchasesPayablesSetup."Credit Acc. for Non-Item Lines";
+
+      IF DefaultGLAccount = '' THEN
+        ErrorMessage.LogMessage(TextToAccountMapping,TextToAccountMapping.FIELDNO("Mapping Text"),
+          ErrorMessage."Message Type"::Error,
+          STRSUBSTNO(NoDebitAccountMappingErr,FieldName,VendorName))
+      ELSE BEGIN
+        GenJournalLine.VALIDATE("Account Type",GenJournalLine."Account Type"::"G/L Account");
+        GenJournalLine.VALIDATE("Account No.",DefaultGLAccount);
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

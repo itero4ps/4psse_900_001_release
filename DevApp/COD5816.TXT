@@ -1,0 +1,293 @@
+OBJECT Codeunit 5816 Undo Return Receipt Line
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW17.00;
+  }
+  PROPERTIES
+  {
+    TableNo=6661;
+    Permissions=TableData 37=imd,
+                TableData 359=imd,
+                TableData 6507=ri,
+                TableData 6509=rimd,
+                TableData 6661=imd;
+    OnRun=BEGIN
+            SETRANGE(Type,Type::Item);
+            IF NOT FIND('-') THEN
+              ERROR(Text005);
+
+            IF NOT HideDialog THEN
+              IF NOT CONFIRM(Text000) THEN
+                EXIT;
+
+            ReturnRcptLine.COPY(Rec);
+            Code;
+            Rec := ReturnRcptLine;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      ReturnRcptLine@1001 : Record 6661;
+      TempWhseJnlLine@1016 : TEMPORARY Record 7311;
+      TempGlobalItemLedgEntry@1029 : TEMPORARY Record 32;
+      TempGlobalItemEntryRelation@1022 : TEMPORARY Record 6507;
+      InvtSetup@1004 : Record 313;
+      UndoPostingMgt@1005 : Codeunit 5817;
+      ItemJnlPostLine@1000 : Codeunit 22;
+      Text000@1007 : TextConst 'ENU=Do you really want to undo the selected Return Receipt lines?';
+      Text001@1006 : TextConst 'ENU=Undo quantity posting...';
+      Text002@1002 : TextConst 'ENU=There is not enough space to insert correction lines.';
+      WhseUndoQty@1014 : Codeunit 7320;
+      InvtAdjmt@1009 : Codeunit 5895;
+      HideDialog@1008 : Boolean;
+      Text003@1011 : TextConst 'ENU=Checking lines...';
+      NextLineNo@1015 : Integer;
+      Text004@1012 : TextConst 'ENU=This receipt has already been invoiced. Undo Return Receipt can be applied only to posted, but not invoiced receipts.';
+      Text005@1010 : TextConst 'ENU=Undo Return Receipt can be performed only for lines of type Item. Please select a line of the Item type and repeat the procedure.';
+
+    PROCEDURE SetHideDialog@7(NewHideDialog@1000 : Boolean);
+    BEGIN
+      HideDialog := NewHideDialog;
+    END;
+
+    LOCAL PROCEDURE Code@2();
+    VAR
+      PostedWhseRcptLine@1003 : Record 7319;
+      SalesLine@1005 : Record 37;
+      Window@1001 : Dialog;
+      ItemShptEntryNo@1002 : Integer;
+      DocLineNo@1000 : Integer;
+      PostedWhseRcptLineFound@1004 : Boolean;
+    BEGIN
+      WITH ReturnRcptLine DO BEGIN
+        CLEAR(ItemJnlPostLine);
+        SETRANGE(Correction,FALSE);
+
+        REPEAT
+          IF NOT HideDialog THEN
+            Window.OPEN(Text003);
+          CheckReturnRcptLine(ReturnRcptLine);
+        UNTIL NEXT = 0;
+
+        FIND('-');
+        REPEAT
+          TempGlobalItemLedgEntry.RESET;
+          IF NOT TempGlobalItemLedgEntry.ISEMPTY THEN
+            TempGlobalItemLedgEntry.DELETEALL;
+          TempGlobalItemEntryRelation.RESET;
+          IF NOT TempGlobalItemEntryRelation.ISEMPTY THEN
+            TempGlobalItemEntryRelation.DELETEALL;
+
+          IF NOT HideDialog THEN
+            Window.OPEN(Text001);
+
+          PostedWhseRcptLineFound :=
+            WhseUndoQty.FindPostedWhseRcptLine(
+              PostedWhseRcptLine,
+              DATABASE::"Return Receipt Line",
+              "Document No.",
+              DATABASE::"Sales Line",
+              SalesLine."Document Type"::"Return Order",
+              "Return Order No.",
+              "Return Order Line No.");
+
+          ItemShptEntryNo := PostItemJnlLine(ReturnRcptLine,DocLineNo);
+
+          InsertNewReceiptLine(ReturnRcptLine,ItemShptEntryNo,DocLineNo);
+
+          SalesLine.GET(SalesLine."Document Type"::"Return Order","Return Order No.",
+            "Return Order Line No.");
+          IF "Item Rcpt. Entry No." > 0 THEN BEGIN
+            IF SalesLine."Appl.-from Item Entry" <> 0 THEN BEGIN
+              SalesLine."Appl.-from Item Entry" := ItemShptEntryNo;
+              SalesLine.MODIFY;
+            END;
+          END;
+
+          IF PostedWhseRcptLineFound THEN
+            WhseUndoQty.UndoPostedWhseRcptLine(PostedWhseRcptLine);
+
+          UpdateOrderLine(ReturnRcptLine);
+          UpdateItemTrkgApplFromEntry(SalesLine);
+          IF PostedWhseRcptLineFound THEN
+            WhseUndoQty.UpdateRcptSourceDocLines(PostedWhseRcptLine);
+
+          "Quantity Invoiced" := Quantity;
+          "Qty. Invoiced (Base)" := "Quantity (Base)";
+          "Return Qty. Rcd. Not Invd." := 0;
+          Correction := TRUE;
+
+          MODIFY;
+        UNTIL NEXT = 0;
+
+        InvtSetup.GET;
+        IF InvtSetup."Automatic Cost Adjustment" <>
+           InvtSetup."Automatic Cost Adjustment"::Never
+        THEN BEGIN
+          InvtAdjmt.SetProperties(TRUE,InvtSetup."Automatic Cost Posting");
+          InvtAdjmt.SetJobUpdateProperties(TRUE);
+          InvtAdjmt.MakeMultiLevelAdjmt;
+        END;
+
+        WhseUndoQty.PostTempWhseJnlLine(TempWhseJnlLine);
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckReturnRcptLine@3(ReturnRcptLine@1001 : Record 6661);
+    VAR
+      TempItemLedgEntry@1006 : TEMPORARY Record 32;
+    BEGIN
+      WITH ReturnRcptLine DO BEGIN
+        TESTFIELD(Type,Type::Item);
+        IF "Return Qty. Rcd. Not Invd." <> Quantity THEN
+          ERROR(Text004);
+
+        UndoPostingMgt.TestReturnRcptLine(ReturnRcptLine);
+        UndoPostingMgt.CollectItemLedgEntries(TempItemLedgEntry,DATABASE::"Return Receipt Line",
+          "Document No.","Line No.","Quantity (Base)","Item Rcpt. Entry No.");
+        UndoPostingMgt.CheckItemLedgEntries(TempItemLedgEntry,"Line No.");
+      END;
+    END;
+
+    LOCAL PROCEDURE PostItemJnlLine@5(ReturnRcptLine@1000 : Record 6661;VAR DocLineNo@1003 : Integer) : Integer;
+    VAR
+      ItemJnlLine@1001 : Record 83;
+      SalesLine@1004 : Record 37;
+      SourceCodeSetup@1002 : Record 242;
+      ReturnRcptHeader@1010 : Record 6660;
+      ReturnRcptLine2@1007 : Record 6661;
+      TempApplyToEntryList@1005 : TEMPORARY Record 32;
+      LineSpacing@1006 : Integer;
+    BEGIN
+      WITH ReturnRcptLine DO BEGIN
+        ReturnRcptLine2.SETRANGE("Document No.","Document No.");
+        ReturnRcptLine2."Document No." := "Document No.";
+        ReturnRcptLine2."Line No." := "Line No.";
+        ReturnRcptLine2.FIND('=');
+
+        IF ReturnRcptLine2.FIND('>') THEN BEGIN
+          LineSpacing := (ReturnRcptLine2."Line No." - "Line No.") DIV 2;
+          IF LineSpacing = 0 THEN
+            ERROR(Text002);
+        END ELSE
+          LineSpacing := 10000;
+        DocLineNo := "Line No." + LineSpacing;
+
+        SourceCodeSetup.GET;
+        ReturnRcptHeader.GET("Document No.");
+        ItemJnlLine.INIT;
+        ItemJnlLine."Entry Type" := ItemJnlLine."Entry Type"::Sale;
+        ItemJnlLine."Item No." := "No.";
+        ItemJnlLine."Posting Date" := ReturnRcptHeader."Posting Date";
+        ItemJnlLine."Document No." := "Document No.";
+        ItemJnlLine."Document Line No." := DocLineNo;
+        ItemJnlLine."Gen. Bus. Posting Group" := "Gen. Bus. Posting Group";
+        ItemJnlLine."Gen. Prod. Posting Group" := "Gen. Prod. Posting Group";
+        ItemJnlLine."Location Code" := "Location Code";
+        ItemJnlLine."Source Code" := SourceCodeSetup.Sales;
+        ItemJnlLine."Applies-to Entry" := "Item Rcpt. Entry No.";
+        ItemJnlLine.Correction := TRUE;
+        ItemJnlLine."Variant Code" := "Variant Code";
+        ItemJnlLine."Bin Code" := "Bin Code";
+        ItemJnlLine.Quantity := Quantity;
+        ItemJnlLine."Quantity (Base)" := "Quantity (Base)";
+        ItemJnlLine."Unit of Measure Code" := "Unit of Measure Code";
+        ItemJnlLine."Qty. per Unit of Measure" := "Qty. per Unit of Measure";
+        ItemJnlLine."Document Date" := ReturnRcptHeader."Document Date";
+
+        WhseUndoQty.InsertTempWhseJnlLine(ItemJnlLine,
+          DATABASE::"Sales Line",
+          SalesLine."Document Type"::"Return Order",
+          "Return Order No.",
+          "Return Order Line No.",
+          TempWhseJnlLine."Reference Document"::"Posted Rtrn. Rcpt.",
+          TempWhseJnlLine,
+          NextLineNo);
+
+        IF "Item Rcpt. Entry No." <> 0 THEN BEGIN
+          ItemJnlPostLine.RUN(ItemJnlLine);
+          EXIT(ItemJnlLine."Item Shpt. Entry No.");
+        END;
+        UndoPostingMgt.CollectItemLedgEntries(TempApplyToEntryList,DATABASE::"Return Receipt Line",
+          "Document No.","Line No.","Quantity (Base)","Item Rcpt. Entry No.");
+
+        UndoPostingMgt.PostItemJnlLineAppliedToList(ItemJnlLine,TempApplyToEntryList,
+          Quantity,"Quantity (Base)",TempGlobalItemLedgEntry,TempGlobalItemEntryRelation);
+
+        EXIT(0); // "Item Shpt. Entry No."
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertNewReceiptLine@1(OldReturnRcptLine@1000 : Record 6661;ItemShptEntryNo@1001 : Integer;DocLineNo@1004 : Integer);
+    VAR
+      NewReturnRcptLine@1002 : Record 6661;
+    BEGIN
+      WITH OldReturnRcptLine DO BEGIN
+        NewReturnRcptLine.INIT;
+        NewReturnRcptLine.COPY(OldReturnRcptLine);
+        NewReturnRcptLine."Line No." := DocLineNo;
+        NewReturnRcptLine."Appl.-from Item Entry" := "Item Rcpt. Entry No.";
+        NewReturnRcptLine."Item Rcpt. Entry No." := ItemShptEntryNo;
+        NewReturnRcptLine.Quantity := -Quantity;
+        NewReturnRcptLine."Return Qty. Rcd. Not Invd." := 0;
+        NewReturnRcptLine."Quantity (Base)" := -"Quantity (Base)";
+        NewReturnRcptLine."Quantity Invoiced" := NewReturnRcptLine.Quantity;
+        NewReturnRcptLine."Qty. Invoiced (Base)" := NewReturnRcptLine."Quantity (Base)";
+        NewReturnRcptLine.Correction := TRUE;
+        NewReturnRcptLine."Dimension Set ID" := "Dimension Set ID";
+        NewReturnRcptLine.INSERT;
+
+        InsertItemEntryRelation(TempGlobalItemEntryRelation,NewReturnRcptLine);
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdateOrderLine@4(ReturnRcptLine@1000 : Record 6661);
+    VAR
+      SalesLine@1001 : Record 37;
+    BEGIN
+      WITH ReturnRcptLine DO BEGIN
+        SalesLine.GET(SalesLine."Document Type"::"Return Order","Return Order No.","Return Order Line No.");
+        UndoPostingMgt.UpdateSalesLine(SalesLine,Quantity,"Quantity (Base)",TempGlobalItemLedgEntry);
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertItemEntryRelation@13(VAR TempItemEntryRelation@1003 : TEMPORARY Record 6507;NewReturnRcptLine@1000 : Record 6661);
+    VAR
+      ItemEntryRelation@1001 : Record 6507;
+    BEGIN
+      IF TempItemEntryRelation.FIND('-') THEN
+        REPEAT
+          ItemEntryRelation := TempItemEntryRelation;
+          ItemEntryRelation.TransferFieldsReturnRcptLine(NewReturnRcptLine);
+          ItemEntryRelation.INSERT;
+        UNTIL TempItemEntryRelation.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE UpdateItemTrkgApplFromEntry@14(SalesLine@1000 : Record 37);
+    VAR
+      ReservationEntry@1001 : Record 337;
+      ItemApplicationEntry@1002 : Record 339;
+      SalesLineReserve@1003 : Codeunit 99000832;
+    BEGIN
+      SalesLineReserve.FilterReservFor(ReservationEntry,SalesLine);
+      IF ReservationEntry.FINDSET THEN
+        REPEAT
+          IF ReservationEntry."Appl.-from Item Entry" <> 0 THEN BEGIN
+            IF ItemApplicationEntry.AppliedOutbndEntryExists(ReservationEntry."Item Ledger Entry No.",FALSE,FALSE) THEN BEGIN
+              ReservationEntry."Appl.-from Item Entry" := ItemApplicationEntry."Outbound Item Entry No.";
+              ReservationEntry.MODIFY;
+            END;
+          END;
+        UNTIL ReservationEntry.NEXT = 0;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

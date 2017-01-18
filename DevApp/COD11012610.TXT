@@ -1,0 +1,596 @@
+OBJECT Codeunit 11012610 Capacity Planning - Rail
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      HrsSetupRec@1100485000 : Record 11012600;
+      PrevCapPlanValRulesRec@1100485004 : Record 11012623;
+      TmpCapPlanValRulesRec@1100485001 : TEMPORARY Record 11012623;
+      TmpWeekendRec@1100485002 : TEMPORARY Record 11012601;
+      HourAccFunctionsCU@1210190000 : Codeunit 11012607;
+      Text000@1210190001 : TextConst 'ENU=Employee ''%1'' has overlap on %2 with planned hours of request line ''%3 - %4'', date %5, time %6..%7, project %8.';
+
+    PROCEDURE UpdateCapacityPlanning@1210190000(IAssEmplRec@1210190000 : Record 11012621);
+    VAR
+      lvCapPlanRec@1210190001 : Record 11012623;
+    BEGIN
+      UpdateCapacityPlanningTable(IAssEmplRec, lvCapPlanRec);
+    END;
+
+    LOCAL PROCEDURE UpdateCapacityPlanningTable@1100485003(IAssEmplRec@1210190000 : Record 11012621;VAR OCapPlanRec@1100485000 : Record 11012623) : Boolean;
+    VAR
+      lvReqLineRec@1210190002 : Record 11012620;
+      lvDate@1210190003 : Date;
+      lvIsDay@1210190007 : Boolean;
+      lvInserted@1100485001 : Boolean;
+    BEGIN
+      //* IF the VAR-argument 'OCapPlanRec' is declared as 'Temporary' in the calling function then the records (cap.planning)
+      //* will be inserted in the temporary table.
+      WITH IAssEmplRec DO BEGIN
+        OCapPlanRec.RESET;
+        OCapPlanRec.SETCURRENTKEY("Request No.", "Request Line No.", "Assigned Employee Line No.");
+        OCapPlanRec.SETRANGE("Request No.", "Request No.");
+        OCapPlanRec.SETRANGE("Request Line No.", "Request Line No.");
+        OCapPlanRec.SETRANGE("Assigned Employee Line No.", "Line No.");
+        OCapPlanRec.DELETEALL;
+
+        OCapPlanRec.RESET;
+        OCapPlanRec.SETCURRENTKEY("Vendor No.", "Employee No.", Date, "Time From", "Line No.");
+
+        IF ("Date From" = 0D) OR ("Date To" = 0D) OR ("Time From" = 0T) OR ("Time To" = 0T) OR ("Employee No." = '') THEN
+          EXIT(FALSE);
+
+        IF NOT lvReqLineRec.GET("Request No.", "Request Line No.") THEN
+          EXIT(FALSE);
+
+        lvIsDay := DetermineDayOrNight("Time From", "Time To");
+
+        FOR lvDate := "Date From" TO "Date To" DO BEGIN
+          IF CheckDateIsDayToPlan(IAssEmplRec, lvDate) THEN BEGIN
+            OCapPlanRec.INIT;
+            OCapPlanRec."Vendor No." := "Vendor No.";
+            OCapPlanRec."Employee No." := "Employee No.";
+            OCapPlanRec.Date := lvDate;
+            OCapPlanRec."Time From" := "Time From";
+            OCapPlanRec."Time To" := "Time To";
+            OCapPlanRec."Line No." := 1;  //* Externen worden niet meer anoniem gepland, daarom nu altijd '1'
+            OCapPlanRec.External := External;
+            OCapPlanRec."Request No." := "Request No.";
+            OCapPlanRec."Request Line No." := "Request Line No.";
+            OCapPlanRec."Assigned Employee Line No." := "Line No.";
+            OCapPlanRec."Project No." := lvReqLineRec."Project No.";
+            OCapPlanRec.Element := lvReqLineRec.Element;
+            OCapPlanRec."Cost Component" := lvReqLineRec."Cost Component";
+            IF lvIsDay THEN
+              OCapPlanRec.Type := OCapPlanRec.Type::Day
+            ELSE
+              OCapPlanRec.Type := OCapPlanRec.Type::Night;
+            OCapPlanRec."Weekend Shift" := DetermineWeekendShift(lvDate, "Time From");
+            OCapPlanRec.Hours := HourAccFunctionsCU.CalcHoursWithinStartEndTime("Time From", "Time To");
+            OCapPlanRec.INSERT;
+            lvInserted := TRUE;
+          END;
+        END;
+      END;
+
+      EXIT(lvInserted);
+    END;
+
+    PROCEDURE CheckCapacityPlanningOverlap@1210190002(IAssEmplRec@1210190000 : Record 11012621);
+    VAR
+      lvCapPlanRec@1210190001 : Record 11012623;
+      lvDate@1210190003 : Date;
+      lvAssTimeFromInt@1210190002 : Integer;
+      lvAssTimeToInt@1210190004 : Integer;
+      lvCapTimeFromInt@1210190006 : Integer;
+      lvCapTimeToInt@1210190005 : Integer;
+    BEGIN
+      WITH IAssEmplRec DO BEGIN
+        IF ("Date From" = 0D) OR ("Date To" = 0D) OR ("Time From" = 0T) OR ("Time To" = 0T) OR ("Employee No." = '') THEN
+          EXIT;
+
+        ConvertDateTimesToInteger(lvAssTimeFromInt, lvAssTimeToInt, "Date From", "Date From", "Time From", "Time To");
+
+        lvCapPlanRec.SETCURRENTKEY("Employee No.", Date, "Time From");
+        lvCapPlanRec.SETRANGE("Employee No.", "Employee No.");
+
+        FOR lvDate := "Date From" TO "Date To" DO BEGIN
+          IF CheckDateIsDayToPlan(IAssEmplRec, lvDate) THEN BEGIN
+            lvCapPlanRec.SETRANGE(Date, lvDate-1, lvDate+1);
+            IF lvCapPlanRec.FIND('-') THEN BEGIN
+              REPEAT
+                IF (lvCapPlanRec."Request No." <> "Request No.") OR
+                   (lvCapPlanRec."Request Line No." <> "Request Line No.") OR
+                   (lvCapPlanRec."Assigned Employee Line No." <> "Line No.")
+                THEN BEGIN  //* Skip current
+                  ConvertDateTimesToInteger(lvCapTimeFromInt, lvCapTimeToInt,
+                    lvDate, lvCapPlanRec.Date, lvCapPlanRec."Time From", lvCapPlanRec."Time To");
+                  IF (lvCapTimeFromInt < lvAssTimeToInt) AND (lvCapTimeToInt > lvAssTimeFromInt) THEN
+                    ERROR(Text000, "Employee No.", lvDate,
+                      lvCapPlanRec."Request No.", lvCapPlanRec."Request Line No.", lvCapPlanRec.Date,
+                      FORMAT(lvCapPlanRec."Time From",0,TimeFormat()), FORMAT(lvCapPlanRec."Time To",0,TimeFormat()),
+                      lvCapPlanRec."Project No.");
+                END;
+              UNTIL lvCapPlanRec.NEXT = 0;
+            END;
+          END;
+        END;
+      END;
+    END;
+
+    PROCEDURE CheckValidationRules@1100485002(IAssEmplRec@1100485000 : Record 11012621);
+    VAR
+      lvCapPlanRec@1100485001 : Record 11012623;
+      lvBelongsCurr@1100485003 : Boolean;
+      lvPrevBelongsCurr@1100485004 : Boolean;
+    BEGIN
+      WITH IAssEmplRec DO BEGIN
+        IF ("Date From" = 0D) OR ("Date To" = 0D) OR ("Time From" = 0T) OR ("Time To" = 0T) OR ("Employee No." = '') THEN
+          EXIT;
+
+        TmpCapPlanValRulesRec.RESET;
+        TmpCapPlanValRulesRec.DELETEALL;
+
+        IF NOT UpdateCapacityPlanningTable(IAssEmplRec, TmpCapPlanValRulesRec) THEN  //* Insert in temporary table
+          EXIT;
+
+        lvCapPlanRec.SETCURRENTKEY("Employee No.", Date, "Time From");
+        lvCapPlanRec.SETRANGE("Employee No.", "Employee No.");
+        lvCapPlanRec.SETRANGE(Date, ("Date From" - 2), ("Date To" + 2));
+        IF lvCapPlanRec.FIND('-') THEN BEGIN
+          REPEAT
+            IF NOT BelongsToCurrAssLine(IAssEmplRec, lvCapPlanRec) THEN BEGIN  //* Skip current
+              TmpCapPlanValRulesRec := lvCapPlanRec;
+              TmpCapPlanValRulesRec.INSERT;
+            END;
+          UNTIL lvCapPlanRec.NEXT = 0;
+        END;
+      END;
+
+      TmpWeekendRec.RESET;
+      TmpWeekendRec.DELETEALL;
+
+      WITH TmpCapPlanValRulesRec DO BEGIN
+        CLEAR(PrevCapPlanValRulesRec);
+        lvPrevBelongsCurr := FALSE;
+        RESET;
+        SETCURRENTKEY("Employee No.", Date, "Time From");
+        FIND('-');
+        REPEAT
+          lvBelongsCurr := BelongsToCurrAssLine(IAssEmplRec, TmpCapPlanValRulesRec);
+          IF lvBelongsCurr AND "Weekend Shift" THEN
+            InsertTmpWeekend(Date);
+          IF lvBelongsCurr OR lvPrevBelongsCurr THEN BEGIN
+            CheckValidationRule001();  //* Min. rest time
+          END;
+          PrevCapPlanValRulesRec := TmpCapPlanValRulesRec;
+          lvPrevBelongsCurr := lvBelongsCurr;
+        UNTIL NEXT = 0;
+      END;
+
+      CheckValidationRule002(IAssEmplRec);  //* Red weekend
+    END;
+
+    PROCEDURE CheckValidationRule001@1100485005();
+    VAR
+      lvText001d@1100485001 : TextConst 'ENU=Less than 11 hrs rest (%1 hr.) after day shift on %2 (%3-%4) in request line %5-%6, project %7.';
+      lvText001n@1100485004 : TextConst 'ENU=Less than 14 hrs rest (%1 hr.) after night shift on %2 (%3-%4) in request line %5-%6, project %7.';
+      lvText002@1100485000 : TextConst 'ENU=Next shift starts on %1 %2 in request line %3-%4-%5, project %6.';
+      lvHoursRest@1100485003 : Decimal;
+      lvWarning@1100485007 : Text[1024];
+      lvText003@1100485008 : TextConst 'ENU=NOTE: Less than 8 hours rest!';
+    BEGIN
+      // Rust na een dagdienst 11 uur, na een nachtdienst 14 uur (dit mag 1 keer per week ingekort worden tot 8 uur, dit
+      // wordt verder niet getest).
+      // Waarschuwing als door inplannen de rusttijd kleiner wordt dan min. rusttijd (11u/14u).
+      // Extra (aanvullende) waarschuwing als de rusttijd korter wordt dan 8 uur.
+
+      lvHoursRest := CalculateTimeBetweenShifts(PrevCapPlanValRulesRec, TmpCapPlanValRulesRec);
+
+      CASE PrevCapPlanValRulesRec.Type OF
+        PrevCapPlanValRulesRec.Type::Day:
+          IF (lvHoursRest < 11) THEN
+            lvWarning := lvText001d;
+        PrevCapPlanValRulesRec.Type::Night:
+          IF (lvHoursRest < 14) THEN
+            lvWarning := lvText001n;
+      END;
+
+      IF (lvWarning = '') THEN
+        EXIT;
+
+      lvWarning :=
+        STRSUBSTNO(lvWarning,
+          ROUND(lvHoursRest,0.01),
+          PrevCapPlanValRulesRec.Date,
+          FORMAT(PrevCapPlanValRulesRec."Time From",0,FillTimeFormat()),
+          FORMAT(PrevCapPlanValRulesRec."Time To",0,FillTimeFormat()),
+          PrevCapPlanValRulesRec."Request No.",
+          PrevCapPlanValRulesRec."Request Line No.",
+          PrevCapPlanValRulesRec."Project No.");
+
+      lvWarning := lvWarning + '\' +
+        STRSUBSTNO(lvText002,
+          TmpCapPlanValRulesRec.Date,
+          FORMAT(TmpCapPlanValRulesRec."Time From",0,FillTimeFormat()),
+          TmpCapPlanValRulesRec."Request No.",
+          TmpCapPlanValRulesRec."Request Line No.",
+          TmpCapPlanValRulesRec."Project No.");
+
+      IF (lvHoursRest < 8) THEN
+        lvWarning := lvWarning + '\ \' + lvText003;
+
+      MESSAGE(lvWarning);
+    END;
+
+    PROCEDURE CheckValidationRule002@1100485007(IAssEmplRec@1100485010 : Record 11012621);
+    VAR
+      lvWeekendRec@1100485000 : Record 11012601;
+      lvCapPlanRec@1100485011 : Record 11012623;
+      lvDate@1100485012 : Date;
+      lvFound@1100485013 : Boolean;
+      lvFirstYear@1100485001 : Integer;
+      lvFirstWeek@1100485002 : Integer;
+      lvLastYear@1100485003 : Integer;
+      lvLastWeek@1100485004 : Integer;
+      lvStartYear@1100485006 : Integer;
+      lvStartWeek@1100485007 : Integer;
+      lvCounter@1100485005 : Integer;
+      lvWarning@1100485008 : Text[1024];
+      lvText001@1100485009 : TextConst 'ENU="Employee ''%1'' is planned %2 weekends after each other (week %3-%4 to %5-%6).  "';
+    BEGIN
+      // Er mag niet in 3 weekends achter elkaar gewerkt worden (zonder toestemming werknemer). Waarschuwing als er een dienst
+      // wordt ingepland waardoor een rood weekend ontstaat.
+
+      IF NOT TmpWeekendRec.FIND('-') THEN
+        EXIT;
+
+      lvCapPlanRec.SETCURRENTKEY("Employee No.", Date, "Time From");
+      lvCapPlanRec.SETRANGE("Employee No.", IAssEmplRec."Employee No.");
+      lvCapPlanRec.SETRANGE("Weekend Shift", TRUE);
+
+      lvFirstYear := TmpWeekendRec.Year;
+      lvFirstWeek := TmpWeekendRec.Week;
+      lvDate := TmpWeekendRec."Starting Date" - 7;
+      REPEAT
+        lvFound := FALSE;
+        lvCapPlanRec.SETRANGE(Date, (lvDate - 3), (lvDate + 3));
+        IF lvCapPlanRec.FIND('-') THEN BEGIN
+          REPEAT
+            IF NOT BelongsToCurrAssLine(IAssEmplRec, lvCapPlanRec) THEN BEGIN  //* Skip current
+              InsertTmpWeekend(lvDate);
+              lvFirstYear := TmpWeekendRec.Year;
+              lvFirstWeek := TmpWeekendRec.Week;
+              lvDate := lvDate - 7;
+              lvFound := TRUE;
+            END;
+          UNTIL (lvCapPlanRec.NEXT = 0) OR lvFound;
+        END;
+      UNTIL (NOT lvFound);
+
+      TmpWeekendRec.FIND('+');
+      lvLastYear := TmpWeekendRec.Year;
+      lvLastWeek := TmpWeekendRec.Week;
+      lvDate := TmpWeekendRec."Starting Date" + 7;
+      REPEAT
+        lvFound := FALSE;
+        lvCapPlanRec.SETRANGE(Date, (lvDate - 3), (lvDate + 3));
+        IF lvCapPlanRec.FIND('-') THEN BEGIN
+          REPEAT
+            IF NOT BelongsToCurrAssLine(IAssEmplRec, lvCapPlanRec) THEN BEGIN  //* Skip current
+              InsertTmpWeekend(lvDate);
+              lvLastYear := TmpWeekendRec.Year;
+              lvLastWeek := TmpWeekendRec.Week;
+              lvDate := lvDate + 7;
+              lvFound := TRUE;
+            END;
+          UNTIL (lvCapPlanRec.NEXT = 0) OR lvFound;
+        END;
+      UNTIL (NOT lvFound);
+
+      lvWeekendRec.GET(lvFirstYear, lvFirstWeek);
+      REPEAT
+        IF TmpWeekendRec.GET(lvWeekendRec.Year, lvWeekendRec.Week) THEN BEGIN
+          lvCounter := lvCounter + 1;
+          IF lvCounter = 1 THEN BEGIN
+            lvStartYear := TmpWeekendRec.Year;
+            lvStartWeek := TmpWeekendRec.Week;
+          END;
+          IF lvCounter >= 3 THEN
+            lvWarning :=
+              STRSUBSTNO(lvText001,
+                IAssEmplRec."Employee No.", lvCounter, lvStartYear, lvStartWeek, TmpWeekendRec.Year, TmpWeekendRec.Week);
+        END ELSE BEGIN
+          IF lvCounter >= 3 THEN
+            MESSAGE(lvWarning);
+          lvCounter := 0;
+        END;
+      UNTIL (lvWeekendRec.NEXT = 0) OR (lvWeekendRec.Year > lvLastYear) OR
+            ((lvWeekendRec.Year = lvLastYear) AND (lvWeekendRec.Week > lvLastWeek));
+
+      IF lvCounter >= 3 THEN
+        MESSAGE(lvWarning);
+    END;
+
+    PROCEDURE BelongsToCurrAssLine@1100485004(IAssEmplRec@1100485000 : Record 11012621;ICapPlanRec@1100485001 : Record 11012623) : Boolean;
+    BEGIN
+      IF (IAssEmplRec."Request No." = ICapPlanRec."Request No.") AND
+         (IAssEmplRec."Request Line No." = ICapPlanRec."Request Line No.") AND
+         (IAssEmplRec."Line No." = ICapPlanRec."Assigned Employee Line No.")
+      THEN
+        EXIT(TRUE);
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE InsertTmpWeekend@1100485010(IDate@1100485001 : Date);
+    VAR
+      lvWeekendRec@1100485000 : Record 11012601;
+    BEGIN
+      lvWeekendRec.SETCURRENTKEY("Starting Date");
+      lvWeekendRec.SETRANGE("Starting Date", (IDate - 3), (IDate + 3));
+      lvWeekendRec.FIND('-');  // Must be present in week table
+
+      IF NOT TmpWeekendRec.GET(lvWeekendRec.Year, lvWeekendRec.Week) THEN BEGIN
+        TmpWeekendRec := lvWeekendRec;
+        TmpWeekendRec.INSERT;
+      END;
+    END;
+
+    PROCEDURE CalculateTimeBetweenShifts@1100485006(IPrevCapPlanRec@1100485000 : Record 11012623;ICurrCapPlanRec@1100485001 : Record 11012623) : Decimal;
+    VAR
+      lvTime@1100485004 : Time;
+      lvDays@1100485002 : Integer;
+      lvHours@1100485003 : Decimal;
+    BEGIN
+      IF (IPrevCapPlanRec.Date = 0D) OR (ICurrCapPlanRec.Date = 0D) THEN
+        EXIT(999999);
+
+      lvDays := ICurrCapPlanRec.Date - IPrevCapPlanRec.Date;
+      IF (IPrevCapPlanRec."Time To" < IPrevCapPlanRec."Time From") THEN  //* Dan is CurrDate > PrevDate want al op overlap getest
+        lvDays := lvDays - 1;
+
+      IF lvDays = 0 THEN
+        lvHours := HourAccFunctionsCU.CalcHoursWithinStartEndTime(IPrevCapPlanRec."Time To", ICurrCapPlanRec."Time From")
+      ELSE BEGIN
+        EVALUATE(lvTime, '0 0');
+        lvHours :=
+          ((lvDays - 1) * 24) +
+          HourAccFunctionsCU.CalcHoursWithinStartEndTime(IPrevCapPlanRec."Time To", lvTime) +
+          HourAccFunctionsCU.CalcHoursWithinStartEndTime(lvTime, ICurrCapPlanRec."Time From");
+      END;
+
+      EXIT(lvHours);
+    END;
+
+    PROCEDURE CalculatePlannedHoursOnDays@1210190008(IEmplNo@1210190000 : Code[20];IDateFrom@1210190003 : Date;IDateTo@1210190002 : Date) : Decimal;
+    VAR
+      lvCapPlanRec@1210190012 : Record 11012623;
+    BEGIN
+      WITH lvCapPlanRec DO BEGIN
+        IF (IEmplNo = '') OR (IDateFrom = 0D) OR (IDateTo = 0D) OR (IDateTo < IDateFrom) THEN
+          EXIT;
+        lvCapPlanRec.SETCURRENTKEY("Employee No.", Date, "Time From");
+        SETRANGE("Employee No.", IEmplNo);
+        SETRANGE(Date, IDateFrom, IDateTo);
+        CALCSUMS(Hours);
+        EXIT(Hours);
+      END;
+    END;
+
+    PROCEDURE CalculatePlanAvailHoursOnTime@1210190003(IEmplNo@1210190004 : Code[20];IDateFrom@1210190003 : Date;IDateTo@1210190002 : Date;ITimeFrom@1210190001 : Time;ITimeTo@1210190000 : Time;VAR OHoursPlanned@1210190007 : Decimal;VAR OHoursAvailable@1210190008 : Decimal);
+    VAR
+      lvEmplRec@1210190005 : Record 5200;
+      lvCapPlanRec@1210190012 : Record 11012623;
+      lvEmployedFrom@1210190006 : Date;
+      lvEmployedTo@1210190009 : Date;
+      lvSelTimeFromInt0@1210190018 : Integer;
+      lvSelTimeToInt0@1210190016 : Integer;
+      lvSelTimeFromInt1@1210190014 : Integer;
+      lvSelTimeToInt1@1210190013 : Integer;
+      lvSelTimeFromInt2@1210190015 : Integer;
+      lvSelTimeToInt2@1210190017 : Integer;
+      lvCapTimeFromInt@1210190010 : Integer;
+      lvCapTimeToInt@1210190011 : Integer;
+    BEGIN
+      OHoursPlanned := 0;
+      OHoursAvailable := 0;
+      IF (IEmplNo = '') OR (IDateFrom = 0D) OR (IDateTo = 0D) OR (IDateTo < IDateFrom) OR (ITimeFrom = 0T) OR (ITimeTo = 0T) THEN
+        EXIT;
+      ConvertDateTimesToInteger(lvSelTimeFromInt0, lvSelTimeToInt0, TODAY, (TODAY-1), ITimeFrom, ITimeTo);
+      ConvertDateTimesToInteger(lvSelTimeFromInt1, lvSelTimeToInt1, TODAY, TODAY, ITimeFrom, ITimeTo);
+      ConvertDateTimesToInteger(lvSelTimeFromInt2, lvSelTimeToInt2, TODAY, (TODAY + 1), ITimeFrom, ITimeTo);
+
+      WITH lvEmplRec DO BEGIN
+        GET(IEmplNo);
+        lvEmployedFrom := IDateFrom;  //* Employed in selected period
+        lvEmployedTo := IDateTo;
+        IF (lvEmployedTo < "Employment Date") OR
+           (("Termination Date" <> 0D) AND (lvEmployedFrom >= "Termination Date")) OR
+           ((Status <> Status::Active) AND ("Inactive Date" <> 0D) AND (lvEmployedFrom >= "Inactive Date"))
+        THEN BEGIN
+          lvEmployedFrom := 0D;
+          lvEmployedTo := 0D;
+        END ELSE BEGIN
+          IF (lvEmployedFrom < "Employment Date") THEN
+            lvEmployedFrom := "Employment Date";
+          IF ("Termination Date" <> 0D) AND (lvEmployedTo >= "Termination Date") THEN
+            lvEmployedTo := "Termination Date" - 1;
+          IF (Status <> Status::Active) AND ("Inactive Date" <> 0D) AND (lvEmployedTo >= "Inactive Date") THEN
+            lvEmployedTo := "Inactive Date" - 1;
+        END;
+      END;
+
+      IF lvEmployedFrom <> 0D THEN
+        OHoursAvailable := (lvEmployedTo - lvEmployedFrom + 1) * HourAccFunctionsCU.CalcHoursWithinStartEndTime(ITimeFrom,ITimeTo);
+
+      WITH lvCapPlanRec DO BEGIN
+        lvCapPlanRec.SETCURRENTKEY("Employee No.", Date, "Time From");
+        SETRANGE("Employee No.", IEmplNo);
+        IF ITimeFrom <= ITimeTo THEN
+          SETRANGE(Date, (IDateFrom - 1), IDateTo)
+        ELSE
+          SETRANGE(Date, (IDateFrom - 1), (IDateTo + 1));
+        IF NOT FIND('-') THEN
+          EXIT;
+        REPEAT
+          ConvertDateTimesToInteger(lvCapTimeFromInt, lvCapTimeToInt, Date, Date, "Time From", "Time To");
+          IF ( (ITimeTo < ITimeFrom) AND
+               ( (Date > IDateFrom) AND
+                 ((Date <= IDateTo) OR ((Date > IDateTo) AND ("Time To" >= "Time From"))) ) )
+          THEN BEGIN
+            lvCalcHoursPlannedAvailable(lvCapTimeFromInt, lvCapTimeToInt, "Time From", "Time To",
+                                        lvSelTimeFromInt0, lvSelTimeToInt0, ITimeFrom, ITimeTo,
+                                        Date, lvEmployedFrom, lvEmployedTo, OHoursPlanned, OHoursAvailable);
+          END;
+          IF ( (Date >= IDateFrom) AND (Date <= IDateTo) ) THEN BEGIN
+            lvCalcHoursPlannedAvailable(lvCapTimeFromInt, lvCapTimeToInt, "Time From", "Time To",
+                                        lvSelTimeFromInt1, lvSelTimeToInt1, ITimeFrom, ITimeTo,
+                                        Date, lvEmployedFrom, lvEmployedTo, OHoursPlanned, OHoursAvailable);
+          END;
+          IF (Date < IDateTo) AND ("Time To" < "Time From") THEN BEGIN
+            lvCalcHoursPlannedAvailable(lvCapTimeFromInt, lvCapTimeToInt, "Time From", "Time To",
+                                        lvSelTimeFromInt2, lvSelTimeToInt2, ITimeFrom, ITimeTo,
+                                        Date, lvEmployedFrom-1, lvEmployedTo, OHoursPlanned, OHoursAvailable);
+          END;
+        UNTIL NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE lvCalcHoursPlannedAvailable@1210190010(ICapTimeFromInt@1210190000 : Integer;ICapTimeToInt@1210190001 : Integer;ICapTimeFrom@1210190002 : Time;ICapTimeTo@1210190003 : Time;ISelTimeFromInt@1210190008 : Integer;ISelTimeToInt@1210190007 : Integer;ISelTimeFrom@1210190006 : Time;ISelTimeTo@1210190005 : Time;IDate@1210190004 : Date;IEmployedFrom@1210190009 : Date;IEmployedTo@1210190010 : Date;VAR IOHoursPlanned@1210190011 : Decimal;VAR IOHoursAvailable@1210190012 : Decimal);
+    VAR
+      lvHours@1210190013 : Decimal;
+    BEGIN
+      IF (ICapTimeFromInt < ISelTimeToInt) AND (ICapTimeToInt > ISelTimeFromInt) THEN BEGIN
+        lvHours := HourAccFunctionsCU.CalcHoursWithinStartEndTime(
+          GetMaxTime(ICapTimeFromInt, ISelTimeFromInt, ICapTimeFrom, ISelTimeFrom),
+          GetMinTime(ICapTimeToInt, ISelTimeToInt, ICapTimeTo, ISelTimeTo));
+        IOHoursPlanned := IOHoursPlanned + lvHours;
+        IF (IDate >= IEmployedFrom) AND (IDate <= IEmployedTo) THEN
+          IOHoursAvailable := IOHoursAvailable - lvHours;
+      END;
+    END;
+
+    PROCEDURE CheckDateIsDayToPlan@1100485000(IAssEmplRec@1100485000 : Record 11012621;IDate@1100485001 : Date) : Boolean;
+    BEGIN
+      WITH IAssEmplRec DO BEGIN
+        CASE DATE2DWY(IDate, 1) OF
+          1: EXIT("Plan on Monday");
+          2: EXIT("Plan on Tuesday");
+          3: EXIT("Plan on Wednesday");
+          4: EXIT("Plan on Thursday");
+          5: EXIT("Plan on Friday");
+          6: EXIT("Plan on Saterday");
+          7: EXIT("Plan on Sunday");
+        END;
+        EXIT(FALSE);
+      END;
+    END;
+
+    PROCEDURE DetermineDayOrNight@1210190006(ITimeFrom@1210190002 : Time;ITimeTo@1210190003 : Time) : Boolean;
+    VAR
+      lvTimeFromInt@1210190001 : Integer;
+      lvTimeToInt@1210190000 : Integer;
+      lvNightShiftTimeInt1@1100485000 : Integer;
+      lvNightShiftTimeInt2@1100485001 : Integer;
+    BEGIN
+      //* Return Value: TRUE=Day; FALSE=Night
+
+      HrsSetupRec.GET;
+      HrsSetupRec.TESTFIELD("Definition Time Night Shift");
+      lvNightShiftTimeInt1 := HourAccFunctionsCU.TimeToInteger(HrsSetupRec."Definition Time Night Shift", 0, 0, 0);
+      lvNightShiftTimeInt2 := lvNightShiftTimeInt1 + 2400;
+
+      ConvertDateTimesToInteger(lvTimeFromInt, lvTimeToInt, TODAY, TODAY, ITimeFrom, ITimeTo);
+
+      IF ((lvNightShiftTimeInt1 >= lvTimeFromInt) AND (lvNightShiftTimeInt1 <= lvTimeToInt)) OR
+         ((lvNightShiftTimeInt2 >= lvTimeFromInt) AND (lvNightShiftTimeInt2 <= lvTimeToInt))
+      THEN
+        EXIT(FALSE);
+
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE DetermineWeekendShift@1100485001(IDate@1100485000 : Date;ITimeFrom@1100485001 : Time) : Boolean;
+    BEGIN
+      //* Weekend shift: A shift that starts in the period Friday 18:00 upto Sunday 24:00 (Monday 00:00).
+
+      CASE DATE2DWY(IDate, 1) OF
+        1:  //* Monday"
+          IF HourAccFunctionsCU.TimeToInteger(ITimeFrom, 0, 0, 0) = 0 THEN
+            EXIT(TRUE);
+        5:  //* Friday
+          IF HourAccFunctionsCU.TimeToInteger(ITimeFrom, 0, 0, 0) >= 1800 THEN
+            EXIT(TRUE);
+        6, 7:  //* Saterday, Sunday
+          EXIT(TRUE);
+      END;
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE ConvertDateTimesToInteger@1210190001(VAR OTimeFromInt@1210190000 : Integer;VAR OTimeToInt@1210190001 : Integer;IRefDate@1210190002 : Date;IDate@1210190003 : Date;ITimeFrom@1210190004 : Time;ITimeTo@1210190005 : Time);
+    VAR
+      lvDateMode@1210190006 : Integer;
+    BEGIN
+      lvDateMode := IDate - IRefDate;
+      OTimeFromInt := HourAccFunctionsCU.TimeToInteger(ITimeFrom, 0, lvDateMode, 0);
+      IF (ITimeFrom > ITimeTo) THEN
+        lvDateMode := lvDateMode + 1;
+      OTimeToInt := HourAccFunctionsCU.TimeToInteger(ITimeTo, 0, lvDateMode, 0);
+    END;
+
+    PROCEDURE GetMaxDec@1210190005(IDec1@1210190000 : Decimal;IDec2@1210190001 : Decimal) : Decimal;
+    BEGIN
+      IF IDec1 > IDec2 THEN
+        EXIT(IDec1);
+
+      EXIT(IDec2);
+    END;
+
+    PROCEDURE GetMinDec@1210190007(IDec1@1210190001 : Decimal;IDec2@1210190000 : Decimal) : Decimal;
+    BEGIN
+      IF IDec1 < IDec2 THEN
+        EXIT(IDec1);
+
+      EXIT(IDec2);
+    END;
+
+    PROCEDURE GetMaxTime@1210190012(ITimeInt1@1210190000 : Integer;ITimeInt2@1210190001 : Integer;ITime1@1210190002 : Time;ITime2@1210190003 : Time) : Time;
+    BEGIN
+      IF ITimeInt1 > ITimeInt2 THEN
+        EXIT(ITime1);
+
+      EXIT(ITime2);
+    END;
+
+    PROCEDURE GetMinTime@1210190013(ITimeInt1@1210190000 : Integer;ITimeInt2@1210190001 : Integer;ITime1@1210190002 : Time;ITime2@1210190003 : Time) : Time;
+    BEGIN
+      IF ITimeInt1 < ITimeInt2 THEN
+        EXIT(ITime1);
+
+      EXIT(ITime2);
+    END;
+
+    PROCEDURE FillTimeFormat@1210190009() : Text[30];
+    BEGIN
+      EXIT('<Hours24,2>:<Minutes,2>');
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

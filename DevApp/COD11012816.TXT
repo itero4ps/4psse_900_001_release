@@ -1,0 +1,797 @@
+OBJECT Codeunit 11012816 Service/Work Order Status Mail
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=VAR
+            Text001@1100525000 : TextConst 'ENU=Input is expected.';
+          BEGIN
+            MESSAGE(Text001);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      ServSetup@1100526217 : Record 11012800;
+      ServOrderRec@1100526202 : Record 11012823;
+      WorkOrder@1100525002 : Record 11229279;
+      FileMgt@1210190000 : Codeunit 419;
+      AllEMailAddressTxt@1100526200 : Text[1024];
+      Text000@1100525001 : TextConst 'ENU=E-mail could not be sent, because no e-mail addresses could be found to send them to.\\Do you still want to continue?';
+      MaxArray@1100526201 : Integer;
+      Text001@1100526209 : TextConst 'ENU=Status of Service Order %1 was changed from "%2" to "%3"';
+      SubjectTxt@1100526211 : Text[250];
+      TempFileName@1100526215 : Text[250];
+      TempFolderName@1100526214 : Text[260];
+      TempReportSelections@1100526213 : TEMPORARY Record 77;
+      UseDefaultReportSelection@1100526212 : Boolean;
+      MailAction@1100528600 : 'Mail Status,Mail Worksheet,Mail Subcontractor,Mail Order Manager,Mail Maintenance Appointment Proposal,Mail Maintenance Appointment';
+      Text002@1100528601 : TextConst 'ENU=Execution Assignment for Service Order %1';
+      Text003@1100409000 : TextConst 'ENU=Subcontractor has changed the expected Starting Date of Work Order %1';
+      Text004@1100528602 : TextConst 'ENU=Planned Maintenance';
+      Text005@1100528603 : TextConst 'ENU=Click %1 to confirm the appointment';
+      Text006@1100528604 : TextConst 'ENU=Click %1 to change the appointment';
+      Text007@1100528605 : TextConst 'ENU=here';
+      NoConfirms@1100528606 : Boolean;
+      Text008@1100528607 : TextConst 'ENU=This Appointment can be confirmed/changed until %1';
+      Text009@1100525000 : TextConst 'ENU=No Bodytext present for %1';
+      Text010@1100528608 : TextConst 'ENU=Execution Assignment for Work Order %1';
+
+    PROCEDURE ServiceOrderMail@1100525003(iServOrder@1100525000 : Code[20]) : Boolean;
+    VAR
+      ServiceOrderEMailQueue@1100528400 : Record 11020337;
+    BEGIN
+      //db, 21-03-11
+      ServSetup.GET;
+      CheckOnBehalf;
+
+      IF NOT ServOrderRec.GET(iServOrder) THEN
+        EXIT;
+      IF MailAction IN [MailAction::"Mail Subcontractor", MailAction::"Mail Order Manager"] THEN
+         EXIT;
+
+      ServSetup.TESTFIELD(ServSetup."Send Automatic E-Mail Using");
+      IF (ServSetup."Send Automatic E-Mail Using" = ServSetup."Send Automatic E-Mail Using"::"Service Order E-Mail Queue") OR
+         (ServSetup."Send Automatic E-Mail Using" = ServSetup."Send Automatic E-Mail Using"::SMTP)
+      THEN BEGIN
+        CASE MailAction OF
+          MailAction::"Mail Maintenance Appointment Proposal",
+          MailAction::"Mail Maintenance Appointment":
+            AllEMailAddressTxt := GetEmailMaintAppointment(ServOrderRec);
+        ELSE
+          AllEMailAddressTxt := FillMailArray(ServOrderRec, MailAction);
+        END;
+        IF AllEMailAddressTxt = '' THEN BEGIN
+          IF NOT GUIALLOWED OR NoConfirms THEN
+            EXIT;
+          IF NOT CONFIRM(Text000, FALSE) THEN
+            ERROR('')
+          ELSE
+            EXIT;
+        END ELSE BEGIN
+          DetermineSubjectTxt;
+          IF ServSetup."Send Automatic E-Mail Using" = ServSetup."Send Automatic E-Mail Using"::"Service Order E-Mail Queue" THEN
+            SendMailQueue(
+              ServOrderRec, ServiceOrderEMailQueue."Document Type"::"Service Order", ServOrderRec."No.");
+          IF ServSetup."Send Automatic E-Mail Using" = ServSetup."Send Automatic E-Mail Using"::SMTP THEN
+            SendEmailViaSMTP;  //db, 12-04-11: tijdelijk oude versie gebruiken
+          EXIT(TRUE);
+        END;
+      END;
+    END;
+
+    PROCEDURE WorkOrderMail@1100528604(IWorkOrderNo@1100525000 : Code[20]) : Boolean;
+    VAR
+      ServiceOrderEMailQueue@1100528400 : Record 11020337;
+    BEGIN
+      ServSetup.GET;
+      CheckOnBehalf;
+
+      IF NOT (MailAction IN [MailAction::"Mail Subcontractor", MailAction::"Mail Order Manager"]) THEN
+        EXIT;
+      IF NOT WorkOrder.GET(IWorkOrderNo) THEN
+        EXIT;
+      ServSetup.TESTFIELD("Send Automatic E-Mail Using");
+      IF (ServSetup."Send Automatic E-Mail Using" = ServSetup."Send Automatic E-Mail Using"::"Service Order E-Mail Queue") OR
+         (ServSetup."Send Automatic E-Mail Using" = ServSetup."Send Automatic E-Mail Using"::SMTP)
+      THEN BEGIN
+        AllEMailAddressTxt := FillMailArrayByWorkOrder(WorkOrder, MailAction);
+        IF AllEMailAddressTxt <> '' THEN BEGIN
+          DetermineSubjectTxtByWorkOrder(IWorkOrderNo);
+          CASE ServSetup."Send Automatic E-Mail Using" OF
+            ServSetup."Send Automatic E-Mail Using"::"Service Order E-Mail Queue":
+              SendMailQueue(
+                WorkOrder,  ServiceOrderEMailQueue."Document Type"::"Work Order", WorkOrder."No.");
+            ServSetup."Send Automatic E-Mail Using"::SMTP:
+              SendEmailViaSMTP;
+          END;
+          EXIT(TRUE);
+        END;
+      END;
+    END;
+
+    PROCEDURE GetStateDescription@1100525000(VAR parPreviousStateTXT@1100525000 : Text[50];VAR parCurrentStateTXT@1100525004 : Text[50]);
+    VAR
+      DocRefPointRec@1100525002 : Record 11020296;
+      Text001@1100525001 : TextConst 'ENU=N/A';
+    BEGIN
+      DocRefPointRec.SETCURRENTKEY(Type,"Document No.","Date-Time (modified)");
+      DocRefPointRec.SETRANGE(Type, DocRefPointRec.Type::ServOrder);
+      DocRefPointRec.SETRANGE("Document No.", ServOrderRec."No.");
+      DocRefPointRec.SETRANGE(Actual, FALSE);
+      IF DocRefPointRec.FINDLAST THEN BEGIN
+        DocRefPointRec.CALCFIELDS("Reference Point Description");
+        parPreviousStateTXT := DocRefPointRec."Reference Point Description";
+      END ELSE
+        parPreviousStateTXT := Text001;
+
+      DocRefPointRec.SETRANGE(Actual, TRUE);
+      IF DocRefPointRec.FINDLAST THEN BEGIN
+        DocRefPointRec.CALCFIELDS("Reference Point Description");
+        parCurrentStateTXT := DocRefPointRec."Reference Point Description";
+      END ELSE
+        parPreviousStateTXT := Text001;
+    END;
+
+    PROCEDURE SendEmailViaSMTP@1100525022();
+    VAR
+      EMailOnBehalf@1100528402 : Record 11012768;
+      EMailSetup@1100528405 : Record 11229911;
+      EMailBodyText@1100528406 : Record 11012769;
+      Customer@1100528404 : Record 18;
+      lvMail002@1210190005 : TextConst 'ENU=L.S.,';
+      lvMail004@1210190003 : TextConst 'ENU=Service order nr.: %1';
+      lvMail005@1210190001 : TextConst 'ENU=Description %1';
+      lvMail006@1210190000 : TextConst 'ENU=With kind regards,';
+      lvMail007@1210190002 : TextConst 'ENU=Ordernumber Customer: %1';
+      lvMail008@1210190007 : TextConst 'ENU=Your Reference: %1';
+      SourceVariant@1100528410 : Variant;
+      DocumentMailing@1100528403 : Codeunit 260;
+      BodyText@1100528400 : Text;
+      OnBehalfOfName@1100528408 : Text[50];
+      OnBehalfOfEMail@1100528407 : Text[80];
+      EMailSetupUsage@1100528401 : Integer;
+      EMailBodyTextUsage@1100528409 : Integer;
+    BEGIN
+      //oude versie
+      GetEmailUsages(EMailSetupUsage, EMailBodyTextUsage);
+      IF Customer.GET(ServOrderRec."Customer No.") THEN;
+      EMailOnBehalf.GetApplicableEMailOnBehalf(
+        EMailOnBehalf.Usage::"Service Order", FALSE, OnBehalfOfName, OnBehalfOfEMail);
+      SourceVariant := ServOrderRec;
+      EMailBodyText.GetApplicableBodyText(
+        BodyText, SourceVariant, EMailBodyTextUsage, Customer."Language Code", FALSE);
+
+      IF BodyText = '' THEN
+        BodyText := //This BodyText is only used for backward compatibility.
+          lvMail002 + CrLf +
+          CrLf +
+          SubjectTxt + CrLf + //Not possible to convert this to E-Mail Body Text.
+          CrLf +
+          STRSUBSTNO(lvMail004, ServOrderRec."No.") + CrLf +
+          STRSUBSTNO(lvMail005, ServOrderRec.Description) + CrLf +
+          STRSUBSTNO(lvMail007, ServOrderRec."Order No. Customer") + CrLf +
+          STRSUBSTNO(lvMail008, ServOrderRec."Your Reference") + CrLf +
+          CrLf +
+          CrLf +
+          lvMail006 + CrLf +
+          CrLf +
+          OnBehalfOfName;
+
+      DocumentMailing.SetSpecialBodyText(BodyText);
+      DocumentMailing.EmailMessageWithoutAttachment(
+        '',
+        AllEMailAddressTxt,
+        EMailOnBehalf.Usage::"Service Order",
+        EMailSetupUsage,
+        -1,
+        ServOrderRec."Global Dimension 1 Code",
+        Customer."Language Code",
+        ServOrderRec,
+        SubjectTxt,
+        FALSE);
+    END;
+
+    PROCEDURE SendMailQueue@1100526206(SourceVariant@1100528400 : Variant;EMailQueueDocumentType@1100528402 : Integer;DocumentNo@1100528401 : Code[20]);
+    VAR
+      ServiceOrderEMailQueue@1100525015 : Record 11020337;
+      TempEmailAttachment@1100528500 : TEMPORARY Record 11229294;
+      BodyText@1100528502 : Text;
+    BEGIN
+      FillBodyMail(BodyText, SourceVariant, DocumentNo);
+      HandleAttachments(ServiceOrderEMailQueue, ServOrderRec, TempEmailAttachment);
+      ServiceOrderEMailQueue.AddEmailToServiceOrderEmailQueue(
+        AllEMailAddressTxt,
+        GetCopyToAddress(ServOrderRec."Global Dimension 1 Code"),
+        SubjectTxt,
+        EMailQueueDocumentType,
+        DocumentNo,
+        BodyText,
+        TempEmailAttachment);
+    END;
+
+    PROCEDURE CrLf@1100525009() retChars : Text[2];
+    BEGIN
+      retChars[1] := 13;
+      retChars[2] := 10;
+    END;
+
+    PROCEDURE CheckOnBehalf@1100526202();
+    VAR
+      EMailOnBehalf@1100528400 : Record 11012768;
+    BEGIN
+      EMailOnBehalf.CheckEMailOnBehalf(EMailOnBehalf.Usage::"Service Order");
+    END;
+
+    PROCEDURE FillMailArray@1100526205(ServOrderRec@1100526208 : Record 11012823;lvAction@1100526209 : Integer) ResultTxt : Text[1024];
+    VAR
+      ServMailRec@1100526203 : Record 11071711;
+      ContactRec@1100526202 : Record 5050;
+      CustomerRec@1100526201 : Record 18;
+      ServContractRec@1100526206 : Record 11012812;
+      ServLocationRec@1100526204 : Record 11012801;
+      Vendor@1100528600 : Record 23;
+      ResourceWOP@1100409000 : Record 11229278;
+      SalespersonPurchaser@1100409001 : Record 13;
+      CounterInt@1100526207 : Integer;
+      CounterInt2@1100526205 : Integer;
+      EMailAddressTxt@1100526200 : ARRAY [20] OF Text[80];
+    BEGIN
+      //db, 21-03-11
+      MaxArray := ARRAYLEN(EMailAddressTxt);
+
+      ServMailRec.SETRANGE("Service Contract No.", ServOrderRec."Service Contract No.");
+      //mg.sn, 09-01-12: M32065
+      IF ServOrderRec."Service Contract No." = '' THEN
+        ServMailRec.SETRANGE("Customer No.", ServOrderRec."Customer No.")
+      ELSE
+        ServMailRec.SETRANGE("Customer No.", '');
+      //mg.en, 09-01-12: M32065
+      ServMailRec.SETRANGE("Source Type", ServOrderRec."Source Type");
+      CASE lvAction OF
+        0:
+          ServMailRec.SETRANGE("Mail Status Update", TRUE);
+        1:
+          ServMailRec.SETRANGE("Mail Work Sheet", TRUE);
+      //  2:
+      //    ServMailRec.SETRANGE("Mail to Subcontractor", TRUE);
+      END;
+      IF ServMailRec.FINDSET THEN BEGIN
+        REPEAT
+          CounterInt := CounterInt + 1;
+          CASE ServMailRec."Source E-Mail" OF
+            ServMailRec."Source E-Mail"::Contract:
+              BEGIN
+                IF ServContractRec.GET(ServOrderRec."Service Contract No.") THEN
+                  EMailAddressTxt[CounterInt] := ServContractRec."E-Mail";
+              END;
+            ServMailRec."Source E-Mail"::ContractManager:
+              BEGIN
+                IF ServContractRec.GET(ServOrderRec."Service Contract No.") THEN
+                  IF SalespersonPurchaser.GET(ServContractRec."Contract Manager") THEN
+                    EMailAddressTxt[CounterInt] := SalespersonPurchaser."E-Mail";
+               END;
+            ServMailRec."Source E-Mail"::ContractContact1:
+              BEGIN
+                IF ServContractRec.GET(ServOrderRec."Service Contract No.") THEN
+                  IF ContactRec.GET(ServContractRec."Contact Person") THEN
+                     EMailAddressTxt[CounterInt] := ContactRec."E-Mail";
+              END;
+            ServMailRec."Source E-Mail"::ContractContact2:
+              BEGIN
+                IF ServContractRec.GET(ServOrderRec."Service Contract No.") THEN
+                  IF ContactRec.GET(ServContractRec."Contact Person") THEN
+                    EMailAddressTxt[CounterInt] := ContactRec."E-Mail 2";
+              END;
+            ServMailRec."Source E-Mail"::Customer:
+              BEGIN
+                IF CustomerRec.GET(ServOrderRec."Customer No.") THEN
+                  EMailAddressTxt[CounterInt] := CustomerRec."E-Mail";
+              END;
+            ServMailRec."Source E-Mail"::CustomerContact1:
+              BEGIN
+                IF CustomerRec.GET(ServOrderRec."Customer No.") THEN
+                  IF ContactRec.GET(CustomerRec."Primary Contact No.") THEN
+                     EMailAddressTxt[CounterInt] := ContactRec."E-Mail";
+              END;
+            ServMailRec."Source E-Mail"::CustomerContact2:
+              BEGIN
+                IF CustomerRec.GET(ServOrderRec."Customer No.") THEN
+                  IF ContactRec.GET(CustomerRec."Primary Contact No.") THEN
+                    EMailAddressTxt[CounterInt] := ContactRec."E-Mail 2";
+              END;
+            ServMailRec."Source E-Mail"::Location:
+              BEGIN
+                IF ServLocationRec.GET(ServOrderRec."Service Location No.") THEN
+                  EMailAddressTxt[CounterInt] := ServLocationRec."E-Mail";
+              END;
+            ServMailRec."Source E-Mail"::LocationContact1:
+              BEGIN
+                IF ServLocationRec.GET(ServOrderRec."Service Location No.") THEN
+                  IF ContactRec.GET(ServLocationRec."Contact Person No.") THEN
+                     EMailAddressTxt[CounterInt] := ContactRec."E-Mail";
+              END;
+            ServMailRec."Source E-Mail"::LocationContact2:
+              BEGIN
+                IF ServLocationRec.GET(ServOrderRec."Service Location No.") THEN
+                  IF ContactRec.GET(ServLocationRec."Contact Person No.") THEN
+                    EMailAddressTxt[CounterInt] := ContactRec."E-Mail 2";
+              END;
+            ServMailRec."Source E-Mail"::Order:
+              BEGIN
+                EMailAddressTxt[CounterInt] := ServOrderRec."E-Mail";
+              END;
+            ServMailRec."Source E-Mail"::OrderSigner:
+              BEGIN
+                EMailAddressTxt[CounterInt] := ServOrderRec."E-Mail Signer";
+              END;
+
+            ServMailRec."Source E-Mail"::OrderManager:
+              BEGIN
+                IF NOT SalespersonPurchaser.GET(ServOrderRec."Order Manager") THEN SalespersonPurchaser.INIT;
+                EMailAddressTxt[CounterInt] := SalespersonPurchaser."E-Mail";
+              END;
+            ServMailRec."Source E-Mail"::OrderContact1:
+              BEGIN
+                IF ContactRec.GET(ServOrderRec."Bill-to Contact Person") THEN
+                  EMailAddressTxt[CounterInt] := ContactRec."E-Mail";
+              END;
+            ServMailRec."Source E-Mail"::OrderContact2:
+              BEGIN
+                IF ContactRec.GET(ServOrderRec."Bill-to Contact Person") THEN
+                  EMailAddressTxt[CounterInt] := ContactRec."E-Mail 2";
+              END;
+          END;
+        UNTIL ServMailRec.NEXT= 0;
+        MaxArray := CounterInt;
+      END;
+
+      FOR CounterInt := 1 TO MaxArray DO BEGIN
+        IF NOT CheckEMailAddress(EMailAddressTxt[CounterInt]) THEN
+          EMailAddressTxt[CounterInt] := '';
+      END;
+
+      //Check Double Address
+      FOR CounterInt := 1 TO (MaxArray-1) DO BEGIN
+        IF EMailAddressTxt[CounterInt] <> '' THEN BEGIN
+          FOR CounterInt2 := CounterInt+1 TO MaxArray DO BEGIN
+            IF UPPERCASE(EMailAddressTxt[CounterInt]) = UPPERCASE(EMailAddressTxt[CounterInt2]) THEN
+              EMailAddressTxt[CounterInt2] := '';
+          END;
+        END;
+      END;
+
+      //Fill Composed EMail Address
+      FOR CounterInt := 1 TO MaxArray DO BEGIN
+        IF EMailAddressTxt[CounterInt] <> '' THEN
+          ResultTxt := ResultTxt + EMailAddressTxt[CounterInt] + ';';
+      END;
+      IF ResultTxt <> '' THEN  //db, 04-04-11
+        ResultTxt := DELSTR(ResultTxt, STRLEN(ResultTxt));
+
+      EXIT(ResultTxt);
+    END;
+
+    PROCEDURE FillMailArrayByWorkOrder@1100528605(IWorkOrder@1100526208 : Record 11229279;IAction@1100526209 : Integer) ResultTxt : Text[1024];
+    BEGIN
+      IF IWorkOrder."Source Type" <> IWorkOrder."Source Type"::ServiceOrder THEN
+        EXIT;
+
+      IF IWorkOrder."Source Company" <> COMPANYNAME THEN
+        ServOrderRec.CHANGECOMPANY(IWorkOrder."Source Company");
+      ServOrderRec.GET(IWorkOrder."Source No.");
+
+      CASE IAction OF
+        MailAction::"Mail Order Manager":
+          ResultTxt := GetEmailOrderManager(ServOrderRec);
+        MailAction::"Mail Subcontractor":
+          ResultTxt := GetEmailSubcontractor(IWorkOrder, ServOrderRec);
+      END;
+    END;
+
+    PROCEDURE CheckEMailAddress@1100526204(parEMailAddressTXT@1100525000 : Text[80]) ValidBLN : Boolean;
+    VAR
+      i@1100525001 : Integer;
+      NoOfAtSigns@1100525002 : Integer;
+    BEGIN
+      // Basicly a ripoff of CU 400, this doesn't respond with an ERROR though, Boolean is returned as result
+
+      ValidBLN := TRUE;
+
+      IF parEMailAddressTXT = '' THEN
+        EXIT(FALSE);
+
+      IF (parEMailAddressTXT[1] = '@') OR (parEMailAddressTXT[STRLEN(parEMailAddressTXT)] = '@') THEN
+        EXIT(FALSE);
+
+      FOR i := 1 TO STRLEN(parEMailAddressTXT) DO BEGIN
+        IF parEMailAddressTXT[i] = '@' THEN
+          NoOfAtSigns := NoOfAtSigns + 1;
+        IF NOT (
+          ((parEMailAddressTXT[i] >='a') AND (parEMailAddressTXT[i] <='z')) OR
+          ((parEMailAddressTXT[i] >='A') AND (parEMailAddressTXT[i] <='Z')) OR
+          ((parEMailAddressTXT[i] >='0') AND (parEMailAddressTXT[i] <='9')) OR
+          (parEMailAddressTXT[i] IN ['@','.','-','_']))
+        THEN
+          EXIT(FALSE);
+      END;
+
+      IF NoOfAtSigns <> 1 THEN
+        EXIT(FALSE);
+    END;
+
+    PROCEDURE FillBodyMail@1100528900(VAR BodyText@1100528902 : Text;SourceVariant@1100528402 : Variant;DocumentNo@1100528400 : Code[20]);
+    VAR
+      CustRec@1100528900 : Record 18;
+      EMailBodyText@1100528901 : Record 11012769;
+      ServPortCustomerRights@1100528602 : Record 11126062;
+      ServiceContractClusterSeq@1100528604 : Record 11071966;
+      AppointmentManagement@1100528601 : Codeunit 11012865;
+      NamedSPTUser@1100528603 : Boolean;
+      UsageNo@1100528502 : Integer;
+    BEGIN
+      //db, 23-08-12: W012386
+      IF NOT CustRec.GET(ServOrderRec."Customer No.") THEN
+        CustRec.INIT;
+
+      UsageNo := GetEmailBodyTextUsage;
+
+      IF NOT GUIALLOWED THEN
+        EMailBodyText.SetLanguageID(GetLanguageID(CustRec."No."));
+
+      EMailBodyText.GetApplicableBodyText(
+        BodyText, SourceVariant, UsageNo, CustRec."Language Code", TRUE);
+      IF BodyText = '' THEN BEGIN
+        EMailBodyText.SETRANGE(Usage, UsageNo);
+        ERROR(Text009, EMailBodyText.GETFILTER(Usage));
+      END;
+
+      NamedSPTUser := ServPortCustomerRights.GET(CustRec."No.");
+      CASE MailAction OF
+        MailAction::"Mail Maintenance Appointment Proposal":
+          BEGIN
+            IF ((ServSetup."Appointment E-Mail Links" = ServSetup."Appointment E-Mail Links"::Confirmation) OR
+                (ServSetup."Appointment E-Mail Links" = ServSetup."Appointment E-Mail Links"::Both)) AND
+               (NOT NamedSPTUser OR ServPortCustomerRights."Confirm Maint. Appointments")
+            THEN
+              BodyText := BodyText + STRSUBSTNO(Text005,
+                AppointmentManagement.GetFullHTMLMaintAppointLink(ServOrderRec."No.", 0, Text007)) + '<br/><br/>';
+
+            IF ((ServSetup."Appointment E-Mail Links" = ServSetup."Appointment E-Mail Links"::Change) OR
+                (ServSetup."Appointment E-Mail Links" = ServSetup."Appointment E-Mail Links"::Both)) AND
+               (NOT NamedSPTUser OR ServPortCustomerRights."Change Maint. Appointments")
+            THEN
+              BodyText := BodyText + STRSUBSTNO(Text006,
+                AppointmentManagement.GetFullHTMLMaintAppointLink(ServOrderRec."No.", 1, Text007)) + '<br/>';
+
+            IF ServiceContractClusterSeq.GET(
+              ServOrderRec."Service Contract No.", ServOrderRec."Service Cluster",
+              ServOrderRec."Service Cluster Seqn.")
+            THEN
+              IF ServiceContractClusterSeq."Last Possible Change Date" <> 0D THEN
+                BodyText := BodyText + '<br/>' + STRSUBSTNO(Text008,
+                  EMailBodyText.FormatDate(ServiceContractClusterSeq."Last Possible Change Date"));
+          END;
+        MailAction::"Mail Maintenance Appointment":
+          BEGIN
+            IF ((ServSetup."Appointment E-Mail Links" = ServSetup."Appointment E-Mail Links"::Change) OR
+                (ServSetup."Appointment E-Mail Links" = ServSetup."Appointment E-Mail Links"::Both)) AND
+               (NOT NamedSPTUser OR ServPortCustomerRights."Change Maint. Appointments")
+            THEN BEGIN
+             BodyText := BodyText + STRSUBSTNO(Text006,
+                AppointmentManagement.GetFullHTMLMaintAppointLink(ServOrderRec."No.", 1, Text007)) + '<br/>';
+              IF ServiceContractClusterSeq.GET(
+                ServOrderRec."Service Contract No.", ServOrderRec."Service Cluster",
+                ServOrderRec."Service Cluster Seqn.")
+              THEN
+                IF ServiceContractClusterSeq."Last Possible Change Date" <> 0D THEN
+                  BodyText := BodyText + '<br/>' + STRSUBSTNO(Text008,
+                    EMailBodyText.FormatDate(ServiceContractClusterSeq."Last Possible Change Date"));
+            END;
+          END;
+      END;
+    END;
+
+    PROCEDURE HandleAttachments@1100528901(ServiceOrderEMailQueue@1100528903 : Record 11020337;ServiceOrder@1100528904 : Record 11012823;VAR TempEmailAttachment@1100528500 : TEMPORARY Record 11229294);
+    VAR
+      ServiceOrderEMailAttachm@1100528600 : Record 11071933;
+      DocumentProperties@1100528602 : Record 11012746;
+      EMailSetup@1100528400 : Record 11229911;
+      DocumentPrint@1100528900 : Codeunit 229;
+      DocumentLinkManagement@1100528603 : Codeunit 11012401;
+      RecRef@1100528601 : RecordRef;
+    BEGIN
+      CASE MailAction OF
+        MailAction::"Mail Status":
+          BEGIN
+            ServSetup.TESTFIELD("Path Name (Archive)");
+            DocumentPrint.GetDefaultReportSelection(TempReportSelections.Usage::"3007", TempReportSelections);
+            ServiceOrder.SETRECFILTER;
+            IF TempReportSelections.FINDSET THEN BEGIN
+              REPEAT
+                DocumentPrint.SaveAnyRecordReportAsPdf(
+                  ServiceOrder, EMailSetup.Usage::"Service Order Status", ServiceOrder."Global Dimension 1 Code",
+                  TempReportSelections."Report ID", TRUE, TempEmailAttachment);
+                DocumentPrint.DownloadServiceDocument(
+                  TempEmailAttachment, ServSetup, ServiceOrder."No.",
+                  TempReportSelections.Usage, TempReportSelections.Sequence);
+              UNTIL TempReportSelections.NEXT = 0;
+            END;
+          END;
+        MailAction::"Mail Subcontractor":
+          BEGIN
+            RecRef.GETTABLE(ServOrderRec);
+            CLEAR(DocumentProperties);
+            DocumentLinkManagement.GetDocuments(DocumentProperties, RecRef);
+            DocumentProperties.MARKEDONLY(TRUE);
+            DocumentProperties.SETRANGE("Publish on Subcont.Portal", TRUE);
+            DocumentPrint.AddRelatedDocuments(TempEmailAttachment, DocumentProperties, FALSE, FALSE);
+          END;
+      END;
+    END;
+
+    PROCEDURE SetMailAction@1100528601(IMailAction@1100528600 : Integer);
+    BEGIN
+      MailAction := IMailAction;
+    END;
+
+    PROCEDURE DetermineSubjectTxt@1100528600();
+    VAR
+      Customer@1100528400 : Record 18;
+      Language@1100528401 : Record 8;
+      PreviousStateTXT@1100528600 : Text[250];
+      CurrentStateTXT@1100528601 : Text[250];
+      lvMail003@1100528603 : TextConst 'ENU=Status of your order with reference %1 has been changed from "%2" to "%3".';
+      CurrentLanguageID@1100528402 : Integer;
+    BEGIN
+      GetStateDescription(PreviousStateTXT, CurrentStateTXT);
+
+      IF NOT Customer.GET(ServOrderRec."Customer No.") THEN
+        Customer.INIT;
+      CurrentLanguageID := GLOBALLANGUAGE;
+      IF Customer."Language Code" <> '' THEN
+        GLOBALLANGUAGE(Language.GetLanguageID(Customer."Language Code"));
+
+      CASE ServSetup."Send Automatic E-Mail Using" OF
+        ServSetup."Send Automatic E-Mail Using"::SMTP:
+          SubjectTxt := STRSUBSTNO(lvMail003, ServOrderRec."No.",
+            LOWERCASE(FORMAT(PreviousStateTXT)), LOWERCASE(FORMAT(CurrentStateTXT)));
+
+        ServSetup."Send Automatic E-Mail Using"::"Service Order E-Mail Queue":
+          CASE MailAction OF
+            MailAction::"Mail Status":
+              SubjectTxt := STRSUBSTNO(Text001, ServOrderRec."No.",
+                LOWERCASE(FORMAT(PreviousStateTXT)), LOWERCASE(FORMAT(CurrentStateTXT)));
+            MailAction::"Mail Maintenance Appointment Proposal",
+            MailAction::"Mail Maintenance Appointment":
+              SubjectTxt := Text004;
+          END;
+      END;
+
+      GLOBALLANGUAGE(CurrentLanguageID);
+    END;
+
+    PROCEDURE DetermineSubjectTxtByWorkOrder@1100528606(IWorkOrderNo@1100528600 : Code[20]);
+    VAR
+      Customer@1100528400 : Record 18;
+      Language@1100528401 : Record 8;
+      lvMail003@1100528603 : TextConst 'ENU=Status of your order with reference %1 has been changed from "%2" to "%3".';
+      CurrentLanguageID@1100528402 : Integer;
+    BEGIN
+      IF NOT Customer.GET(ServOrderRec."Customer No.") THEN
+        Customer.INIT;
+      CurrentLanguageID := GLOBALLANGUAGE;
+      IF Customer."Language Code" <> '' THEN
+        GLOBALLANGUAGE(Language.GetLanguageID(Customer."Language Code"));
+
+      CASE MailAction OF
+        MailAction::"Mail Subcontractor":
+          SubjectTxt := STRSUBSTNO(Text010, IWorkOrderNo);
+        MailAction::"Mail Order Manager":
+          SubjectTxt := STRSUBSTNO(Text003, IWorkOrderNo);
+      END;
+
+      GLOBALLANGUAGE(CurrentLanguageID);
+    END;
+
+    LOCAL PROCEDURE GetEmailOrderManager@1100409000(IServiceOrder@1100409000 : Record 11012823) : Text[250];
+    VAR
+      ServiceOrder@1100409001 : Record 11012823;
+      SalespersonPurchaser@1100409002 : Record 13;
+    BEGIN
+      ServiceOrder.GET(IServiceOrder."Base Service Order No.");
+      IF ServiceOrder."Order Manager" <> '' THEN
+        IF SalespersonPurchaser.GET(ServiceOrder."Order Manager") THEN
+          EXIT(SalespersonPurchaser."E-Mail");
+    END;
+
+    LOCAL PROCEDURE GetEmailSubcontractor@1100528612(IWorkOrder@1100409000 : Record 11229279;ServiceOrder@1100528402 : Record 11012823) EMailAddresses : Text[250];
+    VAR
+      ResourceWOP@1100528600 : Record 11229278;
+      Vendor@1100528601 : Record 23;
+      SubcontPortSetup@1100528400 : Record 11126402;
+      VendorNo@1100528602 : Code[20];
+      SendEMailToSubcontPortUsers@1100528401 : Boolean;
+    BEGIN
+      IF IWorkOrder."Resource No." = '' THEN
+        EXIT;
+      IF IWorkOrder."Resource Type" <> IWorkOrder."Resource Type"::Subcontractor THEN
+        EXIT;
+      IF NOT ResourceWOP.GET(IWorkOrder."Resource No.") THEN
+        EXIT;
+      VendorNo := ResourceWOP.GetVendorNo;
+      IF VendorNo = '' THEN
+        EXIT;
+      Vendor.CHANGECOMPANY(ResourceWOP.Company);
+      IF NOT Vendor.GET(VendorNo) THEN
+        EXIT;
+
+      SubcontPortSetup.CHANGECOMPANY(ResourceWOP.Company);
+      IF SubcontPortSetup.GET('1') THEN
+        SendEMailToSubcontPortUsers :=
+          (SubcontPortSetup."Send E-Mail to" = SubcontPortSetup."Send E-Mail to"::"Subcont. Port. Users");
+
+      IF SendEMailToSubcontPortUsers THEN
+        EMailAddresses := GetEMailAddressesOfSubcontPortUsers(VendorNo, ResourceWOP.Company, ServiceOrder)
+      ELSE
+        EMailAddresses := Vendor."E-Mail for Purch. Order";
+
+      EXIT(EMailAddresses);
+    END;
+
+    LOCAL PROCEDURE GetEMailAddressesOfSubcontPortUsers@1100528400(VendorNo@1100528400 : Code[20];Company@1100528401 : Text[30];ServiceOrder@1100528404 : Record 11012823) EMailAddresses : Text[250];
+    VAR
+      SubcontPortUser@1100528402 : Record 11126401;
+      TempSubcontPortUser@1100528403 : TEMPORARY Record 11126401;
+    BEGIN
+      SubcontPortUser.CHANGECOMPANY(Company);
+      SubcontPortUser.SETRANGE("Vendor No.", VendorNo);
+      SubcontPortUser.SETRANGE("Send Mail at WO Status Update", TRUE);
+      SubcontPortUser.SETFILTER("E-Mail", '<>%1', '');
+      CASE ServiceOrder."Source Type" OF
+        ServiceOrder."Source Type"::Call:
+          SubcontPortUser.SETRANGE("Call Succession", TRUE);
+        ServiceOrder."Source Type"::Contract:
+          SubcontPortUser.SETRANGE("Contract Related", TRUE);
+      ELSE
+        SubcontPortUser.SETRANGE("Additional Orders", TRUE);
+      END;
+      IF NOT SubcontPortUser.FINDSET THEN
+        EXIT;
+
+      REPEAT
+        IF NOT EMailAddressHasBeenAdded(TempSubcontPortUser, SubcontPortUser."E-Mail") THEN BEGIN
+          IF EMailAddresses = '' THEN
+            EMailAddresses := SubcontPortUser."E-Mail"
+          ELSE
+            IF STRLEN(EMailAddresses) + STRLEN(SubcontPortUser."E-Mail") < MAXSTRLEN(EMailAddresses) THEN
+              EMailAddresses := EMailAddresses + ';' + SubcontPortUser."E-Mail";
+          TempSubcontPortUser.COPY(SubcontPortUser);
+          TempSubcontPortUser."E-Mail" := UPPERCASE(TempSubcontPortUser."E-Mail");
+          IF TempSubcontPortUser.INSERT THEN;
+        END;
+      UNTIL SubcontPortUser.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE EMailAddressHasBeenAdded@1100528405(VAR TempSubcontPortUser@1100528400 : TEMPORARY Record 11126401;EMailAddress@1100528401 : Text[250]) : Boolean;
+    BEGIN
+      TempSubcontPortUser.SETRANGE("E-Mail", UPPERCASE(EMailAddress));
+      IF NOT TempSubcontPortUser.ISEMPTY THEN
+        EXIT(TRUE);
+    END;
+
+    PROCEDURE GetEmailMaintAppointment@1100528611(IServiceOrder@1100528600 : Record 11012823) : Text[250];
+    VAR
+      ServiceOrder@1100528601 : Record 11012823;
+    BEGIN
+      ServiceOrder.GET(IServiceOrder."Base Service Order No.");
+      EXIT(ServiceOrder."E-Mail");
+    END;
+
+    PROCEDURE SetNoConfirms@1100528602(INoConfirms@1100528600 : Boolean);
+    BEGIN
+      NoConfirms := INoConfirms;
+    END;
+
+    PROCEDURE GetLanguageID@1100528603(ICustomerNo@1100528600 : Code[20]) : Integer;
+    VAR
+      Customer@1100528601 : Record 18;
+      Language@1100528602 : Record 8;
+      CompanyInformation@1100528603 : Record 79;
+    BEGIN
+      IF Customer.GET(ICustomerNo) THEN BEGIN
+        IF Customer."Language Code" <> '' THEN
+          IF Language.GET(Customer."Language Code") THEN
+            EXIT(Language."Windows Language ID");
+        IF Customer."Country/Region Code" <> '' THEN
+          IF Language.GET(Customer."Country/Region Code") THEN
+            EXIT(Language."Windows Language ID");
+      END;
+      IF CompanyInformation.GET THEN
+        IF CompanyInformation."Country/Region Code" <> '' THEN
+          IF Language.GET(CompanyInformation."Country/Region Code") THEN
+            EXIT(Language."Windows Language ID");
+    END;
+
+    LOCAL PROCEDURE GetCopyToAddress@1100528402(GlobalDimension1Code@1100528400 : Code[20]) : Text;
+    VAR
+      EMailSetup@1100528403 : Record 11229911;
+      TempEmailItem@1100528401 : TEMPORARY Record 9500;
+      DocumentMailing@1100528404 : Codeunit 260;
+      EMailSetupUsageNo@1100528402 : Integer;
+    BEGIN
+      EMailSetupUsageNo := GetEmailSetupUsage;
+      EMailSetup.GetApplicableEMailSetup(EMailSetupUsageNo, GlobalDimension1Code);
+      EXIT(EMailSetup.Bcc);
+    END;
+
+    LOCAL PROCEDURE GetEmailSetupUsage@1100528408() EMailSetupUsage : Integer;
+    VAR
+      EMailBodyTextUsage@1100528400 : Integer;
+    BEGIN
+      GetEmailUsages(EMailSetupUsage, EMailBodyTextUsage);
+    END;
+
+    LOCAL PROCEDURE GetEmailBodyTextUsage@1100528410() EMailBodyTextUsage : Integer;
+    VAR
+      EMailSetupUsage@1100528400 : Integer;
+    BEGIN
+      GetEmailUsages(EMailSetupUsage, EMailBodyTextUsage);
+    END;
+
+    LOCAL PROCEDURE GetEmailUsages@1100528406(VAR EMailSetupUsage@1100528400 : Integer;VAR EMailBodyTextUsage@1100528401 : Integer);
+    VAR
+      EMailSetup@1100528402 : Record 11229911;
+      EMailBodyText@1100528403 : Record 11012769;
+    BEGIN
+      CASE MailAction OF
+        MailAction::"Mail Status":
+          BEGIN
+            EMailSetupUsage := EMailSetup.Usage::"Service Order Status";
+            EMailBodyTextUsage := EMailBodyText.Usage::"Service Order Status";
+          END;
+        MailAction::"Mail Subcontractor":
+          BEGIN
+            EMailSetupUsage := EMailSetup.Usage::"Work Order Subcontractor";
+            EMailBodyTextUsage := EMailBodyText.Usage::"Work Order Subcontractor";
+          END;
+        MailAction::"Mail Order Manager":
+          BEGIN
+            EMailSetupUsage := EMailSetup.Usage::"Subcontractor shifted Expected Dates";
+            EMailBodyTextUsage := EMailBodyText.Usage::"Subcontractor shifted Expected Dates";
+          END;
+        MailAction::"Mail Maintenance Appointment Proposal":
+          BEGIN
+            EMailSetupUsage := EMailSetup.Usage::"Maintenance Appointment Proposal";
+            EMailBodyTextUsage := EMailBodyText.Usage::"Maintenance Appointment Proposal";
+          END;
+        MailAction::"Mail Maintenance Appointment":
+          BEGIN
+            EMailSetupUsage := EMailSetup.Usage::"Maintenance Appointment";
+            EMailBodyTextUsage := EMailBodyText.Usage::"Maintenance Appointment";
+          END;
+      END;
+    END;
+
+    BEGIN
+    {
+      WWB, 21 okt 2008: This codeunit checks if it needs to send an e-mail when the status of a service order changes.
+
+      IMailAction:
+        0: Mail Status
+        1: Mail Worksheet
+        2: Mail to Subcontractor -> only Work Order
+        3: Mail to Order Manager (due to Subcontractor shifting Expected Starting Date) -> Only Work Order
+        4: Mail Maintenance Appointment Proposal
+        5: Mail Maintenance Appointment
+    }
+    END.
+  }
+}
+

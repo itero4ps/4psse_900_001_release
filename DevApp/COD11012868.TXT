@@ -1,0 +1,3304 @@
+OBJECT Codeunit 11012868 Service Order Plan Management
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1100528603 : TextConst 'ENU=Progress: @1@@@@@@@@';
+      Text001@1100528600 : TextConst 'ENU=Field %1 is not equal on all Service Orders';
+      OccupiedType@1100528601 : ' ,Base Calendar,Employee Time Table,Pause,Service Time Table,Employee Absence,Planned Service Order,Maintenance Proposal,Reserved for Calls,Outside Maintenance Window,Consignment,To Plan Service Order,Outside Plan Agreement Window';
+      LastEntryNo@1100528602 : Integer;
+      SeekDate@1100528604 : Date;
+      Text002@1100528605 : TextConst 'ENU=Select lines first';
+      Text003@1100528606 : TextConst 'ENU=No Service Order were Replanned';
+      Text004@1100528607 : TextConst 'ENU=Service Orders %1 are replanned to %2 from %3 to %4';
+      Text005@1100528608 : TextConst 'ENU=Service Order %1 is replanned to %2 from %3 to %4';
+      Text006@1100528609 : TextConst 'ENU=Choosen Plan Time is no more available';
+      Text007@1100528610 : TextConst 'ENU=Choosen time exceeds ending time of free block';
+      Text008@1100528611 : TextConst 'ENU=Select lines first';
+      Text009@1100528613 : TextConst 'ENU=Progress: @1@@@@@@@@@@@';
+      Text010@1100528614 : TextConst 'ENU=Processed %1 of %2 lines.';
+      Text011@1100528612 : TextConst 'ENU=All Lines Processed';
+      NoOfEmployees@1100528615 : Integer;
+      Text012@1100528616 : TextConst 'ENU=Total count of waypoints may not exceed 8, current: %1';
+      Text013@1100528617 : TextConst 'ENU=No waypoints given, a minimal of 1 waypoint is nessesary';
+      ReplanSOExportToFSA@1100528618 : Boolean;
+      Text014@1100528619 : TextConst 'ENU=URL: %1\Error: %2';
+      Text015@1100528620 : TextConst 'ENU=Service Order(s) contain(s) multiple Work Orders, these Work Orders will be replaced with 1 Work Order, continue?';
+      Text016@1100528621 : TextConst 'ENU=Service Order %1 may not be replanned due to choosen blockade by actual Reference Point';
+
+    PROCEDURE GetAvailablePlanTimeBuffer@1100528601(VAR IServiceOrder@1100528612 : Record 11012823;ISeekDate@1100528613 : Date;IStartingDate@1100528622 : Date;IStartingTime@1100528619 : Time;IEndingDate@1100528623 : Date;IEndingTime@1100528620 : Time;IPlanWindowInDays@1100528611 : Integer;IResourceFilter@1100528615 : Text[250];IPostCodeFilter@1100528616 : Text[250];IPlanTimeType@1100528617 : 'Regular Work Time,Consignment Time';IPercentageToReserveForCalls@1100528618 : Decimal;ICalculateTravelTime@1100528621 : Boolean;IPlanSeqNo@1100528614 : Integer;IMaxNoOfResults@1100528625 : Integer;VAR OTempEmplAvailPlanTimeBuffer@1100528607 : TEMPORARY Record 11071976);
+    VAR
+      ServiceOrder@1100528610 : Record 11012823;
+      Employee@1100528609 : Record 5200;
+      Resource@1100525000 : Record 11229278;
+      TmpOccupiedTimeBuffer@1100528608 : TEMPORARY Record 11071809;
+      ProgressDialog@1100528606 : Dialog;
+      TotalDurationTime@1100528605 : Decimal;
+      Discipline@1100528604 : Code[10];
+      DisciplineDiffers@1100528624 : Boolean;
+      EntryNo@1100528602 : Integer;
+      ResourceCount@1100528601 : Integer;
+      ResourceCounter@1100528600 : Integer;
+    BEGIN
+      ServiceOrder.COPY(IServiceOrder);
+      IF NOT ServiceOrder.FINDSET THEN
+        EXIT;
+      REPEAT
+        IF Discipline = '' THEN
+          Discipline := ServiceOrder.Discipline
+        ELSE
+          IF (Discipline <> ServiceOrder.Discipline) AND (ServiceOrder.Discipline <> '') THEN
+            DisciplineDiffers := TRUE;
+      UNTIL ServiceOrder.NEXT = 0;
+      IF DisciplineDiffers THEN
+        MESSAGE(Text001, ServiceOrder.FIELDCAPTION(Discipline));
+
+      TotalDurationTime := GetTotalDurationTime(IServiceOrder);
+
+      OTempEmplAvailPlanTimeBuffer.RESET;
+      OTempEmplAvailPlanTimeBuffer.DELETEALL;
+
+      IF Resource.UseVisibleResources THEN BEGIN
+        Resource.SETFILTER("User ID Filter", USERID);
+        Resource.SETRANGE("Visible in Navision", TRUE);
+      END;
+      Resource.SETFILTER(Schedule, '%1|%2', Resource.Schedule::ServiceOrder, Resource.Schedule::Both);
+      Resource.SETRANGE(Type, Resource.Type::Employee);
+      Resource.SetCompanyPlanGroupFilters;
+
+      IF IResourceFilter <> '' THEN
+        Resource.SETFILTER("No.", IResourceFilter);
+      EntryNo := 1;
+      IF IPlanWindowInDays < 1 THEN
+        IPlanWindowInDays := 1;
+      IF IPlanTimeType = IPlanTimeType::"Consignment Time" THEN
+        SetResourceFilterByConsignment(Resource, ISeekDate, ISeekDate +IPlanWindowInDays -1);
+      IF GUIALLOWED THEN BEGIN
+        ProgressDialog.OPEN(Text000);
+        ResourceCount := Resource.COUNT;
+      END;
+      SetResourceFilterByReadPermission(Resource);
+      IF Resource.FINDSET THEN
+        REPEAT
+          IF ResourceCanDoServiceOrders(Resource."No.", IServiceOrder, ISeekDate, ISeekDate +IPlanWindowInDays -1, IPlanSeqNo) THEN BEGIN
+            IF GUIALLOWED THEN BEGIN
+              ResourceCounter += 1;
+              ProgressDialog.UPDATE(1, ROUND(ResourceCounter / ResourceCount * 9999, 1));
+            END;
+            BuildResourceOccupiedTimeBuffer(
+              Resource."No.", ISeekDate, ISeekDate +IPlanWindowInDays -1, IStartingDate, IStartingTime, IEndingDate, IEndingTime,
+              ServiceOrder, IPlanTimeType, IPercentageToReserveForCalls, TmpOccupiedTimeBuffer);
+            BuildEmplAvailPlanBuffer(ServiceOrder, Resource."No.", TotalDurationTime, EntryNo, TmpOccupiedTimeBuffer, IPlanTimeType, ICalculateTravelTime, OTempEmplAvailPlanTimeBuffer);
+            ClearOccupiedTimeBuffer(Resource."No.", TmpOccupiedTimeBuffer);
+          END;
+        UNTIL (Resource.NEXT = 0) OR ((IMaxNoOfResults > 0) AND (OTempEmplAvailPlanTimeBuffer.COUNT >= IMaxNoOfResults));
+      IF GUIALLOWED THEN
+        ProgressDialog.CLOSE;
+
+      OTempEmplAvailPlanTimeBuffer.SETCURRENTKEY("Plan Date", "Travel Time from Prev. Address");
+      IF IPostCodeFilter <> '' THEN BEGIN
+        OTempEmplAvailPlanTimeBuffer.SETFILTER("Prev. Post Code", IPostCodeFilter);
+        IF OTempEmplAvailPlanTimeBuffer.FINDSET THEN
+          REPEAT
+            OTempEmplAvailPlanTimeBuffer.MARK(TRUE);
+          UNTIL OTempEmplAvailPlanTimeBuffer.NEXT = 0;
+        OTempEmplAvailPlanTimeBuffer.SETFILTER("Next Post Code", IPostCodeFilter);
+        IF OTempEmplAvailPlanTimeBuffer.FINDSET THEN
+          REPEAT
+            OTempEmplAvailPlanTimeBuffer.MARK(TRUE);
+          UNTIL OTempEmplAvailPlanTimeBuffer.NEXT = 0;
+        OTempEmplAvailPlanTimeBuffer.SETRANGE("Next Post Code");
+        OTempEmplAvailPlanTimeBuffer.MARKEDONLY(TRUE);
+      END;
+      IF OTempEmplAvailPlanTimeBuffer.FINDFIRST THEN;
+    END;
+
+    PROCEDURE BuildResourceOccupiedTimeBuffer@1100528607(IResourceNo@1100528600 : Code[20];IFromDate@1100528601 : Date;IToDate@1100528602 : Date;IStartingDate@1100528610 : Date;IStartingTime@1100528608 : Time;IEndingDate@1100528611 : Date;IEndingTime@1100528609 : Time;VAR IExcludeServiceOrder@1100528605 : Record 11012823;IPlanTimeType@1100528606 : 'Regular Work Time,Consignment Time';IPercentageToReserveForCalls@1100528607 : Decimal;VAR OOccupiedTimeBuffer@1100528603 : TEMPORARY Record 11071809);
+    VAR
+      AgendaDate@1100528604 : Date;
+      dt@1100528612 : DateTime;
+      StartingTime@1100409000 : Time;
+    BEGIN
+      IF ((IToDate < IStartingDate) AND (IStartingDate <> 0D)) OR ((IFromDate > IEndingDate) AND (IEndingDate <> 0D)) THEN
+        EXIT;
+      IF (IEndingDate <> 0D) AND (IEndingDate < IToDate) THEN
+        IToDate := IEndingDate;
+      IF (IStartingDate <> 0D) AND (IStartingDate > IFromDate) THEN
+        IFromDate := IStartingDate;
+      IF IFromDate > IToDate THEN
+        EXIT;
+      FOR AgendaDate := IFromDate TO IToDate DO BEGIN
+        StartingTime := IStartingTime;
+        IF (AgendaDate = TODAY) AND (StartingTime < TIME) THEN BEGIN
+          dt := ROUNDDATETIME(CREATEDATETIME(TODAY, TIME), 5 * 60 * 1000, '>');
+          StartingTime := DT2TIME(dt);
+        END;
+        IF AgendaDate >= TODAY THEN
+          FillOccupiedTimeBuffer(
+            AgendaDate, StartingTime, IEndingTime, IResourceNo, IExcludeServiceOrder, IPlanTimeType, IPercentageToReserveForCalls, OOccupiedTimeBuffer);
+      END;
+    END;
+
+    PROCEDURE ReplanServiceOrders@1100528602(VAR IServiceOrder@1100528600 : Record 11012823;IResourceNo@1100528605 : Code[20];IPlanDate@1100528601 : Date;IPlanStartingTime@1100528603 : Time;IPlanEndingTime@1100528607 : Time;IFirstPossibleStartingTime@1100528614 : Time;ILastPossibleEndingTime@1100528615 : Time;IPlanType@1100528608 : 'At Start,At End,Custom';ICustomPlanStartingTime@1100528609 : Time;ITimeBufferType@1100528612 : 'Daytime,Consignment';ICalculateTravelTime@1100528619 : Boolean;ILinkWorkOrders@1100528621 : Boolean;IPlanSeqNo@1100528623 : Integer);
+    VAR
+      ServiceOrder@1100528602 : Record 11012823;
+      ServiceOrderExtension@1100528625 : Record 11071727;
+      WorkOrder@1100528613 : Record 11229279;
+      EmplAvailPlanTimeBuffer@1100528616 : Record 11071976;
+      TmpOptimalRouteBuffer@1100528617 : TEMPORARY Record 11071981;
+      CreatedWorkOrder@1100528620 : Record 11229279;
+      ServiceSetup@1100528624 : Record 11012800;
+      DurationTime@1100528604 : Decimal;
+      TotalDurationTime@1100528610 : Decimal;
+      NoOfPauseHours@1100528606 : Decimal;
+      PlanEndingTime@1100528611 : Time;
+      TravelCalculationStatus@1100528618 : Option;
+      LastWorkOrderNo@1100528622 : Code[20];
+    BEGIN
+      IF NOT IsEmplAvailTimeStillAvailable(
+        IServiceOrder, IResourceNo, IPlanDate, IPlanStartingTime, IPlanEndingTime, ITimeBufferType, 0, ICalculateTravelTime, IPlanSeqNo,
+        EmplAvailPlanTimeBuffer)
+      THEN
+        ERROR(Text006);
+
+      ServiceSetup.GET;
+
+      GetOptimalRouteForServiceOrders(
+        EmplAvailPlanTimeBuffer."Prev. Address", EmplAvailPlanTimeBuffer."Prev. City",
+        IServiceOrder,
+        EmplAvailPlanTimeBuffer."Next Address", EmplAvailPlanTimeBuffer."Next City",
+        ICalculateTravelTime, TmpOptimalRouteBuffer, TravelCalculationStatus);
+
+      TotalDurationTime := GetTotalDurationTime(IServiceOrder) + DurationToHours(GetTotalTravelDurationFromOptimalRouteBuffer(TmpOptimalRouteBuffer));
+      IF IPlanEndingTime = 0T THEN
+        IPlanEndingTime := 235959.999T;
+
+      CASE IPlanType OF
+        IPlanType::"At Start":;
+        IPlanType::"At End":
+          BEGIN
+            IPlanStartingTime := IPlanEndingTime - HoursToDuration(TotalDurationTime);
+            IF PlanTimeInclPause(IResourceNo, IPlanDate, IPlanStartingTime, IPlanEndingTime, NoOfPauseHours) THEN
+              IPlanStartingTime := IPlanStartingTime - HoursToDuration(NoOfPauseHours);
+          END;
+        IPlanType::Custom:
+          BEGIN
+            IPlanStartingTime := ICustomPlanStartingTime;
+            PlanEndingTime := IPlanStartingTime + HoursToDuration(TotalDurationTime);
+            IF PlanTimeInclPause(IResourceNo, IPlanDate, IPlanStartingTime, PlanEndingTime, NoOfPauseHours) THEN
+              PlanEndingTime := PlanEndingTime + HoursToDuration(NoOfPauseHours);
+            IF PlanEndingTime > IPlanEndingTime THEN
+              ERROR(Text007);
+          END;
+      END;
+
+      TmpOptimalRouteBuffer.SETRANGE(Type, TmpOptimalRouteBuffer.Type::"Service Order");
+      IF TmpOptimalRouteBuffer.FINDSET(TRUE) THEN
+        REPEAT
+          //Just keep one Work Order
+          WorkOrder.RESET;
+          WorkOrder.SETCURRENTKEY("Source Company", "Source Type", "Source No.");
+          WorkOrder.SETRANGE("Source Company", COMPANYNAME);
+          WorkOrder.SETRANGE("Source Type", WorkOrder."Source Type"::ServiceOrder);
+          WorkOrder.SETRANGE("Source No.", TmpOptimalRouteBuffer.Code);
+          WorkOrder.SETRANGE("Resource Type", WorkOrder."Resource Type"::Employee);
+          WorkOrder.SETRANGE("WO Finished (Field Service)", FALSE);
+          IF WorkOrder.FINDSET(TRUE) THEN BEGIN
+            WorkOrder.TestIfModificationIsAllowed;
+            WorkOrder.VALIDATE("Resource No.", '');
+            WorkOrder.MODIFY(TRUE);
+            WHILE WorkOrder.NEXT <> 0 DO BEGIN
+              WorkOrder.TestIfDeletionIsAllowed;
+              WorkOrder.DELETE(TRUE);
+            END;
+          END;
+          ServiceOrder.GET(TmpOptimalRouteBuffer.Code);
+
+          DurationTime := ServiceOrder."Duration Time";
+          IF DurationTime = 0 THEN
+            DurationTime := ServiceOrder.GetServiceOrderBudgetHours;
+          IF TmpOptimalRouteBuffer."Travel Duration" <> 0 THEN
+            DurationTime += DurationToHours(TmpOptimalRouteBuffer."Travel Duration");
+          ServiceOrder.VALIDATE("Duration Time", DurationTime);
+          ServiceOrder."Travel Duration" := TmpOptimalRouteBuffer."Travel Duration";
+          IF IPlanStartingTime = 0T THEN
+            IPlanStartingTime := 000000T;
+          ServiceOrder.VALIDATE("Ending Time", 0T);
+          ServiceOrder.VALIDATE("Ending Date", 0D);
+          ServiceOrder.VALIDATE("First Possible Starting Date", 0D);
+          ServiceOrder.VALIDATE("First Possible Starting Time", 0T);
+          ServiceOrder.VALIDATE("Last Possible Ending Time", 0T);
+          ServiceOrder.VALIDATE("Starting Date", IPlanDate);
+          ServiceOrder.VALIDATE("Ending Date", IPlanDate);
+          ServiceOrder.VALIDATE("Starting Time", IPlanStartingTime);
+          ServiceOrder.VALIDATE("Ending Time", 0T);
+          IF ServiceOrder."Ending Date" <> IPlanDate THEN
+            ServiceOrder.VALIDATE("Ending Date", IPlanDate);
+          ServiceOrder.VALIDATE("Ending Time", ServiceOrder."Starting Time" + HoursToDuration(DurationTime));
+          IF PlanTimeInclPause(IResourceNo, ServiceOrder."Starting Date", ServiceOrder."Starting Time", ServiceOrder."Ending Time", NoOfPauseHours) THEN
+            ServiceOrder."Ending Time" := ServiceOrder."Ending Time" + HoursToDuration(NoOfPauseHours);
+          IPlanStartingTime := ServiceOrder."Ending Time";
+          IF IFirstPossibleStartingTime <> 0T THEN BEGIN
+            ServiceOrder.VALIDATE("First Possible Starting Date", IPlanDate);
+            ServiceOrder.VALIDATE("First Possible Starting Time", IFirstPossibleStartingTime);
+          END;
+          IF ILastPossibleEndingTime <> 0T THEN BEGIN
+            ServiceOrder.VALIDATE("Last Possible Ending Date", IPlanDate);
+            ServiceOrder.VALIDATE("Last Possible Ending Time", ILastPossibleEndingTime);
+          END;
+          IF ServiceOrder."Employee No." <> IResourceNo THEN
+            ServiceOrder."Employee No." := IResourceNo;
+          IF ServiceOrder."Export to FSA" THEN
+            ServiceOrder.VALIDATE("Export to FSA", FALSE);
+          ServiceOrder.MODIFY(TRUE);
+          ServiceOrder.UpdateWorkorderEmployee(TRUE);
+
+          IF (ServiceSetup."Ref. Point SO Planned" <> 0) AND (ServiceOrder."Actual Reference Point (Gantt)" <> ServiceSetup."Ref. Point SO Planned") THEN
+            ServiceOrder.UpdateToNextRefPoint(0); // Planned
+          IF ReplanSOExportToFSA THEN BEGIN
+            ServiceOrder.VALIDATE("Export to FSA", TRUE);
+            ServiceOrder.MODIFY(TRUE);
+          END;
+
+          ServiceOrderExtension.GetServOrderExtension(ServiceOrder."No.");
+          IF (ServiceOrderExtension."Appointment Letter Code" <> '') AND
+             (ServiceOrderExtension."Date Appointment Letter Sent" <> 0D)
+          THEN BEGIN
+            ServiceOrderExtension.VALIDATE("Resend Appointment Letter", TRUE);
+            ServiceOrderExtension.UpdateServOrderExtension(ServiceOrder."No.");
+          END;
+
+          WorkOrder.SETRANGE("Source No.", ServiceOrder."No.");
+          WorkOrder.SETRANGE("Resource Type", WorkOrder."Resource Type"::Employee);
+          IF WorkOrder.FINDFIRST THEN BEGIN
+            WorkOrder.VALIDATE("Plan during Clock Time", ITimeBufferType = ITimeBufferType::Consignment);
+            WorkOrder.MODIFY;
+            IF ILinkWorkOrders THEN BEGIN
+              CreatedWorkOrder := WorkOrder;
+              CreatedWorkOrder.MARK(TRUE);
+            END;
+          END;
+        UNTIL TmpOptimalRouteBuffer.NEXT = 0;
+
+      IF ILinkWorkOrders THEN BEGIN
+        CreatedWorkOrder.MARKEDONLY(TRUE);
+        IF CreatedWorkOrder.FINDSET THEN
+          REPEAT
+            IF LastWorkOrderNo <> '' THEN BEGIN
+              CreatedWorkOrder.VALIDATE("Schedule Relation", CreatedWorkOrder."Schedule Relation"::"End-Start");
+              CreatedWorkOrder.VALIDATE("Related Work Order No.", LastWorkOrderNo);
+              CreatedWorkOrder.MODIFY;
+            END;
+            LastWorkOrderNo := CreatedWorkOrder."No.";
+          UNTIL CreatedWorkOrder.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE ReplanServiceOrdersAddParams@1100528634(IExportToFSA@1100528600 : Boolean);
+    BEGIN
+      ReplanSOExportToFSA := IExportToFSA;
+    END;
+
+    PROCEDURE IsEmplAvailTimeStillAvailable@1100528626(VAR IServiceOrder@1100528604 : Record 11012823;IResourceNo@1100528603 : Code[20];IPlanDate@1100528602 : Date;IPlanStartingTime@1100528601 : Time;IPlanEndingTime@1100528600 : Time;ITimeBufferType@1100528606 : 'Daytime,Consignment';IPercentageToReserveForCalls@1100528607 : Decimal;ICalculateTravelTime@1100528609 : Boolean;IPlanSeqNo@1100528610 : Integer;VAR OResourceAvailPlanTimeBuffer@1100528608 : Record 11071976) : Boolean;
+    VAR
+      TempResourceAvailPlanTimeBuffer@1100528605 : TEMPORARY Record 11071976;
+    BEGIN
+      GetAvailablePlanTimeBuffer(
+        IServiceOrder, IPlanDate, IPlanDate, 0T, IPlanDate, 235959.999T, 1, IResourceNo, '',
+        ITimeBufferType, IPercentageToReserveForCalls, ICalculateTravelTime, IPlanSeqNo, 0, TempResourceAvailPlanTimeBuffer);
+      TempResourceAvailPlanTimeBuffer.SETRANGE("Resource No.", IResourceNo);
+      TempResourceAvailPlanTimeBuffer.SETRANGE("Plan Date", IPlanDate);
+      TempResourceAvailPlanTimeBuffer.SETFILTER("Plan Starting Time", '<=%1', IPlanStartingTime);
+      TempResourceAvailPlanTimeBuffer.SETFILTER("Plan Ending Time", '>=%1', IPlanEndingTime);
+      IF TempResourceAvailPlanTimeBuffer.FINDFIRST THEN
+        OResourceAvailPlanTimeBuffer := TempResourceAvailPlanTimeBuffer;
+      EXIT(NOT TempResourceAvailPlanTimeBuffer.ISEMPTY);
+    END;
+
+    PROCEDURE AskShiftedStartTime@1100528629(VAR IServiceOrder@1100528600 : Record 11012823;IResourceAvailPlanTimeBuffer@1100528602 : Record 11071976;VAR OPlanType@1100528603 : 'At Start,At End,Custom';VAR OCustomStartingTime@1100528604 : Time;VAR OExportToFSA@1100528606 : Boolean);
+    VAR
+      ReplanServiceOrderPlanTypePAGE@1100528605 : Page 11126467;
+      TotalDurationTime@1100528601 : Decimal;
+    BEGIN
+      TotalDurationTime := GetTotalDurationTime(IServiceOrder);
+      ReplanServiceOrderPlanTypePAGE.SetPlanData(IServiceOrder, IResourceAvailPlanTimeBuffer);
+      ReplanServiceOrderPlanTypePAGE.LOOKUPMODE := TRUE;
+      IF ReplanServiceOrderPlanTypePAGE.RUNMODAL = ACTION::LookupOK THEN
+        ReplanServiceOrderPlanTypePAGE.GetPlanData(OPlanType, OCustomStartingTime, OExportToFSA)
+      ELSE
+        ERROR('');
+    END;
+
+    PROCEDURE BuildEmplAvailPlanBuffer@1100528600(VAR IServiceOrder@1100528609 : Record 11012823;IResourceNo@1100528602 : Code[20];ITotalDurationTime@1100528604 : Decimal;VAR IOEntryNo@1100528603 : Integer;VAR ITempOccupiedTimeBuffer@1100528601 : TEMPORARY Record 11071809;IPlanTimeType@1100528608 : 'Regular Work Time,Consignment Time';ICalculateTravelTime@1100528614 : Boolean;VAR OTempResourceAvailPlanTimeBuffer@1100528600 : TEMPORARY Record 11071976);
+    VAR
+      ServiceSetup@1100528605 : Record 11012800;
+      CompanyInformation@1100528607 : Record 79;
+      Employee@1100528606 : Record 5200;
+      Resource@1100528615 : Record 11229278;
+      ServiceOrder@1100528610 : Record 11012823;
+      TmpOptimalRouteBuffer@1100528611 : TEMPORARY Record 11071981;
+      PlanningAgreement@1100528617 : Record 11071729;
+      DimensionValue@1100528618 : Record 349;
+      Contact@1100528619 : Record 5050;
+      TotalTravelHours@1100528612 : Decimal;
+      TravelCalculationStatus@1100528613 : Option;
+      EmployeeNo@1100528616 : Code[20];
+    BEGIN
+      ResetOccupiedTimeBufferFilter(IResourceNo, ITempOccupiedTimeBuffer);
+      IF Resource.GET(IResourceNo) THEN
+        IF Resource.Type = Resource.Type::Employee THEN BEGIN
+          EmployeeNo := Resource."Source No.";
+          IF COMPANYNAME <> Resource.Company THEN BEGIN
+            IF NOT Employee.CHANGECOMPANY(Resource.Company) THEN
+              EXIT;
+            CompanyInformation.CHANGECOMPANY(Resource.Company);
+            DimensionValue.CHANGECOMPANY(Resource.Company);
+            Contact.CHANGECOMPANY(Resource.Company);
+            ServiceSetup.CHANGECOMPANY(Resource.Company);
+          END;
+        END;
+      ITempOccupiedTimeBuffer.SETFILTER("Occupied Type", '<>%1', ITempOccupiedTimeBuffer."Occupied Type"::Pause);
+      IF ITempOccupiedTimeBuffer.FINDSET THEN
+        REPEAT
+          IF (ITempOccupiedTimeBuffer."Unoccupied Hours" >= ITotalDurationTime) AND (ITempOccupiedTimeBuffer."Unoccupied Hours" > 0) THEN BEGIN
+            OTempResourceAvailPlanTimeBuffer.INIT;
+            OTempResourceAvailPlanTimeBuffer."Entry No." := IOEntryNo;
+            IOEntryNo +=1;
+            OTempResourceAvailPlanTimeBuffer."Resource No." := ITempOccupiedTimeBuffer."Resource No.";
+            OTempResourceAvailPlanTimeBuffer.VALIDATE("Plan Date", ITempOccupiedTimeBuffer."Starting Date");
+            OTempResourceAvailPlanTimeBuffer."Plan Starting Time" := ITempOccupiedTimeBuffer."Ending Time";
+            IF ITempOccupiedTimeBuffer."Occupied Type" = ITempOccupiedTimeBuffer."Occupied Type"::"Planned Service Order" THEN BEGIN
+              OTempResourceAvailPlanTimeBuffer."Prev. Service Order Company" := ITempOccupiedTimeBuffer.Company;
+              OTempResourceAvailPlanTimeBuffer.VALIDATE("Prev. Service Order No.", ITempOccupiedTimeBuffer."Service Order No.");
+            END;
+            IF ITempOccupiedTimeBuffer.NEXT <> 0 THEN BEGIN
+              IF ITempOccupiedTimeBuffer."Starting Date" = OTempResourceAvailPlanTimeBuffer."Plan Date" THEN BEGIN
+                OTempResourceAvailPlanTimeBuffer."Plan Ending Time" := ITempOccupiedTimeBuffer."Starting Time";
+                IF ITempOccupiedTimeBuffer."Occupied Type" = ITempOccupiedTimeBuffer."Occupied Type"::"Planned Service Order" THEN BEGIN
+                  OTempResourceAvailPlanTimeBuffer."Next Service Order Company" := ITempOccupiedTimeBuffer.Company;
+                  OTempResourceAvailPlanTimeBuffer.VALIDATE("Next Service Order No.", ITempOccupiedTimeBuffer."Service Order No.");
+                END;
+              END;
+              ITempOccupiedTimeBuffer.NEXT(-1);
+            END;
+            IF OTempResourceAvailPlanTimeBuffer."Plan Ending Time" = 0T THEN
+              OTempResourceAvailPlanTimeBuffer."Plan Ending Time" := 235959.999T;
+            OTempResourceAvailPlanTimeBuffer."Available Hours" := ITempOccupiedTimeBuffer."Unoccupied Hours";
+            IF (OTempResourceAvailPlanTimeBuffer."Prev. Service Order No." = '') OR (OTempResourceAvailPlanTimeBuffer."Next Service Order No." = '') THEN BEGIN
+              ServiceSetup.INIT;
+              IF ServiceSetup.READPERMISSION THEN
+                ServiceSetup.GET;
+              CASE ServiceSetup."Start Address for SO Replan" OF
+                ServiceSetup."Start Address for SO Replan"::Company:
+                  BEGIN
+                    IF CompanyInformation.READPERMISSION THEN
+                      CompanyInformation.GET
+                    ELSE
+                      CompanyInformation.INIT;
+                    IF OTempResourceAvailPlanTimeBuffer."Prev. Service Order No." = '' THEN BEGIN
+                      OTempResourceAvailPlanTimeBuffer."Prev. Address" := CompanyInformation.Address;
+                      OTempResourceAvailPlanTimeBuffer."Prev. Address 2" := CompanyInformation."Address 2";
+                      OTempResourceAvailPlanTimeBuffer."Prev. Post Code" := CompanyInformation."Post Code";
+                      OTempResourceAvailPlanTimeBuffer."Prev. City" := CompanyInformation.City;
+                    END;
+                    IF OTempResourceAvailPlanTimeBuffer."Next Service Order No." = '' THEN BEGIN
+                      OTempResourceAvailPlanTimeBuffer."Next Address" := CompanyInformation.Address;
+                      OTempResourceAvailPlanTimeBuffer."Next Address 2" := CompanyInformation."Address 2";
+                      OTempResourceAvailPlanTimeBuffer."Next Post Code" := CompanyInformation."Post Code";
+                      OTempResourceAvailPlanTimeBuffer."Next City" := CompanyInformation.City;
+                    END;
+                  END;
+                ServiceSetup."Start Address for SO Replan"::Employee:
+                  BEGIN
+                    Employee.INIT;
+                    IF Employee.READPERMISSION THEN
+                      IF Employee.GET(EmployeeNo) THEN;
+                    IF OTempResourceAvailPlanTimeBuffer."Prev. Service Order No." = '' THEN BEGIN
+                      OTempResourceAvailPlanTimeBuffer."Prev. Address" := Employee.Address;
+                      OTempResourceAvailPlanTimeBuffer."Prev. Address 2" := Employee."Address 2";
+                      OTempResourceAvailPlanTimeBuffer."Prev. Post Code" := Employee."Post Code";
+                      OTempResourceAvailPlanTimeBuffer."Prev. City" := Employee.City;
+                    END;
+                    IF OTempResourceAvailPlanTimeBuffer."Next Service Order No." = '' THEN BEGIN
+                      OTempResourceAvailPlanTimeBuffer."Next Address" := Employee.Address;
+                      OTempResourceAvailPlanTimeBuffer."Next Address 2" := Employee."Address 2";
+                      OTempResourceAvailPlanTimeBuffer."Next Post Code" := Employee."Post Code";
+                      OTempResourceAvailPlanTimeBuffer."Next City" := Employee.City;
+                    END;
+                  END;
+                ServiceSetup."Start Address for SO Replan"::"Cost Center":
+                  BEGIN
+                    Employee.INIT;
+                    IF Employee.READPERMISSION THEN
+                      IF Employee.GET(EmployeeNo) THEN;
+                    DimensionValue.SETRANGE("Global Dimension No.", 1);
+                    DimensionValue.SETRANGE(Code, Employee."Global Dimension 1 Code");
+                    IF NOT DimensionValue.FINDFIRST THEN
+                      DimensionValue.INIT;
+                    Contact.INIT;
+                    IF Contact.READPERMISSION THEN
+                      IF Contact.GET(DimensionValue."Contact No. (Company)") THEN;
+                    IF OTempResourceAvailPlanTimeBuffer."Prev. Service Order No." = '' THEN BEGIN
+                      OTempResourceAvailPlanTimeBuffer."Prev. Address" := Contact.Address;
+                      OTempResourceAvailPlanTimeBuffer."Prev. Address 2" := Contact."Address 2";
+                      OTempResourceAvailPlanTimeBuffer."Prev. Post Code" := Contact."Post Code";
+                      OTempResourceAvailPlanTimeBuffer."Prev. City" := Contact.City;
+                    END;
+                    IF OTempResourceAvailPlanTimeBuffer."Next Service Order No." = '' THEN BEGIN
+                      OTempResourceAvailPlanTimeBuffer."Next Address" := Contact.Address;
+                      OTempResourceAvailPlanTimeBuffer."Next Address 2" := Contact."Address 2";
+                      OTempResourceAvailPlanTimeBuffer."Next Post Code" := Contact."Post Code";
+                      OTempResourceAvailPlanTimeBuffer."Next City" := Contact.City;
+                    END;
+                  END;
+              END;
+            END;
+            GetOptimalRouteForServiceOrders(
+              OTempResourceAvailPlanTimeBuffer."Prev. Address", OTempResourceAvailPlanTimeBuffer."Prev. City",
+              IServiceOrder,
+              OTempResourceAvailPlanTimeBuffer."Next Address", OTempResourceAvailPlanTimeBuffer."Next City", ICalculateTravelTime, TmpOptimalRouteBuffer, TravelCalculationStatus);
+            OTempResourceAvailPlanTimeBuffer."Travel Time from Prev. Address" := GetFirstTravelDurationFromOptimalRouteBuffer(TmpOptimalRouteBuffer);
+            OTempResourceAvailPlanTimeBuffer."Travel Time to Next Address" := GetLastTravelDurationFromOptimalRouteBuffer(TmpOptimalRouteBuffer);
+            OTempResourceAvailPlanTimeBuffer."Total Travel Time" := GetTotalTravelDurationFromOptimalRouteBuffer(TmpOptimalRouteBuffer);
+            OTempResourceAvailPlanTimeBuffer."Travel Dist. from Prev. Addr." := GetFirstTravelDistanceFromOptimalRouteBuffer(TmpOptimalRouteBuffer);
+            OTempResourceAvailPlanTimeBuffer."Travel Dist. to Next Address" := GetLastTravelDistanceFromOptimalRouteBuffer(TmpOptimalRouteBuffer);
+            OTempResourceAvailPlanTimeBuffer."Work Starting Time" :=
+              OTempResourceAvailPlanTimeBuffer."Plan Starting Time" + OTempResourceAvailPlanTimeBuffer."Travel Time from Prev. Address";
+            IF IPlanTimeType = IPlanTimeType::"Consignment Time" THEN
+              OTempResourceAvailPlanTimeBuffer.DetermineWatchCode;
+            TotalTravelHours := DurationToHours(OTempResourceAvailPlanTimeBuffer."Total Travel Time");
+            OTempResourceAvailPlanTimeBuffer."Travel Calculation Status" := TravelCalculationStatus;
+            OTempResourceAvailPlanTimeBuffer."Planning Agreement Code" :=
+              PlanningAgreement.GetPlanningAgreementCode(OTempResourceAvailPlanTimeBuffer."Plan Starting Time");
+            IF (ITempOccupiedTimeBuffer."Unoccupied Hours" >= ITotalDurationTime + TotalTravelHours) AND (ITempOccupiedTimeBuffer."Unoccupied Hours" > 0) THEN
+              OTempResourceAvailPlanTimeBuffer.INSERT;
+          END;
+        UNTIL ITempOccupiedTimeBuffer.NEXT = 0;
+    END;
+
+    PROCEDURE GetTotalDurationTime@1100528603(VAR IServiceOrder@1100528600 : Record 11012823) TotalDurationTime : Decimal;
+    VAR
+      ServiceOrder@1100528601 : Record 11012823;
+    BEGIN
+      ServiceOrder.COPY(IServiceOrder);
+      IF NOT ServiceOrder.FINDSET THEN
+        EXIT;
+      REPEAT
+        TotalDurationTime += ServiceOrder."Duration Time" - DurationToHours(ServiceOrder."Travel Duration");
+      UNTIL ServiceOrder.NEXT = 0;
+    END;
+
+    PROCEDURE GetDisciplineFilter@1100528604(VAR IServiceOrder@1100528600 : Record 11012823) DisciplineFilter : Text;
+    VAR
+      ServiceOrder@1100528601 : Record 11012823;
+      Discipline@1100528602 : Record 11020204;
+    BEGIN
+      ServiceOrder.COPY(IServiceOrder);
+      IF NOT ServiceOrder.FINDSET THEN
+        EXIT;
+      REPEAT
+        IF Discipline.GET(ServiceOrder.Discipline) THEN
+          Discipline.MARK(TRUE);
+      UNTIL ServiceOrder.NEXT = 0;
+      Discipline.MARKEDONLY(TRUE);
+      IF Discipline.FINDSET THEN
+        REPEAT
+          IF DisciplineFilter <> '' THEN
+            DisciplineFilter := DisciplineFilter + '|';
+          DisciplineFilter := DisciplineFilter + Discipline.Code;
+        UNTIL Discipline.NEXT = 0;
+    END;
+
+    PROCEDURE GetTradeSpecialityFilter@1100528672(VAR IServiceOrder@1100528600 : Record 11012823) TradeSpecialityFilter : Text;
+    VAR
+      ServiceOrder@1100528601 : Record 11012823;
+      TradeSpeciality@1100528602 : Record 11020285;
+    BEGIN
+      ServiceOrder.COPY(IServiceOrder);
+      IF NOT ServiceOrder.FINDSET THEN
+        EXIT;
+      REPEAT
+        IF TradeSpeciality.GET(ServiceOrder.Discipline, ServiceOrder."Trade Speciality") THEN
+          TradeSpeciality.MARK(TRUE);
+      UNTIL ServiceOrder.NEXT = 0;
+      TradeSpeciality.MARKEDONLY(TRUE);
+      IF TradeSpeciality.FINDSET THEN
+        REPEAT
+          IF TradeSpecialityFilter <> '' THEN
+            TradeSpecialityFilter := TradeSpecialityFilter + '|';
+          TradeSpecialityFilter += TradeSpeciality.Code;
+        UNTIL TradeSpeciality.NEXT = 0;
+    END;
+
+    PROCEDURE GetTerritoryFilter@1100528605(VAR IServiceOrder@1100528600 : Record 11012823) TerritoryFilter : Text;
+    VAR
+      ServiceOrder@1100528601 : Record 11012823;
+      Territory@1100528602 : Record 286;
+    BEGIN
+      ServiceOrder.COPY(IServiceOrder);
+      IF NOT ServiceOrder.FINDSET THEN
+        EXIT;
+      REPEAT
+        IF Territory.GET(ServiceOrder."Territory Code") THEN
+          Territory.MARK(TRUE);
+      UNTIL ServiceOrder.NEXT = 0;
+      Territory.MARKEDONLY(TRUE);
+      IF Territory.FINDSET THEN
+        REPEAT
+          IF TerritoryFilter <> '' THEN
+            TerritoryFilter := TerritoryFilter + '|';
+          TerritoryFilter := TerritoryFilter + Territory.Code;
+        UNTIL Territory.NEXT = 0;
+    END;
+
+    PROCEDURE GetPlanningAgreementCode@1100528650(VAR IServiceOrder@1100528600 : Record 11012823) : Code[10];
+    VAR
+      ServiceOrder@1100528601 : Record 11012823;
+      ServiceCall@1100528603 : Record 11012822;
+      PlanningAgreement@1100528602 : Record 11071729;
+    BEGIN
+      ServiceOrder.COPY(IServiceOrder);
+      IF NOT ServiceOrder.FINDSET THEN
+        EXIT;
+      REPEAT
+        IF ServiceCall.GET(ServiceOrder."Call No.") THEN
+          IF ServiceCall."Planning Agreement Code" <> '' THEN
+            IF PlanningAgreement.GET(ServiceCall."Planning Agreement Code") THEN
+              PlanningAgreement.MARK(TRUE);
+      UNTIL ServiceOrder.NEXT = 0;
+      PlanningAgreement.MARKEDONLY(TRUE);
+      IF PlanningAgreement.COUNT = 1 THEN
+        EXIT(PlanningAgreement.Code);
+    END;
+
+    PROCEDURE PlanTimeInclPause@1100528622(IResourceNo@1100528600 : Code[20];IPlanDate@1100528601 : Date;IPlanStartingTime@1100528602 : Time;IPlanEndingTime@1100528603 : Time;VAR ONoOfPauseHours@1100528604 : Decimal) : Boolean;
+    VAR
+      EmployeeTimeTable@1100528605 : Record 11012923;
+      CompanyInformation@1100528606 : Record 79;
+      BaseCalendar@1100528607 : Record 11072014;
+      Resource@1100528610 : Record 11229278;
+      CompanyPlanGroup@1100528612 : Record 11229300;
+      DOW@1100528608 : Integer;
+      EmployeeNo@1100528609 : Code[20];
+      SetupCompanyName@1100528611 : Text[30];
+    BEGIN
+      EmployeeNo := '';
+      IF IResourceNo <> '' THEN BEGIN
+        IF Resource.GET(IResourceNo) THEN BEGIN
+          IF Resource.Type = Resource.Type::Employee THEN
+            EmployeeNo := Resource."Source No.";
+        END;
+      END;
+      IF (EmployeeNo <> '') AND (Resource.Company <> COMPANYNAME) THEN BEGIN
+        IF NOT EmployeeTimeTable.CHANGECOMPANY(Resource.Company) THEN
+          EXIT;
+      END;
+      SetupCompanyName := CompanyPlanGroup.GetSetupCompanyOfCurrentCompanyPlanGroup();
+      IF SetupCompanyName <> COMPANYNAME THEN BEGIN
+        CompanyInformation.CHANGECOMPANY(SetupCompanyName);
+        BaseCalendar.CHANGECOMPANY(SetupCompanyName);
+      END;
+
+      EmployeeTimeTable.SETRANGE("Employee No.", EmployeeNo);
+      EmployeeTimeTable.SETFILTER("Effective Date", '..%1', IPlanDate);
+      DOW := DATE2DWY(IPlanDate, 1);
+      IF (EmployeeNo <> '') AND EmployeeTimeTable.FINDLAST THEN BEGIN
+        CASE DOW OF
+          1:
+            IF (EmployeeTimeTable."Monday Pause From" <> 0T) AND (EmployeeTimeTable."Monday Pause Until" <> 0T) THEN BEGIN
+              IF ((IPlanEndingTime > EmployeeTimeTable."Monday Pause From") AND
+                  (IPlanEndingTime < EmployeeTimeTable."Monday Pause Until")) OR
+                 ((IPlanStartingTime <= EmployeeTimeTable."Monday Pause From") AND
+                  (IPlanEndingTime >= EmployeeTimeTable."Monday Pause Until")) THEN
+              BEGIN
+                ONoOfPauseHours := (EmployeeTimeTable."Monday Pause Until" - EmployeeTimeTable."Monday Pause From") / 1000 / 60 / 60;
+                EXIT(TRUE);
+              END;
+            END;
+          2:
+            IF (EmployeeTimeTable."Tuesday Pause From" <> 0T) AND (EmployeeTimeTable."Tuesday Pause Until" <> 0T) THEN BEGIN
+              IF ((IPlanEndingTime > EmployeeTimeTable."Tuesday Pause From") AND
+                  (IPlanEndingTime < EmployeeTimeTable."Tuesday Pause Until")) OR
+                 ((IPlanStartingTime <= EmployeeTimeTable."Tuesday Pause From") AND
+                  (IPlanEndingTime >= EmployeeTimeTable."Tuesday Pause Until")) THEN
+              BEGIN
+                ONoOfPauseHours := (EmployeeTimeTable."Tuesday Pause Until" - EmployeeTimeTable."Tuesday Pause From") / 1000 / 60 / 60;
+                EXIT(TRUE);
+              END;
+            END;
+          3:
+            IF (EmployeeTimeTable."Wednesday Pause From" <> 0T) AND (EmployeeTimeTable."Wednesday Pause Until" <> 0T) THEN BEGIN
+              IF ((IPlanEndingTime > EmployeeTimeTable."Wednesday Pause From") AND
+                  (IPlanEndingTime < EmployeeTimeTable."Wednesday Pause Until")) OR
+                 ((IPlanStartingTime <= EmployeeTimeTable."Wednesday Pause From") AND
+                  (IPlanEndingTime >= EmployeeTimeTable."Wednesday Pause Until")) THEN
+              BEGIN
+                ONoOfPauseHours := (EmployeeTimeTable."Wednesday Pause Until" - EmployeeTimeTable."Wednesday Pause From") / 1000 / 60 / 60;
+                EXIT(TRUE);
+              END;
+            END;
+          4:
+            IF (EmployeeTimeTable."Thursday Pause From" <> 0T) AND (EmployeeTimeTable."Thursday Pause Until" <> 0T) THEN BEGIN
+              IF ((IPlanEndingTime > EmployeeTimeTable."Thursday Pause From") AND
+                  (IPlanEndingTime < EmployeeTimeTable."Thursday Pause Until")) OR
+                 ((IPlanStartingTime <= EmployeeTimeTable."Thursday Pause From") AND
+                  (IPlanEndingTime >= EmployeeTimeTable."Thursday Pause Until")) THEN
+              BEGIN
+                ONoOfPauseHours := (EmployeeTimeTable."Thursday Pause Until" - EmployeeTimeTable."Thursday Pause From") / 1000 / 60 / 60;
+                EXIT(TRUE);
+              END;
+            END;
+          5:
+            IF (EmployeeTimeTable."Friday Pause From" <> 0T) AND (EmployeeTimeTable."Friday Pause Until" <> 0T) THEN BEGIN
+              IF ((IPlanEndingTime > EmployeeTimeTable."Friday Pause From") AND
+                  (IPlanEndingTime < EmployeeTimeTable."Friday Pause Until")) OR
+                 ((IPlanStartingTime <= EmployeeTimeTable."Friday Pause From") AND
+                  (IPlanEndingTime >= EmployeeTimeTable."Friday Pause Until")) THEN
+              BEGIN
+                ONoOfPauseHours := (EmployeeTimeTable."Friday Pause Until" - EmployeeTimeTable."Friday Pause From") / 1000 / 60 / 60;
+                EXIT(TRUE);
+              END;
+            END;
+          6:
+            IF (EmployeeTimeTable."Saturday Pause From" <> 0T) AND (EmployeeTimeTable."Saturday Pause Until" <> 0T) THEN BEGIN
+              IF ((IPlanEndingTime > EmployeeTimeTable."Saturday Pause From") AND
+                  (IPlanEndingTime < EmployeeTimeTable."Saturday Pause Until")) OR
+                 ((IPlanStartingTime <= EmployeeTimeTable."Saturday Pause From") AND
+                  (IPlanEndingTime >= EmployeeTimeTable."Saturday Pause Until")) THEN
+              BEGIN
+                ONoOfPauseHours := (EmployeeTimeTable."Saturday Pause Until" - EmployeeTimeTable."Saturday Pause From") / 1000 / 60 / 60;
+                EXIT(TRUE);
+              END;
+            END;
+          7:
+            IF (EmployeeTimeTable."Sunday Pause From" <> 0T) AND (EmployeeTimeTable."Sunday Pause Until" <> 0T) THEN BEGIN
+              IF ((IPlanEndingTime > EmployeeTimeTable."Sunday Pause From") AND
+                  (IPlanEndingTime < EmployeeTimeTable."Sunday Pause Until")) OR
+                 ((IPlanStartingTime <= EmployeeTimeTable."Sunday Pause From") AND
+                  (IPlanEndingTime >= EmployeeTimeTable."Sunday Pause Until")) THEN
+              BEGIN
+                ONoOfPauseHours := (EmployeeTimeTable."Sunday Pause Until" - EmployeeTimeTable."Sunday Pause From") / 1000 / 60 / 60;
+                EXIT(TRUE);
+              END;
+            END;
+        END;
+      END ELSE BEGIN
+        CompanyInformation.GET;
+        IF BaseCalendar.GET(CompanyInformation."Base Calendar Code") THEN BEGIN
+          CASE DOW OF
+            1:
+              IF (BaseCalendar."Monday Pause From" <> 0T) AND (BaseCalendar."Monday Pause Until" <> 0T) THEN BEGIN
+                IF ((IPlanEndingTime > BaseCalendar."Monday Pause From") AND
+                    (IPlanEndingTime < BaseCalendar."Monday Pause Until")) OR
+                   ((IPlanStartingTime <= BaseCalendar."Monday Pause From") AND
+                    (IPlanEndingTime >= BaseCalendar."Monday Pause Until")) THEN
+                BEGIN
+                  ONoOfPauseHours := (BaseCalendar."Monday Pause Until" - BaseCalendar."Monday Pause From") / 1000 / 60 / 60;
+                  EXIT(TRUE);
+                END;
+              END;
+            2:
+              IF (BaseCalendar."Tuesday Pause From" <> 0T) AND (BaseCalendar."Tuesday Pause Until" <> 0T) THEN BEGIN
+                IF ((IPlanEndingTime > BaseCalendar."Tuesday Pause From") AND
+                    (IPlanEndingTime < BaseCalendar."Tuesday Pause Until")) OR
+                   ((IPlanStartingTime <= BaseCalendar."Tuesday Pause From") AND
+                    (IPlanEndingTime >= BaseCalendar."Tuesday Pause Until")) THEN
+                BEGIN
+                  ONoOfPauseHours := (BaseCalendar."Tuesday Pause Until" - BaseCalendar."Tuesday Pause From") / 1000 / 60 / 60;
+                  EXIT(TRUE);
+                END;
+              END;
+            3:
+              IF (BaseCalendar."Wednesday Pause From" <> 0T) AND (BaseCalendar."Wednesday Pause Until" <> 0T) THEN BEGIN
+                IF ((IPlanEndingTime > BaseCalendar."Wednesday Pause From") AND
+                    (IPlanEndingTime < BaseCalendar."Wednesday Pause Until")) OR
+                   ((IPlanStartingTime <= BaseCalendar."Wednesday Pause From") AND
+                    (IPlanEndingTime >= BaseCalendar."Wednesday Pause Until")) THEN
+                BEGIN
+                  ONoOfPauseHours := (BaseCalendar."Wednesday Pause Until" - BaseCalendar."Wednesday Pause From") / 1000 / 60 / 60;
+                  EXIT(TRUE);
+                END;
+              END;
+            4:
+              IF (BaseCalendar."Thursday Pause From" <> 0T) AND (BaseCalendar."Thursday Pause Until" <> 0T) THEN BEGIN
+                IF ((IPlanEndingTime > BaseCalendar."Thursday Pause From") AND
+                    (IPlanEndingTime < BaseCalendar."Thursday Pause Until")) OR
+                   ((IPlanStartingTime <= BaseCalendar."Thursday Pause From") AND
+                    (IPlanEndingTime >= BaseCalendar."Thursday Pause Until")) THEN
+                BEGIN
+                  ONoOfPauseHours := (BaseCalendar."Thursday Pause Until" - BaseCalendar."Thursday Pause From") / 1000 / 60 / 60;
+                  EXIT(TRUE);
+                END;
+              END;
+            5:
+              IF (BaseCalendar."Friday Pause From" <> 0T) AND (BaseCalendar."Friday Pause Until" <> 0T) THEN BEGIN
+                IF ((IPlanEndingTime > BaseCalendar."Friday Pause From") AND
+                    (IPlanEndingTime < BaseCalendar."Friday Pause Until")) OR
+                   ((IPlanStartingTime <= BaseCalendar."Friday Pause From") AND
+                    (IPlanEndingTime >= BaseCalendar."Friday Pause Until")) THEN
+                BEGIN
+                  ONoOfPauseHours := (BaseCalendar."Friday Pause Until" - BaseCalendar."Friday Pause From") / 1000 / 60 / 60;
+                  EXIT(TRUE);
+                END;
+              END;
+            6:
+              IF (BaseCalendar."Saturday Pause From" <> 0T) AND (BaseCalendar."Saturday Pause Until" <> 0T) THEN BEGIN
+                IF ((IPlanEndingTime > BaseCalendar."Saturday Pause From") AND
+                    (IPlanEndingTime < BaseCalendar."Saturday Pause Until")) OR
+                   ((IPlanStartingTime <= BaseCalendar."Saturday Pause From") AND
+                    (IPlanEndingTime >= BaseCalendar."Saturday Pause Until")) THEN
+                BEGIN
+                  ONoOfPauseHours := (BaseCalendar."Saturday Pause Until" - BaseCalendar."Saturday Pause From") / 1000 / 60 / 60;
+                  EXIT(TRUE);
+                END;
+              END;
+            7:
+              IF (BaseCalendar."Sunday Pause From" <> 0T) AND (BaseCalendar."Sunday Pause Until" <> 0T) THEN BEGIN
+                IF ((IPlanEndingTime > BaseCalendar."Sunday Pause From") AND
+                    (IPlanEndingTime < BaseCalendar."Sunday Pause Until")) OR
+                   ((IPlanStartingTime <= BaseCalendar."Sunday Pause From") AND
+                    (IPlanEndingTime >= BaseCalendar."Sunday Pause Until")) THEN
+                BEGIN
+                  ONoOfPauseHours := (BaseCalendar."Sunday Pause Until" - BaseCalendar."Sunday Pause From") / 1000 / 60 / 60;
+                  EXIT(TRUE);
+                END;
+              END;
+          END;
+        END;
+      END;
+    END;
+
+    PROCEDURE GetGoogleMapsRouteURL@1100528621(IServiceOrderToPlan@1100528600 : Record 11012823;IEmplAvailPlanTimeBuffer@1100528602 : Record 11071976) GoogleURL : Text;
+    VAR
+      Addresses@1100528601 : ARRAY [3] OF Text;
+      NoOfAddresses@1100528603 : Integer;
+    BEGIN
+      IF IEmplAvailPlanTimeBuffer."Prev. Address" + IEmplAvailPlanTimeBuffer."Prev. City" <> '' THEN
+        Addresses[1] := STRSUBSTNO('%1,%2', IEmplAvailPlanTimeBuffer."Prev. Address", IEmplAvailPlanTimeBuffer."Prev. City");
+      IF IServiceOrderToPlan.Address + IServiceOrderToPlan.City <> '' THEN
+        Addresses[2] := STRSUBSTNO('%1,%2', IServiceOrderToPlan.Address, IServiceOrderToPlan.City);
+      IF IEmplAvailPlanTimeBuffer."Next Address" + IEmplAvailPlanTimeBuffer."Next City" <> '' THEN
+        Addresses[3] := STRSUBSTNO('%1,%2', IEmplAvailPlanTimeBuffer."Next Address", IEmplAvailPlanTimeBuffer."Next City");
+      NoOfAddresses := COMPRESSARRAY(Addresses);
+      CASE NoOfAddresses OF
+        1: GoogleURL := STRSUBSTNO('https://www.google.nl/maps/dir/%1', Addresses[1]);
+        2: GoogleURL := STRSUBSTNO('https://www.google.nl/maps/dir/%1/%2', Addresses[1], Addresses[2]);
+        3: GoogleURL := STRSUBSTNO('https://www.google.nl/maps/dir/%1/%2/%3', Addresses[1], Addresses[2], Addresses[3]);
+      END;
+      GoogleURL := CONVERTSTR(GoogleURL, ' ', '+');
+      GoogleURL := GetFullQualifiedGoogleAPIURL(GoogleURL);
+    END;
+
+    PROCEDURE GetGoogleMapsRouteURLByWayPoints@1100528644(VAR ITmpOptimalRouteBuffer@1100528607 : TEMPORARY Record 11071981) GoogleURL : Text;
+    VAR
+      FirstWayPoint@1100528600 : Boolean;
+    BEGIN
+      ITmpOptimalRouteBuffer.SETRANGE(Type, ITmpOptimalRouteBuffer.Type::"Start Address");
+      IF ITmpOptimalRouteBuffer.FINDFIRST THEN
+        GoogleURL := GoogleURL + STRSUBSTNO('https://www.google.nl/maps/dir/%1', STRSUBSTNO('%1,%2', ITmpOptimalRouteBuffer.Address, ITmpOptimalRouteBuffer.City));
+
+      ITmpOptimalRouteBuffer.SETFILTER(Type, '<>%1', ITmpOptimalRouteBuffer.Type::"Start Address");
+      IF ITmpOptimalRouteBuffer.FINDSET THEN BEGIN
+        FirstWayPoint := TRUE;
+        REPEAT
+          IF FirstWayPoint THEN
+            GoogleURL := GoogleURL + STRSUBSTNO('/%1,%2', ITmpOptimalRouteBuffer.Address, ITmpOptimalRouteBuffer.City)
+          ELSE
+            GoogleURL := GoogleURL + STRSUBSTNO('/%1,%2', ITmpOptimalRouteBuffer.Address, ITmpOptimalRouteBuffer.City);
+          FirstWayPoint := FALSE;
+        UNTIL ITmpOptimalRouteBuffer.NEXT = 0;
+      END;
+      GoogleURL := CONVERTSTR(GoogleURL, ' ', '+');
+      GoogleURL := GetFullQualifiedGoogleAPIURL(GoogleURL);
+    END;
+
+    PROCEDURE GetGoogleMapsURLSingleServiceOrder@1100528623(IServiceOrder@1100528600 : Record 11012823) GoogleURL : Text;
+    VAR
+      EmplAvailPlanTimeBuffer@1100528604 : Record 11071976;
+    BEGIN
+      GoogleURL := GetGoogleMapsRouteURL(IServiceOrder, EmplAvailPlanTimeBuffer);
+    END;
+
+    PROCEDURE GetGoogleMapsURLFromAddressAndCity@1100528624(IAddress@1100528601 : Text[50];ICity@1100528602 : Text[50]) GoogleURL : Text;
+    VAR
+      ServiceOrder@1100528600 : Record 11012823;
+    BEGIN
+      ServiceOrder.Address := IAddress;
+      ServiceOrder.City := ICity;
+      GoogleURL := GetGoogleMapsURLSingleServiceOrder(ServiceOrder);
+    END;
+
+    PROCEDURE GetFullQualifiedGoogleAPIURL@1100528612(IURL@1100528600 : Text) FullQualifiedGoogleMapsURL : Text;
+    VAR
+      ServiceSetup@1100528612 : Record 11012800;
+      Algorithm@1100528609 : DotNet "'mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Security.Cryptography.HMACSHA1";
+      ASCIIEncoding@1100528608 : DotNet "'mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Text.ASCIIEncoding";
+      Convert@1100528607 : DotNet "'mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Convert";
+      PrivateKeyBytes@1100528606 : DotNet "'mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Array";
+      EncodedPathAndQueryBytes@1100528605 : DotNet "'mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Array";
+      Hash@1100528604 : DotNet "'mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Array";
+      Uri@1100528603 : DotNet "'System, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Uri";
+      ClientID@1100528602 : Text;
+      PrivateKey@1100528610 : Text;
+      Signature@1100528611 : Text;
+    BEGIN
+      ServiceSetup.GET;
+      IF ServiceSetup."Google API Client ID" = '' THEN
+        EXIT(IURL);
+      ServiceSetup.TESTFIELD("Google API Private Key");
+
+      ASCIIEncoding := ASCIIEncoding.ASCIIEncoding;
+      PrivateKey := CONVERTSTR(ServiceSetup."Google API Private Key", '-_', '+/');
+      PrivateKeyBytes := Convert.FromBase64String(PrivateKey);
+
+      Uri := Uri.Uri(IURL + '&client=' + ServiceSetup."Google API Client ID");
+      EncodedPathAndQueryBytes := ASCIIEncoding.GetBytes(Uri.LocalPath + Uri.Query);
+
+      //compute the hash
+      Algorithm := Algorithm.HMACSHA1(PrivateKeyBytes);
+      Hash := Algorithm.ComputeHash(EncodedPathAndQueryBytes);
+
+      //convert the bytes to string and make url-safe by replacing '+' and '/' characters
+      Signature := Convert.ToBase64String(Hash);
+      Signature := CONVERTSTR(Signature, '+/', '-_');
+
+      //Add the signature to the existing URI.
+      EXIT(Uri.Scheme + '://' + Uri.Host + Uri.LocalPath + Uri.Query + '&signature=' + Signature);
+    END;
+
+    PROCEDURE GetReplannedServiceOrdersMessage@1100528625(VAR IServiceOrder@1100528600 : Record 11012823) : Text;
+    VAR
+      ServiceOrder@1100528601 : Record 11012823;
+      ServiceOrderNo@1100528602 : Text[250];
+      PlanDate@1100528606 : Date;
+      FirstTime@1100528603 : Time;
+      LastTime@1100528604 : Time;
+      NoOfServiceOrders@1100528605 : Integer;
+    BEGIN
+      ServiceOrder.COPY(IServiceOrder);
+      IF NOT ServiceOrder.FINDSET THEN
+        EXIT(Text003);
+      REPEAT
+        IF ServiceOrderNo <> '' THEN
+          ServiceOrderNo := ServiceOrderNo + ', ';
+        ServiceOrderNo := ServiceOrderNo + ServiceOrder."No.";
+        PlanDate := ServiceOrder."Starting Date";
+        IF (FirstTime = 0T) OR (ServiceOrder."Starting Time" < FirstTime) THEN
+          FirstTime := ServiceOrder."Starting Time";
+        IF (LastTime = 0T) OR (ServiceOrder."Ending Time" > LastTime) THEN
+          LastTime := ServiceOrder."Ending Time";
+        NoOfServiceOrders += 1;
+      UNTIL ServiceOrder.NEXT = 0;
+      IF NoOfServiceOrders > 1 THEN
+        EXIT(STRSUBSTNO(Text004, ServiceOrderNo, PlanDate, FirstTime, LastTime))
+      ELSE
+        EXIT(STRSUBSTNO(Text005, ServiceOrderNo, PlanDate, FirstTime, LastTime));
+    END;
+
+    PROCEDURE GetCommonServiceOrderData@1100528631(VAR IServiceOrder@1100528600 : Record 11012823;VAR OCommonDataServiceOrder@1100528601 : Record 11012823);
+    VAR
+      ServiceOrder@1100528602 : Record 11012823;
+    BEGIN
+      CLEAR(OCommonDataServiceOrder);
+      ServiceOrder.COPY(IServiceOrder);
+      IF ServiceOrder.COUNT = 1 THEN BEGIN
+        ServiceOrder.FINDFIRST;
+        OCommonDataServiceOrder := ServiceOrder
+      END ELSE BEGIN
+        IF ServiceOrder.FINDSET THEN BEGIN
+          OCommonDataServiceOrder.Address := ServiceOrder.Address;
+          OCommonDataServiceOrder."Address 2" := ServiceOrder."Address 2";
+          OCommonDataServiceOrder."Post Code" := ServiceOrder."Post Code";
+          OCommonDataServiceOrder.City := ServiceOrder.City;
+          OCommonDataServiceOrder."Territory Code" := ServiceOrder."Territory Code";
+          OCommonDataServiceOrder."Service Location No." := ServiceOrder."Service Location No.";
+          OCommonDataServiceOrder."Employee No." := ServiceOrder."Employee No.";
+          OCommonDataServiceOrder."Starting Date" := ServiceOrder."Starting Date";
+          OCommonDataServiceOrder."First Possible Starting Date" := ServiceOrder."First Possible Starting Date";
+          OCommonDataServiceOrder."First Possible Starting Time" := ServiceOrder."First Possible Starting Time";
+          OCommonDataServiceOrder."Last Possible Ending Date" := ServiceOrder."Last Possible Ending Date";
+          OCommonDataServiceOrder."Last Possible Ending Time" := ServiceOrder."Last Possible Ending Time";
+          REPEAT
+            IF OCommonDataServiceOrder.Address <> ServiceOrder.Address THEN
+              OCommonDataServiceOrder.Address := '';
+            IF OCommonDataServiceOrder."Address 2" <> ServiceOrder."Address 2" THEN
+              OCommonDataServiceOrder."Address 2" := '';
+            IF OCommonDataServiceOrder."Post Code" <> ServiceOrder."Post Code" THEN
+              OCommonDataServiceOrder."Post Code" := '';
+            IF OCommonDataServiceOrder.City <> ServiceOrder.City THEN
+              OCommonDataServiceOrder.City := '';
+            IF OCommonDataServiceOrder."Territory Code" <> ServiceOrder."Territory Code" THEN
+              OCommonDataServiceOrder."Territory Code" := '';
+            IF OCommonDataServiceOrder."Service Location No." <> ServiceOrder."Service Location No." THEN
+              OCommonDataServiceOrder."Service Location No." := '';
+            IF OCommonDataServiceOrder."Employee No." <> ServiceOrder."Employee No." THEN
+              OCommonDataServiceOrder."Employee No." := '';
+            IF OCommonDataServiceOrder."Starting Date" <> ServiceOrder."Starting Date" THEN
+              OCommonDataServiceOrder."Starting Date" := 0D;
+            IF OCommonDataServiceOrder."First Possible Starting Date" <> ServiceOrder."First Possible Starting Date" THEN
+              OCommonDataServiceOrder."First Possible Starting Date" := 0D;
+            IF OCommonDataServiceOrder."First Possible Starting Time" <> ServiceOrder."First Possible Starting Time" THEN
+              OCommonDataServiceOrder."First Possible Starting Time" := 0T;
+            IF OCommonDataServiceOrder."Last Possible Ending Date" <> ServiceOrder."Last Possible Ending Date" THEN
+              OCommonDataServiceOrder."Last Possible Ending Date" := 0D;
+            IF OCommonDataServiceOrder."Last Possible Ending Time" <> ServiceOrder."Last Possible Ending Time" THEN
+              OCommonDataServiceOrder."Last Possible Ending Time" := 0T;
+            IF ServiceOrder."Firm Planned" THEN
+              OCommonDataServiceOrder."Firm Planned" := TRUE;
+            IF (OCommonDataServiceOrder."Next Deadline" = 0DT) OR (OCommonDataServiceOrder."Next Deadline" > ServiceOrder."Next Deadline") THEN
+              OCommonDataServiceOrder."Next Deadline" := ServiceOrder."Next Deadline";
+          UNTIL ServiceOrder.NEXT = 0;
+        END;
+      END;
+      OCommonDataServiceOrder.CALCFIELDS("Employee Name");
+    END;
+
+    PROCEDURE GetSOCommonMaintSchemeDescription@1100528659(VAR IServiceOrder@1100528600 : Record 11012823;VAR OMaintenanceSchemeDescription@1100525000 : Text[50]) : Code[20];
+    VAR
+      ServiceOrder@1100528601 : Record 11012823;
+      ServiceOrderObject@1100528603 : Record 11071724;
+      MaintenanceScheme@1100528602 : Record 11071745;
+    BEGIN
+      OMaintenanceSchemeDescription := '';
+      ServiceOrder.COPY(IServiceOrder);
+      IF ServiceOrder.FINDSET THEN
+        REPEAT
+          ServiceOrderObject.SETRANGE("Service Order No.", ServiceOrder."No.");
+          IF ServiceOrderObject.FINDSET THEN
+            REPEAT
+              IF MaintenanceScheme.GET(ServiceOrderObject."Maintenance Scheme") THEN
+                MaintenanceScheme.MARK(TRUE);
+            UNTIL ServiceOrderObject.NEXT = 0;
+        UNTIL ServiceOrder.NEXT = 0;
+      MaintenanceScheme.MARKEDONLY(TRUE);
+      IF MaintenanceScheme.ISEMPTY THEN
+        EXIT;
+      IF MaintenanceScheme.COUNT = 1 THEN BEGIN
+        OMaintenanceSchemeDescription := MaintenanceScheme.Description;
+        EXIT(MaintenanceScheme.Code)
+      END ELSE
+        EXIT(STRSUBSTNO('[%1]', MaintenanceScheme.COUNT));
+    END;
+
+    PROCEDURE GetSOCommonStartingEndingTimeWindow@1100528658(VAR IServiceOrder@1100528600 : Record 11012823;VAR OStartingDate@1100528605 : Date;VAR OStartingTime@1100528601 : Time;VAR OEndingDate@1100528606 : Date;VAR OEndingTime@1100528602 : Time);
+    VAR
+      ServiceOrder@1100528603 : Record 11012823;
+    BEGIN
+      OStartingDate := 0D;
+      OStartingTime := 0T;
+      OEndingDate := 0D;
+      OEndingTime := 0T;
+
+      ServiceOrder.COPY(IServiceOrder);
+      //ServiceOrder.SETRANGE("Firm Planned", TRUE);
+      IF ServiceOrder.FINDSET THEN
+        REPEAT
+          IF OStartingDate = 0D THEN
+            OStartingDate := ServiceOrder."First Possible Starting Date";
+      //    IF OStartingDate = 0D THEN
+      //      OStartingDate := ServiceOrder."Starting Date";
+          IF OStartingTime = 0T THEN
+            OStartingTime := ServiceOrder."First Possible Starting Time";
+          IF OEndingDate = 0D THEN
+            OEndingDate := ServiceOrder."Last Possible Ending Date";
+      //    IF OEndingDate = 0D THEN
+      //      OEndingDate := ServiceOrder."Ending Date";
+          IF OEndingTime = 0T THEN
+            OEndingTime := ServiceOrder."Last Possible Ending Time";
+
+          IF (ServiceOrder."First Possible Starting Date" > OStartingDate) AND
+             (ServiceOrder."First Possible Starting Date" <= OEndingDate)
+          THEN
+            OStartingDate := ServiceOrder."First Possible Starting Date";
+
+          IF (ServiceOrder."Last Possible Ending Date" > OStartingDate) AND
+             (ServiceOrder."Last Possible Ending Date" <= OEndingDate)
+          THEN
+            OEndingDate := ServiceOrder."Last Possible Ending Date";
+
+          IF ServiceOrder."First Possible Starting Date" = ServiceOrder."Last Possible Ending Date" THEN BEGIN
+            IF OStartingTime < ServiceOrder."First Possible Starting Time" THEN
+              OStartingTime := ServiceOrder."First Possible Starting Time";
+            IF OEndingTime > ServiceOrder."Last Possible Ending Time" THEN
+              OEndingTime := ServiceOrder."Last Possible Ending Time";
+          END;
+      UNTIL ServiceOrder.NEXT = 0;
+    END;
+
+    PROCEDURE ShowServiceOrderObjects@1100528663(VAR IServiceOrder@1100528600 : Record 11012823);
+    VAR
+      ServiceOrder@1100528601 : Record 11012823;
+      ServiceOrderObject@1100528602 : Record 11071724;
+    BEGIN
+      ServiceOrder.COPY(IServiceOrder);
+      IF ServiceOrder.FINDSET THEN
+        REPEAT
+          ServiceOrderObject.SETRANGE("Service Order No.", ServiceOrder."No.");
+          IF ServiceOrderObject.FINDSET THEN
+            REPEAT
+              ServiceOrderObject.MARK(TRUE);
+            UNTIL ServiceOrderObject.NEXT = 0;
+        UNTIL ServiceOrder.NEXT = 0;
+      ServiceOrderObject.MARKEDONLY(TRUE);
+      PAGE.RUNMODAL(0, ServiceOrderObject);
+    END;
+
+    PROCEDURE ResourceCanDoServiceOrders@1100528662(IResourceNo@1100528600 : Code[20];VAR IServiceOrder@1100528601 : Record 11012823;IPlanDateFrom@1100528604 : Date;IPlanDateUntil@1100528606 : Date;IPlanSeqNo@1100528605 : Integer) : Boolean;
+    VAR
+      ResourcePlanData@1100528602 : Record 11229287;
+      ServiceOrder@1100528603 : Record 11012823;
+    BEGIN
+      ServiceOrder.COPY(IServiceOrder);
+      IF ServiceOrder.FINDSET THEN
+        REPEAT
+          IF NOT ServiceOrderMeetsPlanData(ServiceOrder, IResourceNo, IPlanDateFrom, IPlanDateUntil, IPlanSeqNo) THEN
+            EXIT(FALSE);
+        UNTIL ServiceOrder.NEXT = 0;
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE ResourceCanDoOneServiceOrder@1100409000(IResourceNo@1100528600 : Code[20];VAR IServiceOrder@1100528601 : Record 11012823;IPlanDateFrom@1100528604 : Date;IPlanDateUntil@1100528606 : Date;IPlanSeqNo@1100528605 : Integer) : Boolean;
+    VAR
+      ResourcePlanData@1100528602 : Record 11229287;
+      ServiceOrder@1100528603 : Record 11012823;
+    BEGIN
+      ServiceOrder.COPY(IServiceOrder);
+      IF ServiceOrder.FINDSET THEN
+        REPEAT
+          IF ServiceOrderMeetsPlanData(ServiceOrder, IResourceNo, IPlanDateFrom, IPlanDateUntil, IPlanSeqNo) THEN
+            EXIT(TRUE);
+        UNTIL ServiceOrder.NEXT = 0;
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE SetResourceFilterByConsignment@1100528632(VAR IOResource@1100528600 : Record 11229278;IFromDate@1100528605 : Date;IToDate@1100528604 : Date);
+    VAR
+      ConsignmentTime@1100528602 : Record 11012864;
+      ConsignmentRoster@1100528603 : Record 11012865;
+      Company@1100528606 : Record 2000000006;
+      Resource@1100528607 : Record 11229278;
+      Employee@1100528608 : Record 5200;
+      SeekDate@1100528601 : Date;
+    BEGIN
+      Resource.COPY(IOResource);
+      Resource.SETCURRENTKEY(Type, Company);
+      IF Resource.FINDSET THEN
+        REPEAT
+          IF (Resource.Company <> '') AND (Resource.Company <> Company.Name) THEN BEGIN
+            IF ConsignmentTime.CHANGECOMPANY(Resource.Company) AND ConsignmentTime.READPERMISSION THEN BEGIN
+              Company.Name := Resource.Company;
+              Company.MARK(TRUE);
+            END;
+          END;
+        UNTIL Resource.NEXT = 0;
+      Company.MARKEDONLY(TRUE);
+
+      IF Company.FINDSET THEN
+        REPEAT
+          ConsignmentTime.CHANGECOMPANY(Company.Name);
+          ConsignmentRoster.CHANGECOMPANY(Company.Name);
+          Employee.CHANGECOMPANY(Company.Name);
+          FOR SeekDate := IFromDate TO IToDate DO BEGIN
+            ConsignmentTime.SETFILTER("Start Date", '<=%1', SeekDate);
+            ConsignmentTime.SETFILTER("End Date", '>=%1', SeekDate);
+            IF ConsignmentTime.FINDSET THEN
+              REPEAT
+                ConsignmentRoster.SETRANGE("Consignment Code", ConsignmentTime."Consignment Code");
+                ConsignmentRoster.SETRANGE("Start Date", ConsignmentTime."Start Date");
+                ConsignmentRoster.SETRANGE("Start Time", ConsignmentTime."Start Time");
+                IF ConsignmentRoster.FINDSET THEN
+                  REPEAT
+                    Employee.GET(ConsignmentRoster."Employee No.");
+                    IOResource."No." := Employee.GetResourceNoWithCompany(Company.Name);
+                    IOResource.MARK(TRUE);
+                  UNTIL ConsignmentRoster.NEXT = 0;
+              UNTIL ConsignmentTime.NEXT = 0;
+          END;
+        UNTIL Company.NEXT = 0;
+      IOResource.MARKEDONLY(TRUE);
+    END;
+
+    PROCEDURE GetWatchCode@1100528633(IResourceNo@1100528600 : Code[20];IPlanDate@1100528601 : Date;IPlanTime@1100528602 : Time) : Code[10];
+    VAR
+      ResourceWOP@1100528604 : Record 11229278;
+      ConsignmentRoster@1100528603 : Record 11012865;
+    BEGIN
+      ResourceWOP.GET(IResourceNo);
+      IF NOT ConsignmentRoster.CHANGECOMPANY(ResourceWOP.Company) THEN
+        EXIT;
+      ConsignmentRoster.SETCURRENTKEY("Employee No.");
+      ConsignmentRoster.SETFILTER("Start Date", '<=%1', IPlanDate);
+      ConsignmentRoster.SETFILTER("End Date", '>=%1', IPlanDate);
+      ConsignmentRoster.SETRANGE("Employee No.", ResourceWOP."Source No.");
+      IF ConsignmentRoster.FINDSET THEN
+        REPEAT
+          ConsignmentRoster.CALCFIELDS("End Date", "End Time");
+          IF ConsignmentRoster."Start Date" = IPlanDate THEN BEGIN
+            IF ConsignmentRoster."End Date" = IPlanDate THEN BEGIN
+              IF (IPlanTime >= ConsignmentRoster."Start Time") AND (IPlanTime <= ConsignmentRoster."End Time") THEN
+                EXIT(ConsignmentRoster."Watch Code");
+            END ELSE
+              IF IPlanTime >= ConsignmentRoster."Start Time" THEN
+                EXIT(ConsignmentRoster."Watch Code");
+          END;
+          IF ConsignmentRoster."End Date" = IPlanDate THEN
+            IF IPlanTime <= ConsignmentRoster."End Time" THEN
+              EXIT(ConsignmentRoster."Watch Code");
+        UNTIL ConsignmentRoster.NEXT = 0;
+    END;
+
+    PROCEDURE GetServiceLocationDSFromServiceOrders@1100528638(VAR IServiceOrder@1100528600 : Record 11012823;VAR OServiceLocation@1100528601 : Record 11012801);
+    VAR
+      ServiceOrder@1100528602 : Record 11012823;
+    BEGIN
+      OServiceLocation.RESET;
+      ServiceOrder.COPY(IServiceOrder);
+      IF ServiceOrder.FINDSET THEN
+        REPEAT
+          OServiceLocation."No." := ServiceOrder."Service Location No.";
+          OServiceLocation.MARK(TRUE);
+        UNTIL ServiceOrder.NEXT = 0;
+      OServiceLocation.MARKEDONLY(TRUE);
+    END;
+
+    PROCEDURE SetResourceFilterByReadPermission@1100525003(VAR IOResource@1100525000 : Record 11229278);
+    VAR
+      Company@1100525001 : Record 2000000006;
+      Employee@1100525002 : Record 5200;
+    BEGIN
+      IF Company.FINDSET THEN
+        REPEAT
+          IF Employee.CHANGECOMPANY(Company.Name) AND Employee.READPERMISSION THEN BEGIN
+            IOResource.SETRANGE(Company, Company.Name);
+            IF IOResource.FINDSET THEN
+              REPEAT
+                IOResource.MARK(TRUE);
+              UNTIL IOResource.NEXT = 0;
+          END;
+        UNTIL Company.NEXT = 0;
+      IOResource.SETRANGE(Company);
+      IOResource.MARKEDONLY(TRUE);
+    END;
+
+    PROCEDURE GetServiceOrdersByLinkedWorkorder@1100528660(VAR IServiceOrder@1100528600 : Record 11012823;VAR OServiceOrder@1100528602 : Record 11012823;VAR OLinkedWorkOrders@1100528605 : Boolean);
+    VAR
+      ServiceOrder@1100528601 : Record 11012823;
+      WorkOrder@1100528603 : Record 11229279;
+      LinkedWorkOrder@1100528604 : Record 11229279;
+    BEGIN
+      ServiceOrder.COPY(IServiceOrder);
+      IF ServiceOrder.FINDSET THEN
+        REPEAT
+          OServiceOrder."No." := ServiceOrder."No.";
+          OServiceOrder.MARK(TRUE);
+          WorkOrder.SETCURRENTKEY("Source Company", "Source Type", "Source No.");
+          WorkOrder.SETRANGE("Source Company", COMPANYNAME);
+          WorkOrder.SETRANGE("Source Type", WorkOrder."Source Type"::ServiceOrder);
+          WorkOrder.SETRANGE("Source No.", ServiceOrder."No.");
+          IF WorkOrder.FINDSET THEN
+            REPEAT
+              IF WorkOrder."Related Work Order No." <> '' THEN BEGIN
+                LinkedWorkOrder.SETRANGE("No.", WorkOrder."Related Work Order No.");
+                LinkedWorkOrder.SETRANGE("Source Company", WorkOrder."Source Company");
+                IF LinkedWorkOrder.FINDFIRST THEN BEGIN
+                  OLinkedWorkOrders := TRUE;
+                  OServiceOrder."No." := LinkedWorkOrder."Source No.";
+                  OServiceOrder.MARK(TRUE);
+                END;
+              END;
+              LinkedWorkOrder.RESET;
+              LinkedWorkOrder.SETRANGE("Related Work Order No.", WorkOrder."No.");
+              LinkedWorkOrder.SETRANGE("Source Company", WorkOrder."Source Company");
+              IF LinkedWorkOrder.FINDFIRST THEN BEGIN
+                OLinkedWorkOrders := TRUE;
+                OServiceOrder."No." := LinkedWorkOrder."Source No.";
+                OServiceOrder.MARK(TRUE);
+              END;
+            UNTIL WorkOrder.NEXT = 0;
+        UNTIL ServiceOrder.NEXT = 0;
+      OServiceOrder.MARKEDONLY(TRUE);
+    END;
+
+    PROCEDURE CheckMultipleWorkOrdersPerSO@1100528668(VAR IServiceOrder@1100528604 : Record 11012823);
+    VAR
+      ServiceOrder@1100528601 : Record 11012823;
+      WorkOrder@1100528603 : Record 11229279;
+      MultipleWorkOrdersFound@1100528602 : Boolean;
+    BEGIN
+      ServiceOrder.COPY(IServiceOrder);
+      IF ServiceOrder.FINDSET THEN
+        REPEAT
+          WorkOrder.RESET;
+          WorkOrder.SETCURRENTKEY("Source Company", "Source Type", "Source No.");
+          WorkOrder.SETRANGE("Source Company", COMPANYNAME);
+          WorkOrder.SETRANGE("Source Type", WorkOrder."Source Type"::ServiceOrder);
+          WorkOrder.SETRANGE("Source No.", ServiceOrder."No.");
+          WorkOrder.SETRANGE("WO Finished (Field Service)", FALSE);
+          IF WorkOrder.COUNT > 1 THEN
+            MultipleWorkOrdersFound := TRUE;
+        UNTIL (ServiceOrder.NEXT = 0) OR MultipleWorkOrdersFound;
+      IF MultipleWorkOrdersFound THEN
+        IF GUIALLOWED THEN
+          IF NOT CONFIRM(Text015, FALSE) THEN
+            ERROR('');
+    END;
+
+    PROCEDURE TestReplanAllowed@1100528667(VAR IServiceOrder@1100528600 : Record 11012823);
+    VAR
+      ServiceOrder@1100528601 : Record 11012823;
+      WorkOrder@1100528602 : Record 11229279;
+      ReferencePoint@1100528603 : Record 11020271;
+    BEGIN
+      ServiceOrder.COPY(IServiceOrder);
+      IF ServiceOrder.FINDSET THEN
+        REPEAT
+          WorkOrder.RESET;
+          WorkOrder.SETCURRENTKEY("Source Company", "Source Type", "Source No.");
+          WorkOrder.SETRANGE("Source Company", COMPANYNAME);
+          WorkOrder.SETRANGE("Source Type", WorkOrder."Source Type"::ServiceOrder);
+          WorkOrder.SETRANGE("Source No.", ServiceOrder."No.");
+          WorkOrder.SETRANGE("Resource Type", WorkOrder."Resource Type"::Employee);
+          WorkOrder.SETRANGE("WO Finished (Field Service)", FALSE);
+          IF WorkOrder.FINDSET THEN
+            REPEAT
+              ReferencePoint.CHANGECOMPANY(WorkOrder."Source Company");
+              IF ReferencePoint.GET(WorkOrder."Actual Reference Point") THEN
+                IF ReferencePoint."Block Modify Service Order" THEN
+                  ERROR(Text016, ServiceOrder."No.");
+            UNTIL WorkOrder.NEXT = 0;
+        UNTIL ServiceOrder.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE GetWorkOrdersByServiceOrders@1100528670(VAR IServiceOrder@1100528600 : Record 11012823;VAR OWorkOrder@1100528601 : Record 11229279);
+    VAR
+      ServiceOrder@1100528602 : Record 11012823;
+    BEGIN
+      ServiceOrder.COPY(IServiceOrder);
+      OWorkOrder.RESET;
+      OWorkOrder.SETCURRENTKEY("Source Company");
+      IF ServiceOrder.FINDSET THEN
+        REPEAT
+          OWorkOrder.SETRANGE("Source Company", COMPANYNAME);
+          OWorkOrder.SETRANGE("Source Type", OWorkOrder."Source Type"::ServiceOrder);
+          OWorkOrder.SETRANGE("Source No.", ServiceOrder."No.");
+          IF OWorkOrder.FINDSET THEN
+            REPEAT
+              OWorkOrder.MARK(TRUE);
+            UNTIL OWorkOrder.NEXT = 0;
+        UNTIL ServiceOrder.NEXT = 0;
+      OWorkOrder.SETCURRENTKEY("No.");
+      OWorkOrder.SETRANGE("Source No.");
+      OWorkOrder.MARKEDONLY(TRUE);
+      IF NOT OWorkOrder.ISEMPTY THEN
+        OWorkOrder.FINDFIRST;
+    END;
+
+    PROCEDURE GetNoOfWorkOrdersByServiceOrders@1100528669(VAR IServiceOrder@1100528601 : Record 11012823) : Integer;
+    VAR
+      WorkOrder@1100528600 : Record 11229279;
+    BEGIN
+      GetWorkOrdersByServiceOrders(IServiceOrder, WorkOrder);
+      EXIT(WorkOrder.COUNT);
+    END;
+
+    PROCEDURE ShowWorkOrdersByServiceOrders@1100528671(VAR IServiceOrder@1100528600 : Record 11012823);
+    VAR
+      WorkOrder@1100528601 : Record 11229279;
+    BEGIN
+      GetWorkOrdersByServiceOrders(IServiceOrder, WorkOrder);
+      PAGE.RUNMODAL(0, WorkOrder);
+    END;
+
+    PROCEDURE "---"@1100528611();
+    BEGIN
+    END;
+
+    PROCEDURE BuildOpenWorkloadByServiceLocation@1100528617(VAR IServiceLocation@1100528601 : Record 11012801;IWindowInDays@1100528602 : Integer;VAR IExcludeServiceOrder@1100528610 : Record 11012823;VAR OTmpOpenWorkloadbyServLoc@1100528600 : TEMPORARY Record 11071977);
+    VAR
+      TmpOpenWorkloadbyServLoc@1100528603 : TEMPORARY Record 11071977;
+      ServiceLocation@1100528608 : Record 11012801;
+      ServiceOrder@1100528604 : Record 11012823;
+      ExcludeServiceOrder@1100528611 : Record 11012823;
+      MaintenanceProposalLine@1100528606 : Record 11071696;
+      ServiceContractArrangement@1100528607 : Record 11071705;
+      ServiceObject@1100528609 : Record 11071691;
+      ObjectModificationLine@1100528616 : Record 11071701;
+      ReplacementLine@1100528617 : Record 11071710;
+      MaintenanceManagement@1100528614 : Codeunit 11012829;
+      EntryNo@1100528605 : Integer;
+      DummyDec@1100528612 : Decimal;
+      Hours@1100528613 : Decimal;
+      DepartmentCode@1100528615 : Code[20];
+    BEGIN
+      TmpOpenWorkloadbyServLoc.COPY(OTmpOpenWorkloadbyServLoc, TRUE);
+      OTmpOpenWorkloadbyServLoc.RESET;
+      OTmpOpenWorkloadbyServLoc.DELETEALL;
+      ServiceLocation.COPY(IServiceLocation);
+      IF ServiceLocation.ISEMPTY THEN
+        EXIT;
+      ExcludeServiceOrder.COPY(IExcludeServiceOrder);
+
+      EntryNo := 1;
+      IF ServiceLocation.FINDSET THEN
+        REPEAT
+          ServiceOrder.SETCURRENTKEY("Service Location No.");
+          ServiceOrder.SETRANGE("Service Location No.", ServiceLocation."No.");
+          ServiceOrder.SETRANGE(Status, ServiceOrder.Status::Open);
+          IF ServiceOrder.FINDSET THEN
+            REPEAT
+              ExcludeServiceOrder.FILTERGROUP(7);
+              ExcludeServiceOrder.SETRANGE("No.", ServiceOrder."No.");
+              ExcludeServiceOrder.FILTERGROUP(0);
+              IF ExcludeServiceOrder.ISEMPTY THEN BEGIN
+                OTmpOpenWorkloadbyServLoc.INIT;
+                OTmpOpenWorkloadbyServLoc."Service Location No." := ServiceLocation."No.";
+                OTmpOpenWorkloadbyServLoc.Type := OTmpOpenWorkloadbyServLoc.Type::"Service Order";
+                OTmpOpenWorkloadbyServLoc."Entry No." := EntryNo;
+                EntryNo += 1;
+                OTmpOpenWorkloadbyServLoc.Code := ServiceOrder."No.";
+                OTmpOpenWorkloadbyServLoc."Service Object No." := GetServiceOrderObjectNo(ServiceOrder."No.");
+                OTmpOpenWorkloadbyServLoc."Maintenance Scheme" := '';
+                OTmpOpenWorkloadbyServLoc."Line No." := 0;
+                OTmpOpenWorkloadbyServLoc.Description := ServiceOrder.Description;
+                OTmpOpenWorkloadbyServLoc.Address := ServiceOrder.Address;
+                OTmpOpenWorkloadbyServLoc."Address 2" := ServiceOrder."Address 2";
+                OTmpOpenWorkloadbyServLoc."Post Code" := ServiceOrder."Post Code";
+                OTmpOpenWorkloadbyServLoc.City := ServiceOrder.City;
+                OTmpOpenWorkloadbyServLoc."Territory Code" := ServiceOrder."Territory Code";
+                OTmpOpenWorkloadbyServLoc."Starting Date" := ServiceOrder."Starting Date";
+                OTmpOpenWorkloadbyServLoc."Starting Time" := ServiceOrder."Starting Time";
+                OTmpOpenWorkloadbyServLoc."First Possible Starting Date" := ServiceOrder."First Possible Starting Date";
+                OTmpOpenWorkloadbyServLoc."First Possible Starting Time" := ServiceOrder."First Possible Starting Time";
+                OTmpOpenWorkloadbyServLoc."Last Possible Ending Date"  := ServiceOrder."Last Possible Ending Date";
+                OTmpOpenWorkloadbyServLoc."Last Possible Ending Time" := ServiceOrder."Last Possible Ending Time";
+                OTmpOpenWorkloadbyServLoc."Duration Time" := ServiceOrder."Duration Time";
+                OTmpOpenWorkloadbyServLoc.Discipline := ServiceOrder.Discipline;
+                OTmpOpenWorkloadbyServLoc."Trade Speciality" := ServiceOrder."Trade Speciality";
+                OTmpOpenWorkloadbyServLoc."Employee No." := ServiceOrder."Employee No.";
+                OTmpOpenWorkloadbyServLoc."Order Type" := ServiceOrder."Order Type";
+                OTmpOpenWorkloadbyServLoc.Problem := ServiceOrder.Problem;
+                OTmpOpenWorkloadbyServLoc."Actual Reference Point" := ServiceOrder."Actual Reference Point (Gantt)";
+                OTmpOpenWorkloadbyServLoc."On Hold" := ServiceOrder."On Hold";
+                OTmpOpenWorkloadbyServLoc."Firm Planned" := ServiceOrder."Firm Planned";
+                OTmpOpenWorkloadbyServLoc.INSERT;
+              END;
+            UNTIL ServiceOrder.NEXT = 0;
+
+          MaintenanceProposalLine.SETCURRENTKEY("Service Location No.");
+          MaintenanceProposalLine.SETRANGE("Service Location No.", ServiceLocation."No.");
+          MaintenanceProposalLine.SETRANGE("Service Order No.", '');
+          MaintenanceProposalLine.SETRANGE(Expired, FALSE);
+          IF MaintenanceProposalLine.FINDSET THEN
+            REPEAT
+              MaintenanceProposalLine.CALCFIELDS(Address, "Address 2", City, "Territory Code");
+              OTmpOpenWorkloadbyServLoc.INIT;
+              OTmpOpenWorkloadbyServLoc."Service Location No." := ServiceLocation."No.";
+              OTmpOpenWorkloadbyServLoc.Type := OTmpOpenWorkloadbyServLoc.Type::"Maintenance Proposal";
+              OTmpOpenWorkloadbyServLoc."Entry No." := EntryNo;
+              EntryNo += 1;
+              OTmpOpenWorkloadbyServLoc.Code := MaintenanceProposalLine."Maintenance Proposal";
+              OTmpOpenWorkloadbyServLoc."Service Object No." := MaintenanceProposalLine."Object No.";
+              OTmpOpenWorkloadbyServLoc."Maintenance Scheme" := MaintenanceProposalLine."Maintenance Scheme";
+              OTmpOpenWorkloadbyServLoc."Line No." := MaintenanceProposalLine."Line No.";
+              OTmpOpenWorkloadbyServLoc.Description := MaintenanceProposalLine."Service Order Description";
+              OTmpOpenWorkloadbyServLoc.Address := MaintenanceProposalLine.Address;
+              OTmpOpenWorkloadbyServLoc."Address 2" := MaintenanceProposalLine."Address 2";
+              OTmpOpenWorkloadbyServLoc."Post Code" := MaintenanceProposalLine."Post Code";
+              OTmpOpenWorkloadbyServLoc.City := MaintenanceProposalLine.City;
+              OTmpOpenWorkloadbyServLoc."Territory Code" := MaintenanceProposalLine."Territory Code";
+              OTmpOpenWorkloadbyServLoc."Starting Date" := MaintenanceProposalLine."Starting Date Maintenance";
+              OTmpOpenWorkloadbyServLoc."Starting Time" := MaintenanceProposalLine."Starting Time Maintenance";
+              OTmpOpenWorkloadbyServLoc."Last Possible Ending Date" := MaintenanceProposalLine."Last Possible Maint. Date";
+              OTmpOpenWorkloadbyServLoc."Duration Time" := MaintenanceProposalLine."Budget Working Hours" + MaintenanceProposalLine."Budget Travel Hours";
+              OTmpOpenWorkloadbyServLoc.Discipline := MaintenanceProposalLine.Discipline;
+              OTmpOpenWorkloadbyServLoc."Trade Speciality" := MaintenanceProposalLine."Trade Speciality";
+              OTmpOpenWorkloadbyServLoc."Employee No." := MaintenanceProposalLine."Resource No.";
+              OTmpOpenWorkloadbyServLoc."Firm Planned" := MaintenanceProposalLine."Firm Planned";
+              OTmpOpenWorkloadbyServLoc.INSERT;
+            UNTIL MaintenanceProposalLine.NEXT = 0;
+
+          ServiceLocation.GetRelatedObjects(ServiceObject);
+          ServiceContractArrangement.SETCURRENTKEY("Object No.");
+          IF ServiceObject.FINDSET THEN
+            REPEAT
+              ServiceContractArrangement.SETRANGE("Object No.", ServiceObject."No.");
+              ServiceContractArrangement.SETRANGE("Maintenance Proposal No.", '');
+              ServiceContractArrangement.SETRANGE("Service Order No.", '');
+              ServiceContractArrangement.SETRANGE(Cancelled, FALSE);
+              ServiceContractArrangement.SETFILTER("Theoretical Maintenance Date", '<=%1', TODAY + IWindowInDays);
+              IF ServiceContractArrangement.FINDSET THEN BEGIN
+                ServiceContractArrangement.CALCFIELDS(Discipline, "Trade Speciality");
+                OTmpOpenWorkloadbyServLoc.INIT;
+                OTmpOpenWorkloadbyServLoc."Service Location No." := ServiceLocation."No.";
+                OTmpOpenWorkloadbyServLoc.Type := OTmpOpenWorkloadbyServLoc.Type::"Contract Arrangement";
+                OTmpOpenWorkloadbyServLoc."Entry No." := EntryNo;
+                EntryNo += 1;
+                OTmpOpenWorkloadbyServLoc.Code := ServiceContractArrangement."Service Contract No.";
+                OTmpOpenWorkloadbyServLoc."Service Object No." := ServiceContractArrangement."Object No.";
+                OTmpOpenWorkloadbyServLoc."Maintenance Scheme" := ServiceContractArrangement."Maintenance Scheme";
+                OTmpOpenWorkloadbyServLoc."Line No." := ServiceContractArrangement."Line No.";
+                OTmpOpenWorkloadbyServLoc.Address := ServiceContractArrangement.Address;
+                OTmpOpenWorkloadbyServLoc."Address 2" := ServiceContractArrangement."Address 2";
+                OTmpOpenWorkloadbyServLoc."Post Code" := ServiceContractArrangement."Post Code";
+                OTmpOpenWorkloadbyServLoc.City := ServiceContractArrangement.City;
+                OTmpOpenWorkloadbyServLoc."Territory Code" := ServiceLocation."Territory Code";
+                OTmpOpenWorkloadbyServLoc."Starting Date" := ServiceContractArrangement."Theoretical Maintenance Date";
+                OTmpOpenWorkloadbyServLoc."Starting Time" := 0T;
+
+                DepartmentCode := ServiceObject.GetDepartmentCode(ServiceContractArrangement."Service Contract No.");
+                MaintenanceManagement.CalcBudgetLines2(
+                  6, ServiceContractArrangement."Object No.", ServiceContractArrangement."Maintenance Scheme",
+                  ServiceContractArrangement."Theoretical Maintenance Date", ServiceObject.Quantity, DepartmentCode,
+                  DummyDec, Hours, DummyDec, DummyDec, DummyDec, DummyDec, DummyDec);
+                OTmpOpenWorkloadbyServLoc."Duration Time" := Hours;
+                OTmpOpenWorkloadbyServLoc.Discipline := ServiceContractArrangement.Discipline;
+                OTmpOpenWorkloadbyServLoc."Trade Speciality" := ServiceContractArrangement."Trade Speciality";
+                OTmpOpenWorkloadbyServLoc."Firm Planned" := ServiceContractArrangement."Firm Planned";
+                OTmpOpenWorkloadbyServLoc.INSERT;
+              END;
+            UNTIL ServiceObject.NEXT = 0;
+
+          ObjectModificationLine.SETRANGE("Service Location No.", ServiceLocation."No.");
+          ObjectModificationLine.SETRANGE("Service Order No.", '');
+          IF ObjectModificationLine.FINDSET THEN
+            REPEAT
+              IF NOT ServiceLocation.GET(ObjectModificationLine."Service Location No.") THEN
+                ServiceLocation.INIT;
+              OTmpOpenWorkloadbyServLoc.INIT;
+              OTmpOpenWorkloadbyServLoc."Service Location No." := ServiceLocation."No.";
+              OTmpOpenWorkloadbyServLoc.Type := OTmpOpenWorkloadbyServLoc.Type::Modification;
+              OTmpOpenWorkloadbyServLoc."Entry No." := EntryNo;
+              EntryNo += 1;
+              OTmpOpenWorkloadbyServLoc.Code := ObjectModificationLine."Modification No.";
+              OTmpOpenWorkloadbyServLoc."Service Object No." := ObjectModificationLine."Object No.";
+              OTmpOpenWorkloadbyServLoc."Maintenance Scheme" := '';
+              OTmpOpenWorkloadbyServLoc."Line No." := 0;
+              OTmpOpenWorkloadbyServLoc.Address := ServiceLocation.Address;
+              OTmpOpenWorkloadbyServLoc."Address 2" := ServiceLocation."Address 2";
+              OTmpOpenWorkloadbyServLoc."Post Code" := ServiceLocation."Post Code";
+              OTmpOpenWorkloadbyServLoc.City := ServiceLocation.City;
+              OTmpOpenWorkloadbyServLoc."Territory Code" := ServiceLocation."Territory Code";
+              OTmpOpenWorkloadbyServLoc."Starting Date" := ObjectModificationLine."Execution Date";
+              OTmpOpenWorkloadbyServLoc."Starting Time" := 0T;
+              OTmpOpenWorkloadbyServLoc."Duration Time" := 0;
+              OTmpOpenWorkloadbyServLoc.Discipline := ObjectModificationLine.Discipline;
+              OTmpOpenWorkloadbyServLoc."Trade Speciality" := ObjectModificationLine."Trade Speciality";
+              OTmpOpenWorkloadbyServLoc.INSERT;
+            UNTIL ObjectModificationLine.NEXT = 0;
+
+          ReplacementLine.SETRANGE("Service Location No.", ServiceLocation."No.");
+          ReplacementLine.SETRANGE("Service Order No.", '');
+          IF ReplacementLine.FINDSET THEN
+            REPEAT
+              IF NOT ServiceLocation.GET(ReplacementLine."Service Location No.") THEN
+                ServiceLocation.INIT;
+              OTmpOpenWorkloadbyServLoc.INIT;
+              OTmpOpenWorkloadbyServLoc."Service Location No." := ServiceLocation."No.";
+              OTmpOpenWorkloadbyServLoc.Type := OTmpOpenWorkloadbyServLoc.Type::Replacement;
+              OTmpOpenWorkloadbyServLoc."Entry No." := EntryNo;
+              EntryNo += 1;
+              OTmpOpenWorkloadbyServLoc.Code := ReplacementLine."Replacement No.";
+              OTmpOpenWorkloadbyServLoc."Service Object No." := ReplacementLine."Object No.";
+              OTmpOpenWorkloadbyServLoc."Maintenance Scheme" := '';
+              OTmpOpenWorkloadbyServLoc."Line No." := 0;
+              OTmpOpenWorkloadbyServLoc.Address := ServiceLocation.Address;
+              OTmpOpenWorkloadbyServLoc."Address 2" := ServiceLocation."Address 2";
+              OTmpOpenWorkloadbyServLoc."Post Code" := ServiceLocation."Post Code";
+              OTmpOpenWorkloadbyServLoc.City := ServiceLocation.City;
+              OTmpOpenWorkloadbyServLoc."Territory Code" := ServiceLocation."Territory Code";
+              OTmpOpenWorkloadbyServLoc."Starting Date" := ReplacementLine."Starting Date Replacement";
+              OTmpOpenWorkloadbyServLoc."Starting Time" := 0T;
+              OTmpOpenWorkloadbyServLoc."Duration Time" := 0;
+              OTmpOpenWorkloadbyServLoc.Discipline := ReplacementLine.Discipline;
+              OTmpOpenWorkloadbyServLoc."Trade Speciality" := ReplacementLine."Trade Speciality";
+              OTmpOpenWorkloadbyServLoc.INSERT;
+            UNTIL ObjectModificationLine.NEXT = 0;
+      UNTIL ServiceLocation.NEXT = 0;
+    END;
+
+    PROCEDURE GetNoOfOpenWorkloadByServiceLocation@1100528618(VAR IServiceLocation@1100528603 : Record 11012801;IWindowInDays@1100528602 : Integer;VAR IExcludeServiceOrder@1100528601 : Record 11012823) : Integer;
+    VAR
+      TmpOpenWorkloadbyServLoc@1100528600 : TEMPORARY Record 11071977;
+    BEGIN
+      BuildOpenWorkloadByServiceLocation(IServiceLocation, IWindowInDays, IExcludeServiceOrder, TmpOpenWorkloadbyServLoc);
+      EXIT(TmpOpenWorkloadbyServLoc.COUNT);
+    END;
+
+    PROCEDURE CreateServiceOrdersForOpenWorkloadLines@1100528628(VAR ITmpOpenWorkloadbyServLoc@1100528600 : TEMPORARY Record 11071977);
+    VAR
+      TmpOpenWorkloadbyServLoc@1100528605 : TEMPORARY Record 11071977;
+      ServiceContractArrangement@1100528601 : Record 11071705;
+      MaintenanceProposalLine@1100528603 : Record 11071696;
+      ObjectModificationLine@1100528607 : Record 11071701;
+      ReplacementLine@1100528608 : Record 11071710;
+      MaintenanceManagement@1100528602 : Codeunit 11012829;
+      CreateServiceOrdersCU@1100528604 : Codeunit 11012831;
+      PlanDate@1100528606 : Date;
+    BEGIN
+      TmpOpenWorkloadbyServLoc.COPY(ITmpOpenWorkloadbyServLoc, TRUE);
+      IF TmpOpenWorkloadbyServLoc.ISEMPTY THEN
+        ERROR(Text002);
+      TmpOpenWorkloadbyServLoc.SETFILTER(Type, '>%1', TmpOpenWorkloadbyServLoc.Type::"Service Order");
+      IF TmpOpenWorkloadbyServLoc.FINDSET THEN
+        REPEAT
+          CASE TmpOpenWorkloadbyServLoc.Type OF
+            TmpOpenWorkloadbyServLoc.Type::"Maintenance Proposal":
+              BEGIN
+                IF MaintenanceProposalLine.GET(TmpOpenWorkloadbyServLoc.Code, TmpOpenWorkloadbyServLoc."Line No.") THEN BEGIN
+                  MaintenanceProposalLine.SETRECFILTER;
+                  IF MaintenanceProposalLine."Starting Date Maintenance" < TODAY THEN
+                    PlanDate := TODAY;
+                  CreateServiceOrdersCU.CreateServiceOrdersMaintProp(MaintenanceProposalLine, PlanDate, 0, '', FALSE, FALSE, FALSE, '', 0, FALSE);
+                END;
+              END;
+            TmpOpenWorkloadbyServLoc.Type::"Contract Arrangement":
+              BEGIN
+                IF ServiceContractArrangement.GET(
+                  TmpOpenWorkloadbyServLoc.Code, TmpOpenWorkloadbyServLoc."Service Object No.", TmpOpenWorkloadbyServLoc."Maintenance Scheme",
+                  TmpOpenWorkloadbyServLoc."Line No.")
+                THEN BEGIN
+                  ServiceContractArrangement.SETRECFILTER;
+                  MaintenanceManagement.CreateSOFromContrArr(ServiceContractArrangement);
+                END;
+              END;
+            ITmpOpenWorkloadbyServLoc.Type::Modification:
+              BEGIN
+                IF ObjectModificationLine.GET(TmpOpenWorkloadbyServLoc.Code, TmpOpenWorkloadbyServLoc."Service Object No.") THEN BEGIN
+                  ObjectModificationLine.SETRECFILTER;
+                  IF ObjectModificationLine."Execution Date" < TODAY THEN
+                    PlanDate := TODAY;
+                  CreateServiceOrdersCU.CreateServiceOrdersModifi(ObjectModificationLine, PlanDate, 0, '', FALSE, '');
+                END;
+              END;
+            ITmpOpenWorkloadbyServLoc.Type::Replacement:
+              BEGIN
+                IF ReplacementLine.GET(TmpOpenWorkloadbyServLoc.Code, TmpOpenWorkloadbyServLoc."Service Object No.") THEN BEGIN
+                  ReplacementLine.SETRECFILTER;
+                  IF ReplacementLine."Replacement Date" < TODAY THEN
+                    PlanDate := TODAY;
+                  CreateServiceOrdersCU.CreateServiceOrdersReplace(ReplacementLine, PlanDate, 0, '', FALSE, '');
+                END;
+              END;
+          END;
+        UNTIL TmpOpenWorkloadbyServLoc.NEXT = 0;
+    END;
+
+    PROCEDURE GetServiceOrderObjectNo@1100528606(IServiceOrderNo@1100528600 : Code[20]) : Code[20];
+    VAR
+      ServiceOrderObject@1100528601 : Record 11071724;
+      NoOfObjects@1100528602 : Integer;
+    BEGIN
+      ServiceOrderObject.SETRANGE("Service Order No.", IServiceOrderNo);
+      IF ServiceOrderObject.ISEMPTY THEN
+        EXIT;
+      NoOfObjects := ServiceOrderObject.COUNT;
+      CASE NoOfObjects OF
+        1:
+          BEGIN
+            ServiceOrderObject.FINDFIRST;
+            EXIT(ServiceOrderObject."Object No.");
+          END;
+      ELSE
+        EXIT(STRSUBSTNO('[%1]', NoOfObjects));
+      END;
+    END;
+
+    PROCEDURE MergeServiceOrderDataSets@1100528614(VAR IServiceOrder1@1100528600 : Record 11012823;VAR IServiceOrder2@1100528601 : Record 11012823;VAR OServiceOrder@1100528602 : Record 11012823);
+    BEGIN
+      IF IServiceOrder1.FINDSET THEN
+        REPEAT
+          OServiceOrder."No." := IServiceOrder1."No.";
+          OServiceOrder.MARK(TRUE);
+        UNTIL IServiceOrder1.NEXT = 0;
+      IF IServiceOrder2.FINDSET THEN
+        REPEAT
+          OServiceOrder."No." := IServiceOrder2."No.";
+          OServiceOrder.MARK(TRUE);
+        UNTIL IServiceOrder2.NEXT = 0;
+      OServiceOrder.MARKEDONLY(TRUE);
+    END;
+
+    PROCEDURE "----"@1100528627();
+    BEGIN
+    END;
+
+    PROCEDURE PlanServiceOrdersByResource@1100528643(VAR IServiceOrder@1100528600 : Record 11012823;VAR ITmpCollectivePlanTeam@1100528621 : TEMPORARY Record 11071979;IStartingDate@1100528602 : Date;IEndingDate@1100528607 : Date;ITravelDuration@1100528603 : Duration;IMinimalUnoccupiedHours@1100528608 : Decimal;IOccupySeveralDays@1100528609 : Boolean;IPercentageToReserveForCalls@1100528618 : Decimal;IOverlapPercentage@1100528622 : Decimal;IKeepPlanAgreementWindow@1100528623 : Boolean);
+    VAR
+      ServiceOrder@1100528604 : Record 11012823;
+      MarkedServiceOrder@1100528620 : Record 11012823;
+      TmpServiceOrder@1100528605 : TEMPORARY Record 11012823;
+      Resource@1100528601 : Record 11229278;
+      TmpOccupiedTimeBuffer@1100528615 : TEMPORARY Record 11071809;
+      Workorder@1100528617 : Record 11229279;
+      StartingDate@1100528606 : Date;
+      StartingDate2@1100528610 : Date;
+      HoursToOccupy@1100528611 : Decimal;
+      LinesToProcess@1100528612 : Integer;
+      LinesProcessed@1100528613 : Integer;
+      ProgressDialog@1100528614 : Dialog;
+      OriginalStartingDate@1100528616 : Date;
+      PlanWindowType@1100528619 : 'PlanAgreementWindow,Other';
+    BEGIN
+      ServiceOrder.COPY(IServiceOrder);
+
+      MarkedServiceOrder.COPY(IServiceOrder);
+      StripFiltersOfServiceOrderDS(MarkedServiceOrder); // Remove all filters without losing the current key
+
+      IF ServiceOrder.ISEMPTY THEN
+        ERROR(Text008);
+      IF ServiceOrder.FINDSET THEN
+        REPEAT
+          MarkedServiceOrder."No." := ServiceOrder."No.";
+          MarkedServiceOrder.MARK(TRUE);
+        UNTIL ServiceOrder.NEXT = 0;
+      MarkedServiceOrder.MARKEDONLY(TRUE);
+      LinesToProcess := MarkedServiceOrder.COUNT;
+
+      ProgressDialog.OPEN(Text009);
+      OriginalStartingDate := IStartingDate;
+
+      Resource.SETRANGE("No.", ITmpCollectivePlanTeam.GetResourceNoTeamLeader(ITmpCollectivePlanTeam));
+      Resource.SETFILTER(Schedule, '%1|%2', Resource.Schedule::ServiceOrder, Resource.Schedule::Both);
+      Resource.SETRANGE(Type, Resource.Type::Employee);
+      IF NOT Resource.FINDSET THEN
+        EXIT;
+      REPEAT
+        IStartingDate := OriginalStartingDate;
+        TmpServiceOrder.RESET;
+        TmpServiceOrder.DELETEALL;
+        MarkedServiceOrder.SETFILTER("Duration Time", '<>%1', 0);
+        IF MarkedServiceOrder.FINDSET THEN
+          REPEAT
+            TmpServiceOrder.COPY(MarkedServiceOrder);
+            TmpServiceOrder.INSERT;
+          UNTIL MarkedServiceOrder.NEXT = 0;
+
+        ClearOccupiedTimeBuffer(Resource."No.", TmpOccupiedTimeBuffer);
+
+        IF IKeepPlanAgreementWindow THEN
+          PlanWindowType := PlanWindowType::PlanAgreementWindow
+        ELSE
+          PlanWindowType := PlanWindowType::Other;
+        FOR PlanWindowType := PlanWindowType TO PlanWindowType::Other DO BEGIN
+          IF TmpServiceOrder.FINDSET THEN BEGIN
+            IF NOT IOccupySeveralDays THEN BEGIN
+              StartingDate := IStartingDate;
+              REPEAT
+                FillOccupiedTimeBuffer(
+                  StartingDate, 0T, 000000T, Resource."No.", MarkedServiceOrder, 0, IPercentageToReserveForCalls, TmpOccupiedTimeBuffer);
+                CASE PlanWindowType OF
+                  PlanWindowType::PlanAgreementWindow:
+                    BEGIN
+                      TmpServiceOrder.SETFILTER("First Possible Starting Date", '<>%1&<=%2', 0D, StartingDate);
+                      TmpServiceOrder.SETFILTER("Last Possible Ending Date", '>=%1', StartingDate);
+                    END;
+                  PlanWindowType::Other:
+                    IF IKeepPlanAgreementWindow THEN BEGIN
+                      TmpServiceOrder.SETRANGE("First Possible Starting Date", 0D);
+                      TmpServiceOrder.SETRANGE("Last Possible Ending Date", 0D);
+                    END;
+                END;
+                IF TmpServiceOrder.FINDSET THEN
+                  REPEAT
+                    IF ServiceOrderMeetsPlanData(TmpServiceOrder, Resource."No.", StartingDate, StartingDate, 1) THEN BEGIN
+                      IF PlanWindowType = PlanWindowType::PlanAgreementWindow THEN
+                        AddPlanAgreementWindow(TmpServiceOrder, Resource."No.", StartingDate, TmpOccupiedTimeBuffer);
+                      IF PlanSingleServiceOrder(
+                        TmpServiceOrder, StartingDate, IEndingDate, Resource."No.", ITmpCollectivePlanTeam.COUNT,
+                        '', ITravelDuration, FALSE, FALSE, 0, IOverlapPercentage, TmpOccupiedTimeBuffer)
+                      THEN BEGIN
+                        TmpServiceOrder.DELETE;
+                        LinesProcessed += 1;
+                        ProgressDialog.UPDATE(1, ROUND(LinesProcessed / LinesToProcess * 9999, 1));
+                      END;
+                      IF PlanWindowType = PlanWindowType::PlanAgreementWindow THEN
+                        RemovePlanAgreementWindow(Resource."No.", IStartingDate, IEndingDate, TmpOccupiedTimeBuffer);
+                    END;
+                  UNTIL TmpServiceOrder.NEXT = 0;
+                IF PlanWindowType = PlanWindowType::PlanAgreementWindow THEN BEGIN
+                  TmpServiceOrder.SETFILTER("First Possible Starting Date", '<>%1', 0D);
+                  TmpServiceOrder.SETFILTER("Last Possible Ending Date", '<>%1', 0D);
+                END;
+                StartingDate := StartingDate + 1;
+              UNTIL (TmpServiceOrder.COUNT = 0) OR (StartingDate > IEndingDate);
+            END ELSE BEGIN
+              TmpServiceOrder.FINDSET;
+              REPEAT
+                IF ServiceOrderMeetsPlanData(TmpServiceOrder, Resource."No.", IStartingDate, IStartingDate, 1) THEN BEGIN
+                  StartingDate := IStartingDate;
+                  REPEAT
+                    IF PlanWindowType = PlanWindowType::PlanAgreementWindow THEN
+                      AddPlanAgreementWindow(TmpServiceOrder, Resource."No.", StartingDate, TmpOccupiedTimeBuffer);
+                    FillOccupiedTimeBuffer(StartingDate, 0T, 000000T, Resource."No.", MarkedServiceOrder, 0, IPercentageToReserveForCalls, TmpOccupiedTimeBuffer);
+                    PlanSingleServiceOrder(
+                      TmpServiceOrder, StartingDate, IEndingDate, Resource."No.", ITmpCollectivePlanTeam.COUNT, '',
+                      ITravelDuration, IOccupySeveralDays, IOccupySeveralDays, IMinimalUnoccupiedHours, IOverlapPercentage,
+                      TmpOccupiedTimeBuffer);
+                    IF TmpServiceOrder."Duration Time" > 0 THEN
+                      StartingDate := StartingDate + 1;
+                  UNTIL (TmpServiceOrder."Duration Time" = 0) OR (StartingDate > IEndingDate) OR NOT IOccupySeveralDays;
+                  IF TmpServiceOrder."Duration Time" > 0 THEN // Could not occupy enough hours
+                    RemoveOccupiedTimeEntries(Resource."No.", IStartingDate, IEndingDate, TmpOccupiedTimeBuffer)
+                  ELSE BEGIN
+                    TmpServiceOrder.DELETE;
+                    IStartingDate := StartingDate;
+                    UpdateUnoccupiedTimeEntries(Resource."No.", IStartingDate, TmpOccupiedTimeBuffer);
+                    LinesProcessed += 1;
+                    ProgressDialog.UPDATE(1, ROUND(LinesProcessed / LinesToProcess * 9999, 1));
+                  END;
+                END;
+                IF PlanWindowType = PlanWindowType::PlanAgreementWindow THEN
+                  RemovePlanAgreementWindow(Resource."No.", IStartingDate, IEndingDate, TmpOccupiedTimeBuffer);
+              UNTIL (TmpServiceOrder.NEXT = 0) OR (IStartingDate > IEndingDate);
+            END;
+            ProcessOccWorkingHours(ITmpCollectivePlanTeam, '', IOverlapPercentage, TmpOccupiedTimeBuffer, MarkedServiceOrder, FALSE, IKeepPlanAgreementWindow);
+          END;
+          TmpServiceOrder.RESET;
+        END;
+      UNTIL Resource.NEXT = 0;
+      ProgressDialog.CLOSE;
+
+      ServiceOrder.RESET;
+      ServiceOrder.COPY(MarkedServiceOrder);
+      ServiceOrder.SETFILTER("Employee No.", '<>%1', '');
+      ServiceOrder.SETFILTER("Starting Time", '<>%1', 0T);
+      ServiceOrder.SETFILTER("Ending Time", '<>%1', 0T);
+      IF LinesToProcess <> LinesProcessed THEN
+        MESSAGE(Text010,  LinesProcessed, LinesToProcess)
+      ELSE
+        MESSAGE(Text011);
+    END;
+
+    PROCEDURE PlanServiceOrdersResourceByResource@1100525006(VAR IServiceOrder@1100528600 : Record 11012823;VAR ITmpCollectivePlanTeam@1100528621 : TEMPORARY Record 11071979;IStartingDate@1100528602 : Date;IEndingDate@1100528607 : Date;ITravelDuration@1100528603 : Duration;IMinimalUnoccupiedHours@1100528608 : Decimal;IOccupySeveralDays@1100528609 : Boolean;IPercentageToReserveForCalls@1100528618 : Decimal;IOverlapPercentage@1100528622 : Decimal;IKeepPlanAgreementWindow@1100528619 : Boolean);
+    VAR
+      ServiceOrder@1100528604 : Record 11012823;
+      MarkedServiceOrder@1100528620 : Record 11012823;
+      TmpServiceOrder@1100528605 : TEMPORARY Record 11012823;
+      Resource@1100528601 : Record 11229278;
+      TmpOccupiedTimeBuffer@1100528615 : TEMPORARY Record 11071809;
+      Workorder@1100528617 : Record 11229279;
+      StartingDate@1100528606 : Date;
+      StartingDate2@1100528610 : Date;
+      HoursToOccupy@1100528611 : Decimal;
+      LinesToProcess@1100528612 : Integer;
+      LinesProcessed@1100528613 : Integer;
+      ProgressDialog@1100528614 : Dialog;
+      OriginalStartingDate@1100528616 : Date;
+      FirstTryToGetSOPlanned@1100528623 : Boolean;
+      PlanWindowType@1100528624 : 'PlanAgreementWindow,Other';
+    BEGIN
+      ServiceOrder.COPY(IServiceOrder);
+      IF ServiceOrder.ISEMPTY THEN
+        ERROR(Text008);
+
+      MarkedServiceOrder.COPY(IServiceOrder);
+      StripFiltersOfServiceOrderDS(MarkedServiceOrder); // Remove all filters without losing the current key
+      IF ServiceOrder.FINDSET THEN
+        REPEAT
+          MarkedServiceOrder."No." := ServiceOrder."No.";
+          MarkedServiceOrder.MARK(TRUE);
+        UNTIL ServiceOrder.NEXT = 0;
+      MarkedServiceOrder.MARKEDONLY(TRUE);
+      LinesToProcess := MarkedServiceOrder.COUNT;
+
+      ProgressDialog.OPEN(Text009);
+      OriginalStartingDate := IStartingDate;
+
+      IStartingDate := OriginalStartingDate;
+      Resource.SETFILTER("No.", ITmpCollectivePlanTeam.GetResourceFilter(ITmpCollectivePlanTeam));
+      Resource.SETFILTER(Schedule, '%1|%2', Resource.Schedule::ServiceOrder, Resource.Schedule::Both);
+      Resource.SETRANGE(Type, Resource.Type::Employee);
+      IF NOT Resource.FINDSET THEN
+        EXIT;
+      REPEAT    // loop through days
+        Resource.FINDSET;
+        REPEAT  // loop through resources
+          TmpServiceOrder.RESET;
+          TmpServiceOrder.DELETEALL;
+          MarkedServiceOrder.SETFILTER("Duration Time", '<>%1', 0);
+          IF MarkedServiceOrder.FINDSET THEN
+            REPEAT
+              TmpServiceOrder.COPY(MarkedServiceOrder);
+              TmpServiceOrder.INSERT;
+            UNTIL MarkedServiceOrder.NEXT = 0;
+
+          IF IKeepPlanAgreementWindow THEN
+            PlanWindowType := PlanWindowType::PlanAgreementWindow
+          ELSE
+            PlanWindowType := PlanWindowType::Other;
+          FOR PlanWindowType := PlanWindowType TO PlanWindowType::Other DO BEGIN
+            CASE PlanWindowType OF
+              PlanWindowType::PlanAgreementWindow:
+                BEGIN
+                  TmpServiceOrder.SETFILTER("First Possible Starting Date", '<>%1&<=%2', 0D, IStartingDate);
+                  TmpServiceOrder.SETFILTER("Last Possible Ending Date", '>=%1', IStartingDate);
+                END;
+              PlanWindowType::Other:
+                IF IKeepPlanAgreementWindow THEN
+                  TmpServiceOrder.SETRANGE("First Possible Starting Date", 0D);
+            END;
+            IF TmpServiceOrder.FINDSET THEN BEGIN
+              IF NOT IOccupySeveralDays THEN BEGIN
+                FillOccupiedTimeBuffer(
+                  IStartingDate, 0T, 000000T, Resource."No.", MarkedServiceOrder, 0, IPercentageToReserveForCalls, TmpOccupiedTimeBuffer);
+                REPEAT
+                  IF ServiceOrderMeetsPlanData(TmpServiceOrder, Resource."No.", IStartingDate, IStartingDate, 1) THEN BEGIN
+                    IF PlanWindowType = PlanWindowType::PlanAgreementWindow THEN
+                      AddPlanAgreementWindow(TmpServiceOrder, Resource."No.", IStartingDate, TmpOccupiedTimeBuffer);
+                    IF PlanSingleServiceOrder(
+                      TmpServiceOrder, IStartingDate, IEndingDate, Resource."No.", 1,
+                      '', ITravelDuration, FALSE, FALSE, 0, IOverlapPercentage, TmpOccupiedTimeBuffer)
+                    THEN BEGIN
+                      TmpServiceOrder.DELETE;
+                      LinesProcessed += 1;
+                      ProgressDialog.UPDATE(1, ROUND(LinesProcessed / LinesToProcess * 9999, 1));
+                    END;
+                    IF PlanWindowType = PlanWindowType::PlanAgreementWindow THEN
+                      RemovePlanAgreementWindow(Resource."No.", IStartingDate, IStartingDate, TmpOccupiedTimeBuffer);
+                  END;
+                UNTIL TmpServiceOrder.NEXT = 0;
+              END ELSE BEGIN
+                REPEAT
+                  IF ServiceOrderMeetsPlanData(TmpServiceOrder, Resource."No.", IStartingDate, IStartingDate, 1) THEN BEGIN
+                    StartingDate := IStartingDate;
+                    FirstTryToGetSOPlanned := TRUE;
+                    REPEAT
+                      IF PlanWindowType = PlanWindowType::PlanAgreementWindow THEN
+                        AddPlanAgreementWindow(TmpServiceOrder, Resource."No.", StartingDate, TmpOccupiedTimeBuffer);
+                      FillOccupiedTimeBuffer(StartingDate, 0T, 000000T, Resource."No.", MarkedServiceOrder, 0, IPercentageToReserveForCalls, TmpOccupiedTimeBuffer);
+                      IF PlanSingleServiceOrder(
+                        TmpServiceOrder, StartingDate, IEndingDate, Resource."No.", 1, '', ITravelDuration, IOccupySeveralDays,
+                        IOccupySeveralDays, IMinimalUnoccupiedHours, IOverlapPercentage, TmpOccupiedTimeBuffer)
+                      THEN
+                        FirstTryToGetSOPlanned := FALSE;
+                      IF TmpServiceOrder."Duration Time" > 0 THEN
+                        StartingDate := StartingDate + 1;
+                    UNTIL FirstTryToGetSOPlanned OR (TmpServiceOrder."Duration Time" = 0) OR (StartingDate > IEndingDate) OR NOT IOccupySeveralDays;
+                    IF NOT FirstTryToGetSOPlanned THEN BEGIN
+                      IF TmpServiceOrder."Duration Time" > 0 THEN // Could not occupy enough hours
+                        RemoveOccupiedTimeEntries(Resource."No.", IStartingDate, IEndingDate, TmpOccupiedTimeBuffer)
+                      ELSE BEGIN
+                        TmpServiceOrder.DELETE;
+                        UpdateUnoccupiedTimeEntries(Resource."No.", IStartingDate, TmpOccupiedTimeBuffer);
+                        LinesProcessed += 1;
+                        ProgressDialog.UPDATE(1, ROUND(LinesProcessed / LinesToProcess * 9999, 1));
+                      END;
+                    END;
+                  END;
+                  IF PlanWindowType = PlanWindowType::PlanAgreementWindow THEN
+                    RemovePlanAgreementWindow(Resource."No.", IStartingDate, IEndingDate, TmpOccupiedTimeBuffer);
+                UNTIL TmpServiceOrder.NEXT = 0;
+              END;
+              ProcessOccWorkingHours(ITmpCollectivePlanTeam, Resource."No.", IOverlapPercentage, TmpOccupiedTimeBuffer, MarkedServiceOrder, TRUE, IKeepPlanAgreementWindow);
+              ClearOccupiedTimeBuffer(Resource."No.", TmpOccupiedTimeBuffer);
+            END;
+            TmpServiceOrder.RESET;
+          END;
+        UNTIL Resource.NEXT = 0;
+        IStartingDate += 1;
+      UNTIL (TmpServiceOrder.COUNT = 0) OR (IStartingDate > IEndingDate);
+      ProgressDialog.CLOSE;
+
+      IF LinesToProcess <> LinesProcessed THEN
+        MESSAGE(Text010,  LinesProcessed, LinesToProcess)
+      ELSE
+        MESSAGE(Text011);
+    END;
+
+    PROCEDURE StripFiltersOfServiceOrderDS@1100525002(VAR IOServiceOrder@1100525000 : Record 11012823);
+    VAR
+      TableRef@1100525001 : RecordRef;
+      FieldRef@1100525002 : FieldRef;
+      FieldNo@1100525003 : Integer;
+    BEGIN
+      TableRef.GETTABLE(IOServiceOrder);
+      FOR FieldNo := 1 TO TableRef.FIELDCOUNT DO BEGIN
+        FieldRef := TableRef.FIELDINDEX(FieldNo);
+        FieldRef.SETRANGE;
+      END;
+      TableRef.SETTABLE(IOServiceOrder);
+    END;
+
+    LOCAL PROCEDURE FillOccupiedTimeBuffer@1100528610(IDate@1100528601 : Date;IStartingTime@1100528616 : Time;IEndingTime@1100528623 : Time;IResourceNo@1100528606 : Code[20];VAR IExcludeServiceOrder@1100528612 : Record 11012823;IPlanTimeType@1100528617 : 'Regular Work Time,Consignment Time';IPercentageToReserveForCalls@1100528622 : Decimal;VAR OTmpOccupiedTimeBuffer@1100528613 : TEMPORARY Record 11071809);
+    VAR
+      CompanyInformation@1100528602 : Record 79;
+      EmployeeTimeTable@1100528600 : Record 11012923;
+      BaseCalendar@1100528607 : Record 11072014;
+      EmployeeAbsence@1100528609 : Record 5207;
+      ServiceOrder@1100528611 : Record 11012823;
+      ConsignmentRoster@1100528619 : Record 11012865;
+      ConsignmentRoster2@1100528621 : Record 11012865;
+      Resource@1100528625 : Record 11229278;
+      WorkOrder@1100528618 : Record 11229279;
+      CompanyPlanGroup@1100528630 : Record 11229300;
+      CalendarManagement@1100528604 : Codeunit 7600;
+      NonWorking@1100528603 : Boolean;
+      Description@1100528605 : Text[30];
+      DOW@1100528610 : Integer;
+      StartingTime@1100528614 : Time;
+      EndingTime@1100528615 : Time;
+      ConsignmentRosterFound@1100528620 : Boolean;
+      EmployeeNo@1100528624 : Code[20];
+      SeekStartingTime@1100528626 : Time;
+      SeekEndingTime@1100528628 : Time;
+      RosterFollowing@1100528627 : Boolean;
+      SetupCompanyName@1100528629 : Text[30];
+    BEGIN
+      ResetOccupiedTimeBufferFilter(IResourceNo, OTmpOccupiedTimeBuffer);
+      OTmpOccupiedTimeBuffer.SETRANGE("Starting Date", IDate);
+      IF NOT OTmpOccupiedTimeBuffer.ISEMPTY THEN
+        EXIT;
+
+      EmployeeNo := '';
+      IF IResourceNo <> '' THEN BEGIN
+        IF Resource.GET(IResourceNo) THEN BEGIN
+          IF Resource.Type = Resource.Type::Employee THEN
+            EmployeeNo := Resource."Source No.";
+        END;
+      END;
+      IF (EmployeeNo <> '') AND (Resource.Company <> COMPANYNAME) THEN BEGIN
+        IF NOT CompanyInformation.CHANGECOMPANY(Resource.Company) THEN
+          EXIT;
+        EmployeeTimeTable.CHANGECOMPANY(Resource.Company);
+        EmployeeAbsence.CHANGECOMPANY(Resource.Company);
+        ConsignmentRoster.CHANGECOMPANY(Resource.Company);
+        ConsignmentRoster2.CHANGECOMPANY(Resource.Company);
+      END;
+      SetupCompanyName := CompanyPlanGroup.GetSetupCompanyOfCurrentCompanyPlanGroup();
+      IF SetupCompanyName <> COMPANYNAME THEN BEGIN
+        CompanyInformation.CHANGECOMPANY(SetupCompanyName);
+        BaseCalendar.CHANGECOMPANY(SetupCompanyName);
+      END;
+
+      IF IPlanTimeType = IPlanTimeType::"Regular Work Time" THEN BEGIN
+        CompanyInformation.GET;
+        NonWorking := CalendarManagement.CheckDateStatus(CompanyInformation."Base Calendar Code", IDate, Description);
+        IF NonWorking THEN BEGIN
+          InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, 235959.999T, OccupiedType::"Base Calendar", '', '', OTmpOccupiedTimeBuffer);
+          EXIT;
+        END;
+
+        DOW := DATE2DWY(IDate, 1);
+        EmployeeTimeTable.SETRANGE("Employee No.", EmployeeNo);
+        EmployeeTimeTable.SETFILTER("Effective Date", '..%1', IDate);
+        IF (EmployeeNo <> '') AND EmployeeTimeTable.FINDLAST THEN BEGIN
+          CASE DOW OF
+            1:
+              BEGIN
+                IF EmployeeTimeTable."Monday Work From" <> 0T THEN BEGIN
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, EmployeeTimeTable."Monday Work From", OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, EmployeeTimeTable."Monday Work Until", 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                END ELSE
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                IF (EmployeeTimeTable."Monday Pause From" <> 0T) AND (EmployeeTimeTable."Monday Pause Until" <> 0T) THEN
+                  InsertOccupiedTimeEntry(
+                    IResourceNo, IDate, EmployeeTimeTable."Monday Pause From", EmployeeTimeTable."Monday Pause Until", OccupiedType::Pause, '', '', OTmpOccupiedTimeBuffer);
+              END;
+            2:
+              BEGIN
+                IF EmployeeTimeTable."Tuesday Work From" <> 0T THEN BEGIN
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, EmployeeTimeTable."Tuesday Work From", OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, EmployeeTimeTable."Tuesday Work Until", 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                END ELSE
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                IF (EmployeeTimeTable."Tuesday Pause From" <> 0T) AND (EmployeeTimeTable."Tuesday Pause Until" <> 0T) THEN
+                  InsertOccupiedTimeEntry(
+                    IResourceNo, IDate, EmployeeTimeTable."Tuesday Pause From", EmployeeTimeTable."Tuesday Pause Until", OccupiedType::Pause, '', '', OTmpOccupiedTimeBuffer);
+              END;
+            3:
+              BEGIN
+                IF EmployeeTimeTable."Wednesday Work From" <> 0T THEN BEGIN
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, EmployeeTimeTable."Wednesday Work From", OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, EmployeeTimeTable."Wednesday Work Until", 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                END ELSE
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                IF (EmployeeTimeTable."Wednesday Pause From" <> 0T) AND (EmployeeTimeTable."Wednesday Pause Until" <> 0T) THEN
+                  InsertOccupiedTimeEntry(
+                    IResourceNo, IDate, EmployeeTimeTable."Wednesday Pause From", EmployeeTimeTable."Wednesday Pause Until", OccupiedType::Pause, '', '', OTmpOccupiedTimeBuffer);
+              END;
+            4:
+              BEGIN
+                IF EmployeeTimeTable."Thursday Work From" <> 0T THEN BEGIN
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, EmployeeTimeTable."Thursday Work From", OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, EmployeeTimeTable."Thursday Work Until", 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                END ELSE
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                IF (EmployeeTimeTable."Thursday Pause From" <> 0T) AND (EmployeeTimeTable."Thursday Pause Until" <> 0T) THEN
+                  InsertOccupiedTimeEntry(
+                    IResourceNo, IDate, EmployeeTimeTable."Thursday Pause From", EmployeeTimeTable."Thursday Pause Until", OccupiedType::Pause, '', '', OTmpOccupiedTimeBuffer);
+              END;
+            5:
+              BEGIN
+                IF EmployeeTimeTable."Friday Work From" <> 0T THEN BEGIN
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, EmployeeTimeTable."Friday Work From", OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, EmployeeTimeTable."Friday Work Until", 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                END ELSE
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                IF (EmployeeTimeTable."Friday Pause From" <> 0T) AND (EmployeeTimeTable."Friday Pause Until" <> 0T) THEN
+                  InsertOccupiedTimeEntry(
+                    IResourceNo, IDate, EmployeeTimeTable."Friday Pause From", EmployeeTimeTable."Friday Pause Until", OccupiedType::Pause, '', '', OTmpOccupiedTimeBuffer);
+              END;
+            6:
+              BEGIN
+                IF EmployeeTimeTable."Saturday Work From" <> 0T THEN BEGIN
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, EmployeeTimeTable."Saturday Work From", OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, EmployeeTimeTable."Saturday Work Until", 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                END ELSE
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                IF (EmployeeTimeTable."Saturday Pause From" <> 0T) AND (EmployeeTimeTable."Saturday Pause Until" <> 0T) THEN
+                  InsertOccupiedTimeEntry(
+                    IResourceNo, IDate, EmployeeTimeTable."Saturday Pause From", EmployeeTimeTable."Saturday Pause Until", OccupiedType::Pause, '', '', OTmpOccupiedTimeBuffer);
+              END;
+            7:
+              BEGIN
+                IF EmployeeTimeTable."Sunday Work From" <> 0T THEN BEGIN
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, EmployeeTimeTable."Sunday Work From", OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, EmployeeTimeTable."Sunday Work Until", 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                END ELSE
+                  InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                IF (EmployeeTimeTable."Sunday Pause From" <> 0T) AND (EmployeeTimeTable."Sunday Pause Until" <> 0T) THEN
+                  InsertOccupiedTimeEntry(
+                    IResourceNo, IDate, EmployeeTimeTable."Sunday Pause From", EmployeeTimeTable."Sunday Pause Until", OccupiedType::Pause, '', '', OTmpOccupiedTimeBuffer);
+              END;
+          END;
+        END ELSE BEGIN
+          IF CompanyInformation.READPERMISSION THEN
+            IF NOT CompanyInformation.GET THEN
+              CompanyInformation.INIT;
+          IF BaseCalendar.READPERMISSION THEN BEGIN
+            IF BaseCalendar.GET(CompanyInformation."Base Calendar Code") THEN BEGIN
+              CASE DOW OF
+                1:
+                  BEGIN
+                    IF BaseCalendar."Monday Work From" <> 0T THEN BEGIN
+                      InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, BaseCalendar."Monday Work From", OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                      InsertOccupiedTimeEntry(IResourceNo, IDate, BaseCalendar."Monday Work Until", 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                    END ELSE
+                      InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                    IF (BaseCalendar."Monday Pause From" <> 0T) AND (BaseCalendar."Monday Pause Until" <> 0T) THEN
+                      InsertOccupiedTimeEntry(
+                        IResourceNo, IDate, BaseCalendar."Monday Pause From", BaseCalendar."Monday Pause Until", OccupiedType::Pause, '', '', OTmpOccupiedTimeBuffer);
+                  END;
+                2:
+                  BEGIN
+                    IF BaseCalendar."Tuesday Work From" <> 0T THEN BEGIN
+                      InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, BaseCalendar."Tuesday Work From", OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                      InsertOccupiedTimeEntry(IResourceNo, IDate, BaseCalendar."Tuesday Work Until", 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                    END ELSE
+                      InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                    IF (BaseCalendar."Tuesday Pause From" <> 0T) AND (BaseCalendar."Tuesday Pause Until" <> 0T) THEN
+                      InsertOccupiedTimeEntry(
+                        IResourceNo, IDate, BaseCalendar."Tuesday Pause From", BaseCalendar."Tuesday Pause Until", OccupiedType::Pause, '', '', OTmpOccupiedTimeBuffer);
+                  END;
+                3:
+                  BEGIN
+                    IF BaseCalendar."Wednesday Work From" <> 0T THEN BEGIN
+                      InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, BaseCalendar."Wednesday Work From", OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                      InsertOccupiedTimeEntry(
+                       IResourceNo, IDate, BaseCalendar."Wednesday Work Until", 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                    END ELSE
+                      InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                    IF (BaseCalendar."Wednesday Pause From" <> 0T) AND (BaseCalendar."Wednesday Pause Until" <> 0T) THEN
+                      InsertOccupiedTimeEntry(
+                        IResourceNo, IDate, BaseCalendar."Wednesday Pause From", BaseCalendar."Wednesday Pause Until", OccupiedType::Pause, '', '', OTmpOccupiedTimeBuffer);
+                  END;
+                4:
+                  BEGIN
+                    IF BaseCalendar."Thursday Work From" <> 0T THEN BEGIN
+                      InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, BaseCalendar."Thursday Work From", OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                      InsertOccupiedTimeEntry(
+                        IResourceNo, IDate, BaseCalendar."Thursday Work Until", 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                    END ELSE
+                      InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                    IF (BaseCalendar."Thursday Pause From" <> 0T) AND (BaseCalendar."Thursday Pause Until" <> 0T) THEN
+                      InsertOccupiedTimeEntry(
+                        IResourceNo, IDate, BaseCalendar."Thursday Pause From", BaseCalendar."Thursday Pause Until", OccupiedType::Pause, '', '', OTmpOccupiedTimeBuffer);
+                  END;
+                5:
+                  BEGIN
+                    IF BaseCalendar."Friday Work From" <> 0T THEN BEGIN
+                      InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, BaseCalendar."Friday Work From", OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                      InsertOccupiedTimeEntry(IResourceNo, IDate, BaseCalendar."Friday Work Until", 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                    END ELSE
+                      InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                    IF (BaseCalendar."Friday Pause From" <> 0T) AND (BaseCalendar."Friday Pause Until" <> 0T) THEN
+                      InsertOccupiedTimeEntry(
+                        IResourceNo, IDate, BaseCalendar."Friday Pause From", BaseCalendar."Friday Pause Until", OccupiedType::Pause, '', '', OTmpOccupiedTimeBuffer);
+                  END;
+                6:
+                  BEGIN
+                    IF BaseCalendar."Saturday Work From" <> 0T THEN BEGIN
+                      InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, BaseCalendar."Saturday Work From", OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                      InsertOccupiedTimeEntry(
+                        IResourceNo, IDate, BaseCalendar."Saturday Work Until", 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                    END ELSE
+                      InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                    IF (BaseCalendar."Saturday Pause From" <> 0T) AND (BaseCalendar."Saturday Pause Until" <> 0T) THEN
+                      InsertOccupiedTimeEntry(
+                        IResourceNo, IDate, BaseCalendar."Saturday Pause From", BaseCalendar."Saturday Pause Until", OccupiedType::Pause, '', '', OTmpOccupiedTimeBuffer);
+                  END;
+                7:
+                  BEGIN
+                    IF BaseCalendar."Sunday Work From" <> 0T THEN BEGIN
+                      InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, BaseCalendar."Sunday Work From", OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                      InsertOccupiedTimeEntry(IResourceNo, IDate, BaseCalendar."Sunday Work Until", 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                    END ELSE
+                      InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, 235959.999T, OccupiedType::"Employee Time Table", '', '', OTmpOccupiedTimeBuffer);
+                    IF (BaseCalendar."Sunday Pause From" <> 0T) AND (BaseCalendar."Sunday Pause Until" <> 0T) THEN
+                      InsertOccupiedTimeEntry(
+                        IResourceNo, IDate, BaseCalendar."Sunday Pause From", BaseCalendar."Sunday Pause Until", OccupiedType::Pause, '', '', OTmpOccupiedTimeBuffer);
+                  END;
+              END;
+            END;
+          END;
+        END;
+
+        IF EmployeeNo <> '' THEN BEGIN
+          EmployeeAbsence.SETCURRENTKEY("Employee No.", "From Date");
+          EmployeeAbsence.SETRANGE("Employee No.", EmployeeNo);
+          EmployeeAbsence.SETFILTER("From Date", '<=%1', IDate);
+          EmployeeAbsence.SETFILTER("To Date", '>=%1', IDate);
+          EmployeeAbsence.SETRANGE(Plannable, FALSE);
+          IF EmployeeAbsence.FINDFIRST THEN
+            REPEAT
+              IF EmployeeAbsence."From Date" < IDate THEN
+                StartingTime := 0T
+              ELSE
+                StartingTime := EmployeeAbsence."From Time";
+              IF EmployeeAbsence."To Date" > IDate THEN
+                EndingTime := 0T
+              ELSE
+                EndingTime := EmployeeAbsence."Until Time";
+              IF EndingTime = 0T THEN
+                EndingTime := 235959.999T;
+              InsertOccupiedTimeEntry(IResourceNo, IDate, StartingTime, EndingTime, OccupiedType::"Employee Absence", '', '', OTmpOccupiedTimeBuffer);
+            UNTIL EmployeeAbsence.NEXT = 0;
+          IF IPercentageToReserveForCalls <> 0 THEN BEGIN
+            RemoveDoubleOccTimeEntries(IResourceNo, IDate, OTmpOccupiedTimeBuffer);
+            UpdateUnoccupiedTimeEntries(IResourceNo, IDate, OTmpOccupiedTimeBuffer);
+            InsertReserveHoursPercForCalls(IDate, IResourceNo, IPercentageToReserveForCalls, OTmpOccupiedTimeBuffer);
+          END;
+        END;
+      END ELSE BEGIN // Consignment
+        ConsignmentRoster.SETCURRENTKEY("Employee No.");
+        ConsignmentRoster.SETFILTER("Start Date", '<=%1', IDate);
+        ConsignmentRoster.SETFILTER("End Date", '>=%1', IDate);
+        ConsignmentRoster.SETRANGE("Employee No.", EmployeeNo);
+        ConsignmentRoster.SETFILTER("Watch Code", GetWatchFilterByServiceOrder(Resource.Company, IExcludeServiceOrder));
+        IF ConsignmentRoster.FINDSET THEN BEGIN
+          REPEAT
+            ConsignmentRoster.CALCFIELDS("End Date", "End Time");
+            IF ConsignmentRoster."Start Date" = IDate THEN BEGIN
+              StartingTime := 0T;
+              EndingTime := ConsignmentRoster."Start Time";
+              SeekStartingTime := EndingTime;
+              REPEAT
+                ConsignmentRoster2.RESET;
+                ConsignmentRoster2.SETRANGE("Employee No.", EmployeeNo);
+                ConsignmentRoster2.SETRANGE("End Date", IDate);
+                ConsignmentRoster2.SETFILTER("End Time", '<=%1', SeekStartingTime);
+                IF ConsignmentRoster2.FINDLAST THEN BEGIN
+                  ConsignmentRoster2.CALCFIELDS("End Time");
+                  RosterFollowing := SeekStartingTime = ConsignmentRoster2."End Time";
+                  IF RosterFollowing THEN BEGIN
+                    SeekStartingTime := ConsignmentRoster2."Start Time";
+                    EndingTime := ConsignmentRoster2."Start Time";
+                  END ELSE
+                    StartingTime := ConsignmentRoster2."End Time";
+                END;
+              UNTIL ConsignmentRoster2.ISEMPTY OR NOT RosterFollowing;
+              IF StartingTime < EndingTime THEN BEGIN
+                InsertOccupiedTimeEntry(IResourceNo, IDate, StartingTime, EndingTime, OccupiedType::Consignment, '', '', OTmpOccupiedTimeBuffer);
+                ConsignmentRosterFound := TRUE;
+              END;
+            END;
+            IF (ConsignmentRoster."End Date" = IDate) AND (ConsignmentRoster."End Time" <> 0T) THEN BEGIN
+              StartingTime := ConsignmentRoster."End Time";
+              EndingTime := 235959.999T;
+              SeekEndingTime := StartingTime;
+              REPEAT
+                ConsignmentRoster2.RESET;
+                ConsignmentRoster2.SETRANGE("Employee No.", EmployeeNo);
+                ConsignmentRoster2.SETRANGE("Start Date", IDate);
+                ConsignmentRoster2.SETFILTER("Start Time", '>=%1', SeekEndingTime);
+                IF ConsignmentRoster2.FINDFIRST THEN BEGIN
+                  RosterFollowing := SeekEndingTime = ConsignmentRoster2."Start Time";
+                  IF RosterFollowing THEN BEGIN
+                    ConsignmentRoster2.CALCFIELDS("End Time");
+                    SeekEndingTime := ConsignmentRoster2."End Time";
+                    StartingTime := SeekEndingTime
+                  END ELSE
+                    EndingTime := ConsignmentRoster2."Start Time";
+                END;
+              UNTIL ConsignmentRoster2.ISEMPTY OR NOT RosterFollowing;
+              IF StartingTime < EndingTime THEN BEGIN
+                InsertOccupiedTimeEntry(IResourceNo, IDate, StartingTime, EndingTime, OccupiedType::Consignment, '', '', OTmpOccupiedTimeBuffer);
+                ConsignmentRosterFound := TRUE;
+              END;
+            END;
+          UNTIL ConsignmentRoster.NEXT = 0;
+        END;
+        IF ConsignmentRosterFound THEN
+          InsertOccupiedTimeEntry(IResourceNo, IDate, 000000T, 000000T, OccupiedType::Consignment, '', '', OTmpOccupiedTimeBuffer)
+        ELSE
+          InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, 235959.999T, OccupiedType::Consignment, '', '', OTmpOccupiedTimeBuffer);
+      END;
+
+      RemoveDoubleOccTimeEntries(IResourceNo, IDate, OTmpOccupiedTimeBuffer);
+      UpdateUnoccupiedTimeEntries(IResourceNo, IDate, OTmpOccupiedTimeBuffer);
+
+      IF IStartingTime <> 0T THEN
+        InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, IStartingTime, OccupiedType::"Outside Maintenance Window", '', '', OTmpOccupiedTimeBuffer);
+      IF (IEndingTime <> 0T) AND (IEndingTime <> 000000T) THEN
+        InsertOccupiedTimeEntry(IResourceNo, IDate, IEndingTime, 235959.999T, OccupiedType::"Outside Maintenance Window", '', '', OTmpOccupiedTimeBuffer);
+
+      WorkOrder.SETCURRENTKEY("Resource No.");
+      WorkOrder.SETRANGE("Resource No.", IResourceNo);
+      WorkOrder.SETRANGE("Source Type", WorkOrder."Source Type"::ServiceOrder);
+      WorkOrder.SETFILTER("Starting Date/Time", '<=%1', DATI2VARIANT(IDate, 235959.999T));
+      WorkOrder.SETFILTER("Ending Date/Time", '>=%1', DATI2VARIANT(IDate, 0T));
+      IF WorkOrder.FINDSET THEN
+        REPEAT
+          IF DT2DATE(WorkOrder."Starting Date/Time") < IDate THEN
+            StartingTime := 0T
+          ELSE
+            StartingTime := DT2TIME(WorkOrder."Starting Date/Time");
+          IF DT2DATE(WorkOrder."Ending Date/Time") > IDate THEN
+            EndingTime := 235959.999T
+          ELSE
+            EndingTime := DT2TIME(WorkOrder."Ending Date/Time");
+          IF ServiceOrder.CHANGECOMPANY(WorkOrder."Source Company") AND ServiceOrder.READPERMISSION THEN
+            ServiceOrder.GET(WorkOrder."Source No.")
+          ELSE
+            ServiceOrder.INIT;
+          IF (ServiceOrder."No." = '') OR (ServiceOrder.Status < ServiceOrder.Status::Cancelled) THEN
+            IF NOT IsServiceOrderInDataSet(ServiceOrder, IExcludeServiceOrder) THEN
+              InsertOccupiedTimeEntry(IResourceNo, IDate, StartingTime, EndingTime, OccupiedType::"Planned Service Order", WorkOrder."Source No.",
+                WorkOrder."Source Company", OTmpOccupiedTimeBuffer);
+        UNTIL WorkOrder.NEXT = 0;
+
+      RemoveDoubleOccTimeEntries(IResourceNo, IDate, OTmpOccupiedTimeBuffer);
+      UpdateUnoccupiedTimeEntries(IResourceNo, IDate, OTmpOccupiedTimeBuffer);
+    END;
+
+    PROCEDURE ClearOccupiedTimeBuffer@1100528619(IResourceNo@1100528601 : Code[20];VAR OTmpOccupiedTimeBuffer@1100528600 : TEMPORARY Record 11071809);
+    BEGIN
+      ResetOccupiedTimeBufferFilter(IResourceNo, OTmpOccupiedTimeBuffer);
+      OTmpOccupiedTimeBuffer.DELETEALL;
+    END;
+
+    LOCAL PROCEDURE InsertOccupiedTimeEntry@1100528608(IResourceNo@1100528604 : Code[20];IStartingDate@1100528600 : Date;IStartTime@1100528601 : Time;IEndTime@1100528603 : Time;IOccupiedType@1100528605 : Option;IServiceOrderNo@1100528606 : Code[20];ICompanyName@1100528607 : Text[30];VAR OTmpOccupiedTimeBuffer@1100528602 : TEMPORARY Record 11071809);
+    BEGIN
+      OTmpOccupiedTimeBuffer.INIT;
+      LastEntryNo += 1;
+      OTmpOccupiedTimeBuffer."Entry No." := LastEntryNo;
+      OTmpOccupiedTimeBuffer.VALIDATE("Starting Date", IStartingDate);
+      OTmpOccupiedTimeBuffer."Starting Time" := IStartTime;
+      OTmpOccupiedTimeBuffer."Ending Time" := IEndTime;
+      OTmpOccupiedTimeBuffer."Occupied Type" := IOccupiedType;
+      OTmpOccupiedTimeBuffer."Resource No." := IResourceNo;
+      OTmpOccupiedTimeBuffer."Service Order No." := IServiceOrderNo;
+      OTmpOccupiedTimeBuffer.Company := ICompanyName;
+      OTmpOccupiedTimeBuffer.INSERT(TRUE);
+    END;
+
+    PROCEDURE RemoveDoubleOccTimeEntries@1100528609(IResourceNo@1100528605 : Code[20];IStartingDate@1100528602 : Date;VAR OTmpOccupiedTimeBuffer@1100528604 : TEMPORARY Record 11071809);
+    VAR
+      TmpOccupiedTimeBuffer2@1100528603 : TEMPORARY Record 11071809;
+      StartingTime@1100528600 : Time;
+      EndingTime@1100528601 : Time;
+      IsFirstRecord@1100528606 : Boolean;
+    BEGIN
+      TmpOccupiedTimeBuffer2.COPY(OTmpOccupiedTimeBuffer, TRUE);
+      ResetOccupiedTimeBufferFilter(IResourceNo, TmpOccupiedTimeBuffer2);
+      TmpOccupiedTimeBuffer2.SETRANGE("Starting Date", IStartingDate);
+      IF TmpOccupiedTimeBuffer2.FINDFIRST THEN BEGIN
+        IsFirstRecord := TRUE;
+        REPEAT
+          IF TmpOccupiedTimeBuffer2."Ending Time" > EndingTime THEN BEGIN
+            IF TmpOccupiedTimeBuffer2."Starting Time" > EndingTime THEN
+              StartingTime := TmpOccupiedTimeBuffer2."Starting Time";
+            EndingTime := TmpOccupiedTimeBuffer2."Ending Time";
+          END
+          ELSE
+          IF NOT IsFirstRecord AND (TmpOccupiedTimeBuffer2."Ending Time" <= EndingTime) THEN BEGIN
+            TmpOccupiedTimeBuffer2.Deleted := TRUE;
+            TmpOccupiedTimeBuffer2.MODIFY;
+          END;
+          IsFirstRecord := FALSE;
+        UNTIL TmpOccupiedTimeBuffer2.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE UpdateUnoccupiedTimeEntries@1100528616(IResourceNo@1100528607 : Code[20];IStartingDate@1100528602 : Date;VAR OTmpOccupiedTimeBuffer@1100528606 : TEMPORARY Record 11071809);
+    VAR
+      TmpOccupiedTimeBuffer2@1100528605 : TEMPORARY Record 11071809;
+      LastOccupiedTimeBuffer@1100528601 : TEMPORARY Record 11071809;
+      EndingTime@1100528600 : Time;
+      TimeDuration@1100528603 : Duration;
+      PauseStartingTime@1100528604 : Time;
+      IsFirstRecord@1100528608 : Boolean;
+    BEGIN
+      EndingTime := 0T;
+      LastOccupiedTimeBuffer.COPY(OTmpOccupiedTimeBuffer, TRUE);
+      TmpOccupiedTimeBuffer2.COPY(OTmpOccupiedTimeBuffer, TRUE);
+      ResetOccupiedTimeBufferFilter(IResourceNo, TmpOccupiedTimeBuffer2);
+      TmpOccupiedTimeBuffer2.SETRANGE("Starting Date", IStartingDate);
+      TmpOccupiedTimeBuffer2.SETFILTER("Occupied Type", '<>%1', TmpOccupiedTimeBuffer2."Occupied Type"::Pause);
+      IF TmpOccupiedTimeBuffer2.FINDSET THEN BEGIN
+        IsFirstRecord := TRUE;
+        REPEAT
+          IF NOT IsFirstRecord THEN BEGIN
+            IF (TmpOccupiedTimeBuffer2."Starting Time" >= EndingTime) AND (TmpOccupiedTimeBuffer2."Starting Time" <> 0T) THEN
+              TimeDuration := TmpOccupiedTimeBuffer2."Starting Time" - EndingTime
+            ELSE
+              TimeDuration := 0;
+            LastOccupiedTimeBuffer."Unoccupied Hours" :=
+              TimeDuration / 1000 / 60 / 60 -
+              GetPauseHoursFromOccupiedTimeEntries(IResourceNo, IStartingDate, EndingTime, TmpOccupiedTimeBuffer2."Starting Time", PauseStartingTime, OTmpOccupiedTimeBuffer);
+            LastOccupiedTimeBuffer.MODIFY;
+          END;
+          EndingTime := TmpOccupiedTimeBuffer2."Ending Time";
+          LastOccupiedTimeBuffer := TmpOccupiedTimeBuffer2;
+          IsFirstRecord := FALSE;
+        UNTIL TmpOccupiedTimeBuffer2.NEXT = 0;
+        TimeDuration := 235959.999T - EndingTime;
+      //  TimeDuration := EndingTime - 000000T;
+        LastOccupiedTimeBuffer."Unoccupied Hours" :=
+          TimeDuration / 1000 / 60 / 60 -
+          GetPauseHoursFromOccupiedTimeEntries(IResourceNo, IStartingDate, TmpOccupiedTimeBuffer2."Starting Time", EndingTime, PauseStartingTime, OTmpOccupiedTimeBuffer);
+        LastOccupiedTimeBuffer.MODIFY;
+      END;
+    END;
+
+    PROCEDURE RemoveOccupiedTimeEntries@1100528620(IResourceNo@1100528600 : Code[20];IStartingDate@1100528602 : Date;IEndingDate@1100528603 : Date;VAR OTmpOccupiedTimeBuffer@1100528601 : TEMPORARY Record 11071809);
+    VAR
+      TmpOccupiedTimeBuffer2@1100528604 : TEMPORARY Record 11071809;
+    BEGIN
+      TmpOccupiedTimeBuffer2.COPY(OTmpOccupiedTimeBuffer, TRUE);
+      ResetOccupiedTimeBufferFilter(IResourceNo, TmpOccupiedTimeBuffer2);
+      WHILE IStartingDate <= IEndingDate DO BEGIN
+        TmpOccupiedTimeBuffer2.SETRANGE("Starting Date", IStartingDate);
+        IF NOT TmpOccupiedTimeBuffer2.ISEMPTY THEN BEGIN
+          TmpOccupiedTimeBuffer2.DELETEALL;
+          UpdateUnoccupiedTimeEntries(IResourceNo, IStartingDate, OTmpOccupiedTimeBuffer);
+        END;
+        IStartingDate += 1;
+      END;
+    END;
+
+    PROCEDURE ResetOccupiedTimeBufferFilter@1100528615(IResourceNo@1100528601 : Code[20];VAR OBuffer@1100528600 : TEMPORARY Record 11071809);
+    BEGIN
+      OBuffer.RESET;
+      OBuffer.SETCURRENTKEY("Resource No.", "Starting Date", "Starting Time");
+      OBuffer.SETRANGE("Resource No.", IResourceNo);
+      OBuffer.SETRANGE(Deleted, FALSE);
+    END;
+
+    PROCEDURE GetPauseHoursFromOccupiedTimeEntries@1100528613(IResourceNo@1100528607 : Code[20];IStartingDate@1100528605 : Date;IStartingTime@1100528601 : Time;IEndingTime@1100528602 : Time;VAR OPauseStartingTime@1100528600 : Time;VAR OTmpOccupiedTimeBuffer@1100528606 : TEMPORARY Record 11071809) : Decimal;
+    VAR
+      TmpOccupiedTimeBuffer2@1100528603 : TEMPORARY Record 11071809;
+      TimeDuration@1100528604 : Duration;
+    BEGIN
+      TmpOccupiedTimeBuffer2.COPY(OTmpOccupiedTimeBuffer, TRUE);
+      ResetOccupiedTimeBufferFilter(IResourceNo, TmpOccupiedTimeBuffer2);
+      TmpOccupiedTimeBuffer2.SETRANGE("Starting Date", IStartingDate);
+      TmpOccupiedTimeBuffer2.SETRANGE("Occupied Type", TmpOccupiedTimeBuffer2."Occupied Type"::Pause);
+      IF TmpOccupiedTimeBuffer2.FINDSET THEN
+        REPEAT
+          IF
+            ((IEndingTime > TmpOccupiedTimeBuffer2."Starting Time") AND
+            (IEndingTime < TmpOccupiedTimeBuffer2."Ending Time")) OR
+            ((IStartingTime > TmpOccupiedTimeBuffer2."Starting Time") AND
+            (IStartingTime < TmpOccupiedTimeBuffer2."Starting Time")) OR
+            ((IStartingTime <= TmpOccupiedTimeBuffer2."Starting Time") AND
+            (IEndingTime >= TmpOccupiedTimeBuffer2."Ending Time"))
+          THEN BEGIN
+            TimeDuration := TmpOccupiedTimeBuffer2."Ending Time" - TmpOccupiedTimeBuffer2."Starting Time";
+            OPauseStartingTime := TmpOccupiedTimeBuffer2."Starting Time";
+            EXIT(TimeDuration / 1000 / 60 / 60);
+          END;
+        UNTIL TmpOccupiedTimeBuffer2.NEXT = 0;
+    END;
+
+    PROCEDURE AddPlanAgreementWindow@1100528664(IServiceOrder@1100528601 : Record 11012823;IResourceNo@1100528603 : Code[20];IDate@1100528602 : Date;VAR OBuffer@1100528600 : Record 11071809);
+    VAR
+      FirstPossibleStartingTime@1100528604 : Time;
+      LastPossibleEndingTime@1100528605 : Time;
+    BEGIN
+      IF (IServiceOrder."First Possible Starting Date" <> 0D) AND
+         (IServiceOrder."First Possible Starting Date" <= IDate) AND
+         (IServiceOrder."Last Possible Ending Date" >= IDate)
+      THEN BEGIN
+        IF IServiceOrder."First Possible Starting Date" = IDate THEN
+          FirstPossibleStartingTime := IServiceOrder."First Possible Starting Time";
+        IF IServiceOrder."Last Possible Ending Date" = IDate THEN
+          LastPossibleEndingTime := IServiceOrder."Last Possible Ending Time";
+        IF (LastPossibleEndingTime = 0T) OR (LastPossibleEndingTime = 000000T) THEN
+          LastPossibleEndingTime := 235959.999T;
+        IF FirstPossibleStartingTime <> 0T THEN
+          InsertOccupiedTimeEntry(IResourceNo, IDate, 0T, FirstPossibleStartingTime, OccupiedType::"Outside Plan Agreement Window", '', '', OBuffer);
+        IF LastPossibleEndingTime <> 235959.999T THEN
+          InsertOccupiedTimeEntry(IResourceNo, IDate, LastPossibleEndingTime, 235959.999T, OccupiedType::"Outside Plan Agreement Window", '', '', OBuffer);
+        IF (FirstPossibleStartingTime <> 0T) OR (LastPossibleEndingTime <> 235959.999T) THEN
+          UpdateUnoccupiedTimeEntries(IResourceNo, IDate, OBuffer);
+      END;
+    END;
+
+    PROCEDURE RemovePlanAgreementWindow@1100528665(IResourceNo@1100528601 : Code[20];IStartingDate@1100528602 : Date;IEndingDate@1100528603 : Date;VAR OBuffer@1100528600 : Record 11071809);
+    BEGIN
+      ResetOccupiedTimeBufferFilter(IResourceNo, OBuffer);
+      OBuffer.SETRANGE("Occupied Type", OBuffer."Occupied Type"::"Outside Plan Agreement Window");
+      OBuffer.DELETEALL;
+      OBuffer.SETRANGE("Occupied Type");
+      WHILE IStartingDate <= IEndingDate DO BEGIN
+        UpdateUnoccupiedTimeEntries(IResourceNo, IStartingDate, OBuffer);
+        IStartingDate += 1;
+      END;
+    END;
+
+    PROCEDURE IsServiceOrderInDataSet@1100528630(IServiceOrder@1100528600 : Record 11012823;VAR IServiceOrderDS@1100528601 : Record 11012823) : Boolean;
+    VAR
+      ServiceOrder@1100528602 : Record 11012823;
+    BEGIN
+      ServiceOrder.COPY(IServiceOrderDS);
+      ServiceOrder.FILTERGROUP(7);
+      ServiceOrder.SETRANGE("No.", IServiceOrder."No.");
+      ServiceOrder.FILTERGROUP(0);
+      EXIT(NOT ServiceOrder.ISEMPTY);
+    END;
+
+    PROCEDURE InsertReserveHoursPercForCalls@1100528635(IStartingDate@1100528600 : Date;IResourceNo@1100528605 : Code[20];IPercentageToReserveForCalls@1100528617 : Decimal;VAR OTmpOccupiedTimeBuffer@1100528614 : TEMPORARY Record 11071809);
+    VAR
+      TmpOccupiedTimeBuffer2@1100528601 : TEMPORARY Record 11071809;
+      ServiceSetup@1100528610 : Record 11012800;
+      Resource@1100528603 : Record 11229278;
+      MaintenanceManagement@1100528613 : Codeunit 11012829;
+      TotalUnoccupiedHours@1100528602 : Decimal;
+      StartingTime@1100528606 : Time;
+      EndingTime@1100528607 : Time;
+      HoursToReserve@1100528604 : Decimal;
+      OpenHoursToReserve@1100528612 : Decimal;
+      PauseStartingTime@1100528608 : Time;
+      PauseDuration@1100528609 : Duration;
+      DayPartLoop@1100528611 : 'Morning,Afternone';
+    BEGIN
+      IF IPercentageToReserveForCalls = 0 THEN
+        EXIT;
+
+      TmpOccupiedTimeBuffer2.COPY(OTmpOccupiedTimeBuffer, TRUE);
+      ResetOccupiedTimeBufferFilter(IResourceNo, TmpOccupiedTimeBuffer2);
+      TmpOccupiedTimeBuffer2.SETRANGE("Starting Date", IStartingDate);
+      TmpOccupiedTimeBuffer2.SETFILTER("Unoccupied Hours", '>%1', 0);
+      IF TmpOccupiedTimeBuffer2.FINDSET THEN
+        REPEAT
+          TotalUnoccupiedHours += TmpOccupiedTimeBuffer2."Unoccupied Hours";
+        UNTIL TmpOccupiedTimeBuffer2.NEXT = 0;
+      IF TotalUnoccupiedHours = 0 THEN
+        EXIT;
+      HoursToReserve := ROUND(TotalUnoccupiedHours * IPercentageToReserveForCalls / 100, 0.1);
+      IF HoursToReserve = 0 THEN
+        EXIT;
+
+      IF Resource.GET(IResourceNo) THEN
+        IF Resource.Type = Resource.Type::Employee THEN
+          IF COMPANYNAME <> Resource.Company THEN
+            IF NOT ServiceSetup.CHANGECOMPANY(Resource.Company) THEN
+              EXIT;
+
+      ServiceSetup.GET;
+      IF ServiceSetup."Reserve Hours for Calls" = ServiceSetup."Reserve Hours for Calls"::"Per Daypart" THEN BEGIN
+        GetPauseHours(IResourceNo, IStartingDate, 000000T, 235900T, PauseStartingTime, OTmpOccupiedTimeBuffer);
+        HoursToReserve := ROUND(HoursToReserve / 2, 0.1);
+        DayPartLoop := DayPartLoop::Morning;
+      END ELSE
+        DayPartLoop := DayPartLoop::Afternone;
+
+      FOR DayPartLoop := DayPartLoop TO DayPartLoop::Afternone DO BEGIN
+        OpenHoursToReserve := HoursToReserve;
+        IF ServiceSetup."Reserve Hours for Calls" = ServiceSetup."Reserve Hours for Calls"::"Per Daypart" THEN BEGIN
+          IF DayPartLoop = DayPartLoop::Morning THEN
+            TmpOccupiedTimeBuffer2.SETFILTER("Ending Time", '<%1', PauseStartingTime)
+          ELSE
+            TmpOccupiedTimeBuffer2.SETFILTER("Ending Time", '>=%1', PauseStartingTime);
+        END;
+        IF TmpOccupiedTimeBuffer2.FINDLAST THEN BEGIN
+          REPEAT
+            EndingTime := TmpOccupiedTimeBuffer2."Ending Time" + TmpOccupiedTimeBuffer2."Unoccupied Hours" * 1000 * 60 * 60;
+            PauseDuration :=
+              GetPauseHours(IResourceNo, IStartingDate, TmpOccupiedTimeBuffer2."Ending Time", EndingTime, PauseStartingTime, OTmpOccupiedTimeBuffer) * 1000 * 60 * 60;
+            EndingTime := EndingTime + PauseDuration;
+            IF DayPartLoop = DayPartLoop::Morning THEN BEGIN
+              IF (EndingTime > PauseStartingTime) AND (TmpOccupiedTimeBuffer2."Ending Time" < PauseStartingTime) THEN
+                EndingTime := PauseStartingTime;
+              IF OpenHoursToReserve > ROUND((EndingTime - TmpOccupiedTimeBuffer2."Ending Time") / 1000 / 60 / 60, 0.1) THEN
+                StartingTime := TmpOccupiedTimeBuffer2."Ending Time"
+              ELSE
+                StartingTime := EndingTime - ROUND(OpenHoursToReserve * 1000 * 60 * 60, 1);
+            END ELSE BEGIN
+              IF OpenHoursToReserve > TmpOccupiedTimeBuffer2."Unoccupied Hours" THEN
+                StartingTime := TmpOccupiedTimeBuffer2."Ending Time"
+              ELSE
+                StartingTime := EndingTime - ROUND(OpenHoursToReserve * 1000 * 60 * 60, 1);
+            END;
+            PauseDuration :=
+              GetPauseHours(IResourceNo, IStartingDate, StartingTime, EndingTime, PauseStartingTime, OTmpOccupiedTimeBuffer) * 1000 * 60 * 60;
+            IF PauseDuration > 0 THEN
+              StartingTime := StartingTime - PauseDuration;
+            InsertOccupiedTimeEntry(IResourceNo, IStartingDate, StartingTime, EndingTime, OccupiedType::"Reserved for Calls", '', '', OTmpOccupiedTimeBuffer);
+            OpenHoursToReserve -= (EndingTime - StartingTime) / 1000 / 60 / 60;
+          UNTIL (TmpOccupiedTimeBuffer2.NEXT(-1) = 0) OR (OpenHoursToReserve <= 0);
+        END;
+        UpdateUnoccupiedTimeEntries(IResourceNo, IStartingDate, OTmpOccupiedTimeBuffer);
+      END;
+    END;
+
+    PROCEDURE GetPauseHours@1100528637(IResourceNo@1100528607 : Code[20];IStartingDate@1100528605 : Date;IStartingTime@1100528601 : Time;IEndingTime@1100528602 : Time;VAR OPauseStartingTime@1100528600 : Time;VAR OTmpOccupiedTimeBuffer@1100528606 : TEMPORARY Record 11071809) : Decimal;
+    VAR
+      TmpOccupiedTimeBuffer2@1100528603 : TEMPORARY Record 11071809;
+      TimeDuration@1100528604 : Duration;
+    BEGIN
+      TmpOccupiedTimeBuffer2.COPY(OTmpOccupiedTimeBuffer, TRUE);
+      ResetOccupiedTimeBufferFilter(IResourceNo, TmpOccupiedTimeBuffer2);
+      TmpOccupiedTimeBuffer2.SETRANGE("Starting Date", IStartingDate);
+      TmpOccupiedTimeBuffer2.SETRANGE("Occupied Type", TmpOccupiedTimeBuffer2."Occupied Type"::Pause);
+      IF TmpOccupiedTimeBuffer2.FINDSET THEN
+        REPEAT
+          IF
+            ((IEndingTime > TmpOccupiedTimeBuffer2."Starting Time") AND
+            (IEndingTime < TmpOccupiedTimeBuffer2."Ending Time")) OR
+            ((IStartingTime > TmpOccupiedTimeBuffer2."Starting Time") AND
+            (IStartingTime < TmpOccupiedTimeBuffer2."Starting Time")) OR
+            ((IStartingTime <= TmpOccupiedTimeBuffer2."Starting Time") AND
+            (IEndingTime >= TmpOccupiedTimeBuffer2."Ending Time"))
+          THEN BEGIN
+            TimeDuration := TmpOccupiedTimeBuffer2."Ending Time" - TmpOccupiedTimeBuffer2."Starting Time";
+            OPauseStartingTime := TmpOccupiedTimeBuffer2."Starting Time";
+            EXIT(TimeDuration / 1000 / 60 / 60);
+          END;
+        UNTIL TmpOccupiedTimeBuffer2.NEXT = 0;
+    END;
+
+    PROCEDURE PlanSingleServiceOrder@1100528636(VAR IServiceOrder@1100528600 : Record 11012823;IStartingDate@1100528601 : Date;IEndingDate@1100528609 : Date;IResourceNoTeamLeader@1100528611 : Code[20];INoOfTeamMembers@1100528623 : Integer;ISubcontractorNo@1100528620 : Code[20];ITravelDuration@1100528605 : Duration;IOccupySeveralDays@1100528614 : Boolean;IOrigOccupySeveralDays@1100528619 : Boolean;IMinimalUnoccupiedHours@1100528613 : Decimal;IOverlapPercentage@1100528624 : Decimal;VAR OTmpOccupiedTimeBuffer@1100528621 : TEMPORARY Record 11071809) : Boolean;
+    VAR
+      ServiceOrder@1100528612 : Record 11012823;
+      TmpOccupiedTimeBuffer@1100528622 : TEMPORARY Record 11071809;
+      StartingDate@1100528610 : Date;
+      StartingTime@1100528602 : Time;
+      EndingTime@1100528603 : Time;
+      TimeDuration@1100528604 : Duration;
+      PauseStartingTime@1100528606 : Time;
+      DOW@1100528607 : Integer;
+      HoursToOccupy@1100528608 : Decimal;
+      TravelDuration@1100528615 : Duration;
+      UseTravelTime@1100528616 : Boolean;
+      FirstInLine@1100528617 : Boolean;
+      MustCombine@1100528618 : Boolean;
+    BEGIN
+      DOW := DATE2DWY(IStartingDate, 1);
+      IF IServiceOrder."Duration Time" = 0 THEN
+        EXIT;
+
+      IF NOT IOccupySeveralDays THEN
+        IServiceOrder."Duration Time" *= (100 - IOverlapPercentage) / 100;
+
+      TravelDuration := ITravelDuration;
+      HoursToOccupy :=
+        IServiceOrder."Duration Time" / INoOfTeamMembers + TravelDuration / 1000 / 60 / 60;
+
+      TmpOccupiedTimeBuffer.COPY(OTmpOccupiedTimeBuffer, TRUE);
+
+      ResetOccupiedTimeBufferFilter(IResourceNoTeamLeader, TmpOccupiedTimeBuffer);
+      TmpOccupiedTimeBuffer.SETFILTER("Occupied Type", '<>%1', TmpOccupiedTimeBuffer."Occupied Type"::Pause);
+      TmpOccupiedTimeBuffer.SETFILTER("Unoccupied Hours", '>=%1', HoursToOccupy);
+      TmpOccupiedTimeBuffer.SETRANGE("Starting Date", IStartingDate);
+      IF TmpOccupiedTimeBuffer.FINDFIRST THEN BEGIN
+        StartingTime := TmpOccupiedTimeBuffer."Ending Time";
+        TimeDuration := ROUND(IServiceOrder."Duration Time" * 1000 * 60 * 60 / INoOfTeamMembers, 1) + TravelDuration;
+        EndingTime := StartingTime + TimeDuration;
+        TimeDuration := ROUND(GetPauseHours(IResourceNoTeamLeader, IStartingDate, StartingTime, EndingTime, PauseStartingTime, TmpOccupiedTimeBuffer) * 1000 * 60 * 60, 1);
+        IF TimeDuration > 0 THEN
+          IF StartingTime = PauseStartingTime THEN
+            StartingTime := StartingTime + TimeDuration;
+          EndingTime := EndingTime + TimeDuration;
+
+        InsertOccupiedTimeEntry(IResourceNoTeamLeader, IStartingDate, StartingTime, EndingTime, OccupiedType::"To Plan Service Order", IServiceOrder."No.", COMPANYNAME, TmpOccupiedTimeBuffer);
+        IF UseTravelTime THEN
+          TmpOccupiedTimeBuffer."Travel Hours" := TravelDuration / 1000 / 60 / 60;
+        TmpOccupiedTimeBuffer."Service Location No." := IServiceOrder."Service Location No.";
+        TmpOccupiedTimeBuffer.MODIFY;
+
+        IServiceOrder."Duration Time" := 0;
+        UpdateUnoccupiedTimeEntries(IResourceNoTeamLeader, IStartingDate, TmpOccupiedTimeBuffer);
+        EXIT(TRUE);
+      END ELSE BEGIN
+        IF NOT IOccupySeveralDays THEN
+          EXIT;
+
+        // Occupy all unoccupied hourparts
+        TmpOccupiedTimeBuffer.SETFILTER("Unoccupied Hours", '>=%1', IMinimalUnoccupiedHours);
+        IF TmpOccupiedTimeBuffer.FINDSET THEN BEGIN
+          REPEAT
+            StartingTime := TmpOccupiedTimeBuffer."Ending Time";
+            TimeDuration := ROUND(TmpOccupiedTimeBuffer."Unoccupied Hours" * 1000 * 60 * 60, 1);
+            EndingTime := StartingTime + TimeDuration;
+            ServiceOrder := IServiceOrder;
+            IF ServiceOrder."Duration Time" / INoOfTeamMembers + TravelDuration / 1000 / 60 / 60 >
+              TmpOccupiedTimeBuffer."Unoccupied Hours"
+            THEN
+              ServiceOrder."Duration Time" :=
+                TmpOccupiedTimeBuffer."Unoccupied Hours" - TravelDuration / 1000 / 60 / 60;
+            HoursToOccupy := ServiceOrder."Duration Time" / INoOfTeamMembers;
+            IF PlanSingleServiceOrder(
+              ServiceOrder, IStartingDate, IEndingDate, IResourceNoTeamLeader, INoOfTeamMembers, ISubcontractorNo, TravelDuration,
+              FALSE, IOrigOccupySeveralDays, 0, IOverlapPercentage, TmpOccupiedTimeBuffer)
+            THEN
+              IServiceOrder."Duration Time" -= HoursToOccupy * INoOfTeamMembers;
+          UNTIL (TmpOccupiedTimeBuffer.NEXT = 0) OR (IServiceOrder."Duration Time" = 0);
+          EXIT(TRUE);
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE ProcessOccWorkingHours@1100528640(VAR ITmpCollectivePlanTeam@1100528605 : Record 11071979;IEmployeeResourceNo@1100525000 : Code[20];IOverlapPercentage@1100525002 : Decimal;VAR OTmpOccupiedTimeBuffer@1100528603 : TEMPORARY Record 11071809;VAR OToPlanServiceOrder@1100528601 : Record 11012823;IPlanIndividually@1100528604 : Boolean;IKeepPlanAgreementWindow@1100528608 : Boolean);
+    VAR
+      ServiceOrder@1100528600 : Record 11012823;
+      TmpOccupiedTimeBuffer@1100528602 : TEMPORARY Record 11071809;
+      WorkOrder@1100528606 : Record 11229279;
+      ServiceSetup@1100528607 : Record 11012800;
+      EmployeeResourceNo@1100525001 : Code[20];
+    BEGIN
+      ServiceSetup.GET;
+      IF IEmployeeResourceNo <> '' THEN
+        EmployeeResourceNo := IEmployeeResourceNo
+      ELSE
+        EmployeeResourceNo := ITmpCollectivePlanTeam.GetResourceNoTeamLeader(ITmpCollectivePlanTeam);
+      ResetOccupiedTimeBufferFilter(EmployeeResourceNo, OTmpOccupiedTimeBuffer);
+      TmpOccupiedTimeBuffer.COPY(OTmpOccupiedTimeBuffer, TRUE);
+      TmpOccupiedTimeBuffer.SETRANGE(TmpOccupiedTimeBuffer."Occupied Type", TmpOccupiedTimeBuffer."Occupied Type"::"To Plan Service Order");
+      TmpOccupiedTimeBuffer.SETFILTER("Service Order No.", '<>%1', '');
+      IF TmpOccupiedTimeBuffer.FINDSET THEN
+        REPEAT
+          IF ServiceOrder.GET(TmpOccupiedTimeBuffer."Service Order No.") THEN BEGIN
+            WorkOrder.RESET;
+            WorkOrder.SETCURRENTKEY("Source Company", "Source Type", "Source No.");
+            WorkOrder.SETRANGE("Source Company", COMPANYNAME);
+            WorkOrder.SETRANGE("Source Type", WorkOrder."Source Type"::ServiceOrder);
+            WorkOrder.SETRANGE("Source No.", ServiceOrder."No.");
+            WorkOrder.SETRANGE("Resource Type", WorkOrder."Resource Type"::Employee);
+            WorkOrder.SETRANGE("WO Finished (Field Service)", FALSE);
+            IF WorkOrder.FINDSET(TRUE) THEN BEGIN
+              WorkOrder.TestIfModificationIsAllowed;
+              WorkOrder.VALIDATE("Resource No.", '');
+              WorkOrder.MODIFY(TRUE);
+              WHILE WorkOrder.NEXT <> 0 DO BEGIN
+                WorkOrder.TestIfDeletionIsAllowed;
+                WorkOrder.DELETE(TRUE);
+              END;
+            END;
+            ServiceOrder.FIND('=');
+
+            IF NOT IKeepPlanAgreementWindow THEN BEGIN
+              ServiceOrder.VALIDATE("First Possible Starting Date", 0D);
+              ServiceOrder.VALIDATE("First Possible Starting Time", 0T);
+              ServiceOrder.VALIDATE("Last Possible Ending Time", 0T);
+            END;
+            ServiceOrder.VALIDATE("Starting Date", 0D);
+            ServiceOrder.VALIDATE("Employee No.", '');
+            IF ServiceOrder.Subcontractor <> '' THEN
+              ServiceOrder.VALIDATE(Subcontractor, '');
+
+            ServiceOrder."Ending Date" :=
+              TmpOccupiedTimeBuffer."Starting Date"; // prevent error on next validate
+
+            ServiceOrder.VALIDATE("Starting Date", TmpOccupiedTimeBuffer."Starting Date");
+            ServiceOrder.VALIDATE("Starting Time", TmpOccupiedTimeBuffer."Starting Time");
+            TmpOccupiedTimeBuffer.SETRANGE("Service Order No.", TmpOccupiedTimeBuffer."Service Order No.");
+            TmpOccupiedTimeBuffer.FINDLAST;
+            ServiceOrder.VALIDATE("Ending Date", TmpOccupiedTimeBuffer."Starting Date");
+            ServiceOrder.VALIDATE("Ending Time",
+              TmpOccupiedTimeBuffer."Starting Time" +
+              (TmpOccupiedTimeBuffer."Ending Time" - TmpOccupiedTimeBuffer."Starting Time") / ((100 - IOverlapPercentage) / 100));
+            ServiceOrder."Employee No." := EmployeeResourceNo;
+            ServiceOrder.MODIFY(TRUE);
+            ServiceOrder.UpdateWorkorderEmployee(TRUE);
+
+            IF ServiceSetup."Ref. Point SO Planned" <> 0 THEN
+              ServiceOrder.UpdateToNextRefPoint(0); // Planned
+
+            OToPlanServiceOrder."No." := ServiceOrder."No.";
+            OToPlanServiceOrder.MARK(FALSE);
+
+            IF NOT IPlanIndividually THEN BEGIN
+              IF IEmployeeResourceNo <> '' THEN
+                ITmpCollectivePlanTeam.SETRANGE("Resource No.", IEmployeeResourceNo)
+              ELSE
+                ITmpCollectivePlanTeam.SETRANGE("Team Leader", FALSE);
+              IF ITmpCollectivePlanTeam.FINDSET THEN
+                REPEAT
+                  WorkOrder.INIT;
+                  WorkOrder."No." := '';
+                  WorkOrder."Source Company" := COMPANYNAME;
+                  WorkOrder."Source Type" := WorkOrder."Source Type"::ServiceOrder;
+                  WorkOrder.VALIDATE("Source No.", ServiceOrder."No.");
+                  WorkOrder."Resource Type" := WorkOrder."Resource Type"::Employee;
+                  WorkOrder.VALIDATE("Resource No.", ITmpCollectivePlanTeam."Resource No.");
+                  WorkOrder.INSERT(TRUE);
+                UNTIL ITmpCollectivePlanTeam.NEXT = 0;
+            END;
+            TmpOccupiedTimeBuffer.SETFILTER("Service Order No.", '<>%1', '');
+          END;
+          COMMIT;
+        UNTIL TmpOccupiedTimeBuffer.NEXT = 0;
+      TmpOccupiedTimeBuffer.SETRANGE("Service Order No.");
+    END;
+
+    PROCEDURE ServiceOrderMeetsPlanData@1100528661(IServiceOrder@1100528600 : Record 11012823;IResourceNo@1100528601 : Code[20];IPlanDateFrom@1100528605 : Date;IPlanDateUntil@1100528606 : Date;IPlanSeqNo@1100528603 : Integer) : Boolean;
+    VAR
+      ResourcePlanData@1100528602 : Record 11229287;
+      ResourceWOP@1100528604 : Record 11229278;
+      ResourceDiscipline@1100528610 : Record 11229286;
+      Period@1100528607 : Record 2000000007;
+      PeriodStart@1100528608 : Date;
+      PeriodEnd@1100528609 : Date;
+    BEGIN
+      IF NOT ResourceWOP.GET(IResourceNo) THEN
+        EXIT(FALSE);
+      ResourcePlanData.SETCURRENTKEY("Resource No.", "Plan Seq. No.");
+      ResourcePlanData.SETRANGE("Resource No.", IResourceNo);
+      IF ResourcePlanData.ISEMPTY THEN BEGIN
+        ResourceDiscipline.SETRANGE("Resource No.", IResourceNo);
+        IF ResourceDiscipline.ISEMPTY THEN
+          EXIT(IServiceOrder.Discipline = '');
+        IF IServiceOrder.Discipline = '' THEN
+          EXIT(TRUE);
+        ResourceDiscipline.SETRANGE(Discipline, IServiceOrder.Discipline);
+        IF NOT ResourceDiscipline.ISEMPTY THEN
+          EXIT(TRUE);
+      END;
+      ResourcePlanData.SETFILTER("Plan Seq. No.", '<=%1', IPlanSeqNo);
+      ResourcePlanData.SETFILTER("Source Type", '%1|%2', ResourcePlanData."Source Type"::" ", IServiceOrder."Source Type" +1);
+      ResourcePlanData.SETFILTER("Order Kind", '%1|%2', '', IServiceOrder."Order Kind");
+      ResourcePlanData.SETFILTER("Order Type", '%1|%2', '', IServiceOrder."Order Type");
+      IF IServiceOrder.Discipline <> '' THEN
+        ResourcePlanData.SETFILTER(Discipline, '%1|%2', '', IServiceOrder.Discipline);
+      IF IServiceOrder."Trade Speciality" <> '' THEN
+        ResourcePlanData.SETFILTER("Trade Speciality", '%1|%2', '', IServiceOrder."Trade Speciality");
+      ResourcePlanData.SETFILTER("Territory Code", '%1|%2', '', IServiceOrder."Territory Code");
+      Period.SETRANGE("Period Type", Period."Period Type"::Month);
+      Period.SETFILTER("Period Start", '..%1', IPlanDateFrom);
+      IF Period.FINDLAST THEN
+        PeriodStart := Period."Period Start";
+      Period.SETFILTER("Period Start", '..%1', IPlanDateUntil);
+      IF Period.FINDLAST THEN
+        PeriodEnd := Period."Period Start";
+      Period.SETRANGE("Period Start", PeriodStart, PeriodEnd);
+      IF ResourcePlanData.FINDSET THEN
+        REPEAT
+          IF Period.FINDSET THEN
+            REPEAT
+              CASE Period."Period No." OF
+                1:
+                  IF ResourcePlanData.January THEN
+                    EXIT(TRUE);
+                2:
+                  IF ResourcePlanData.February THEN
+                    EXIT(TRUE);
+                3:
+                  IF ResourcePlanData.March THEN
+                    EXIT(TRUE);
+                4:
+                  IF ResourcePlanData.April THEN
+                    EXIT(TRUE);
+                5:
+                  IF ResourcePlanData.May THEN
+                    EXIT(TRUE);
+                6:
+                  IF ResourcePlanData.June THEN
+                    EXIT(TRUE);
+                7:
+                  IF ResourcePlanData.July THEN
+                    EXIT(TRUE);
+                8:
+                  IF ResourcePlanData.August THEN
+                    EXIT(TRUE);
+                9:
+                  IF ResourcePlanData.September THEN
+                    EXIT(TRUE);
+                10:
+                  IF ResourcePlanData.October THEN
+                    EXIT(TRUE);
+                11:
+                  IF ResourcePlanData.November THEN
+                    EXIT(TRUE);
+                12:
+                  IF ResourcePlanData.December THEN
+                    EXIT(TRUE);
+              END;
+            UNTIL Period.NEXT = 0;
+        UNTIL ResourcePlanData.NEXT = 0;
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE GetWatchFilterByServiceOrder@1100528666(ICompanyName@1100528604 : Text[50];VAR IServiceOrder@1100528600 : Record 11012823) WatchCodeFilter : Text[250];
+    VAR
+      ServiceOrder@1100528602 : Record 11012823;
+      Watch@1100528601 : Record 11012861;
+      NoOfServiceOrders@1100528603 : Integer;
+    BEGIN
+      ServiceOrder.COPY(IServiceOrder);
+      NoOfServiceOrders := ServiceOrder.COUNT;
+      ServiceOrder.FILTERGROUP(8);
+      IF NOT Watch.CHANGECOMPANY(ICompanyName) OR NOT Watch.READPERMISSION THEN
+        EXIT;
+      IF Watch.FINDSET THEN
+        REPEAT
+          IF Watch."Discipline Filter" <> '' THEN
+            ServiceOrder.SETFILTER(Discipline, Watch."Discipline Filter")
+          ELSE
+            ServiceOrder.SETRANGE(Discipline);
+          IF Watch."Territory Filter" <> '' THEN
+            ServiceOrder.SETFILTER("Territory Code", Watch."Territory Filter")
+          ELSE
+            ServiceOrder.SETRANGE("Territory Code");
+          IF Watch."Global Dimension 1 Filter" <> '' THEN
+            ServiceOrder.SETFILTER("Global Dimension 1 Code", Watch."Global Dimension 1 Filter")
+          ELSE
+            ServiceOrder.SETRANGE("Global Dimension 1 Code");
+          IF Watch."Trade Speciality Filter" <> '' THEN
+            ServiceOrder.SETFILTER("Trade Speciality", Watch."Trade Speciality Filter")
+          ELSE
+            ServiceOrder.SETRANGE("Trade Speciality");
+          IF ServiceOrder.COUNT = NoOfServiceOrders THEN BEGIN
+            IF WatchCodeFilter <> '' THEN
+              WatchCodeFilter += '|';
+            WatchCodeFilter += Watch.Code;
+          END;
+        UNTIL Watch.NEXT = 0;
+    END;
+
+    PROCEDURE BuildOccupiedTimeBufferByTeam@1100528674(VAR IResourceWOP@1100528607 : Record 11229278;VAR OTmpOccupiedTimeBuffer@1100528600 : TEMPORARY Record 11071809;VAR IExcludeServiceOrder@1100528608 : Record 11012823;IFromDate@1100528606 : Date;IToDate@1100528604 : Date);
+    VAR
+      ResourceWOP@1100528605 : Record 11229278;
+      SeekDate@1100528602 : Date;
+      PlanTimeType@1100528601 : 'Regular Work Time,Consignment Time';
+    BEGIN
+      OTmpOccupiedTimeBuffer.RESET;
+      OTmpOccupiedTimeBuffer.DELETEALL;
+      IF (IFromDate = 0D) OR (IToDate = 0D) THEN
+        EXIT;
+      ResourceWOP.COPY(IResourceWOP);
+      IF ResourceWOP.FINDSET THEN
+        REPEAT
+          SeekDate := IFromDate;
+          REPEAT
+            FillOccupiedTimeBuffer(SeekDate, 0T, 0T, ResourceWOP."No.", IExcludeServiceOrder, PlanTimeType::"Regular Work Time", 0, OTmpOccupiedTimeBuffer);
+            SeekDate += 1;
+          UNTIL SeekDate > IToDate;
+        UNTIL ResourceWOP.NEXT = 0;
+      OTmpOccupiedTimeBuffer.RESET;
+      OTmpOccupiedTimeBuffer.SETCURRENTKEY("Resource No.");
+      OTmpOccupiedTimeBuffer.SETRANGE(Deleted, FALSE);
+    END;
+
+    PROCEDURE GetAvailableHoursByTeam@1100528677(VAR IResourceWOP@1100528603 : Record 11229278;VAR IExcludeServiceOrder@1100528604 : Record 11012823;IFromDate@1100528601 : Date;IToDate@1100528600 : Date) : Decimal;
+    VAR
+      TmpOccupiedTimeBuffer@1100528602 : TEMPORARY Record 11071809;
+    BEGIN
+      BuildOccupiedTimeBufferByTeam(IResourceWOP, TmpOccupiedTimeBuffer, IExcludeServiceOrder, IFromDate, IToDate);
+      TmpOccupiedTimeBuffer.CALCSUMS("Unoccupied Hours");
+      EXIT(TmpOccupiedTimeBuffer."Unoccupied Hours");
+    END;
+
+    PROCEDURE ShowResourceCalendar@1100528673(VAR IResourceWOP@1100528600 : Record 11229278;VAR IExcludeServiceOrder@1100528601 : Record 11012823;IFromDate@1100528603 : Date;IToDate@1100528604 : Date);
+    VAR
+      TmpOccupiedTimeBuffer@1100528602 : TEMPORARY Record 11071809;
+    BEGIN
+      BuildOccupiedTimeBufferByTeam(IResourceWOP, TmpOccupiedTimeBuffer, IExcludeServiceOrder, IFromDate, IToDate);
+      TmpOccupiedTimeBuffer.SETFILTER("Occupied Type", '%1|%2|%3|%4',
+        TmpOccupiedTimeBuffer."Occupied Type"::"Base Calendar",
+        TmpOccupiedTimeBuffer."Occupied Type"::"Employee Absence",
+        TmpOccupiedTimeBuffer."Occupied Type"::"Planned Service Order",
+        TmpOccupiedTimeBuffer."Occupied Type"::"Maintenance Proposal");
+      PAGE.RUNMODAL(0, TmpOccupiedTimeBuffer);
+    END;
+
+    PROCEDURE ShowAvailableHoursResources@1100528675(VAR IResourceWOP@1100528602 : Record 11229278;VAR IExcludeServiceOrder@1100528605 : Record 11012823;IFromDate@1100528601 : Date;IToDate@1100528600 : Date);
+    VAR
+      TmpOccupiedTimeBuffer@1100528604 : TEMPORARY Record 11071809;
+      AvailableHoursResource@1100528603 : Page 11229255;
+    BEGIN
+      BuildOccupiedTimeBufferByTeam(IResourceWOP, TmpOccupiedTimeBuffer, IExcludeServiceOrder, IFromDate, IToDate);
+      AvailableHoursResource.SetDefaults(IResourceWOP, IFromDate, IToDate, TmpOccupiedTimeBuffer);
+      AvailableHoursResource.RUNMODAL;
+    END;
+
+    PROCEDURE "-----"@1100528639();
+    BEGIN
+    END;
+
+    PROCEDURE GetTavelDurationBetweenAddresses@1100528641(IFromAddress@1100528600 : Text[50];IFromCity@1100528603 : Text[30];IToAddress@1100528601 : Text[50];IToCity@1100528604 : Text[30]) TravelTime : Duration;
+    VAR
+      ServiceSetup@1100528615 : Record 11012800;
+      URL@1100528602 : Text;
+      FullFromAddress@1100528605 : Text;
+      FullToAddress@1100528606 : Text;
+      FullUrl@1100528607 : Text;
+      WebClient@1100528609 : DotNet "'System, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Net.WebClient";
+      WebContent@1100528610 : Text;
+      XmlDoc@1100528608 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      XmlNodeList@1100528611 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+      XmlElement@1100528612 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlElement";
+      i@1100528613 : Integer;
+      StatusOK@1100528614 : Boolean;
+      DurationSeconds@1100528618 : Integer;
+    BEGIN
+      IF (IFromAddress = '') OR (IFromCity = '') OR (IToAddress = '') OR (IToCity = '') THEN
+        EXIT;
+      ServiceSetup.GET;
+      URL := 'https://maps.googleapis.com/maps/api/distancematrix/xml?origins=%1&destinations=%2&sensor=false';
+      FullFromAddress := STRSUBSTNO('%1,%2', IFromAddress, IFromCity);
+      FullToAddress := STRSUBSTNO('%1,%2', IToAddress, IToCity);
+      FullUrl := STRSUBSTNO(URL, FullFromAddress, FullToAddress);
+      FullUrl := GetFullQualifiedGoogleAPIURL(FullUrl);
+
+      WebClient := WebClient.WebClient;
+      WebContent := WebClient.DownloadString(FullUrl);
+
+      XmlDoc := XmlDoc.XmlDocument;
+      XmlDoc.LoadXml(WebContent);
+      XmlNodeList := XmlDoc.GetElementsByTagName('status');
+
+      IF XmlNodeList.Count() > 0 THEN BEGIN
+        StatusOK := TRUE;
+        FOR i := 0 TO XmlNodeList.Count() -1 DO BEGIN
+          XmlElement := XmlNodeList.Item(i);
+          StatusOK := StatusOK AND (XmlElement.InnerText = 'OK');
+        END;
+      END;
+
+      IF StatusOK THEN BEGIN
+        XmlElement := XmlDoc.SelectSingleNode('/DistanceMatrixResponse/row/element/duration/value');
+        IF NOT ISNULL(XmlElement) THEN BEGIN
+          EVALUATE(DurationSeconds, XmlElement.InnerText);
+          TravelTime := ROUND(DurationSeconds / 60, 1) * 60 * 1000;
+        END;
+      END;
+    END;
+
+    PROCEDURE GetOptimalRouteForServiceOrders@1100528642(IStartAddress@1100528600 : Text[50];IStartCity@1100528601 : Text[30];VAR IWayPoints@1100528604 : Record 11012823;IEndAddress@1100528603 : Text[50];IEndCity@1100528602 : Text[30];ICalculateTravelTime@1100528630 : Boolean;VAR OTmpOptimalRouteBuffer@1100528620 : TEMPORARY Record 11071981;VAR OTravelCalculationStatus@1100528629 : 'OK,Not Found,Zero Results,Max waypoints exceeded,Invalid Request,Over Query Limit,Request Denied,Unknown Error,Access Denied') RetValue : Text;
+    VAR
+      TmpOptimalRouteBuffer@1100528618 : TEMPORARY Record 11071981;
+      ServiceSetup@1100528631 : Record 11012800;
+      WebClientManagement@1100528625 : Codeunit 11012869;
+      URL@1100528605 : Text;
+      FullURL@1100528606 : Text;
+      FullStartAddress@1100528608 : Text;
+      FullEndAddress@1100528607 : Text;
+      WayPointAddresses@1100528609 : Text;
+      WebContent@1100528611 : Text;
+      XmlDoc@1100528614 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      WayPointNodeList@1100528613 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+      DurationNodeList@1100528624 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+      DistanceNodeList@1100528627 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+      XmlElement@1100528617 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlElement";
+      i@1100528616 : Integer;
+      RecordNo@1100528619 : Integer;
+      EntryID@1100528621 : Integer;
+      PrevAddress@1100528610 : Text[50];
+      PrevCity@1100528622 : Text[30];
+      NoOfWayPoints@1100528623 : Integer;
+      DurationSeconds@1100528626 : Integer;
+      Distance@1100528628 : Integer;
+      RequestStatus@1100528612 : Text;
+      Retries@1100528615 : Integer;
+      ErrorText@1100528632 : Text;
+    BEGIN
+      ServiceSetup.GET;
+
+      TmpOptimalRouteBuffer.COPY(OTmpOptimalRouteBuffer, TRUE);
+      TmpOptimalRouteBuffer.RESET;
+      TmpOptimalRouteBuffer.DELETEALL;
+
+      NoOfWayPoints := IWayPoints.COUNT;
+      IF ((NoOfWayPoints > 8) AND (ServiceSetup."Google API Client ID" = '')) OR (NoOfWayPoints > 21) THEN
+        ERROR(Text012, NoOfWayPoints);
+      IF NoOfWayPoints = 0 THEN
+        ERROR(Text013);
+
+      IF (IEndAddress = '') AND (IEndCity = '') THEN BEGIN
+        IEndAddress := IStartAddress;
+        IEndCity := IStartCity;
+      END;
+
+      IF ICalculateTravelTime THEN BEGIN
+        URL := 'https://maps.googleapis.com/maps/api/directions/xml?origin=%1&destination=%2&waypoints=%3&sensor=false';
+        FullStartAddress := STRSUBSTNO('%1,%2', IStartAddress, IStartCity);
+        FullEndAddress := STRSUBSTNO('%1,%2', IEndAddress, IEndCity);
+
+        WayPointAddresses := 'optimize:true';
+        IF IWayPoints.FINDSET THEN
+          REPEAT
+            IF WayPointAddresses <> '' THEN
+              WayPointAddresses := WayPointAddresses + '|';
+            WayPointAddresses := WayPointAddresses + STRSUBSTNO('%1,%2', IWayPoints.Address, IWayPoints.City);
+          UNTIL IWayPoints.NEXT = 0;
+
+        FullURL := STRSUBSTNO(URL, FullStartAddress, FullEndAddress, WayPointAddresses);
+        FullURL := CONVERTSTR(FullURL, ' ', '+');
+        FullURL := GetFullQualifiedGoogleAPIURL(FullURL);
+
+        REPEAT
+          WebContent := WebClientManagement.DownloadStringWithError(FullURL, ErrorText);
+
+          IF WebContent <> '' THEN BEGIN
+            XmlDoc := XmlDoc.XmlDocument;
+            XmlDoc.LoadXml(WebContent);
+            XmlElement := XmlDoc.SelectSingleNode('/DirectionsResponse/status');
+            IF NOT ISNULL(XmlElement) THEN
+              RequestStatus := XmlElement.InnerText;
+            OTravelCalculationStatus := ConvertRequestStatusToTravelCalculationStatus(RequestStatus);
+          END ELSE
+            ERROR(Text014, FullURL, ErrorText);
+          IF OTravelCalculationStatus = OTravelCalculationStatus::"Over Query Limit" THEN BEGIN
+            SLEEP(200 * Retries);
+            Retries += 1;
+          END;
+        UNTIL (Retries > 10) OR (OTravelCalculationStatus <> OTravelCalculationStatus::"Over Query Limit");
+      END;
+
+      EntryID := 1;
+      TmpOptimalRouteBuffer."Entry ID" := EntryID;
+      TmpOptimalRouteBuffer.Type := TmpOptimalRouteBuffer.Type::"Start Address";
+      TmpOptimalRouteBuffer.Code := '';
+      TmpOptimalRouteBuffer.Address := IStartAddress;
+      TmpOptimalRouteBuffer.City := IStartCity;
+      TmpOptimalRouteBuffer."Travel Duration" := 0;
+      TmpOptimalRouteBuffer.INSERT;
+
+      PrevAddress := IStartAddress;
+      PrevCity := IStartCity;
+
+      IF ICalculateTravelTime AND (OTravelCalculationStatus = OTravelCalculationStatus::OK) THEN BEGIN
+        WayPointNodeList := XmlDoc.SelectNodes('/DirectionsResponse/route/waypoint_index');
+        DurationNodeList := XmlDoc.SelectNodes('/DirectionsResponse/route/leg/duration/value');
+        DistanceNodeList := XmlDoc.SelectNodes('/DirectionsResponse/route/leg/distance/value');
+        IF WayPointNodeList.Count > 0 THEN BEGIN
+          FOR i := 0 TO WayPointNodeList.Count -1 DO BEGIN
+            XmlElement := WayPointNodeList.Item(i);
+            EVALUATE(RecordNo, XmlElement.InnerText);
+            IWayPoints.FINDSET;
+            IF RecordNo > 0 THEN
+              IWayPoints.NEXT(RecordNo);
+
+            EntryID += 1;
+            TmpOptimalRouteBuffer."Entry ID" := EntryID;
+            TmpOptimalRouteBuffer.Type := TmpOptimalRouteBuffer.Type::"Service Order";
+            TmpOptimalRouteBuffer.Code := IWayPoints."No.";
+            TmpOptimalRouteBuffer.Address := IWayPoints.Address;
+            TmpOptimalRouteBuffer.City := IWayPoints.City;
+
+            XmlElement := DurationNodeList.Item(i);
+            EVALUATE(DurationSeconds, XmlElement.InnerText);
+            TmpOptimalRouteBuffer."Travel Duration" := ROUND(DurationSeconds / 60, 1) * 60 * 1000;
+
+            XmlElement := DistanceNodeList.Item(i);
+            EVALUATE(Distance, XmlElement.InnerText);
+            TmpOptimalRouteBuffer."Travel Distance" := ROUND(Distance / 1000, 1);
+            TmpOptimalRouteBuffer.INSERT;
+          END;
+        END;
+      END ELSE BEGIN
+        IF IWayPoints.FINDSET THEN
+          REPEAT
+            EntryID += 1;
+            TmpOptimalRouteBuffer."Entry ID" := EntryID;
+            TmpOptimalRouteBuffer.Type := TmpOptimalRouteBuffer.Type::"Service Order";
+            TmpOptimalRouteBuffer.Code := IWayPoints."No.";
+            TmpOptimalRouteBuffer.Address := IWayPoints.Address;
+            TmpOptimalRouteBuffer.City := IWayPoints.City;
+            TmpOptimalRouteBuffer."Travel Duration" := 0;
+            TmpOptimalRouteBuffer.INSERT;
+          UNTIL IWayPoints.NEXT = 0;
+      END;
+
+      EntryID += 1;
+      TmpOptimalRouteBuffer."Entry ID" := EntryID;
+      TmpOptimalRouteBuffer.Type := TmpOptimalRouteBuffer.Type::"End Address";
+      TmpOptimalRouteBuffer.Code := '';
+      TmpOptimalRouteBuffer.Address := IEndAddress;
+      TmpOptimalRouteBuffer.City := IEndCity;
+
+      IF NOT ISNULL(DurationNodeList) THEN BEGIN
+        XmlElement := DurationNodeList.Item(DurationNodeList.Count -1);
+        EVALUATE(DurationSeconds, XmlElement.InnerText);
+        TmpOptimalRouteBuffer."Travel Duration" := ROUND(DurationSeconds / 60, 1) * 60 * 1000;
+      END ELSE
+        TmpOptimalRouteBuffer."Travel Duration" := 0;
+      IF NOT ISNULL(DistanceNodeList) THEN BEGIN
+        XmlElement := DistanceNodeList.Item(DistanceNodeList.Count -1);
+        EVALUATE(Distance, XmlElement.InnerText);
+        TmpOptimalRouteBuffer."Travel Distance" := ROUND(Distance / 1000, 1);
+      END ELSE
+        TmpOptimalRouteBuffer."Travel Distance" := 0;
+      TmpOptimalRouteBuffer.INSERT;
+    END;
+
+    PROCEDURE GetTotalTravelDurationFromOptimalRouteBuffer@1100528657(VAR ITmpOptimalRouteBuffer@1100528600 : TEMPORARY Record 11071981) TotalDuration : Duration;
+    VAR
+      TmpOptimalRouteBuffer@1100528601 : TEMPORARY Record 11071981;
+    BEGIN
+      TmpOptimalRouteBuffer.COPY(ITmpOptimalRouteBuffer, TRUE);
+      TmpOptimalRouteBuffer.SETRANGE(Type, TmpOptimalRouteBuffer.Type::"Service Order");
+      IF TmpOptimalRouteBuffer.FINDSET THEN
+        REPEAT
+          TotalDuration := TotalDuration + TmpOptimalRouteBuffer."Travel Duration";
+        UNTIL TmpOptimalRouteBuffer.NEXT = 0;
+    END;
+
+    PROCEDURE GetFirstTravelDurationFromOptimalRouteBuffer@1100528652(VAR ITmpOptimalRouteBuffer@1100528600 : TEMPORARY Record 11071981) : Duration;
+    VAR
+      TmpOptimalRouteBuffer@1100528601 : TEMPORARY Record 11071981;
+    BEGIN
+      TmpOptimalRouteBuffer.COPY(ITmpOptimalRouteBuffer, TRUE);
+      TmpOptimalRouteBuffer.SETFILTER(Type, '<>%1', TmpOptimalRouteBuffer.Type::"Start Address");
+      IF TmpOptimalRouteBuffer.FINDFIRST THEN
+        EXIT(TmpOptimalRouteBuffer."Travel Duration");
+    END;
+
+    PROCEDURE GetLastTravelDurationFromOptimalRouteBuffer@1100528653(VAR ITmpOptimalRouteBuffer@1100528600 : TEMPORARY Record 11071981) : Duration;
+    VAR
+      TmpOptimalRouteBuffer@1100528601 : TEMPORARY Record 11071981;
+    BEGIN
+      TmpOptimalRouteBuffer.COPY(ITmpOptimalRouteBuffer, TRUE);
+      TmpOptimalRouteBuffer.SETRANGE(Type, TmpOptimalRouteBuffer.Type::"End Address");
+      IF TmpOptimalRouteBuffer.FINDLAST THEN
+        EXIT(TmpOptimalRouteBuffer."Travel Duration");
+    END;
+
+    PROCEDURE GetTotalTravelDistanceFromOptimalRouteBuffer@1100528649(VAR ITmpOptimalRouteBuffer@1100528600 : TEMPORARY Record 11071981) TotalDistance : Integer;
+    VAR
+      TmpOptimalRouteBuffer@1100528601 : TEMPORARY Record 11071981;
+    BEGIN
+      TmpOptimalRouteBuffer.COPY(ITmpOptimalRouteBuffer, TRUE);
+      TmpOptimalRouteBuffer.SETRANGE(Type, TmpOptimalRouteBuffer.Type::"Service Order");
+      IF TmpOptimalRouteBuffer.FINDSET THEN
+        REPEAT
+          TotalDistance := TotalDistance + TmpOptimalRouteBuffer."Travel Distance";
+        UNTIL TmpOptimalRouteBuffer.NEXT = 0;
+    END;
+
+    PROCEDURE GetFirstTravelDistanceFromOptimalRouteBuffer@1100528648(VAR ITmpOptimalRouteBuffer@1100528600 : TEMPORARY Record 11071981) : Integer;
+    VAR
+      TmpOptimalRouteBuffer@1100528601 : TEMPORARY Record 11071981;
+    BEGIN
+      TmpOptimalRouteBuffer.COPY(ITmpOptimalRouteBuffer, TRUE);
+      TmpOptimalRouteBuffer.SETFILTER(Type, '<>%1', TmpOptimalRouteBuffer.Type::"Start Address");
+      IF TmpOptimalRouteBuffer.FINDFIRST THEN
+        EXIT(TmpOptimalRouteBuffer."Travel Distance");
+    END;
+
+    PROCEDURE GetLastTravelDistanceFromOptimalRouteBuffer@1100528646(VAR ITmpOptimalRouteBuffer@1100528600 : TEMPORARY Record 11071981) : Integer;
+    VAR
+      TmpOptimalRouteBuffer@1100528601 : TEMPORARY Record 11071981;
+    BEGIN
+      TmpOptimalRouteBuffer.COPY(ITmpOptimalRouteBuffer, TRUE);
+      TmpOptimalRouteBuffer.SETRANGE(Type, TmpOptimalRouteBuffer.Type::"End Address");
+      IF TmpOptimalRouteBuffer.FINDLAST THEN
+        EXIT(TmpOptimalRouteBuffer."Travel Distance");
+    END;
+
+    PROCEDURE DurationToHours@1100528647(IDuration@1100528600 : Duration) : Decimal;
+    BEGIN
+      EXIT(IDuration / 1000 / 60 / 60);
+    END;
+
+    PROCEDURE HoursToDuration@1100528655(IHours@1100528600 : Decimal) : Duration;
+    BEGIN
+      EXIT(ROUND(IHours * 60 * 60 * 1000, 1));
+    END;
+
+    PROCEDURE ShowOptimalRouteForServiceOrders@1100528645(IStartAddress@1100528604 : Text[50];IStartCity@1100528603 : Text[30];VAR IServiceOrder@1100528602 : Record 11012823;IEndAddress@1100528601 : Text[50];IEndCity@1100528600 : Text[30];ICalculateTravelTime@1100528607 : Boolean);
+    VAR
+      TmpOptimalRouteBuffer@1100528605 : TEMPORARY Record 11071981;
+      TravelCalculationStatus@1100528606 : Option;
+    BEGIN
+      GetOptimalRouteForServiceOrders(IStartAddress, IStartCity, IServiceOrder, IEndAddress, IEndCity, ICalculateTravelTime, TmpOptimalRouteBuffer, TravelCalculationStatus);
+      HYPERLINK(GetGoogleMapsRouteURLByWayPoints(TmpOptimalRouteBuffer));
+    END;
+
+    PROCEDURE ConvertRequestStatusToTravelCalculationStatus@1100528651(IRequestStatus@1100528600 : Text) : Integer;
+    VAR
+      EmplAvailPlanTimeBuffer@1100528601 : Record 11071976;
+    BEGIN
+      CASE TRUE OF
+        IRequestStatus = 'OK':
+          EXIT(EmplAvailPlanTimeBuffer."Travel Calculation Status"::OK);
+        IRequestStatus = 'NOT_FOUND':
+          EXIT(EmplAvailPlanTimeBuffer."Travel Calculation Status"::"Not Found");
+        IRequestStatus = 'ZERO_RESULTS':
+          EXIT(EmplAvailPlanTimeBuffer."Travel Calculation Status"::"Zero Results");
+        IRequestStatus = 'MAX_WAYPOINTS_EXCEEDED':
+          EXIT(EmplAvailPlanTimeBuffer."Travel Calculation Status"::"Max waypoints exceeded");
+        IRequestStatus = 'INVALID_REQUEST':
+          EXIT(EmplAvailPlanTimeBuffer."Travel Calculation Status"::"Invalid Request");
+        IRequestStatus = 'OVER_QUERY_LIMIT':
+          EXIT(EmplAvailPlanTimeBuffer."Travel Calculation Status"::"Over Query Limit");
+        IRequestStatus = 'REQUEST_DENIED':
+          EXIT(EmplAvailPlanTimeBuffer."Travel Calculation Status"::"Request Denied");
+        IRequestStatus = 'UNKNOWN_ERROR':
+          EXIT(EmplAvailPlanTimeBuffer."Travel Calculation Status"::"Unknown Error");
+      END;
+    END;
+
+    PROCEDURE "------"@1100528654();
+    BEGIN
+    END;
+
+    PROCEDURE UnplanServiceOrders@1100528656(VAR IServiceOrder@1100528600 : Record 11012823) NoOfServiceOrdersUnplanned : Integer;
+    VAR
+      ServiceOrder@1100528602 : Record 11012823;
+      WorkOrder@1100528601 : Record 11229279;
+    BEGIN
+      ServiceOrder.COPY(IServiceOrder);
+      ServiceOrder.SETFILTER("Company Filter", COMPANYNAME);
+      ServiceOrder.SETFILTER("No. of Work Orders", '>%1', 0);
+      IF ServiceOrder.FINDSET THEN
+        REPEAT
+          WorkOrder.SETCURRENTKEY("Source Company", "Source Type", "Source No.");
+          WorkOrder.SETRANGE("Source Company", COMPANYNAME);
+          WorkOrder.SETRANGE("Source Type", WorkOrder."Source Type"::ServiceOrder);
+          WorkOrder.SETRANGE("Source No.", ServiceOrder."No.");
+          IF WorkOrder.FINDSET THEN
+            REPEAT
+              WorkOrder.VALIDATE("Resource No.", '');
+              WorkOrder.VALIDATE("Starting Date/Time", CREATEDATETIME(DT2DATE(WorkOrder."Starting Date/Time"), 0T));
+              WorkOrder.VALIDATE("Ending Date/Time", 0DT);
+              WorkOrder.MODIFY(TRUE);
+            UNTIL WorkOrder.NEXT = 0;
+          ServiceOrder.FIND('=');
+          ServiceOrder.VALIDATE("Employee No.", '');
+          ServiceOrder.VALIDATE(Subcontractor, '');
+          ServiceOrder.SetSkipStatusCheck(TRUE);
+          ServiceOrder.MODIFY(TRUE);
+          NoOfServiceOrdersUnplanned += 1;
+        UNTIL ServiceOrder.NEXT = 0;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

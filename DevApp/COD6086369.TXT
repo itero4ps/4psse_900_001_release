@@ -1,0 +1,453 @@
+OBJECT Codeunit 6086369 EM Approvals Bridge
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=EMW19.00.00.1.02.00;
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 454=rimd;
+    SingleInstance=Yes;
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      ConfirmSendMultipleForApproval@1000 : TextConst 'ENU=This will send %1 Expenses for approval.\\Do you want to continue?';
+      ExpStatusChangedMsg@1013 : TextConst 'ENU=Expense %1 has been automatically approved. The status has been changed to %2.';
+      HasCommentErrors@1010 : TextConst 'ENU=There is one or more error on this Expense.\\Please correct these before the sending the Expense for approval.';
+      HasCommentQuestion@1001 : TextConst 'ENU=There is one or more error on this Expense.\\Do you want to send it for approval anyway?';
+      PendingApprovalMsg@1014 : TextConst 'ENU=An approval request has been sent.';
+      NothingToSend@1012 : TextConst 'ENU=There is nothing to send for approval.';
+      SentForApproval@1011 : TextConst 'ENU=%1 Expenses were sent for approval.';
+      Text001@1002 : TextConst 'ENU=There is no active %1 for %2 %3';
+      Text002@1003 : TextConst 'ENU=There is no supported workflow for force approval.';
+      Text003@1004 : TextConst 'ENU=The table %1 is not supported for approval in Expense Management.';
+      Text004@1005 : TextConst 'ENU=Approvals for expenses is not enabled.';
+      Text005@1009 : TextConst 'ENU=There is no approval request to delegate.';
+      CurrentUser@1006 : Code[50];
+      WorkflowStepInstance@1007 : Record 1504;
+      WorkflowStepArgument@1008 : Record 1523;
+
+    PROCEDURE InitializeApprovalEntry@80(RecRef@1000 : RecordRef;VAR ApprovalEntryArgument@1001 : Record 454);
+    VAR
+      Customer@1006 : Record 18;
+      Expense@1009 : Record 6086320;
+      GenJournalBatch@1008 : Record 232;
+      GenJournalLine@1007 : Record 81;
+      PurchaseHeader@1003 : Record 38;
+      SalesHeader@1004 : Record 36;
+      IncomingDocument@1010 : Record 130;
+      ApprovalAmount@1005 : Decimal;
+      ApprovalAmountLCY@1002 : Decimal;
+    BEGIN
+      ApprovalEntryArgument.INIT;
+      ApprovalEntryArgument."Table ID" := RecRef.NUMBER;
+      ApprovalEntryArgument."Record ID to Approve" := RecRef.RECORDID;
+      ApprovalEntryArgument."Document Type" := ApprovalEntryArgument."Document Type"::" ";
+      ApprovalEntryArgument."Approval Code" := WorkflowStepInstance."Workflow Code";
+      ApprovalEntryArgument."Workflow Step Instance ID" := WorkflowStepInstance.ID;
+
+      CASE RecRef.NUMBER OF
+        DATABASE::Expense :
+          BEGIN
+            RecRef.SETTABLE(Expense);
+            ApprovalEntryArgument."Document Type" := ApprovalEntryArgument."Document Type"::Invoice;
+            ApprovalEntryArgument."Document No." := FORMAT(Expense."Entry No.");
+            ApprovalEntryArgument.Amount := Expense.Amount;
+            ApprovalEntryArgument."Amount (LCY)" := Expense."Amount (LCY)";
+            ApprovalEntryArgument."Currency Code" := Expense."Currency Code";
+          END;
+        ELSE
+          ERROR(Text003);
+      END;
+
+      ApprovalEntryArgument.SETRANGE("Workflow Step Instance ID",WorkflowStepInstance.ID);
+    END;
+
+    PROCEDURE CreateApprovalRequestsStandard@6(VAR RecRef@1000 : RecordRef) : Boolean;
+    VAR
+      ApprovalsMgmt@1001 : Codeunit 1535;
+    BEGIN
+      ApprovalsMgmt.CreateApprovalRequests(RecRef,WorkflowStepInstance);
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE GetApprovalType@5() : Integer;
+    VAR
+      ApprovalEntry@1000 : Record 454;
+    BEGIN
+      CASE WorkflowStepArgument."Approver Type" OF
+        WorkflowStepArgument."Approver Type"::"Salesperson/Purchaser":
+          EXIT(ApprovalEntry."Approval Type"::"Sales Pers./Purchaser");
+        WorkflowStepArgument."Approver Type"::"Advanced Approver":
+          EXIT(ApprovalEntry."Approval Type"::"Advanced Approver");
+        WorkflowStepArgument."Approver Type"::Approver:
+          EXIT(ApprovalEntry."Approval Type"::Approver);
+        WorkflowStepArgument."Approver Type"::"Workflow User Group":
+          EXIT(ApprovalEntry."Approval Type"::"Workflow User Group");
+      END;
+    END;
+
+    PROCEDURE GetApprovalDueDate@23() : Date;
+    BEGIN
+      EXIT(CALCDATE(WorkflowStepArgument."Due Date Formula",TODAY));
+    END;
+
+    PROCEDURE GetLastSequenceNo@16(ApprovalEntryArgument@1000 : Record 454) : Integer;
+    VAR
+      ApprovalEntry@1001 : Record 454;
+    BEGIN
+      WITH ApprovalEntry DO BEGIN
+        SETCURRENTKEY("Record ID to Approve","Workflow Step Instance ID","Sequence No.");
+        SETRANGE("Table ID",ApprovalEntryArgument."Table ID");
+        SETRANGE("Record ID to Approve",ApprovalEntryArgument."Record ID to Approve");
+        SETRANGE("Workflow Step Instance ID",ApprovalEntryArgument."Workflow Step Instance ID");
+        IF FINDLAST THEN
+          EXIT("Sequence No.");
+      END;
+      EXIT(0);
+    END;
+
+    PROCEDURE GetLimitType@81() : Integer;
+    VAR
+      ApprovalEntry@1000 : Record 454;
+    BEGIN
+      CASE WorkflowStepArgument."Approver Limit Type" OF
+        WorkflowStepArgument."Approver Limit Type"::"Approver Chain",
+        WorkflowStepArgument."Approver Limit Type"::"First Qualified Approver":
+          EXIT(ApprovalEntry."Limit Type"::"Approval Limits");
+        WorkflowStepArgument."Approver Limit Type"::"Direct Approver":
+          EXIT(ApprovalEntry."Limit Type"::"No Limits");
+      END;
+
+      IF ApprovalEntry."Approval Type" = ApprovalEntry."Approval Type"::"Workflow User Group" THEN
+        EXIT(ApprovalEntry."Limit Type"::"No Limits");
+    END;
+
+    PROCEDURE FinishApprovalEntry@37(VAR ApprovalEntry@1000 : Record 454;ApprovalEntryArgument@1001 : Record 454);
+    BEGIN
+      WITH ApprovalEntry DO BEGIN
+        CASE WorkflowStepArgument."Delegate After" OF
+        WorkflowStepArgument."Delegate After"::Never:
+          EVALUATE("Delegation Date Formula",'');
+        WorkflowStepArgument."Delegate After"::"1 day":
+          EVALUATE("Delegation Date Formula",'<1D>');
+        WorkflowStepArgument."Delegate After"::"2 days":
+          EVALUATE("Delegation Date Formula",'<2D>');
+        WorkflowStepArgument."Delegate After"::"5 days":
+          EVALUATE("Delegation Date Formula",'<5D>');
+        ELSE
+          EVALUATE("Delegation Date Formula",'');
+        END;
+
+        "Record ID to Approve" := ApprovalEntryArgument."Record ID to Approve";
+        "Workflow Step Instance ID" := ApprovalEntryArgument."Workflow Step Instance ID";
+      END;
+    END;
+
+    PROCEDURE OrderByTableIDDocTypeAndSeq@41(VAR ApprovalEntry@1000 : Record 454);
+    BEGIN
+      ApprovalEntry.SETCURRENTKEY("Table ID","Document Type","Document No.","Sequence No.","Record ID to Approve");
+      ApprovalEntry.SETRANGE("Workflow Step Instance ID", WorkflowStepInstance.ID);
+    END;
+
+    LOCAL PROCEDURE "-- GUI"@5000();
+    BEGIN
+    END;
+
+    PROCEDURE SendApprovalRequest@1160040001(VAR Expense@1160040000 : Record 6086320);
+    VAR
+      Expense2@1160040004 : Record 6086320;
+      EMApprovalMgt@1160040002 : Codeunit 6086312;
+      CntProcessed@1160040001 : Integer;
+      NoOfRecords@1160040003 : Integer;
+    BEGIN
+      Expense.SETRANGE(Status,Expense.Status::Open);
+      NoOfRecords := Expense.COUNT;
+
+      IF NoOfRecords > 1 THEN
+        IF NOT CONFIRM(STRSUBSTNO(ConfirmSendMultipleForApproval,Expense.COUNT),TRUE) THEN
+          EXIT;
+
+      IF NoOfRecords = 1 THEN BEGIN
+        Expense.FINDSET;
+        IF EMApprovalMgt.HasInvalidComments(Expense) THEN
+          IF NOT CONFIRM(HasCommentQuestion,FALSE) THEN
+            EXIT;
+        SendExpenseApprovalRequest(Expense);
+        CntProcessed := 1
+      END ELSE
+        BEGIN
+          IF Expense.FINDSET THEN
+            REPEAT
+              IF NOT EMApprovalMgt.HasInvalidComments(Expense) THEN BEGIN
+                Expense2 := Expense;
+                SendExpenseApprovalRequest(Expense2);
+                CntProcessed += 1
+              END ELSE
+                IF NoOfRecords = 1 THEN
+                  ERROR(HasCommentErrors);
+            UNTIL Expense.NEXT = 0;
+          END;
+
+      IF GUIALLOWED THEN
+        IF CntProcessed = 0 THEN
+          MESSAGE(NothingToSend)
+        ELSE
+          MESSAGE(SentForApproval,CntProcessed);
+    END;
+
+    PROCEDURE SendExpenseApprovalRequest@8(VAR Expense@1000 : Record 6086320);
+    VAR
+      ApprovalsMgmt@1001 : Codeunit 1535;
+    BEGIN
+      IF CheckExpenseApprovalsWorkflowEnabled(Expense) THEN
+        OnSendExpenseForApproval(Expense);
+    END;
+
+    PROCEDURE CancelApprovalRequest@10(VAR Expense@1000 : Record 6086320);
+    VAR
+      ApprovalsMgmt@1001 : Codeunit 1535;
+    BEGIN
+      OnCancelExpenseApprovalRequest(Expense);
+    END;
+
+    PROCEDURE ForceApproval@11(VAR Expense@1000 : Record 6086320);
+    VAR
+      DCApprovalMgmt@1001 : Codeunit 6085722;
+    BEGIN
+      IF IsExpenseForceApprovalsWorkflowEnabled(Expense) THEN
+        OnExpenseForceApproveApprovalRequest(Expense);
+    END;
+
+    PROCEDURE ApproveApprovalRequest@17(ApprovalEntry@1000 : Record 454);
+    VAR
+      ApprovalsMgmt@1002 : Codeunit 1535;
+    BEGIN
+      ApprovalEntry.SETRECFILTER;
+      ApprovalsMgmt.ApproveApprovalRequests(ApprovalEntry);
+    END;
+
+    PROCEDURE Approve@12(VAR Expense@1000 : Record 6086320);
+    VAR
+      EMApprovalManagement@1002 : Codeunit 6086312;
+    BEGIN
+      EMApprovalManagement.Approve(Expense);
+    END;
+
+    PROCEDURE ForceReject@21(VAR Expense@1000 : Record 6086320);
+    BEGIN
+      OnExpenseForceRejectApprovalRequest(Expense);
+    END;
+
+    PROCEDURE Reject@13(VAR Expense@1000 : Record 6086320);
+    VAR
+      EMApprovalManagement@1001 : Codeunit 6086312;
+    BEGIN
+      EMApprovalManagement.Reject(Expense);
+    END;
+
+    PROCEDURE RejectApprovalRequest@34(VAR ApprovalEntry@1000 : Record 454);
+    VAR
+      ApprovalsMgmt@1001 : Codeunit 1535;
+    BEGIN
+      ApprovalsMgmt.RejectRecordApprovalRequest(ApprovalEntry."Record ID to Approve");
+    END;
+
+    PROCEDURE Forward@14(VAR Expense@1000 : Record 6086320);
+    VAR
+      ApprovalEntry@1003 : Record 454;
+      ApprovalsMgmt@1002 : Codeunit 1535;
+      DCApprovalsBridge@1004 : Codeunit 6085790;
+      DCApprovalMgmt@1001 : Codeunit 6085722;
+      EMApprovalMgmt@1005 : Codeunit 6086312;
+    BEGIN
+      EMApprovalMgmt.Delegate(Expense);
+      DCApprovalsBridge.OnDelegateRecordApprovalRequested(ApprovalEntry);
+    END;
+
+    PROCEDURE OnHold@15(VAR Expense@1000 : Record 6086320);
+    VAR
+      EMApprovalMgmt@1001 : Codeunit 6086312;
+    BEGIN
+      EMApprovalMgmt.PutOnHold(Expense);
+    END;
+
+    LOCAL PROCEDURE "-- Core Deprated Function"@24();
+    BEGIN
+    END;
+
+    PROCEDURE SendApprovalsMail@1160040022(Expense@1001 : Record 6086320;ApprovalEntry@1000 : Record 454);
+    BEGIN
+      MESSAGE('Approval Mail is not supported in NAV 2016')
+    END;
+
+    PROCEDURE FillExpenseTemplate@1160040004(VAR Body@1000 : Text[254];TextNo@1001 : Text[30];Header@1002 : Record 6086320;AppEntry@1003 : Record 454);
+    BEGIN
+      // Not used in 90 Bridge. It's here to reserve the ID
+    END;
+
+    LOCAL PROCEDURE "-- Setup Functionality"@25();
+    BEGIN
+    END;
+
+    PROCEDURE CreateEMApprovalTemplate@1160040014();
+    BEGIN
+      // Create a workflow from template here?
+    END;
+
+    LOCAL PROCEDURE "-- Common Events"@5001();
+    BEGIN
+    END;
+
+    PROCEDURE InformUserOnStatusChange@22(VAR RecRef@1000 : RecordRef);
+    VAR
+      Expense@1002 : Record 6086320;
+    BEGIN
+      IF NOT GUIALLOWED THEN
+        EXIT;
+
+      IF NOT WorkflowStepArgument."Show Confirmation Message" THEN
+        EXIT;
+
+      CASE RecRef.NUMBER OF
+        DATABASE::Expense:
+          BEGIN
+            RecRef.SETTABLE(Expense);
+            ShowExpenseApprovalStatus(Expense);
+          END;
+      END;
+    END;
+
+    LOCAL PROCEDURE ShowExpenseApprovalStatus@5010(Expense@1000 : Record 6086320);
+    BEGIN
+      Expense.FIND;
+
+      CASE Expense.Status OF
+        Expense.Status::Approved:
+          MESSAGE(ExpStatusChangedMsg,Expense."Entry No.",Expense.Status);
+        Expense.Status::"Pending Approval":
+          MESSAGE(PendingApprovalMsg);
+      END;
+    END;
+
+    LOCAL PROCEDURE "-- Check Functions"@5003();
+    BEGIN
+    END;
+
+    PROCEDURE IsApprovalsMailEnabled@30() : Boolean;
+    BEGIN
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE IsRejectionsMailEnabled@31() : Boolean;
+    BEGIN
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE IsRejectionsEnabled@45() : Boolean;
+    BEGIN
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE IsWorkflowSupported@40() : Boolean;
+    VAR
+      Object@1000 : Record 2000000001;
+    BEGIN
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE IsExpenseForceApprovalsWorkflowEnabled@59(VAR Expense@1002 : Record 6086320) : Boolean;
+    VAR
+      WorkflowManagement@1000 : Codeunit 1501;
+      EMWorkflowEventHandling@1001 : Codeunit 6086370;
+    BEGIN
+      EXIT(WorkflowManagement.CanExecuteWorkflow(Expense,EMWorkflowEventHandling.RunWorkflowOnExpenseForceApproveApprovalRequestCode));
+    END;
+
+    PROCEDURE CheckExpenseForceApprovalsWorkflowEnabled@77(VAR Expense@1002 : Record 6086320) : Boolean;
+    BEGIN
+      IF NOT IsExpenseForceApprovalsWorkflowEnabled(Expense) THEN
+        ERROR(Text002);
+
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE IsExpenseApprovalsWorkflowEnabled@2(VAR Expense@1002 : Record 6086320) : Boolean;
+    VAR
+      WorkflowManagement@1000 : Codeunit 1501;
+      EMWorkflowEventHandling@1001 : Codeunit 6086370;
+    BEGIN
+      EXIT(WorkflowManagement.CanExecuteWorkflow(Expense,EMWorkflowEventHandling.RunWorkflowOnSendExpenseForApprovalCode));
+    END;
+
+    PROCEDURE CheckExpenseApprovalsWorkflowEnabled@1(VAR Expense@1002 : Record 6086320) : Boolean;
+    BEGIN
+      IF NOT IsExpenseApprovalsWorkflowEnabled(Expense) THEN
+        ERROR(Text004);
+
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE "-- Publishers"@3();
+    BEGIN
+    END;
+
+    [Integration]
+    PROCEDURE OnSendExpenseForApproval@18(VAR Expense@1000 : Record 6086320);
+    BEGIN
+    END;
+
+    [Integration]
+    PROCEDURE OnExpenseForceApproveApprovalRequest@9(VAR Expense@1000 : Record 6086320);
+    BEGIN
+    END;
+
+    [Integration]
+    PROCEDURE OnExpenseForceRejectApprovalRequest@7(VAR Expense@1000 : Record 6086320);
+    BEGIN
+    END;
+
+    [Integration]
+    PROCEDURE OnCancelExpenseApprovalRequest@4(VAR Expense@1000 : Record 6086320);
+    BEGIN
+    END;
+
+    LOCAL PROCEDURE "-- SubScriber"@20();
+    BEGIN
+    END;
+
+    [EventSubscriber(Codeunit,6086371,OnBeforeExecuteResponseStepInstance)]
+    PROCEDURE OnNewWorkflowStepInstance@19(VAR NewWorkflowStepInstance@1000 : Record 1504);
+    BEGIN
+      WorkflowStepInstance := NewWorkflowStepInstance;
+      WorkflowStepArgument.GET(WorkflowStepInstance.Argument);
+    END;
+
+    LOCAL PROCEDURE "-- Test Functionality"@54();
+    BEGIN
+    END;
+
+    PROCEDURE SetCurrentUser@56(CurrentUserIn@1000 : Code[50]);
+    BEGIN
+      CurrentUser := CurrentUserIn;
+    END;
+
+    PROCEDURE GetCurrentUser@55() : Code[50];
+    BEGIN
+      IF CurrentUser <> '' THEN
+        EXIT(CurrentUser)
+      ELSE
+        EXIT(USERID);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

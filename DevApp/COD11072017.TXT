@@ -1,0 +1,456 @@
+OBJECT Codeunit 11072017 Job Calculate Batches
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00 (1005);
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      JobDiffBuffer@1002 : ARRAY [2] OF TEMPORARY Record 11020411;
+      Text000@1004 : TextConst 'ENU=%1 lines were successfully transferred to the journal.';
+      Text001@1003 : TextConst 'ENU=There is no remaining usage on the job(s).';
+      Text002@1001 : TextConst 'ENU=The lines were successfully changed.';
+      Text003@1005 : TextConst 'ENU=The From Date is later than the To Date.';
+      Text004@1006 : TextConst 'ENU=You must specify %1.';
+      Text005@1007 : TextConst 'ENU=There is nothing to invoice.';
+      Text006@1008 : TextConst 'ENU=1 invoice is created.';
+      Text007@1009 : TextConst 'ENU=%1 invoices are created.';
+      Text008@1010 : TextConst 'ENU=The selected entries were successfully transferred to planning lines.';
+      Text009@1012 : TextConst 'ENU=Total Cost,Total Price,Line Discount Amount,Line Amount';
+      PeriodLength2@1000 : DateFormula;
+
+    PROCEDURE SplitLines@11(VAR JT2@1000 : Record 11072600) : Integer;
+    VAR
+      JT@1002 : Record 11072600;
+      JobPlanningLine@1001 : Record 11020401;
+      NoOfLinesSplitted@1003 : Integer;
+    BEGIN
+      JobPlanningLine.LOCKTABLE;
+      JT.LOCKTABLE;
+      JT := JT2;
+      JT.FIND;
+      JobPlanningLine.SETRANGE("Job No.",JT."Job No.");
+      JobPlanningLine.SETRANGE("Job Task No.",JT."Job Task No.");
+      JobPlanningLine.SETFILTER("Planning Date",JT2.GETFILTER("Planning Date Filter"));
+      IF JobPlanningLine.FIND('-') THEN
+        REPEAT
+          IF JobPlanningLine."Line Type" = JobPlanningLine."Line Type"::"Both Schedule and Contract" THEN
+            IF SplitOneLine(JobPlanningLine) THEN
+              NoOfLinesSplitted += 1;
+        UNTIL JobPlanningLine.NEXT = 0;
+      EXIT(NoOfLinesSplitted);
+    END;
+
+    LOCAL PROCEDURE SplitOneLine@12(JobPlanningLine@1000 : Record 11020401) : Boolean;
+    VAR
+      JobPlanningLine2@1001 : Record 11020401;
+      NextLineNo@1002 : Integer;
+    BEGIN
+      JobPlanningLine.TESTFIELD("Job No.");
+      JobPlanningLine.TESTFIELD("Job Task No.");
+      JobPlanningLine2 := JobPlanningLine;
+      JobPlanningLine2.SETRANGE("Job No.",JobPlanningLine2."Job No.");
+      JobPlanningLine2.SETRANGE("Job Task No.",JobPlanningLine2."Job Task No.");
+      NextLineNo := JobPlanningLine."Line No." + 10000;
+      IF JobPlanningLine2.NEXT <> 0 THEN
+        NextLineNo := (JobPlanningLine."Line No." + JobPlanningLine2."Line No.") DIV 2;
+      JobPlanningLine.VALIDATE("Line Type",JobPlanningLine."Line Type"::Contract);
+      JobPlanningLine.MODIFY;
+      JobPlanningLine.VALIDATE("Line Type",JobPlanningLine."Line Type"::Schedule);
+      JobPlanningLine."Serial No." := '';
+      JobPlanningLine."Lot No." := '';
+      JobPlanningLine."Line No." := NextLineNo;
+      JobPlanningLine.InitJobPlanningLine;
+      JobPlanningLine.INSERT(TRUE);
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE TransferToPlanningLine@9(VAR JobLedgEntry@1000 : Record 11072005;LineType@1001 : Integer);
+    VAR
+      JobPostLine@1002 : Codeunit 11072006;
+    BEGIN
+      JobLedgEntry.LOCKTABLE;
+      IF JobLedgEntry.FIND('-') THEN
+        REPEAT
+          JobLedgEntry.TESTFIELD("Job No.");
+          JobLedgEntry.TESTFIELD("Job Task No.");
+          JobLedgEntry.TESTFIELD("Entry Type",JobLedgEntry."Entry Type"::Usage);
+          JobLedgEntry."Line Type" := LineType;
+          CLEAR(JobPostLine);
+          JobPostLine.InsertPlLineFromLedgEntry(JobLedgEntry);
+        UNTIL JobLedgEntry.NEXT = 0;
+      COMMIT;
+      MESSAGE(Text008);
+    END;
+
+    PROCEDURE ChangePlanningDates@1(JT@1010 : Record 11072600;ScheduleLine@1008 : Boolean;ContractLine@1007 : Boolean;PeriodLength@1006 : DateFormula;FixedDate@1005 : Date;StartingDate@1004 : Date;EndingDate@1002 : Date);
+    VAR
+      Job@1003 : Record 11072003;
+      JobPlanningLine@1009 : Record 11020401;
+    BEGIN
+      JobPlanningLine.LOCKTABLE;
+      JT.LOCKTABLE;
+
+      IF EndingDate = 0D THEN
+        EndingDate := 99991231D;
+      IF EndingDate < StartingDate THEN
+        ERROR(Text003);
+      JT.TESTFIELD("Job No.");
+      JT.TESTFIELD("Job Task No.");
+      Job.GET(JT."Job No.");
+      IF Job.Blocked = Job.Blocked::All THEN
+        Job.TestBlocked;
+      JT.FIND;
+      JobPlanningLine.SETCURRENTKEY("Job No.","Job Task No.");
+      JobPlanningLine.SETRANGE("Job No.",Job."No.");
+      JobPlanningLine.SETRANGE("Job Task No.",JT."Job Task No.");
+
+      IF ScheduleLine AND NOT ContractLine THEN
+        JobPlanningLine.SETRANGE("Schedule Line",TRUE);
+      IF NOT ScheduleLine AND ContractLine THEN
+        JobPlanningLine.SETRANGE("Contract Line",TRUE);
+      JobPlanningLine.SETRANGE("Planning Date",StartingDate,EndingDate);
+      IF JobPlanningLine.FIND('-') THEN
+        REPEAT
+          JobPlanningLine.CALCFIELDS("Qty. Transferred to Invoice");
+          IF JobPlanningLine."Qty. Transferred to Invoice" = 0 THEN BEGIN
+            JobPlanningLine.TESTFIELD("Planning Date");
+            IF FixedDate > 0D THEN
+              JobPlanningLine."Planning Date" := FixedDate
+            ELSE
+              IF PeriodLength <> PeriodLength2 THEN
+                JobPlanningLine."Planning Date" :=
+                  CALCDATE(PeriodLength,JobPlanningLine."Planning Date");
+            JobPlanningLine."Last Date Modified" := TODAY;
+            JobPlanningLine."User ID" := USERID;
+            JobPlanningLine.MODIFY;
+          END;
+        UNTIL JobPlanningLine.NEXT = 0;
+    END;
+
+    PROCEDURE ChangeCurrencyDates@2(JT@1013 : Record 11072600;scheduleLine@1005 : Boolean;ContractLine@1006 : Boolean;PeriodLength@1011 : DateFormula;FixedDate@1008 : Date;StartingDate@1004 : Date;EndingDate@1007 : Date);
+    VAR
+      Job@1003 : Record 11072003;
+      JobPlanningLine@1009 : Record 11020401;
+    BEGIN
+      IF EndingDate = 0D THEN
+        EndingDate := 99991231D;
+      IF EndingDate < StartingDate THEN
+        ERROR(Text003);
+      JT.TESTFIELD("Job No.");
+      JT.TESTFIELD("Job Task No.");
+      Job.GET(JT."Job No.");
+      IF Job.Blocked = Job.Blocked::All THEN
+        Job.TestBlocked;
+      JT.FIND;
+      JobPlanningLine.SETCURRENTKEY("Job No.","Job Task No.");
+      JobPlanningLine.SETRANGE("Job No.",Job."No.");
+      JobPlanningLine.SETRANGE("Job Task No.",JT."Job Task No.");
+
+      IF scheduleLine AND NOT ContractLine THEN
+        JobPlanningLine.SETRANGE("Schedule Line",TRUE);
+      IF NOT scheduleLine AND ContractLine THEN
+        JobPlanningLine.SETRANGE("Contract Line",TRUE);
+      JobPlanningLine.SETRANGE("Currency Date",StartingDate,EndingDate);
+      IF JobPlanningLine.FIND('-') THEN
+        REPEAT
+          JobPlanningLine.CALCFIELDS("Qty. Transferred to Invoice");
+          IF JobPlanningLine."Qty. Transferred to Invoice" = 0 THEN BEGIN
+            JobPlanningLine.TESTFIELD("Planning Date");
+            JobPlanningLine.TESTFIELD("Currency Date");
+            IF FixedDate > 0D THEN BEGIN
+              JobPlanningLine."Currency Date" := FixedDate;
+              JobPlanningLine."Document Date" := FixedDate;
+            END ELSE
+              IF PeriodLength <> PeriodLength2 THEN BEGIN
+                JobPlanningLine."Currency Date" :=
+                  CALCDATE(PeriodLength,JobPlanningLine."Currency Date");
+                JobPlanningLine."Document Date" :=
+                  CALCDATE(PeriodLength,JobPlanningLine."Document Date");
+              END;
+            JobPlanningLine.VALIDATE("Currency Date");
+            JobPlanningLine."Last Date Modified" := TODAY;
+            JobPlanningLine."User ID" := USERID;
+            JobPlanningLine.MODIFY(TRUE);
+          END;
+        UNTIL JobPlanningLine.NEXT = 0;
+    END;
+
+    PROCEDURE ChangeDatesEnd@8();
+    BEGIN
+      COMMIT;
+      MESSAGE(Text002);
+    END;
+
+    PROCEDURE CreateJT@5(JobPlanningLine@1000 : Record 11020401);
+    VAR
+      Job@1003 : Record 11072003;
+      JT@1002 : Record 11072600;
+    BEGIN
+      WITH JobPlanningLine DO BEGIN
+        IF Type = Type::Text THEN
+          EXIT;
+        IF NOT "Schedule Line" THEN
+          EXIT;
+        Job.GET("Job No.");
+        JT.GET("Job No.","Job Task No.");
+        JobDiffBuffer[1]."Job No." := "Job No.";
+        JobDiffBuffer[1]."Job Task No." := "Job Task No.";
+        JobDiffBuffer[1].Type := Type;
+        JobDiffBuffer[1]."No." := "No.";
+        JobDiffBuffer[1]."Location Code" := "Location Code";
+        JobDiffBuffer[1]."Variant Code" := "Variant Code";
+        JobDiffBuffer[1]."Unit of Measure code" := "Unit of Measure Code";
+        JobDiffBuffer[1]."Work Type Code" := "Work Type Code";
+        JobDiffBuffer[1].Quantity := Quantity;
+        JobDiffBuffer[2] := JobDiffBuffer[1];
+        IF JobDiffBuffer[2].FIND THEN BEGIN
+          JobDiffBuffer[2].Quantity := JobDiffBuffer[2].Quantity + JobDiffBuffer[1].Quantity;
+          JobDiffBuffer[2].MODIFY;
+        END ELSE
+          JobDiffBuffer[1].INSERT;
+      END;
+    END;
+
+    PROCEDURE InitDiffBuffer@4();
+    BEGIN
+      CLEAR(JobDiffBuffer);
+      JobDiffBuffer[1].DELETEALL;
+    END;
+
+    PROCEDURE PostDiffBuffer@3(DocNo@1000 : Code[20];PostingDate@1001 : Date;TemplateName@1005 : Code[10];BatchName@1006 : Code[10]);
+    VAR
+      JobLedgEntry@1002 : Record 11072005;
+      JobJnlLine@1003 : Record 11072008;
+      JobJnlTemplate@1008 : Record 11072007;
+      JobJnlBatch@1009 : Record 11072011;
+      NextLineNo@1004 : Integer;
+      LineNo@1007 : Integer;
+    BEGIN
+      IF JobDiffBuffer[1].FIND('-') THEN
+        REPEAT
+          JobLedgEntry.SETCURRENTKEY("Job No.","Job Task No.");
+          JobLedgEntry.SETRANGE("Job No.",JobDiffBuffer[1]."Job No.");
+          JobLedgEntry.SETRANGE("Job Task No.",JobDiffBuffer[1]."Job Task No.");
+          JobLedgEntry.SETRANGE("Entry Type",JobLedgEntry."Entry Type"::Usage);
+          JobLedgEntry.SETRANGE(Type,JobDiffBuffer[1].Type);
+          JobLedgEntry.SETRANGE("No.",JobDiffBuffer[1]."No.");
+          JobLedgEntry.SETRANGE("Location Code",JobDiffBuffer[1]."Location Code");
+          JobLedgEntry.SETRANGE("Variant Code",JobDiffBuffer[1]."Variant Code");
+          JobLedgEntry.SETRANGE("Unit of Measure Code",JobDiffBuffer[1]."Unit of Measure code");
+          JobLedgEntry.SETRANGE("Work Type Code",JobDiffBuffer[1]."Work Type Code");
+          IF JobLedgEntry.FIND('-') THEN
+            REPEAT
+              JobDiffBuffer[1].Quantity := JobDiffBuffer[1].Quantity - JobLedgEntry.Quantity;
+            UNTIL JobLedgEntry.NEXT = 0;
+          JobDiffBuffer[1].MODIFY;
+        UNTIL JobDiffBuffer[1].NEXT = 0;
+      JobJnlLine.LOCKTABLE;
+      JobJnlLine.VALIDATE("Journal Template Name",TemplateName);
+      JobJnlLine.VALIDATE("Journal Batch Name",BatchName);
+      JobJnlLine.SETRANGE("Journal Template Name",JobJnlLine."Journal Template Name");
+      JobJnlLine.SETRANGE("Journal Batch Name",JobJnlLine."Journal Batch Name");
+      IF JobJnlLine.FINDLAST THEN
+        NextLineNo := JobJnlLine."Line No." + 10000
+      ELSE
+        NextLineNo := 10000;
+
+      IF JobDiffBuffer[1].FIND('-') THEN
+        REPEAT
+          IF JobDiffBuffer[1].Quantity > 0 THEN BEGIN
+            CLEAR(JobJnlLine);
+            JobJnlLine."Journal Template Name" := TemplateName;
+            JobJnlLine."Journal Batch Name" := BatchName;
+            JobJnlTemplate.GET(TemplateName);
+            JobJnlBatch.GET(TemplateName,BatchName);
+            JobJnlLine."Source Code" := JobJnlTemplate."Source Code";
+            JobJnlLine."Reason Code" := JobJnlBatch."Reason Code";
+            JobJnlLine.DontCheckStdCost;
+            JobJnlLine.VALIDATE("Job No.",JobDiffBuffer[1]."Job No.");
+            JobJnlLine.VALIDATE("Job Task No.",JobDiffBuffer[1]."Job Task No.");
+            JobJnlLine.VALIDATE("Posting Date",PostingDate);
+            JobJnlLine.VALIDATE(Type,JobDiffBuffer[1].Type);
+            JobJnlLine.VALIDATE("No.",JobDiffBuffer[1]."No.");
+            JobJnlLine.VALIDATE("Variant Code",JobDiffBuffer[1]."Variant Code");
+            JobJnlLine.VALIDATE("Unit of Measure Code",JobDiffBuffer[1]."Unit of Measure code");
+            JobJnlLine.VALIDATE("Location Code",JobDiffBuffer[1]."Location Code");
+            IF JobDiffBuffer[1].Type = JobDiffBuffer[1].Type::Resource THEN
+              JobJnlLine.VALIDATE("Work Type Code",JobDiffBuffer[1]."Work Type Code");
+            JobJnlLine."Document No." := DocNo;
+            JobJnlLine.VALIDATE(Quantity,JobDiffBuffer[1].Quantity);
+            JobJnlLine."Line No." := NextLineNo;
+            NextLineNo := NextLineNo + 10000;
+            JobJnlLine.INSERT(TRUE);
+            LineNo := LineNo + 1;
+          END;
+        UNTIL JobDiffBuffer[1].NEXT = 0;
+      COMMIT;
+      IF LineNo = 0 THEN
+        MESSAGE(Text001)
+      ELSE
+        MESSAGE(Text000,LineNo);
+    END;
+
+    PROCEDURE BatchError@6(PostingDate@1000 : Date;DocNo@1001 : Code[20]);
+    VAR
+      GLEntry@1002 : Record 17;
+    BEGIN
+      IF PostingDate = 0D THEN
+        ERROR(Text004,GLEntry.FIELDCAPTION("Posting Date"));
+      IF DocNo = '' THEN
+        ERROR(Text004,GLEntry.FIELDCAPTION("Document No."));
+    END;
+
+    PROCEDURE EndCreateInvoice@7(NoOfInvoices@1000 : Integer);
+    BEGIN
+      COMMIT;
+      IF NoOfInvoices <= 0 THEN
+        MESSAGE(Text005);
+      IF NoOfInvoices = 1 THEN
+        MESSAGE(Text006);
+      IF NoOfInvoices > 1 THEN
+        MESSAGE(Text007,NoOfInvoices);
+    END;
+
+    PROCEDURE CalculateActualToBudget@10(VAR Job@1005 : Record 11072003;JT@1001 : Record 11072600;VAR JobDiffBuffer2@1000 : Record 11020411;VAR JobDiffBuffer3@1006 : Record 11020411;CurrencyType@1002 : 'LCY,FCY');
+    VAR
+      JobPlanningLine@1003 : Record 11020401;
+      JobLedgEntry@1004 : Record 11072005;
+    BEGIN
+      CLEARALL;
+      CLEAR(JobDiffBuffer);
+      CLEAR(JobDiffBuffer2);
+      CLEAR(JobDiffBuffer3);
+
+      JobDiffBuffer[1].DELETEALL;
+      JobDiffBuffer2.DELETEALL;
+      JobDiffBuffer3.DELETEALL;
+
+      JT.FIND;
+      JobPlanningLine.SETRANGE("Job No.",JT."Job No.");
+      JobPlanningLine.SETRANGE("Job Task No.",JT."Job Task No.");
+      JobPlanningLine.SETFILTER("Planning Date",Job.GETFILTER("Planning Date Filter"));
+
+      JobLedgEntry.SETRANGE("Job No.",JT."Job No.");
+      JobLedgEntry.SETRANGE("Job Task No.",JT."Job Task No.");
+      JobLedgEntry.SETFILTER("Posting Date",Job.GETFILTER("Posting Date Filter"));
+
+      IF JobPlanningLine.FIND('-') THEN
+        REPEAT
+          InsertDiffBuffer(JobLedgEntry,JobPlanningLine,0,CurrencyType);
+        UNTIL JobPlanningLine.NEXT = 0;
+
+      IF JobLedgEntry.FIND('-') THEN
+        REPEAT
+          InsertDiffBuffer(JobLedgEntry,JobPlanningLine,1,CurrencyType);
+        UNTIL JobLedgEntry.NEXT = 0;
+
+      IF JobDiffBuffer[1].FIND('-') THEN
+        REPEAT
+          IF JobDiffBuffer[1]."Entry type" = JobDiffBuffer[1]."Entry type"::Schedule THEN BEGIN
+            JobDiffBuffer2 := JobDiffBuffer[1];
+            JobDiffBuffer2.INSERT;
+          END ELSE BEGIN
+            JobDiffBuffer3 := JobDiffBuffer[1];
+            JobDiffBuffer3."Entry type" := JobDiffBuffer3."Entry type"::Schedule;
+            JobDiffBuffer3.INSERT;
+          END;
+        UNTIL JobDiffBuffer[1].NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE InsertDiffBuffer@13(VAR JobLedgEntry@1003 : Record 11072005;VAR JobPlanningLine@1000 : Record 11020401;LineType@1002 : 'Schedule,Usage';CurrencyType@1001 : 'LCY,FCY');
+    BEGIN
+      IF LineType = LineType::Schedule THEN
+        WITH JobPlanningLine DO BEGIN
+          IF Type = Type::Text THEN
+            EXIT;
+          IF NOT "Schedule Line" THEN
+            EXIT;
+          JobDiffBuffer[1].Type := Type;
+          JobDiffBuffer[1]."No." := "No.";
+          JobDiffBuffer[1]."Entry type" := JobDiffBuffer[1]."Entry type"::Schedule;
+          JobDiffBuffer[1]."Unit of Measure code" := "Unit of Measure Code";
+          JobDiffBuffer[1]."Work Type Code" := "Work Type Code";
+          JobDiffBuffer[1].Quantity := Quantity;
+          IF CurrencyType = CurrencyType::LCY THEN BEGIN
+            JobDiffBuffer[1]."Total Cost" := "Total Cost (LCY)";
+            JobDiffBuffer[1]."Line Amount" := "Line Amount (LCY)";
+          END ELSE BEGIN
+            JobDiffBuffer[1]."Total Cost" := "Total Cost";
+            JobDiffBuffer[1]."Line Amount" := "Line Amount";
+          END;
+          JobDiffBuffer[2] := JobDiffBuffer[1];
+          IF JobDiffBuffer[2].FIND THEN BEGIN
+            JobDiffBuffer[2].Quantity :=
+              JobDiffBuffer[2].Quantity + JobDiffBuffer[1].Quantity;
+            JobDiffBuffer[2]."Total Cost" :=
+              JobDiffBuffer[2]."Total Cost" + JobDiffBuffer[1]."Total Cost";
+            JobDiffBuffer[2]."Line Amount" :=
+              JobDiffBuffer[2]."Line Amount" + JobDiffBuffer[1]."Line Amount";
+            JobDiffBuffer[2].MODIFY;
+          END ELSE
+            JobDiffBuffer[1].INSERT;
+        END;
+
+      IF LineType = LineType::Usage THEN
+        WITH JobLedgEntry DO BEGIN
+          IF "Entry Type" <> "Entry Type"::Usage THEN
+            EXIT;
+          JobDiffBuffer[1].Type := Type;
+          JobDiffBuffer[1]."No." := "No.";
+          JobDiffBuffer[1]."Entry type" := JobDiffBuffer[1]."Entry type"::Usage;
+          JobDiffBuffer[1]."Unit of Measure code" := "Unit of Measure Code";
+          JobDiffBuffer[1]."Work Type Code" := "Work Type Code";
+          JobDiffBuffer[1].Quantity := Quantity;
+          IF CurrencyType = CurrencyType::LCY THEN BEGIN
+            JobDiffBuffer[1]."Total Cost" := "Total Cost (LCY)";
+            JobDiffBuffer[1]."Line Amount" := "Line Amount (LCY)";
+          END ELSE BEGIN
+            JobDiffBuffer[1]."Total Cost" := "Total Cost";
+            JobDiffBuffer[1]."Line Amount" := "Line Amount";
+          END;
+          JobDiffBuffer[2] := JobDiffBuffer[1];
+          IF JobDiffBuffer[2].FIND THEN BEGIN
+            JobDiffBuffer[2].Quantity :=
+              JobDiffBuffer[2].Quantity + JobDiffBuffer[1].Quantity;
+            JobDiffBuffer[2]."Total Cost" :=
+              JobDiffBuffer[2]."Total Cost" + JobDiffBuffer[1]."Total Cost";
+            JobDiffBuffer[2]."Line Amount" :=
+              JobDiffBuffer[2]."Line Amount" + JobDiffBuffer[1]."Line Amount";
+            JobDiffBuffer[2].MODIFY;
+          END ELSE
+            JobDiffBuffer[1].INSERT;
+        END;
+    END;
+
+    PROCEDURE GetCurrencyCode@14(VAR Job@1000 : Record 11072003;Type@1002 : '0,1,2,3';CurrencyType@1004 : 'Local Currency,Foreign Currency') : Text[50];
+    VAR
+      GLSetup@1001 : Record 98;
+      CurrencyCode@1003 : Code[20];
+    BEGIN
+      GLSetup.GET;
+      IF CurrencyType = CurrencyType::"Local Currency" THEN
+        CurrencyCode := GLSetup."LCY Code"
+      ELSE BEGIN
+        IF Job."Currency Code" <> '' THEN
+          CurrencyCode := Job."Currency Code"
+        ELSE
+          CurrencyCode := GLSetup."LCY Code";
+      END;
+      EXIT(SELECTSTR(Type + 1,Text009) + ' (' + CurrencyCode + ')');
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

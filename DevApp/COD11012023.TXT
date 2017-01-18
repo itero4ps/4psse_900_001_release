@@ -1,0 +1,303 @@
+OBJECT Codeunit 11012023 Purch.-Get Receipt Inv.Approv.
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=11012032;
+    Permissions=TableData 25=m,
+                TableData 120=rimd,
+                TableData 122=m,
+                TableData 380=m;
+    OnRun=BEGIN
+            IF "Document Type" = "Document Type"::"Purchase Invoice" THEN BEGIN
+              DocumentType := DocumentType::Invoice;
+              PurchInvHeader.GET("Document No.");
+              IF PurchInvHeader."DMS Status" > PurchInvHeader."DMS Status"::"Awaiting Line Entry" THEN
+                PurchInvHeader.FIELDERROR("DMS Status");
+              AmountsOnly := PurchInvHeader."Amounts only";
+            END ELSE BEGIN
+              DocumentType := DocumentType::"Credit Memo";
+              PurchCredHeader.GET("Document No.");
+              IF PurchCredHeader."DMS Status" > PurchCredHeader."DMS Status"::"Awaiting Line Entry" THEN
+                PurchCredHeader.FIELDERROR("DMS Status");
+              AmountsOnly := PurchCredHeader."Amounts only";
+            END;
+
+            //C014159
+            PurchRcptLine.SETCURRENTKEY("Buy-from Vendor No.","Document No.","Order No.");
+            IF DocumentType = DocumentType::Invoice THEN BEGIN
+              PurchRcptLine.SETRANGE("Buy-from Vendor No.",PurchInvHeader."Buy-from Vendor No.");
+              IF PurchInvHeader."Related Purch. Order No." <> '' THEN
+                PurchRcptLine.SETRANGE(PurchRcptLine."Order No.", PurchInvHeader."Related Purch. Order No.");
+            END ELSE BEGIN
+              PurchRcptLine.SETRANGE("Buy-from Vendor No.",PurchCredHeader."Buy-from Vendor No.");
+              IF PurchCredHeader."Related Purch. Order No." <> '' THEN
+                PurchRcptLine.SETRANGE(PurchRcptLine."Order No.", PurchCredHeader."Related Purch. Order No.");
+            END;
+
+            IF AmountsOnly THEN
+              PurchRcptLine.SETFILTER(Quantity,'0');
+
+            IF DocumentType = DocumentType::Invoice THEN
+              IF AmountsOnly THEN
+                PurchRcptLine.SETFILTER("Amnt. Rcd. Not Invoiced",'<>0')
+              ELSE
+                PurchRcptLine.SETFILTER("Qty. Rcd. Not Invoiced",'<>0');
+
+            PurchSetup.GET;
+            IF PurchSetup."Close Pl.Ext.Rent Ord. on Rcpt" THEN BEGIN
+              //* See T312, OnValidate field 11012020 (may only be set if plant is active, so no problem with read permission plantsetup)
+              PlantSetup.GET;
+              IF PlantSetup."Cost Component Rent" <> '' THEN BEGIN
+                PurchRcptLine.FILTERGROUP(9);
+                //* Now there are also Hour Hire Orders for external Plant (Order with Hours Hire Order Type::Plant).
+                //* these also have "Cost Component Rent", so filter on "Cost Component Plant" can not be used anymore.
+                //* A new field is added on the Receipt Line (filled in C90), so filter on new field.
+                //PurchRcptLine.SETFILTER("Cost Component Plant", '<>%1', PlantSetup."Cost Component Rent");
+                PurchRcptLine.SETRANGE("Close Pl.Ext.Rent Ord. on Rcpt", FALSE);
+                PurchRcptLine.FILTERGROUP(0);
+              END;
+            END;
+            //
+
+            IF "Document Type" = "Document Type"::"Purchase Invoice" THEN
+              IF GetReceiptsAutomatic AND (PurchInvHeader."Related Purch. Order No." <> '') THEN BEGIN
+                PurchRcptLine.SETFILTER("Order Status", '<>%1', PurchRcptLine."Order Status"::Closed);
+                IF PurchRcptLine.FINDFIRST THEN
+                  CreateInvLines(PurchRcptLine);
+                EXIT;
+              END;
+
+            GetReceipts.SETTABLEVIEW(PurchRcptLine);
+            GetReceipts.LOOKUPMODE := TRUE;
+            GetReceipts.SetInvApprHeader("Document Type","Document No.");
+            GetReceipts.RUNMODAL;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@11012017 : TextConst 'ENU="%1 %2 of %3 %4 differs from %5 %6 (%7); continue ?"';
+      GLSetup@11012000 : Record 98;
+      PurchInvHeader@11012002 : Record 122;
+      PurchCredHeader@11012003 : Record 124;
+      InvApprLine@11012004 : Record 11012032;
+      PurchRcptHeader@11012005 : Record 120;
+      PurchRcptLine@11012006 : Record 121;
+      VendorRec@11012010 : Record 23;
+      PurchSetup@1100525001 : Record 312;
+      PlantSetup@1100525000 : Record 11012550;
+      GetReceipts@1000000001 : Page 5709;
+      InvCurrency@11012014 : Code[10];
+      ReceiptsCurr@11012015 : Code[10];
+      Text002@1000000002 : TextConst 'ENU=The %1 on the %2 %3 and the %4 %5 must be the same.';
+      DocumentType@1000000005 : 'Invoice,Credit Memo';
+      DocumentNo@1000000006 : Code[20];
+      AmountsOnly@1210190000 : Boolean;
+      Text003@1210190001 : TextConst 'ENU=Attention, the %1 of the Invoice are changed';
+      GetReceiptsAutomatic@1100525002 : Boolean;
+
+    PROCEDURE SetPurchHeader@2(lDocType@1000000000 : 'Invoice,Credit Memo';lDocNo@1000 : Code[20]);
+    BEGIN
+      IF lDocType = lDocType::Invoice THEN BEGIN
+        PurchInvHeader.GET(lDocNo);
+        AmountsOnly := PurchInvHeader."Amounts only";
+      END ELSE BEGIN
+        PurchCredHeader.GET(lDocNo);
+        AmountsOnly := PurchCredHeader."Amounts only";
+      END;
+
+      DocumentType := lDocType;
+      DocumentNo := lDocNo;
+    END;
+
+    PROCEDURE SetGetReceiptsAutomatic@1100525001();
+    BEGIN
+      GetReceiptsAutomatic := TRUE;
+    END;
+
+    PROCEDURE CreateInvLines@1000000010(VAR PurchRcptLine2@1000000000 : Record 121);
+    VAR
+      lvVendLedgEntryRec@1100485002 : Record 25;
+      lvDetailVendLedgEntryRec@1100485003 : Record 380;
+      PurchRcptLine3@1100525002 : Record 121;
+      PurchGetRcptCU@1100525000 : Codeunit 74;
+    BEGIN
+      WITH PurchRcptLine2 DO BEGIN
+        //IF "Order No." <> '' THEN BEGIN  //*18693.so
+        //  IF lvPurchHeadOrderRec.GET(lvPurchHeadOrderRec."Document Type"::Order, "Order No.") THEN BEGIN
+        //    IF (lvPurchHeadOrderRec."Purchase Order Type" = lvPurchHeadOrderRec."Purchase Order Type"::"Return Order") THEN
+        //      lvIsReturnOrder := TRUE;
+        //  END;
+        //END;  //*18693.eo
+        SETCURRENTKEY("Document No.","Line No.");
+        IF DocumentType = DocumentType::Invoice THEN
+          IF AmountsOnly THEN
+            SETFILTER("Amnt. Rcd. Not Invoiced",'<>0')
+          ELSE
+            SETFILTER("Qty. Rcd. Not Invoiced",'<>0');
+        IF FINDSET THEN BEGIN
+          REPEAT
+            IF PurchRcptHeader."No." <> "Document No." THEN BEGIN
+              PurchRcptHeader.GET("Document No.");
+
+              IF DocumentType = DocumentType::Invoice THEN BEGIN
+                PurchInvHeader.GET(DocumentNo);
+                IF PurchInvHeader."Pay-to Vendor No." <> PurchRcptHeader."Pay-to Vendor No." THEN
+                  IF CONFIRM(
+                    Text000,
+                    FALSE,
+                    PurchInvHeader.FIELDCAPTION("Pay-to Vendor No."),
+                    PurchInvHeader."Pay-to Vendor No.",
+                    PurchInvHeader.TABLECAPTION,
+                    PurchInvHeader."No.",
+                    PurchRcptHeader.TABLECAPTION,
+                    PurchRcptHeader."No.",
+                    PurchRcptHeader."Pay-to Vendor No.")
+                  THEN BEGIN
+                    VendorRec.GET(PurchInvHeader."Pay-to Vendor No.");
+                    PurchRcptHeader."Pay-to Vendor No." := VendorRec."No.";
+                    PurchRcptHeader."Pay-to Name" := VendorRec.Name;
+                    PurchRcptHeader."Pay-to Name 2" := VendorRec."Name 2";
+                    PurchRcptHeader."Pay-to Address" := VendorRec.Address;
+                    PurchRcptHeader."Pay-to Address 2" := VendorRec."Address 2";
+                    PurchRcptHeader."Pay-to City" := VendorRec.City;
+                    PurchRcptHeader."Pay-to Post Code" := VendorRec."Post Code";
+                    PurchRcptHeader."Pay-to County" := VendorRec.County;
+                    PurchRcptHeader."Pay-to Country/Region Code" := VendorRec."Country/Region Code";
+                    PurchRcptHeader."Pay-to Contact" := VendorRec.Contact;
+                    PurchRcptHeader.MODIFY;
+                  END;
+                PurchRcptHeader.TESTFIELD("Pay-to Vendor No.",PurchInvHeader."Pay-to Vendor No.")
+              END ELSE BEGIN //call C008665 c
+                //call C008665 sn
+                PurchCredHeader.GET(DocumentNo);
+                IF PurchCredHeader."Pay-to Vendor No." <> PurchRcptHeader."Pay-to Vendor No." THEN
+                  IF CONFIRM(
+                    Text000,
+                    FALSE,
+                    PurchCredHeader.FIELDCAPTION("Pay-to Vendor No."),
+                    PurchCredHeader."Pay-to Vendor No.",
+                    PurchCredHeader.TABLECAPTION,
+                    PurchCredHeader."No.",
+                    PurchRcptHeader.TABLECAPTION,
+                    PurchRcptHeader."No.",
+                    PurchRcptHeader."Pay-to Vendor No.")
+                  THEN BEGIN
+                    VendorRec.GET(PurchCredHeader."Pay-to Vendor No.");
+                    PurchRcptHeader."Pay-to Vendor No." := VendorRec."No.";
+                    PurchRcptHeader."Pay-to Name" := VendorRec.Name;
+                    PurchRcptHeader."Pay-to Name 2" := VendorRec."Name 2";
+                    PurchRcptHeader."Pay-to Address" := VendorRec.Address;
+                    PurchRcptHeader."Pay-to Address 2" := VendorRec."Address 2";
+                    PurchRcptHeader."Pay-to City" := VendorRec.City;
+                    PurchRcptHeader."Pay-to Post Code" := VendorRec."Post Code";
+                    PurchRcptHeader."Pay-to County" := VendorRec.County;
+                    PurchRcptHeader."Pay-to Country/Region Code" := VendorRec."Country/Region Code";
+                    PurchRcptHeader."Pay-to Contact" := VendorRec.Contact;
+                    PurchRcptHeader.MODIFY;
+                  END;
+                //call C008665 en
+                PurchRcptHeader.TESTFIELD("Pay-to Vendor No.",PurchCredHeader."Pay-to Vendor No.");
+              END; //call C008665 n
+            END;
+          UNTIL NEXT = 0;
+        END;
+
+        CLEAR(PurchRcptHeader);
+        IF FINDSET THEN BEGIN
+
+          InvApprLine.LOCKTABLE;
+          InvApprLine.SETRANGE("Document Type",DocumentType);
+          InvApprLine.SETRANGE("Document No.",DocumentNo);
+          InvApprLine."Document Type" := DocumentType;
+          InvApprLine."Document No." := DocumentNo;
+
+          REPEAT
+            IF PurchRcptHeader."No." <> "Document No." THEN BEGIN
+              PurchRcptHeader.GET("Document No.");
+
+              //Update Invoice Payment Terms
+              IF DocumentType = DocumentType::Invoice THEN BEGIN
+                IF (PurchRcptHeader."Payment Terms Code" <> '') AND
+                   (PurchInvHeader."Payment Terms Code" <> PurchRcptHeader."Payment Terms Code")
+                THEN BEGIN
+                  PurchInvHeader.VALIDATE("Payment Terms Code", PurchRcptHeader."Payment Terms Code");
+                  PurchInvHeader.MODIFY;
+                  //* A vendor ledger entry is already created, which contains old due date.
+                  //* This due date should be updated if vendor ledger entry is still 'Open'. Also due date in
+                  //* detailed vendor ledger entry must be updated (07-02-2008, call 10163/10785).
+                  lvVendLedgEntryRec.RESET;
+                  lvVendLedgEntryRec.SETCURRENTKEY("Document No.");
+                  lvVendLedgEntryRec.SETRANGE("Document No.", PurchInvHeader."No.");
+                  lvVendLedgEntryRec.SETRANGE("Document Type", lvVendLedgEntryRec."Document Type"::Invoice);
+                  lvVendLedgEntryRec.SETRANGE(Open, TRUE);
+                  IF lvVendLedgEntryRec.FINDSET(TRUE,FALSE) THEN BEGIN
+                    lvDetailVendLedgEntryRec.RESET;
+                    lvDetailVendLedgEntryRec.SETCURRENTKEY("Vendor Ledger Entry No.");
+                    REPEAT
+                      lvVendLedgEntryRec."Due Date" := PurchInvHeader."Due Date";
+                      lvVendLedgEntryRec."Pmt. Discount Date" := PurchInvHeader."Pmt. Discount Date";
+                      lvVendLedgEntryRec.MODIFY;
+                      //
+                      lvDetailVendLedgEntryRec.SETRANGE("Vendor Ledger Entry No.", lvVendLedgEntryRec."Entry No.");
+                      IF lvDetailVendLedgEntryRec.FINDSET(TRUE,FALSE) THEN BEGIN
+                        REPEAT
+                          lvDetailVendLedgEntryRec."Due Date" := PurchInvHeader."Due Date";
+                          lvDetailVendLedgEntryRec.MODIFY;
+                        UNTIL lvDetailVendLedgEntryRec.NEXT = 0;
+                      END;
+                    UNTIL lvVendLedgEntryRec.NEXT = 0;
+                  END;
+                  MESSAGE(Text003, PurchInvHeader.FIELDCAPTION("Payment Terms Code"));
+                END;
+              END;
+
+              GetCurrencyConversion;
+              IF ReceiptsCurr <> InvCurrency THEN
+                IF DocumentType = DocumentType::Invoice THEN
+                  ERROR(Text002,
+                    PurchInvHeader.FIELDCAPTION("Currency Code"),
+                    PurchInvHeader.TABLECAPTION, PurchInvHeader."No.",
+                    PurchRcptHeader.TABLECAPTION,PurchRcptHeader."No.")
+                ELSE
+                  ERROR(Text002,
+                    PurchCredHeader.FIELDCAPTION("Currency Code"),
+                    PurchCredHeader.TABLECAPTION, PurchCredHeader."No.",
+                    PurchRcptHeader.TABLECAPTION,PurchRcptHeader."No.");
+            END;
+
+            PurchRcptLine3.COPY(PurchRcptLine2);
+            PurchGetRcptCU.CheckNotSKUConsigment(PurchRcptLine3, TRUE);  //*18314
+            PurchRcptLine3.InsertInvApprLineFromRcptLine(InvApprLine);  //*18693 argument lvIsReturnOrder deleted
+          UNTIL NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE GetCurrencyConversion@1();
+    BEGIN
+      GLSetup.GET;
+
+      IF DocumentType = DocumentType::Invoice THEN
+        InvCurrency := PurchInvHeader."Currency Code"
+      ELSE
+        InvCurrency := PurchCredHeader."Currency Code";
+
+      ReceiptsCurr := PurchRcptHeader."Currency Code";
+
+      IF InvCurrency = '' THEN InvCurrency := GLSetup."LCY Code";
+      IF ReceiptsCurr = '' THEN ReceiptsCurr := GLSetup."LCY Code";
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

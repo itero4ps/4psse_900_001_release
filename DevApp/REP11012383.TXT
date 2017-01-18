@@ -1,0 +1,218 @@
+OBJECT Report 11012383 Divide Revenues by Allocation
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    CaptionML=ENU=Divide Revenues by Allocation;
+    ProcessingOnly=Yes;
+    OnPreReport=BEGIN
+                  IF PostingDate = 0D THEN
+                    ERROR(Text003);
+
+                  GLSetup.GET;
+                  ProjSetUp.GET;
+                  JnlTemplRec.GET(ProjSetUp."Intern Charge Journal Template");
+                  JnlBatchRec.GET(ProjSetUp."Intern Charge Journal Template", ProjSetUp."Intern Charge Journal Batch");
+                END;
+
+    OnPostReport=BEGIN
+                   IF FirstLineProcessed THEN
+                     MESSAGE(Text002, ProjSetUp."Intern Charge Journal Template", ProjSetUp."Intern Charge Journal Batch");
+                 END;
+
+  }
+  DATASET
+  {
+    { 8019;    ;DataItem;                    ;
+               DataItemTable=Table11072003;
+               DataItemTableView=SORTING(No.)
+                                 WHERE(Single/Main/Sub Project=CONST(Main Project));
+               OnAfterGetRecord=BEGIN
+                                  IF Blocked <> Blocked::" " THEN
+                                    CurrReport.SKIP;
+
+                                  IF NOT ProjSetUp."Provisions at Closure" THEN BEGIN
+                                    IF "Project Status" >= "Project Status"::Finished THEN
+                                      CurrReport.SKIP;
+                                  END;
+
+                                  CalculateRevenues("No.");
+                                END;
+
+               ReqFilterFields=No. }
+
+  }
+  REQUESTPAGE
+  {
+    PROPERTIES
+    {
+    }
+    CONTROLS
+    {
+      { 1100525000;;Container;
+                  ContainerType=ContentArea }
+
+      { 1100525001;1;Group  ;
+                  CaptionML=ENU=Options;
+                  GroupType=Group }
+
+      { 1100525002;2;Field  ;
+                  CaptionML=ENU=Posting Date;
+                  SourceExpr=PostingDate }
+
+    }
+  }
+  LABELS
+  {
+  }
+  CODE
+  {
+    VAR
+      ProjSetUp@1100528820 : Record 315;
+      GLSetup@1100528816 : Record 98;
+      GenJnlLine@1100528819 : Record 81;
+      JnlTemplRec@1100528818 : Record 80;
+      JnlBatchRec@1100528817 : Record 232;
+      AllocationRevenuesProjects@1100528822 : Record 11020685;
+      GenericTempTable@1100528823 : TEMPORARY Record 11020579;
+      LineCounter@1100528815 : Integer;
+      DocNoCde@1100528814 : Code[6];
+      NewDocNo@1100528828 : Code[20];
+      Text001@1100528829 : TextConst 'ENU=For project %1 is the sum of the allocation not equal 100 %';
+      Text002@1100528800 : TextConst 'ENU=Journal Lines generated in Journal %1 and Batch %2';
+      PostingDate@1100528801 : Date;
+      FirstLineProcessed@1100528802 : Boolean;
+      Text003@1100528803 : TextConst 'ENU=Posting Date has to be entered';
+
+    PROCEDURE CalculateRevenues@1100528802(VAR ProjectNo@1100528801 : Code[20]);
+    VAR
+      JobLedgerEntry@1100528800 : Record 11072005;
+    BEGIN
+      JobLedgerEntry.SETRANGE("Job No.",ProjectNo);
+      JobLedgerEntry.SETFILTER("Cost Type", '%1', JobLedgerEntry."Cost Type"::Revenues);
+      JobLedgerEntry.SETCURRENTKEY("Job No.","Cost Type","Global Dimension 2 Code","Entry Type","Posting Date");
+      IF JobLedgerEntry.FINDSET THEN BEGIN
+        REPEAT
+        GenericTempTable."Key Code1" := ProjectNo;
+        GenericTempTable."Key Code2" := JobLedgerEntry."Global Dimension 2 Code";
+        GenericTempTable."Key Code3" := JobLedgerEntry.Element;  //db, 20-03-13: C001515
+        IF GenericTempTable.GET(ProjectNo,
+          JobLedgerEntry."Global Dimension 2 Code",
+          JobLedgerEntry.Element,'','','') THEN BEGIN  //db, 20-03-13: C001515
+          GenericTempTable.Dec1 := GenericTempTable.Dec1 + JobLedgerEntry."Total Price (LCY)";
+          GenericTempTable.MODIFY;
+        END ELSE
+          BEGIN
+            GenericTempTable.Dec1 := JobLedgerEntry."Total Price (LCY)";
+            GenericTempTable.Text1 := JobLedgerEntry.Description;
+            GenericTempTable.INSERT;
+          END;
+        UNTIL JobLedgerEntry.NEXT = 0;
+      END;
+
+      GenerateMemorialBooking(ProjectNo);
+      GenericTempTable.DELETEALL;
+    END;
+
+    PROCEDURE GenerateMemorialBooking@1100528803(ProjectNo@1100528800 : Code[20]);
+    VAR
+      AllocationCounter@1100528801 : Integer;
+      Counter@1100528802 : Integer;
+      Saldo@1100528803 : Decimal;
+      Amt@1100528805 : Decimal;
+      TotalPerc@1100528804 : Decimal;
+    BEGIN
+      IF GenericTempTable.FINDSET THEN
+      REPEAT
+        AllocationRevenuesProjects.SETRANGE("Main Project", ProjectNo);
+        AllocationCounter := AllocationRevenuesProjects.COUNT;
+        Counter := 0;
+        IF AllocationRevenuesProjects.FINDSET THEN BEGIN
+          Amt := ROUND( -1*GenericTempTable.Dec1, GLSetup."Amount Rounding Precision");
+          IF Amt <> 0 THEN BEGIN
+            GenerateMemorialBookingGenJL(ProjectNo,Amt);
+            Saldo := Amt;
+            TotalPerc := 0;
+            REPEAT
+              Counter := Counter + 1;
+              Amt := ROUND(AllocationRevenuesProjects.Allocation * GenericTempTable.Dec1/100, GLSetup."Amount Rounding Precision");
+              TotalPerc := TotalPerc + AllocationRevenuesProjects.Allocation;
+              Saldo := Saldo + Amt;
+              IF Counter = AllocationCounter THEN BEGIN
+                IF TotalPerc <> 100 THEN
+                  ERROR(Text001,ProjectNo);
+                Amt := Amt - Saldo;
+              END;
+              GenerateMemorialBookingGenJL(AllocationRevenuesProjects."Sub Project", Amt);
+            UNTIL AllocationRevenuesProjects.NEXT = 0;
+          END;
+        END;
+      UNTIL GenericTempTable.NEXT = 0;
+    END;
+
+    PROCEDURE GenerateMemorialBookingGenJL@1100528833(ProjectNo@1100528800 : Code[20];RevenueAmount@1100528801 : Decimal);
+    BEGIN
+      WITH GenJnlLine DO BEGIN
+        "Journal Template Name" := ProjSetUp."Intern Charge Journal Template";
+        "Journal Batch Name" := ProjSetUp."Intern Charge Journal Batch";
+        IF NOT FirstLineProcessed THEN
+          CreateNewDocumentNo("Journal Template Name","Journal Batch Name",NewDocNo);
+
+        LineCounter := LineCounter + 10000;
+        "Line No." := LineCounter;
+        INSERT;
+        "Document No." := NewDocNo;
+        VALIDATE("Posting Date",PostingDate);
+        VALIDATE("Job No.",ProjectNo);
+        VALIDATE(Element,GenericTempTable."Key Code3");  //db, 20-03-13: C001515
+        VALIDATE("Shortcut Dimension 2 Code",GenericTempTable."Key Code2");
+        VALIDATE(Amount,RevenueAmount);
+        Description := COPYSTR(GenericTempTable.Text1,1,MAXSTRLEN(Description));
+        "Gen. Posting Type" := "Gen. Posting Type"::" ";
+        "Gen. Bus. Posting Group" := '';
+        "Gen. Prod. Posting Group"  := '';
+        "VAT Bus. Posting Group" := '';
+        VALIDATE("VAT Prod. Posting Group", '');
+        MODIFY;
+
+        FirstLineProcessed := TRUE;
+      END;
+    END;
+
+    PROCEDURE CreateNewDocumentNo@1100528800(JournalTemplateName@1100528801 : Code[10];JournalBatchName@1100528802 : Code[10];VAR NewDocNo@1100528803 : Code[20]);
+    VAR
+      GenJnlBatch@1100528804 : Record 232;
+      NoSeriesMgt@1100528805 : Codeunit 396;
+    BEGIN
+      GenJnlBatch.GET(JournalTemplateName,JournalBatchName);
+      GenJnlLine.SETRANGE("Journal Template Name",JournalTemplateName);
+      GenJnlLine.SETRANGE("Journal Batch Name",JournalBatchName);
+      IF GenJnlLine.FINDLAST THEN BEGIN
+        NewDocNo := GenJnlLine."Document No.";
+        NewDocNo := INCSTR(NewDocNo);
+        LineCounter := GenJnlLine."Line No.";
+      END ELSE BEGIN
+        IF GenJnlBatch."No. Series" <> '' THEN BEGIN
+          CLEAR(NoSeriesMgt);
+          NewDocNo := NoSeriesMgt.TryGetNextNo(GenJnlBatch."No. Series",WORKDATE);
+          LineCounter := 0;
+        END;
+      END;
+    END;
+
+    BEGIN
+    {
+      RFC dp00022
+    }
+    END.
+  }
+  RDLDATA
+  {
+  }
+}
+

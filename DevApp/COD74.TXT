@@ -1,0 +1,770 @@
+OBJECT Codeunit 74 Purch.-Get Receipt
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00.00.45243,4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=39;
+    OnRun=BEGIN
+            PurchHeader.GET("Document Type","Document No.");
+            //PurchHeader.TESTFIELD("Document Type",PurchHeader."Document Type"::Invoice);  //**4PS.o
+            PurchHeader.TESTFIELD(Status,PurchHeader.Status::Open);
+
+            //**4PS.sn
+            //* Autom. get receipts of related order. Flowfield 'Item Type' is used as indicator (see T38)
+            GetRelatedOrderAutomatically :=
+              (PurchHeader."Related Purch. Order No." <> '') AND
+              ("Item Type" = '<' + PurchHeader.FIELDNAME("Related Purch. Order No.") + '>');
+            //**4PS.en
+
+            PurchRcptLine.SETCURRENTKEY("Pay-to Vendor No.");
+            //PurchRcptLine.SETRANGE("Pay-to Vendor No.",PurchHeader."Pay-to Vendor No."); //**4PS.o
+            PurchRcptLine.SETRANGE("Buy-from Vendor No.",PurchHeader."Buy-from Vendor No.");
+            //**4PS.sn
+            //**4PS03.sn
+            IF PurchHeader."Related Purch. Order No." <> '' THEN
+              PurchRcptLine.SETRANGE("Order No.", PurchHeader."Related Purch. Order No.");
+            //**4PS03.en
+
+            PurchSetup.GET;
+            IF PurchSetup."Close Pl.Ext.Rent Ord. on Rcpt" THEN BEGIN
+              //* See T312, OnValidate field 11012020 (may only be set if plant is active, so no problem with read permission plantsetup)
+              PlantSetup.GET;
+              IF PlantSetup."Cost Component Rent" <> '' THEN BEGIN
+                PurchRcptLine.FILTERGROUP(9);
+                //* Now there are also Hour Hire Orders for external Plant (Order with Hours Hire Order Type::Plant).
+                //* these also have "Cost Component Rent", so filter on "Cost Component Plant" can not be used anymore.
+                //* A new field is added on the Receipt Line (filled in C90), so filter on new field.
+                //PurchRcptLine.SETFILTER("Cost Component Plant", '<>%1', PlantSetup."Cost Component Rent");
+                PurchRcptLine.SETRANGE("Close Pl.Ext.Rent Ord. on Rcpt", FALSE);
+                PurchRcptLine.FILTERGROUP(0);
+              END;
+            END;
+
+            IF PurchHeader."Amounts only" THEN
+              PurchRcptLine.SETFILTER(Quantity,'0');
+
+            IF PurchHeader."Document Type" = PurchHeader."Document Type"::Invoice THEN
+              IF PurchHeader."Amounts only" THEN
+                PurchRcptLine.SETFILTER("Amnt. Rcd. Not Invoiced",'<>0')
+              ELSE
+            //**4PS.en
+              PurchRcptLine.SETFILTER("Qty. Rcd. Not Invoiced",'<>0');
+
+            PurchRcptLine.SETRANGE("Currency Code",PurchHeader."Currency Code");
+
+            //**4PS DP00558 sn
+            PurchaseOrder.INIT;
+            IF PurchHeader."Related Purch. Order No." <> '' THEN BEGIN
+              PurchaseOrder.GET(PurchaseOrder."Document Type"::Order, PurchHeader."Related Purch. Order No.");
+              IF PurchaseOrder."Tolerate Exceeding Invoice Qu." THEN
+                PurchRcptLine.SETRANGE("Qty. Rcd. Not Invoiced");
+            END;
+            //**4PS DP00558 en
+
+            //**4PS.sn
+            IF GetRelatedOrderAutomatically THEN BEGIN
+              PurchRcptLine.SETFILTER("Order Status", '<>%1', PurchRcptLine."Order Status"::Closed);
+              SkipSKUConsigmentError := TRUE;
+              CreateInvLines(PurchRcptLine);
+              EXIT;
+            END;
+            //**4PS.en
+
+            GetReceipts.SETTABLEVIEW(PurchRcptLine);
+            GetReceipts.LOOKUPMODE := TRUE;
+            GetReceipts.SetPurchHeader(PurchHeader);
+            GetReceipts.RUNMODAL;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1000 : TextConst 'ENU=The %1 on the %2 %3 and the %4 %5 must be the same.';
+      PurchHeader@1001 : Record 38;
+      PurchLine@1002 : Record 39;
+      PurchRcptHeader@1003 : Record 120;
+      PurchRcptLine@1004 : Record 121;
+      GetReceipts@1005 : Page 5709;
+      PurchSetup@1100525001 : Record 312;
+      PlantSetup@1100525000 : Record 11012550;
+      CumulatedICFSurchargeRec@1100525003 : Record 11012131;
+      GLSetup@11012000 : Record 98;
+      InvCurrency@11012012 : Code[10];
+      ReceiptsCurr@11012013 : Code[10];
+      Text11012000@1210190000 : TextConst 'ENU="""Pay-to Vendor"" differs from the ""Pay-to Vendor"" on the Order.\Continue?"';
+      Text11012001@1210190001 : TextConst 'ENU=Attention, the %1 of the Invoice are changed';
+      SkipSKUConsigmentError@1100525002 : Boolean;
+      GetRelatedOrderAutomatically@1100528500 : Boolean;
+      Text11012002@1100525004 : TextConst 'ENU=The selected %1 of the purchase order %2 differs from that of the purchase receipt %3.';
+      PurchaseOrder@1100409000 : Record 38;
+      Text11012003@1100528403 : TextConst 'ENU=Getting Receipt Lines @1@@@@@@@@@@';
+
+    PROCEDURE CreateInvLines@1(VAR PurchRcptLine2@1000 : Record 121);
+    VAR
+      TransferLine@1001 : Boolean;
+      SkipSKUConsigment@1100525001 : Boolean;
+      RejectionLine@1100525000 : Record 11020374;
+      lPurchHeader@1100525002 : Record 38;
+      PurchRcptLine3@1100528400 : Record 121;
+      Window@1100528403 : Dialog;
+      lPaymentTermsCode@1100525003 : Code[10];
+      NoOfRecords@1100528401 : Integer;
+      Progress@1100528402 : Integer;
+    BEGIN
+      WITH PurchRcptLine2 DO BEGIN
+        //**4PS.sn
+        IF GUIALLOWED THEN
+          Window.OPEN(Text11012003);
+        SkipSKUConsigment := FALSE;
+        IF SkipSKUConsigmentError THEN BEGIN
+          SkipSKUConsigmentError := FALSE;
+          SkipSKUConsigment := TRUE;
+        END;
+        //IF "Order No." <> '' THEN BEGIN  //*18693.so
+        //  IF lvPurchHeadOrderRec.GET(lvPurchHeadOrderRec."Document Type"::Order, "Order No.") THEN BEGIN
+        //    IF (lvPurchHeadOrderRec."Purchase Order Type" = lvPurchHeadOrderRec."Purchase Order Type"::"Return Order") THEN
+        //      lvIsReturnOrder := TRUE;
+        //  END;
+        //END;  //*18693.eo
+        //SETCURRENTKEY("Buy-from Vendor No.","Document No."); //**4PS.o
+        SETCURRENTKEY("Buy-from Vendor No.","Document No.","Order No."); //**4PS.n
+        IF PurchHeader."Document Type" = PurchHeader."Document Type"::Invoice THEN
+          IF PurchHeader."Amounts only" THEN
+            SETFILTER("Amnt. Rcd. Not Invoiced",'<>0')
+          ELSE
+        //**4PS.en
+            SETFILTER("Qty. Rcd. Not Invoiced",'<>0');
+
+
+        //**4PS.sn
+        PurchaseOrder.INIT;
+        IF PurchHeader."Related Purch. Order No." <> '' THEN BEGIN
+          PurchaseOrder.GET(PurchaseOrder."Document Type"::Order, PurchHeader."Related Purch. Order No.");
+          IF PurchaseOrder."Tolerate Exceeding Invoice Qu." THEN
+            SETRANGE("Qty. Rcd. Not Invoiced");
+        END;
+        NoOfRecords := COUNT;
+        //**4PS.en
+
+        IF FIND('-') THEN BEGIN
+          PurchLine.LOCKTABLE;
+          PurchLine.SETRANGE("Document Type",PurchHeader."Document Type");
+          PurchLine.SETRANGE("Document No.",PurchHeader."No.");
+          PurchLine."Document Type" := PurchHeader."Document Type";
+          PurchLine."Document No." := PurchHeader."No.";
+
+          REPEAT
+            //**4PS.sn
+            Progress := Progress + 1;
+            IF GUIALLOWED AND
+               (NoOfRecords > 0)
+            THEN
+              Window.UPDATE(1, 100 * ROUND(100 * Progress / NoOfRecords, 1));
+            RejectionLine.CheckRejectionForPurchRcptLine(PurchRcptLine2);
+            //**4PS.en
+            IF PurchRcptHeader."No." <> "Document No." THEN BEGIN
+              PurchRcptHeader.GET("Document No.");
+              TransferLine := TRUE;
+              { //**4PS.so
+              IF PurchRcptHeader."Currency Code" <> PurchHeader."Currency Code" THEN BEGIN
+                MESSAGE(
+                  Text000,
+                  PurchHeader.FIELDCAPTION("Currency Code"),
+                  PurchHeader.TABLECAPTION,PurchHeader."No.",
+                  PurchRcptHeader.TABLECAPTION,PurchRcptHeader."No.");
+                TransferLine := FALSE;
+              END;
+              IF PurchRcptHeader."Pay-to Vendor No." <> PurchHeader."Pay-to Vendor No." THEN BEGIN
+                MESSAGE(
+                  Text000,
+                  PurchHeader.FIELDCAPTION("Pay-to Vendor No."),
+                  PurchHeader.TABLECAPTION,PurchHeader."No.",
+                  PurchRcptHeader.TABLECAPTION,PurchRcptHeader."No.");
+                TransferLine := FALSE;
+              END;
+              } //**4PS.eo
+
+              //**4PS.sn
+              IF GUIALLOWED AND
+                 (PurchRcptHeader."Pay-to Vendor No." <> PurchHeader."Pay-to Vendor No.")
+              THEN
+                IF NOT CONFIRM(Text11012000) THEN ERROR('');
+              IF PurchHeader."Document Type" = PurchHeader."Document Type"::Invoice THEN BEGIN
+
+                //**4PS Call C009163.so
+                //IF (PurchRcptHeader."Payment Terms Code" <> '') AND
+                //   (PurchHeader."Payment Terms Code" <> PurchRcptHeader."Payment Terms Code")
+                //THEN BEGIN
+                //  PurchHeader.VALIDATE("Payment Terms Code", PurchRcptHeader."Payment Terms Code");
+                //**4PS Call C009163.eo
+                //**4PS Call C009163.sn
+                IF lPurchHeader."No." <> PurchRcptHeader."Order No." THEN
+                  IF NOT lPurchHeader.GET(lPurchHeader."Document Type"::Order, PurchRcptHeader."Order No.") THEN BEGIN
+                    lPurchHeader.INIT;
+                    lPurchHeader."No." := '';
+                  END;
+
+                IF lPurchHeader."No." <> '' THEN BEGIN
+                  lPaymentTermsCode := lPurchHeader."Payment Terms Code";
+                  IF lPaymentTermsCode <> PurchRcptHeader."Payment Terms Code" THEN
+                    IF GUIALLOWED THEN
+                      MESSAGE(Text11012002, PurchHeader.FIELDCAPTION("Payment Terms Code"),lPaymentTermsCode,PurchRcptHeader."Payment Terms Code");
+                END ELSE
+                  lPaymentTermsCode := PurchRcptHeader."Payment Terms Code";
+
+
+                IF (lPaymentTermsCode <> '') AND
+                   (PurchHeader."Payment Terms Code" <> lPaymentTermsCode)
+                THEN BEGIN
+                  PurchHeader.VALIDATE("Payment Terms Code", lPaymentTermsCode);
+                //**4PS Call C009163.en
+                  PurchHeader.MODIFY(TRUE);
+                  IF GUIALLOWED THEN
+                    MESSAGE(Text11012001, PurchHeader.FIELDCAPTION("Payment Terms Code"));
+                END;
+                // dp00206.sn
+                IF (PurchRcptHeader."On Hold" <> '') AND
+                   (PurchHeader."On Hold" <> PurchRcptHeader."On Hold")
+                THEN BEGIN
+                  PurchHeader.VALIDATE("On Hold", PurchRcptHeader."On Hold");
+                  PurchHeader.MODIFY(TRUE);
+                END;
+                // dp00206.en
+              END;
+              GetCurrencyConversion;
+              IF (ReceiptsCurr <> InvCurrency) THEN
+                ERROR(Text000,
+                  PurchHeader.FIELDCAPTION("Currency Code"),
+                  PurchHeader.TABLECAPTION, PurchHeader."No.",
+                  PurchRcptHeader.TABLECAPTION,PurchRcptHeader."No.");
+              //**4PS.en
+            END;
+
+            IF TransferLine THEN BEGIN
+              //**4PS.so
+              //PurchRcptLine := PurchRcptLine2;
+              //PurchRcptLine.TESTFIELD("VAT Bus. Posting Group",PurchHeader."VAT Bus. Posting Group");
+              //PurchRcptLine.InsertInvLineFromRcptLine(PurchLine);
+              //**4PS.eo
+              //**4PS.sn
+              PurchRcptLine3.COPY(PurchRcptLine2);
+              PurchRcptLine3.TESTFIELD("VAT Bus. Posting Group",PurchHeader."VAT Bus. Posting Group");
+              IF CheckNotSKUConsigment(PurchRcptLine3, NOT SkipSKUConsigment) THEN  //**4PS.n 18314
+                PurchRcptLine3.InsertInvLineFromRcptLine(PurchLine);
+              //**4PS.en
+              IF Type = Type::"Charge (Item)" THEN
+                GetItemChargeAssgnt(PurchRcptLine2,PurchLine."Qty. to Invoice");
+            END;
+          UNTIL NEXT = 0;
+
+          CalcInvoiceDiscount(PurchLine);
+        END;
+        //**4PS.sn
+        IF GUIALLOWED THEN
+          Window.CLOSE;
+        //**4PS.en
+      END;
+    END;
+
+    PROCEDURE SetPurchHeader@2(VAR PurchHeader2@1000 : Record 38);
+    BEGIN
+      PurchHeader.GET(PurchHeader2."Document Type",PurchHeader2."No.");
+      //PurchHeader.TESTFIELD("Document Type",PurchHeader."Document Type"::Invoice); //**4PS.o
+    END;
+
+    PROCEDURE GetItemChargeAssgnt@5800(VAR PurchRcptLine@1000 : Record 121;QtyToInv@1003 : Decimal);
+    VAR
+      PurchOrderLine@1001 : Record 39;
+      ItemChargeAssgntPurch@1002 : Record 5805;
+    BEGIN
+      WITH PurchRcptLine DO
+        IF PurchOrderLine.GET(PurchOrderLine."Document Type"::Order,"Order No.","Order Line No.")
+        THEN BEGIN
+          ItemChargeAssgntPurch.LOCKTABLE;
+          ItemChargeAssgntPurch.RESET;
+          ItemChargeAssgntPurch.SETRANGE("Document Type",PurchOrderLine."Document Type");
+          ItemChargeAssgntPurch.SETRANGE("Document No.",PurchOrderLine."Document No.");
+          ItemChargeAssgntPurch.SETRANGE("Document Line No.",PurchOrderLine."Line No.");
+          IF ItemChargeAssgntPurch.FINDFIRST THEN BEGIN
+            ItemChargeAssgntPurch.CALCSUMS("Qty. to Assign");
+            IF ItemChargeAssgntPurch."Qty. to Assign" <> 0 THEN
+              CopyItemChargeAssgnt(
+                PurchOrderLine,PurchRcptLine,ItemChargeAssgntPurch."Qty. to Assign",QtyToInv / ItemChargeAssgntPurch."Qty. to Assign");
+          END;
+        END;
+    END;
+
+    LOCAL PROCEDURE CopyItemChargeAssgnt@5801(PurchOrderLine@1000 : Record 39;PurchRcptLine@1001 : Record 121;QtyToAssign@1002 : Decimal;QtyFactor@1008 : Decimal);
+    VAR
+      PurchRcptLine2@1003 : Record 121;
+      PurchLine2@1004 : Record 39;
+      ItemChargeAssgntPurch@1005 : Record 5805;
+      ItemChargeAssgntPurch2@1006 : Record 5805;
+      InsertChargeAssgnt@1007 : Boolean;
+      LineQtyToAssign@1009 : Decimal;
+    BEGIN
+      WITH PurchOrderLine DO BEGIN
+        ItemChargeAssgntPurch.SETRANGE("Document Type","Document Type");
+        ItemChargeAssgntPurch.SETRANGE("Document No.","Document No.");
+        ItemChargeAssgntPurch.SETRANGE("Document Line No.","Line No.");
+        IF ItemChargeAssgntPurch.FIND('-') THEN
+          REPEAT
+            IF ItemChargeAssgntPurch."Qty. to Assign" <> 0 THEN BEGIN
+              ItemChargeAssgntPurch2 := ItemChargeAssgntPurch;
+              ItemChargeAssgntPurch2."Qty. to Assign" := QtyFactor * ItemChargeAssgntPurch2."Qty. to Assign";
+              PurchLine2.SETRANGE("Receipt No.",PurchRcptLine."Document No.");
+              PurchLine2.SETRANGE("Receipt Line No.",PurchRcptLine."Line No.");
+              IF PurchLine2.FIND('-') THEN
+                REPEAT
+                  PurchLine2.CALCFIELDS("Qty. to Assign");
+                  InsertChargeAssgnt := PurchLine2."Qty. to Assign" <> PurchLine2.Quantity;
+                UNTIL (PurchLine2.NEXT = 0) OR InsertChargeAssgnt;
+
+              IF InsertChargeAssgnt THEN BEGIN
+                ItemChargeAssgntPurch2."Document Type" := PurchLine2."Document Type";
+                ItemChargeAssgntPurch2."Document No." := PurchLine2."Document No.";
+                ItemChargeAssgntPurch2."Document Line No." := PurchLine2."Line No.";
+                ItemChargeAssgntPurch2."Qty. Assigned" := 0;
+                LineQtyToAssign :=
+                  ItemChargeAssgntPurch2."Qty. to Assign" - GetQtyAssignedInNewLine(ItemChargeAssgntPurch2);
+                InsertChargeAssgnt := LineQtyToAssign <> 0;
+                IF InsertChargeAssgnt THEN BEGIN
+                  IF ABS(QtyToAssign) < ABS(LineQtyToAssign) THEN
+                    ItemChargeAssgntPurch2."Qty. to Assign" := QtyToAssign;
+                  IF ABS(PurchLine2.Quantity - PurchLine2."Qty. to Assign") <
+                     ABS(LineQtyToAssign)
+                  THEN
+                    ItemChargeAssgntPurch2."Qty. to Assign" :=
+                      PurchLine2.Quantity - PurchLine2."Qty. to Assign";
+                  ItemChargeAssgntPurch2.VALIDATE("Unit Cost");
+
+                  IF ItemChargeAssgntPurch2."Applies-to Doc. Type" = "Document Type" THEN BEGIN
+                    ItemChargeAssgntPurch2."Applies-to Doc. Type" := PurchLine2."Document Type";
+                    ItemChargeAssgntPurch2."Applies-to Doc. No." := PurchLine2."Document No.";
+                    PurchRcptLine2.SETCURRENTKEY("Order No.","Order Line No.");
+                    PurchRcptLine2.SETRANGE("Order No.",ItemChargeAssgntPurch."Applies-to Doc. No.");
+                    PurchRcptLine2.SETRANGE("Order Line No.",ItemChargeAssgntPurch."Applies-to Doc. Line No.");
+                    PurchRcptLine2.SETRANGE("Document No.",PurchRcptLine."Document No.");
+                    IF PurchRcptLine2.FINDFIRST THEN BEGIN
+                      PurchLine2.SETCURRENTKEY("Document Type","Receipt No.","Receipt Line No.");
+                      PurchLine2.SETRANGE("Document Type",PurchLine2."Document Type"::Invoice);
+                      PurchLine2.SETRANGE("Receipt No.",PurchRcptLine2."Document No.");
+                      PurchLine2.SETRANGE("Receipt Line No.",PurchRcptLine2."Line No.");
+                      IF PurchLine2.FIND('-') AND (PurchLine2.Quantity <> 0) THEN
+                        ItemChargeAssgntPurch2."Applies-to Doc. Line No." := PurchLine2."Line No."
+                      ELSE
+                        InsertChargeAssgnt := FALSE;
+                    END ELSE
+                      InsertChargeAssgnt := FALSE;
+                  END;
+                END;
+              END;
+
+              IF InsertChargeAssgnt AND (ItemChargeAssgntPurch2."Qty. to Assign" <> 0) THEN BEGIN
+                ItemChargeAssgntPurch2.INSERT;
+                QtyToAssign := QtyToAssign - ItemChargeAssgntPurch2."Qty. to Assign";
+              END;
+            END;
+          UNTIL ItemChargeAssgntPurch.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE GetQtyAssignedInNewLine@4(ItemChargeAssgntPurch@1000 : Record 5805) : Decimal;
+    BEGIN
+      WITH ItemChargeAssgntPurch DO BEGIN
+        SETRANGE("Document Type","Document Type");
+        SETRANGE("Document No.","Document No.");
+        SETRANGE("Document Line No.","Document Line No.");
+        SETRANGE("Applies-to Doc. Type","Applies-to Doc. Type");
+        SETRANGE("Applies-to Doc. No.","Applies-to Doc. No.");
+        SETRANGE("Applies-to Doc. Line No.","Applies-to Doc. Line No.");
+        CALCSUMS("Qty. to Assign");
+        EXIT("Qty. to Assign");
+      END;
+    END;
+
+    LOCAL PROCEDURE CalcInvoiceDiscount@14(VAR PurchLine@1001 : Record 39);
+    VAR
+      PurchSetup@1000 : Record 312;
+      PurchCalcDiscount@1002 : Codeunit 70;
+    BEGIN
+      PurchSetup.GET;
+      IF PurchSetup."Calc. Inv. Discount" THEN
+        PurchCalcDiscount.CalculateInvoiceDiscountOnLine(PurchLine);
+    END;
+
+    PROCEDURE GetCurrencyConversion@11012001();
+    BEGIN
+      //**4PS
+      GLSetup.GET;
+
+      InvCurrency := PurchHeader."Currency Code";
+      ReceiptsCurr := PurchRcptHeader."Currency Code";
+
+      IF InvCurrency = '' THEN InvCurrency := GLSetup."LCY Code";
+      IF ReceiptsCurr = '' THEN ReceiptsCurr := GLSetup."LCY Code";
+    END;
+
+    PROCEDURE MatchReceiptICFInvoice@1210190005(lvInv@1210190004 : Code[20];lvCreditMemo@1210190003 : Boolean);
+    VAR
+      lvICFLineRec@1210190000 : Record 11012327;
+      lvPurchLineRec@1210190001 : Record 39;
+      NextLino@1210190002 : Integer;
+      LastLino@1210190005 : Integer;
+      SingleLine@1100525000 : Boolean;
+      lVendor@1100525001 : Code[20];
+      lTotAmount@1100525002 : Decimal;
+      LinesFound@1100525003 : Boolean;
+      lFactor@1100525004 : Integer;
+    BEGIN
+      //**4PS
+      IF lvInv = '' THEN EXIT;  //db, 01-03-05: no match invoice (purchaseheader missing; see dataport 11012327)
+
+      GLSetup.GET;
+
+      lvICFLineRec.RESET;
+      lvICFLineRec.SETRANGE("Invoice No.", lvInv);
+      lvICFLineRec.SETFILTER("Record Type", 'FR10|FR30');  //db, 12-06-08 (FR10=invoice line; FR30=surcharge)
+      IF lvICFLineRec.FINDLAST THEN;
+
+      LastLino := 0;
+      NextLino := 0;
+
+      IF lvCreditMemo = TRUE THEN
+        lvPurchLineRec.SETRANGE("Document Type", lvPurchLineRec."Document Type"::"Credit Memo")
+      ELSE
+        lvPurchLineRec.SETRANGE("Document Type", lvPurchLineRec."Document Type"::Invoice);
+
+      lvPurchLineRec.SETRANGE("Document No.", lvICFLineRec."Invoice No.");
+      IF lvPurchLineRec.FINDLAST THEN
+        LastLino := lvPurchLineRec."Line No.";
+
+      LinesFound := FALSE;
+
+      IF lvICFLineRec.FIND('-') THEN BEGIN
+        LinesFound := TRUE;
+        lVendor := lvICFLineRec.Vendor;
+        REPEAT
+
+          IF (lvICFLineRec."Surcharge Code (Detail)" <> '') AND
+            CumulatedICFSurchargeRec.GET(lvICFLineRec.Vendor,
+                                         lvICFLineRec."Record Type",
+                                         lvICFLineRec."Surcharge Code (Detail)")
+          THEN
+            SingleLine := FALSE
+          ELSE
+            SingleLine := TRUE;
+
+          IF SingleLine THEN BEGIN
+
+            IF lvCreditMemo = TRUE THEN
+              lvPurchLineRec.SETRANGE("Document Type", lvPurchLineRec."Document Type"::"Credit Memo")
+            ELSE
+              lvPurchLineRec.SETRANGE("Document Type", lvPurchLineRec."Document Type"::Invoice);
+
+            lvPurchLineRec.SETRANGE("Document No.", lvICFLineRec."Invoice No.");
+            lvPurchLineRec.SETFILTER("Line No.", '..%1', LastLino);
+            IF lvPurchLineRec.FINDSET(TRUE, FALSE) THEN BEGIN
+              REPEAT
+                IF ItemMatchICF(lvICFLineRec, lvPurchLineRec) THEN BEGIN
+                  lvICFLineRec."Receipt No." := lvPurchLineRec."Receipt No.";
+                  lvICFLineRec."Receipt Line No." := lvPurchLineRec."Receipt Line No.";
+                  lvICFLineRec.MODIFY;
+                  lvPurchLineRec."ICF Quantity" := lvICFLineRec."Quantity (Invoice)";
+                  IF lvICFLineRec."Unit Code" <> '' THEN
+                    lvPurchLineRec."ICF Unit" := lvICFLineRec."Unit Code"
+                  ELSE
+                    lvPurchLineRec."ICF Unit" := lvICFLineRec."Price Unit";
+                  IF lvICFLineRec."Quantity (Invoice)" <> 0 THEN
+                    lvPurchLineRec."ICF Price" := lvICFLineRec."Line Amount" / lvICFLineRec."Quantity (Invoice)"
+                  ELSE
+                    lvPurchLineRec."ICF Price" := lvICFLineRec."Line Amount";
+                  lvPurchLineRec."ICF Line Amount" := lvICFLineRec."Line Amount";
+                  IF lvPurchLineRec.Quantity = lvPurchLineRec."ICF Quantity" THEN
+                    lvPurchLineRec.VALIDATE("ICF Line Approved", lvPurchLineRec.CheckICFMargin);
+                  lvPurchLineRec.MODIFY(TRUE);
+                END;
+              UNTIL lvPurchLineRec.NEXT = 0;
+            END;
+            IF lvICFLineRec."Receipt No." = '' THEN BEGIN
+              IF NextLino = 0 THEN
+                CreateLineForICFInvoice(lvICFLineRec, NextLino, lvCreditMemo); //header text
+              CreateLineForICFInvoice(lvICFLineRec, NextLino, lvCreditMemo);   //missing line
+            END;
+
+          END;
+        UNTIL lvICFLineRec.NEXT = 0;
+      END;
+
+      //Handle Lines which are cumulated in the ICF file versus splitted lines in Purchase
+      IF LinesFound THEN BEGIN
+
+        lvICFLineRec.RESET;
+        lvICFLineRec.SETRANGE("Invoice No.", lvInv);
+
+        CumulatedICFSurchargeRec.RESET;
+        CumulatedICFSurchargeRec.SETRANGE(Vendor, lVendor);
+        CumulatedICFSurchargeRec.SETFILTER("Record Type", '<>%1', '');
+        CumulatedICFSurchargeRec.SETFILTER("Surcharge Code", '<>%1', '');
+        CumulatedICFSurchargeRec.SETFILTER("Cost Object", '<>%1', '');
+        IF CumulatedICFSurchargeRec.FIND('-') THEN BEGIN
+          REPEAT
+
+            lvICFLineRec.SETRANGE("Record Type", CumulatedICFSurchargeRec."Record Type");
+            IF COPYSTR(CumulatedICFSurchargeRec."Record Type",1,2) = 'FH' THEN BEGIN
+              lvICFLineRec.SETRANGE("Surcharge Code (Detail)");
+              lvICFLineRec.SETRANGE("Surcharge Code (Header)", CumulatedICFSurchargeRec."Surcharge Code");
+            END;
+            IF COPYSTR(CumulatedICFSurchargeRec."Record Type",1,2) = 'FR' THEN BEGIN
+              lvICFLineRec.SETRANGE("Surcharge Code (Header)");
+              lvICFLineRec.SETRANGE("Surcharge Code (Detail)",CumulatedICFSurchargeRec."Surcharge Code");
+            END;
+
+            IF lvICFLineRec.FINDFIRST THEN BEGIN  // Only one record is assumed to present, because it's a cumulate.
+
+              IF lvCreditMemo = TRUE THEN
+                lvPurchLineRec.SETRANGE("Document Type", lvPurchLineRec."Document Type"::"Credit Memo")
+              ELSE
+                lvPurchLineRec.SETRANGE("Document Type", lvPurchLineRec."Document Type"::Invoice);
+
+              lvPurchLineRec.SETRANGE("Document No.", lvICFLineRec."Invoice No.");
+              lvPurchLineRec.SETRANGE("Shortcut Dimension 2 Code", CumulatedICFSurchargeRec."Cost Object");
+              lvPurchLineRec.SETFILTER("Line No.", '..%1', LastLino);
+              IF lvPurchLineRec.FINDSET THEN BEGIN
+
+                lTotAmount := 0;
+                REPEAT
+                  lTotAmount += lvPurchLineRec."Line Amount";
+                UNTIL lvPurchLineRec.NEXT = 0;
+
+                IF CumulatedSurchargeMatchICF(lvICFLineRec, lTotAmount) THEN BEGIN
+
+                  lvPurchLineRec.FINDSET(TRUE, FALSE);
+                  lvICFLineRec."Receipt No." := lvPurchLineRec."Receipt No.";
+                  lvICFLineRec."Receipt Line No." := lvPurchLineRec."Receipt Line No.";
+                  lvICFLineRec.MODIFY;
+
+                  REPEAT
+
+                    lFactor := lvPurchLineRec."Line Amount"/lTotAmount;
+
+                    lvPurchLineRec."ICF Quantity" := ROUND((lvICFLineRec."Quantity (Invoice)" * lFactor),
+                                                           0.01);
+
+                    IF lvICFLineRec."Unit Code" <> '' THEN
+                      lvPurchLineRec."ICF Unit" := lvICFLineRec."Unit Code"
+                    ELSE
+                      lvPurchLineRec."ICF Unit" := lvICFLineRec."Price Unit";
+
+                    IF lvICFLineRec."Quantity (Invoice)" <> 0 THEN
+                      lvPurchLineRec."ICF Price" := lvICFLineRec."Line Amount" / lvICFLineRec."Quantity (Invoice)"
+                    ELSE
+                      lvPurchLineRec."ICF Price" := lvICFLineRec."Line Amount";
+
+                    lvPurchLineRec."ICF Price" := lvICFLineRec."Line Amount" * lFactor;
+                    lvPurchLineRec."ICF Price" := ROUND(lvPurchLineRec."ICF Price",
+                                                        GLSetup."Unit-Amount Rounding Precision");
+                    lvPurchLineRec."ICF Line Amount" := ROUND((lvICFLineRec."Line Amount" * lFactor),
+                                                              GLSetup."Amount Rounding Precision");
+
+
+                    //Total Amount is allready checked before, so parameter must be true
+                    lvPurchLineRec.VALIDATE("ICF Line Approved", TRUE);
+
+                    lvPurchLineRec.MODIFY(TRUE);
+
+                  UNTIL lvPurchLineRec.NEXT = 0;
+
+                END;
+              END;
+
+              IF lvICFLineRec."Receipt No." = '' THEN BEGIN
+                IF NextLino = 0 THEN
+                  CreateLineForICFInvoice(lvICFLineRec, NextLino, lvCreditMemo); //header text
+                CreateLineForICFInvoice(lvICFLineRec, NextLino, lvCreditMemo);   //missing line
+              END;
+
+            END;
+
+          UNTIL CumulatedICFSurchargeRec.NEXT = 0;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE CreateLineForICFInvoice@1210190008(lvICFLineRec@1210190004 : Record 11012327;VAR NextLino@1210190003 : Integer;lvCreditMemo@1210190000 : Boolean);
+    VAR
+      lvPurchHeaderRec@1210190006 : Record 38;
+      lvPurchLineRec@1210190002 : Record 39;
+      lvText000@1210190001 : TextConst 'ENU=Reference (Customer) %1:';
+      lvVendorRec@1210190007 : Record 23;
+      lvItemRec@1210190010 : Record 27;
+      lvTradeItemRec@1210190009 : Record 11012317;
+      lvDesc@1210190005 : Text[100];
+    BEGIN
+      //**4PS
+      lvDesc := '';
+      IF NextLino = 0 THEN BEGIN
+        IF lvCreditMemo = TRUE THEN
+          lvPurchLineRec.SETRANGE("Document Type", lvPurchLineRec."Document Type"::"Credit Memo")
+        ELSE
+          lvPurchLineRec.SETRANGE("Document Type", lvPurchLineRec."Document Type"::Invoice);
+
+        lvPurchLineRec.SETRANGE("Document No.", lvICFLineRec."Invoice No.");
+        IF lvPurchLineRec.FINDLAST THEN
+          NextLino := lvPurchLineRec."Line No." + 10000
+        ELSE
+          NextLino := 10000;
+
+        lvDesc := COPYSTR(STRSUBSTNO(lvText000,
+          lvICFLineRec."Reference (Customer)"),
+          1, MAXSTRLEN(lvPurchLineRec.Description));
+      END;
+
+      lvPurchLineRec.INIT;
+      IF lvCreditMemo = TRUE THEN
+        lvPurchLineRec."Document Type" := lvPurchLineRec."Document Type"::"Credit Memo"
+      ELSE
+        lvPurchLineRec."Document Type" := lvPurchLineRec."Document Type"::Invoice;
+      lvPurchLineRec."Document No." := lvICFLineRec."Invoice No.";
+      lvPurchLineRec."Line No." := NextLino;
+      lvPurchLineRec.Description := lvDesc;
+      lvPurchLineRec."Input by" := USERID; //DP00469
+      lvPurchLineRec."Input Date" := TODAY; //DP00469
+      lvPurchLineRec.INSERT;
+
+      IF lvDesc = '' THEN BEGIN
+        lvPurchLineRec.Type := lvPurchLineRec.Type::"G/L Account";
+        lvPurchLineRec.Description :=
+          COPYSTR(lvICFLineRec."Item Description", 1, MAXSTRLEN(lvPurchLineRec.Description)); //db, 12-12-08: M13608
+
+        lvPurchHeaderRec.GET(lvPurchLineRec."Document Type", lvPurchLineRec."Document No.");
+        lvPurchLineRec.VALIDATE("VAT Bus. Posting Group", lvPurchHeaderRec."VAT Bus. Posting Group");
+        lvPurchLineRec.VALIDATE("VAT Prod. Posting Group", lvPurchHeaderRec."VAT Prod. Posting Group");
+        lvPurchLineRec."Buy-from Vendor No." := lvPurchHeaderRec."Buy-from Vendor No.";
+        lvPurchLineRec."Pay-to Vendor No." := lvPurchHeaderRec."Pay-to Vendor No.";
+        lvPurchLineRec."Order Date" := lvPurchHeaderRec."Order Date";
+        lvPurchLineRec."Posting Date" := lvPurchHeaderRec."Posting Date";
+        lvPurchLineRec.VALIDATE("Job No.", lvPurchHeaderRec."Job No.");
+
+        lvVendorRec.GET(lvICFLineRec.Vendor);
+        IF lvTradeItemRec.GET(lvVendorRec."Vendor (Trade Item)", lvICFLineRec."Item Code") THEN BEGIN
+          lvPurchLineRec.Manufacturer := lvTradeItemRec.Manufacturer;
+          lvPurchLineRec."Basic Item" := lvTradeItemRec."Product Code";
+          lvPurchLineRec."Vendor (Trade Item)" := lvTradeItemRec.Vendor;
+          lvPurchLineRec.VALIDATE("Trade Item", lvTradeItemRec."Item Code");
+        END ELSE BEGIN
+          lvItemRec.RESET;
+          IF lvItemRec.GET(lvICFLineRec."Item Code") THEN BEGIN
+            lvPurchLineRec.VALIDATE("Item No.", lvItemRec."No.");
+          END ELSE BEGIN
+            lvItemRec.SETCURRENTKEY("Vendor Item No.", "Vendor No.");
+            lvItemRec.SETRANGE("Vendor Item No.", lvICFLineRec."Item Code");
+            lvItemRec.SETRANGE("Vendor No.", lvVendorRec."No.");
+            IF lvItemRec.FIND('-') THEN
+              lvPurchLineRec.VALIDATE("Item No.", lvItemRec."No.");
+          END;
+        END;
+
+        lvPurchLineRec."ICF Quantity" := lvICFLineRec."Quantity (Invoice)";
+        IF lvICFLineRec."Unit Code" <> '' THEN
+          lvPurchLineRec."ICF Unit" := lvICFLineRec."Unit Code"
+        ELSE
+          lvPurchLineRec."ICF Unit" := lvICFLineRec."Price Unit";
+        IF lvICFLineRec."Quantity (Invoice)" <> 0 THEN
+          lvPurchLineRec."ICF Price" := lvICFLineRec."Line Amount" / lvICFLineRec."Quantity (Invoice)"
+        ELSE
+          lvPurchLineRec."ICF Price" := lvICFLineRec."Line Amount";
+        lvPurchLineRec."ICF Line Amount" := lvICFLineRec."Line Amount";
+
+        lvPurchLineRec.VALIDATE(Quantity, lvICFLineRec."Quantity (Invoice)");
+        lvPurchLineRec."Unit of Measure Code" := lvICFLineRec."Unit Code";
+        lvPurchLineRec.VALIDATE("Line Amount", lvICFLineRec."Line Amount");
+        //**4PS.sn
+        lvPurchLineRec."Modified by" := USERID; //DP00469
+        lvPurchLineRec."Last Date Modified" := TODAY;//DP00469
+        //**4PS.en
+        lvPurchLineRec.MODIFY;
+      END;
+
+      NextLino := NextLino + 10000;
+    END;
+
+    PROCEDURE ItemMatchICF@1100485000(lvICFLineRec@1100485001 : Record 11012327;lvPurchLineRec@1100485000 : Record 39) : Boolean;
+    VAR
+      lvItemRec@1100485002 : Record 27;
+    BEGIN
+      //**4PS
+      IF lvICFLineRec."Record Type" = 'FR30' THEN BEGIN  //db, 08-05-09: M14373, 10610
+        IF ((lvICFLineRec."Surcharge Code (Detail)" = 'BAT') OR (lvICFLineRec."Surcharge Code (Detail)" = 'CRS')) AND
+           (lvPurchLineRec."Removal Contribution" = TRUE) AND
+      //   (lvPurchLineRec.Quantity = lvICFLineRec."Quantity (Invoice)") AND
+           (lvPurchLineRec."Line Amount" = lvICFLineRec."Line Amount") THEN
+          EXIT(TRUE)
+        ELSE
+          EXIT(FALSE);
+      END;
+
+      IF lvICFLineRec."Item Code" = '' THEN EXIT(FALSE); //call 25145
+      IF lvPurchLineRec."Trade Item" = lvICFLineRec."Item Code" THEN EXIT(TRUE);
+      IF lvPurchLineRec."Item No." = lvICFLineRec."Item Code" THEN EXIT(TRUE);
+
+      IF NOT lvItemRec.GET(lvPurchLineRec."Item No.") THEN lvItemRec.INIT;
+      IF lvItemRec."Vendor Item No." = lvICFLineRec."Item Code" THEN EXIT(TRUE);
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE CumulatedSurchargeMatchICF@1100525005(lvICFLineRec@1100485001 : Record 11012327;CheckAmount@1100525000 : Decimal) : Boolean;
+    BEGIN
+      //**4PS
+      //lvPurchLineRec.VALIDATE("ICF Line Approved", lvPurchLineRec.CheckICFMargin);
+
+
+      IF COPYSTR(CumulatedICFSurchargeRec."Record Type",1,2) = 'FR' THEN BEGIN
+        IF CheckAmount = lvICFLineRec."Line Amount" THEN
+          EXIT(TRUE)
+        ELSE
+          EXIT(FALSE);
+      END;
+
+      IF COPYSTR(CumulatedICFSurchargeRec."Record Type",1,2) = 'FH' THEN BEGIN
+        IF CheckAmount = lvICFLineRec."Surcharge Amount (Header)" THEN
+          EXIT(TRUE)
+        ELSE
+          EXIT(FALSE);
+      END;
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE CheckNotSKUConsigment@1100525000(PurchRcptLineRec@1100525000 : Record 121;ErrorMode@1100525002 : Boolean) : Boolean;
+    VAR
+      SKURec@1100525001 : Record 5700;
+    BEGIN
+      //**4PS
+      //* 18314  SKU with Consigment not allowed
+      IF (PurchRcptLineRec."Item No." = '') OR (PurchRcptLineRec."Location Code" = '') THEN
+        EXIT(TRUE);
+
+      IF NOT SKURec.GET(PurchRcptLineRec."Location Code", PurchRcptLineRec."Item No.", PurchRcptLineRec."Variant Code") THEN
+        EXIT(TRUE);
+
+      IF NOT SKURec.Consignment THEN
+        EXIT(TRUE);
+
+      IF ErrorMode THEN
+        SKURec.TESTFIELD(Consignment, FALSE);
+      EXIT(FALSE);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

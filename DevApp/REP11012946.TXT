@@ -1,0 +1,313 @@
+OBJECT Report 11012946 Rental Unit Delayed Index.Inv.
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    CaptionML=ENU=Invoice Rental Unit Delayed Indexation;
+    ProcessingOnly=Yes;
+    OnInitReport=BEGIN
+                   ProjSetup.GET;
+                   ProjSetup.TESTFIELD("Rental Units active", TRUE);
+                   ProjSetup.TESTFIELD("Invoice Period Rental Units");
+                 END;
+
+    OnPreReport=BEGIN
+                  IF PostingDate = 0D THEN
+                    ERROR(Text001, SalesHeadTmp.FIELDCAPTION("Posting Date"));
+                  IF DocumentDate = 0D THEN
+                    ERROR(Text001, SalesHeadTmp.FIELDCAPTION("Document Date"));
+
+                  TmpError.RESET;
+                  TmpError.DELETEALL;
+                END;
+
+    OnPostReport=BEGIN
+                   IF TmpError.FINDFIRST THEN BEGIN
+                     COMMIT;
+                     PAGE.RUN(PAGE::Errors, TmpError);
+                   END;
+                 END;
+
+  }
+  DATASET
+  {
+    { 6200;    ;DataItem;                    ;
+               DataItemTable=Table11012941;
+               DataItemTableView=SORTING(Project No.,Rental Unit,Starting Date)
+                                 WHERE(Invoice Delayed Indexation=CONST(Yes),
+                                       Customer No.=FILTER(<>''),
+                                       Status=FILTER(>Preparation),
+                                       Last Invoice No.=FILTER(<>''));
+               OnPreDataItem=BEGIN
+                               Window.OPEN(FIELDCAPTION("Project No.") + '/' + FIELDCAPTION("Rental Unit") + '#1############################');
+                             END;
+
+               OnAfterGetRecord=VAR
+                                  RentalUnit@1100529004 : Record 11012940;
+                                  RentalPackageLineRate@1100529005 : Record 11229856;
+                                  RefDate@1100529006 : Date;
+                                  RentalStartDate@1100528403 : Date;
+                                  RentalEndDate@1100528404 : Date;
+                                  InvoiceRunNo@1100529001 : Integer;
+                                  PeriodAmountOld@1100529007 : Decimal;
+                                  PeriodAmountNew@1100529009 : Decimal;
+                                  DelayedIndexAmount@1100529008 : Decimal;
+                                  SalesHeadTmpInserted@1100529000 : Boolean;
+                                BEGIN
+                                  Window.UPDATE(1, "Project No." + '/' + "Rental Unit");
+                                  IF ProjSetup."Invoice Period Rental Units" = ProjSetup."Invoice Period Rental Units" THEN
+                                    RentalUnitInvoicingCU.BuildPackageInvoicePeriods("Rental Package");
+                                  IF NOT RentalUnitInvoicingCU.CheckPackageAndReadRelatedData(
+                                    "Rental Package", 0D, TRUE, Proj, ProjType, ProjPrin, DefaultProjElement, RentalUnit, TmpError)
+                                  THEN
+                                    CurrReport.SKIP;
+
+                                  RentalRateLine.SETRANGE("Project No.", "Project No.");
+                                  RentalRateLine.SETRANGE("Rental Unit", "Rental Unit");
+                                  RentalRateLine.SETRANGE("Starting Date Package", "Starting Date");
+                                  RentalRateLine.SETFILTER("Start Delayed Index. Period", '>%1', TODAY-360);  // <>0D, but also not (very) old
+                                  RentalRateLine.SETFILTER("End Delayed Index. Period", '<>%1', 0D);
+                                  IF RentalRateLine.FINDSET(TRUE,FALSE) THEN BEGIN
+                                    REPEAT
+                                      RentalRateLine.CALCFIELDS(Type);
+                                      RefDate := RentalRateLine."Start Delayed Index. Period";  //Start date is always 'Date Indexed', see Notes in R11012945
+                                      IF RentalRateLine.GetLineRateOnRefDate(RentalRateLine, (RefDate - 1), RentalPackageLineRate) THEN BEGIN
+                                        PeriodAmountOld := RentalPackageLineRate."Period Amount";
+                                        IF RentalRateLine.GetLineRateOnRefDate(RentalRateLine, RefDate, RentalPackageLineRate) THEN BEGIN
+                                          PeriodAmountNew := RentalPackageLineRate."Period Amount";
+                                          IF PeriodAmountNew <> PeriodAmountOld THEN BEGIN
+                                            RentalStartDate := RentalRateLine."Start Delayed Index. Period";
+                                            RentalEndDate := RentalRateLine."End Delayed Index. Period";
+                                            IF RentalRateLine."Starting Date Line" > RentalStartDate THEN
+                                              RentalStartDate := RentalRateLine."Starting Date Line";
+                                            IF "Starting Date" > RentalStartDate THEN
+                                              RentalStartDate := "Starting Date";
+                                            DelayedIndexAmount := (PeriodAmountNew - PeriodAmountOld) *
+                                              RentalUnitInvoicingCU.CalculateNoOfPeriods("Invoice Frequency", RentalStartDate, RentalEndDate);
+                                            IF DelayedIndexAmount <> 0 THEN BEGIN
+                                              IF NOT SalesHeadTmpInserted THEN BEGIN
+                                                SalesHeadTmpInserted := TRUE;
+                                                InsertSalesHeadTmp("Rental Package");
+                                                UpdateRentalPackage();
+                                                InvoiceRunNo := RentalUnitInvoicingCU.WriteHistoryHead("Project No.", "Rental Unit", "Starting Date", TRUE);
+                                              END;
+                                              UpdateRentalRateLine();
+                                              InsertSalesLineTmp(InvoiceRunNo, RentalStartDate, RentalEndDate, DelayedIndexAmount);
+                                              RentalUnitInvoicingCU.WriteHistoryLine(
+                                                RentalRateLine, InvoiceRunNo, 1, '', DelayedIndexAmount, RentalStartDate, RentalEndDate, 1, 0, 0);
+                                            END;
+                                          END;
+                                        END;
+                                      END;
+                                    UNTIL RentalRateLine.NEXT = 0;
+                                  END;
+                                  "Invoice Delayed Indexation" := FALSE;
+                                  MODIFY(FALSE);
+                                END;
+
+               OnPostDataItem=BEGIN
+                                Window.CLOSE;
+                                RentalUnitInvoicingCU.CreateRentalInvoices(SalesHeadTmp, SalesLineTmp, TRUE);
+                              END;
+
+               ReqFilterFields=Project No.,Customer No.,Rental Unit }
+
+  }
+  REQUESTPAGE
+  {
+    PROPERTIES
+    {
+      SaveValues=Yes;
+      OnOpenPage=BEGIN
+                   PostingDate := 0D;
+                   DocumentDate := TODAY;
+                 END;
+
+    }
+    CONTROLS
+    {
+      { 1100409001;0;Container;
+                  ContainerType=ContentArea }
+
+      { 1100409000;1;Group  ;
+                  CaptionML=ENU=Options }
+
+      { 1100409004;2;Field  ;
+                  CaptionML=ENU=Posting Date;
+                  NotBlank=Yes;
+                  SourceExpr=PostingDate }
+
+      { 1100409005;2;Field  ;
+                  CaptionML=ENU=Document Date;
+                  NotBlank=Yes;
+                  SourceExpr=DocumentDate }
+
+    }
+  }
+  LABELS
+  {
+  }
+  CODE
+  {
+    VAR
+      RentalRateLine@1210190021 : Record 11012942;
+      SalesHeadTmp@1210190008 : TEMPORARY Record 36;
+      SalesLineTmp@1210190009 : TEMPORARY Record 37;
+      ProjSetup@1210190023 : Record 315;
+      Proj@1210190014 : Record 11072003;
+      ProjType@1210190015 : Record 11012009;
+      ProjPrin@1100485000 : Record 11012005;
+      TmpError@1100529011 : TEMPORARY Record 11012051;
+      RentalUnitInvoicingCU@1210190019 : Codeunit 11012940;
+      Window@1210190038 : Dialog;
+      PostingDate@1210190002 : Date;
+      DocumentDate@1100485001 : Date;
+      SalesLineNo@1210190012 : Integer;
+      DefaultProjElement@1210190022 : Code[20];
+      Text001@1210190028 : TextConst 'ENU=%1 must be filled';
+      Text002@1100529000 : TextConst 'ENU=Invoice delayed indexation';
+
+    PROCEDURE UpdateRentalPackage@1100529000();
+    BEGIN
+      "Rental Package"."Previous Invoice No." := "Rental Package"."Last Invoice No.";
+      "Rental Package"."Previous Invoiced Until" := "Rental Package"."Invoiced Until";
+      "Rental Package"."Previous Invoice Type" :=  "Rental Package"."Invoice Type";
+      "Rental Package"."Last Invoice No." := SalesHeadTmp."No.";
+      "Rental Package"."Invoice Status" :=  "Rental Package"."Invoice Status"::"Temporary";
+      "Rental Package"."Invoice Type" :=  "Rental Package"."Invoice Type"::Invoice;
+      "Rental Package".MODIFY;
+    END;
+
+    PROCEDURE UpdateRentalRateLine@1100529002();
+    BEGIN
+      RentalRateLine."Previous Invoice No." := RentalRateLine."Last Invoice No.";
+      RentalRateLine."Previous Invoiced Until" := RentalRateLine."Invoiced Until";
+      RentalRateLine."Previous Invoice Type" :=  RentalRateLine."Invoice Type";
+      RentalRateLine."Last Invoice No." := SalesHeadTmp."No.";
+      RentalRateLine."Invoice Status" :=  RentalRateLine."Invoice Status"::"Temporary";
+      RentalRateLine."Invoice Type" :=  RentalRateLine."Invoice Type"::Invoice;
+      RentalRateLine.MODIFY;
+    END;
+
+    LOCAL PROCEDURE InsertSalesHeadTmp@1210190000(RentalPackage@1210190000 : Record 11012941);
+    VAR
+      Found@1100529000 : Boolean;
+    BEGIN
+      WITH RentalPackage DO BEGIN
+        SalesLineNo := 10000;
+        IF Proj."Rental Unit Invoice by" = Proj."Rental Unit Invoice by"::Customer THEN BEGIN
+          SalesHeadTmp.RESET;
+          SalesHeadTmp.SETRANGE("Job No.", "Project No.");
+          SalesHeadTmp.SETRANGE("Sell-to Customer No.", "Customer No.");
+          IF SalesHeadTmp.FINDFIRST THEN BEGIN
+            SalesLineTmp.RESET;
+            SalesLineTmp.SETRANGE("Document Type", SalesHeadTmp."Document Type");
+            SalesLineTmp.SETRANGE("Document No.", SalesHeadTmp."No.");
+            IF SalesLineTmp.FINDLAST THEN
+              SalesLineNo := SalesLineTmp."Line No." + 10000;
+            SalesHeadTmp.RESET;
+            EXIT;
+          END;
+        END;
+
+        SalesHeadTmp.RESET;
+        Found := SalesHeadTmp.FINDLAST;
+
+        SalesHeadTmp.INIT;
+        SalesHeadTmp."Document Type" := SalesHeadTmp."Document Type"::Invoice;
+        IF Found THEN
+          SalesHeadTmp."No." := INCSTR(SalesHeadTmp."No.")
+        ELSE
+          SalesHeadTmp."No." := STRSUBSTNO('T-M-P-%1', 1);
+        SalesHeadTmp."No. Series" := ProjType."Sales Invoice Nos.";
+        SalesHeadTmp."Posting No. Series" := ProjType."Posted Sales Invoice Nos.";
+        SalesHeadTmp."Last Shipping No." := ProjType."Credit Memo Nos.";        // Fields used (only) in tmp record
+        SalesHeadTmp."Last Posting No." := ProjType."Posted Credit Memo Nos.";  // for No. Series of a Credit Memo
+        SalesHeadTmp."Job No." := "Project No.";
+        SalesHeadTmp."Sell-to Customer No." := "Customer No.";
+        SalesHeadTmp."Posting Date" := PostingDate;
+        SalesHeadTmp."Document Date" := DocumentDate;
+        SalesHeadTmp."Your Reference" := "Customer Reference";
+        SalesHeadTmp."Principal Reference" := ProjPrin."Principal Reference";
+        SalesHeadTmp.INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertSalesLineTmp@1210190001(InvoiceRunNo@1100529000 : Integer;RentalStartDate@1100528400 : Date;RentalEndDate@1100528401 : Date;DelayedIndexAmt@1100528403 : Decimal);
+    BEGIN
+      SalesLineTmp.INIT;
+      SalesLineTmp."Document Type" := SalesHeadTmp."Document Type";
+      SalesLineTmp."Document No." := SalesHeadTmp."No.";
+      SalesLineTmp."Line No." := SalesLineNo;
+      SalesLineTmp."System-Created Entry" := TRUE;
+      SalesLineTmp."Sell-to Customer No." := SalesHeadTmp."Sell-to Customer No.";
+      SalesLineTmp."Job No." := SalesHeadTmp."Job No.";
+      IF SalesLineNo = 10000 THEN BEGIN  // Add textline before First invoice line
+        SalesLineTmp.Type := SalesLineTmp.Type::" ";
+        SalesLineTmp.Description := Text002;
+        SalesLineTmp.INSERT;
+        SalesLineNo := SalesLineNo + 10000;
+        SalesLineTmp."Line No." := SalesLineNo;
+      END;
+      IF RentalRateLine.Element <> '' THEN
+        SalesLineTmp.Element := RentalRateLine.Element
+      ELSE
+        SalesLineTmp.Element := DefaultProjElement;
+      SalesLineTmp.Type := SalesLineTmp.Type::"G/L Account";
+      SalesLineTmp."Shortcut Dimension 2 Code" := RentalRateLine."Cost Object";
+      IF (ProjSetup."Provisions at Closure") AND
+         (Proj."Project Status" >= Proj."Project Status"::Finished) THEN
+        SalesLineTmp."No." := ProjType."Provision Account Rental UR"
+      ELSE BEGIN
+        CASE RentalRateLine.Type OF
+          RentalRateLine.Type::ServiceCost:
+            SalesLineTmp."No." := ProjType."Rental Unit Service Cost Rev.";
+          RentalRateLine.Type::Utilities:
+            SalesLineTmp."No." := ProjType."Rental Unit Acc Utilities Rev.";
+          ELSE
+            SalesLineTmp."No." := ProjType."Rental Unit Account Revenue";
+        END;
+      END;
+      SalesLineTmp.Quantity := 1;
+      SalesLineTmp."Unit Price" := DelayedIndexAmt;
+      SalesLineTmp.Amount := ROUND((SalesLineTmp.Quantity * SalesLineTmp."Unit Price"));
+      SalesLineTmp."Line Discount %" := 0;
+      SalesLineTmp."Amount (LCY)" := SalesLineTmp.Amount;
+      SalesLineTmp.Description := RentalRateLine.Description;
+      SalesLineTmp."Unit of Measure Code" := '';
+      SalesLineTmp."VAT Prod. Posting Group" := RentalRateLine."VAT Prod. Posting Group";
+      IF (ProjPrin."VAT Bus. Posting Group" <> '') THEN
+        SalesLineTmp."VAT Bus. Posting Group" := ProjPrin."VAT Bus. Posting Group"
+      ELSE
+        SalesLineTmp."VAT Bus. Posting Group" := Proj."VAT Bus. Posting Group";
+      SalesLineTmp."Relate to" := SalesLineTmp."Relate to"::Rental;
+      SalesLineTmp."Rental Period" := STRSUBSTNO('%1..%2', RentalStartDate, RentalEndDate);
+      SalesLineTmp."Rental Unit" := RentalRateLine."Rental Unit";
+      SalesLineTmp."Rental Package Date" := RentalRateLine."Starting Date Package";
+      CASE RentalRateLine.Type OF
+        RentalRateLine.Type::ServiceCost:
+          SalesLineTmp."Rental Unit Line Type" := SalesLineTmp."Rental Unit Line Type"::ServiceCost;
+        RentalRateLine.Type::Utilities:
+          SalesLineTmp."Rental Unit Line Type" := SalesLineTmp."Rental Unit Line Type"::Utilities;
+        ELSE
+          SalesLineTmp."Rental Unit Line Type" := SalesLineTmp."Rental Unit Line Type"::Rent;
+      END;
+      SalesLineTmp."Plant Rental Split No." := RentalRateLine."Line No.";
+      SalesLineTmp."Alternative No." := InvoiceRunNo;  //Only fill this field in tmp-rec!
+      SalesLineTmp.INSERT;
+      SalesLineNo := SalesLineNo + 10000;
+    END;
+
+    BEGIN
+    END.
+  }
+  RDLDATA
+  {
+  }
+}
+

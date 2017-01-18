@@ -1,0 +1,1628 @@
+OBJECT Codeunit 442 Sales-Post Prepayments
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00.00.43897,4PS9.00;
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 37=imd,
+                TableData 49=imd,
+                TableData 112=imd,
+                TableData 113=imd,
+                TableData 114=imd,
+                TableData 115=imd,
+                TableData 252=imd,
+                TableData 357=imd,
+                TableData 359=imd;
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1000 : TextConst 'ENU=is not within your range of allowed posting dates';
+      GLSetup@1024 : Record 98;
+      GenPostingSetup@1002 : Record 252;
+      Text001@1003 : TextConst 'ENU=There is nothing to post.';
+      Text002@1006 : TextConst 'ENU=Posting Prepayment Lines   #2######\';
+      Text003@1004 : TextConst 'ENU=%1 %2 -> Invoice %3';
+      Text004@1005 : TextConst 'ENU=Posting sales and VAT      #3######\';
+      Text005@1007 : TextConst 'ENU=Posting to customers       #4######\';
+      Text006@1022 : TextConst 'ENU=Posting to bal. account    #5######';
+      Text007@1009 : TextConst 'ENU=The combination of dimensions that is used in the document of type %1 with the number %2 is blocked. %3.';
+      Text008@1008 : TextConst 'ENU=The combination of dimensions that is used in the document of type %1 with the number %2, line no. %3 is blocked. %4.';
+      Text009@1011 : TextConst 'ENU=The dimensions that are used in the document of type %1 with the number %2 are not valid. %3.';
+      Text010@1010 : TextConst 'ENU=The dimensions that are used in the document of type %1 with the number %2, line no. %3 are not valid. %4.';
+      TempPrepmtInvLineBuf@1025 : TEMPORARY Record 461;
+      GenJnlPostLine@1013 : Codeunit 12;
+      Text011@1001 : TextConst 'ENU=%1 %2 -> Credit Memo %3';
+      Text012@1015 : TextConst 'ENU=Prepayment %1, %2 %3.';
+      Text013@1016 : TextConst 'ENU=It is not possible to assign a prepayment amount of %1 to the sales lines.';
+      Text014@1018 : TextConst 'ENU=VAT Amount';
+      Text015@1017 : TextConst 'ENU=%1% VAT';
+      Text016@1019 : TextConst 'ENU=The new prepayment amount must be between %1 and %2.';
+      Text017@1020 : TextConst 'ENU=At least one line must have %1 > 0 to distribute prepayment amount.';
+      Text018@1021 : TextConst 'ENU=must be positive when %1 is not 0';
+      Text019@1014 : TextConst 'ENU=Invoice,Credit Memo';
+
+    PROCEDURE Invoice@9(VAR SalesHeader@1000 : Record 36);
+    BEGIN
+      Code(SalesHeader,0);
+    END;
+
+    PROCEDURE CreditMemo@10(VAR SalesHeader@1000 : Record 36);
+    BEGIN
+      Code(SalesHeader,1);
+    END;
+
+    LOCAL PROCEDURE Code@2(VAR SalesHeader2@1013 : Record 36;DocumentType@1022 : 'Invoice,Credit Memo');
+    VAR
+      SalesSetup@1010 : Record 311;
+      SourceCodeSetup@1027 : Record 242;
+      Cust@1029 : Record 18;
+      SalesHeader@1000 : Record 36;
+      SalesLine@1001 : Record 37;
+      SalesInvHeader@1002 : Record 112;
+      SalesCrMemoHeader@1023 : Record 114;
+      SalesInvLine@1014 : Record 113;
+      SalesCrMemoLine@1024 : Record 115;
+      PrepmtInvBuffer@1021 : TEMPORARY Record 461;
+      TotalPrepmtInvLineBuffer@1019 : Record 461;
+      TotalPrepmtInvLineBufferLCY@1020 : Record 461;
+      GenJnlLine@1012 : Record 81;
+      TempVATAmountLine@1000000002 : TEMPORARY Record 290;
+      TempVATAmountLineDeduct@1015 : TEMPORARY Record 290;
+      CustLedgEntry@1031 : Record 21;
+      TempSalesLines@1032 : TEMPORARY Record 37;
+      GenJnlCheckLine@1009 : Codeunit 11;
+      NoSeriesMgt@1008 : Codeunit 396;
+      Window@1000000003 : Dialog;
+      GenJnlLineDocNo@1006 : Code[20];
+      GenJnlLineExtDocNo@1005 : Code[35];
+      SrcCode@1004 : Code[10];
+      PostingNoSeriesCode@1007 : Code[10];
+      CalcPmtDiscOnCrMemos@1011 : Boolean;
+      PostingDescription@1028 : Text[50];
+      GenJnlLineDocType@1003 : Integer;
+      PrevLineNo@1016 : Integer;
+      LineCount@1000000004 : Integer;
+      PostedDocTabNo@1025 : Integer;
+      LineNo@1026 : Integer;
+    BEGIN
+      SalesHeader := SalesHeader2;
+      GLSetup.GET;
+      WITH SalesHeader DO BEGIN
+        TESTFIELD("Document Type","Document Type"::Order);
+        TESTFIELD("Sell-to Customer No.");
+        TESTFIELD("Bill-to Customer No.");
+        TESTFIELD("Posting Date");
+        TESTFIELD("Document Date");
+        IF GenJnlCheckLine.DateNotAllowed("Posting Date") THEN
+          FIELDERROR("Posting Date",Text000);
+
+        IF NOT CheckOpenPrepaymentLines(SalesHeader,DocumentType) THEN
+          ERROR(Text001);
+
+        ValidatePaymentMethod(SalesHeader);
+        CheckDim(SalesHeader);
+        OnCheckSalesPostRestrictions;
+        Cust.GET("Sell-to Customer No.");
+        Cust.CheckBlockedCustOnDocs(Cust,PrepmtDocTypeToDocType("Document Type"),FALSE,TRUE);
+        IF "Bill-to Customer No." <> "Sell-to Customer No." THEN BEGIN
+          Cust.GET("Bill-to Customer No.");
+          Cust.CheckBlockedCustOnDocs(Cust,PrepmtDocTypeToDocType("Document Type"),FALSE,TRUE);
+        END;
+
+        // Get Doc. No. and save
+        CASE DocumentType OF
+          DocumentType::Invoice:
+            BEGIN
+              TESTFIELD("Prepayment Due Date");
+              TESTFIELD("Prepmt. Cr. Memo No.",'');
+              IF "Prepayment No." = '' THEN BEGIN
+                TESTFIELD("Prepayment No. Series");
+                "Prepayment No." :=
+                  NoSeriesMgt.GetNextNo("Prepayment No. Series","Posting Date",TRUE);
+                MODIFY;
+                COMMIT;
+              END;
+              GenJnlLineDocNo := "Prepayment No.";
+              PostingNoSeriesCode := "Prepayment No. Series";
+            END;
+          DocumentType::"Credit Memo":
+            BEGIN
+              TESTFIELD("Prepayment No.",'');
+              IF "Prepmt. Cr. Memo No." = '' THEN BEGIN
+                TESTFIELD("Prepmt. Cr. Memo No. Series");
+                "Prepmt. Cr. Memo No." :=
+                  NoSeriesMgt.GetNextNo("Prepmt. Cr. Memo No. Series","Posting Date",TRUE);
+                MODIFY;
+                COMMIT;
+              END;
+              GenJnlLineDocNo := "Prepmt. Cr. Memo No.";
+              PostingNoSeriesCode := "Prepmt. Cr. Memo No. Series";
+            END;
+        END;
+
+        Window.OPEN(
+          '#1#################################\\' +
+          Text002 +
+          Text004 +
+          Text005 +
+          Text006);
+        Window.UPDATE(1,STRSUBSTNO('%1 %2',SELECTSTR(1 + DocumentType,Text019),"No."));
+
+        SalesSetup.GET;
+        SourceCodeSetup.GET;
+        SrcCode := SourceCodeSetup.Sales;
+        IF "Prepmt. Posting Description" <> '' THEN
+          PostingDescription := "Prepmt. Posting Description"
+        ELSE
+          PostingDescription :=
+            COPYSTR(
+              STRSUBSTNO(Text012,SELECTSTR(1 + DocumentType,Text019),"Document Type","No."),
+              1,MAXSTRLEN("Posting Description"));
+
+        // Create posted header
+        IF SalesSetup."Ext. Doc. No. Mandatory" THEN
+          TESTFIELD("External Document No.");
+        CASE DocumentType OF
+          DocumentType::Invoice:
+            BEGIN
+              InsertSalesInvHeader(SalesInvHeader,SalesHeader,PostingDescription,GenJnlLineDocNo,SrcCode,PostingNoSeriesCode);
+              GenJnlLineDocType := GenJnlLine."Document Type"::Invoice;
+              PostedDocTabNo := DATABASE::"Sales Invoice Header";
+              Window.UPDATE(1,STRSUBSTNO(Text003,"Document Type","No.",SalesInvHeader."No."));
+            END;
+          DocumentType::"Credit Memo":
+            BEGIN
+              CalcPmtDiscOnCrMemos := GetCalcPmtDiscOnCrMemos("Prepmt. Payment Terms Code");
+              InsertSalesCrMemoHeader(
+                SalesCrMemoHeader,SalesHeader,PostingDescription,GenJnlLineDocNo,SrcCode,PostingNoSeriesCode,
+                CalcPmtDiscOnCrMemos);
+              GenJnlLineDocType := GenJnlLine."Document Type"::"Credit Memo";
+              PostedDocTabNo := DATABASE::"Sales Cr.Memo Header";
+              Window.UPDATE(1,STRSUBSTNO(Text011,"Document Type","No.",SalesCrMemoHeader."No."));
+            END;
+        END;
+        IF SalesSetup."Copy Comments Order to Invoice" THEN
+          CopyCommentLines("No.",PostedDocTabNo,GenJnlLineDocNo);
+        GenJnlLineExtDocNo := "External Document No.";
+        // Reverse old lines
+        IF DocumentType = DocumentType::Invoice THEN BEGIN
+          GetSalesLinesToDeduct(SalesHeader,TempSalesLines);
+          IF NOT TempSalesLines.ISEMPTY THEN
+            CalcVATAmountLines(SalesHeader,TempSalesLines,TempVATAmountLineDeduct,DocumentType::"Credit Memo");
+        END;
+
+        // Create Lines
+        PrepmtInvBuffer.DELETEALL;
+        CalcVATAmountLines(SalesHeader,SalesLine,TempVATAmountLine,DocumentType);
+        TempVATAmountLine.DeductVATAmountLine(TempVATAmountLineDeduct);
+        UpdateVATOnLines(SalesHeader,SalesLine,TempVATAmountLine,DocumentType);
+        BuildInvLineBuffer(SalesHeader,SalesLine,DocumentType,PrepmtInvBuffer,TRUE);
+        PrepmtInvBuffer.FIND('-');
+        REPEAT
+          LineCount := LineCount + 1;
+          Window.UPDATE(2,LineCount);
+          IF PrepmtInvBuffer."Line No." <> 0 THEN
+            LineNo := PrevLineNo + PrepmtInvBuffer."Line No."
+          ELSE
+            LineNo := PrevLineNo + 10000;
+          CASE DocumentType OF
+            DocumentType::Invoice:
+              BEGIN
+                SalesInvLine.INIT;
+                SalesInvLine."Document No." := SalesInvHeader."No.";
+                SalesInvLine."Line No." := LineNo;
+                SalesInvLine."Sell-to Customer No." := SalesInvHeader."Sell-to Customer No.";
+                SalesInvLine."Bill-to Customer No." := SalesInvHeader."Bill-to Customer No.";
+                SalesInvLine.Type := SalesInvLine.Type::"G/L Account";
+                SalesInvLine."No." := PrepmtInvBuffer."G/L Account No.";
+                SalesInvLine."Posting Date" := "Posting Date";
+                SalesInvLine."Shortcut Dimension 1 Code" := PrepmtInvBuffer."Global Dimension 1 Code";
+                SalesInvLine."Shortcut Dimension 2 Code" := PrepmtInvBuffer."Global Dimension 2 Code";
+                SalesInvLine."Dimension Set ID" := PrepmtInvBuffer."Dimension Set ID";
+                SalesInvLine.Description := PrepmtInvBuffer.Description;
+                SalesInvLine.Quantity := 1;
+                IF "Prices Including VAT" THEN BEGIN
+                  SalesInvLine."Unit Price" := PrepmtInvBuffer."Amount Incl. VAT";
+                  SalesInvLine."Line Amount" := PrepmtInvBuffer."Amount Incl. VAT";
+                END ELSE BEGIN
+                  SalesInvLine."Unit Price" := PrepmtInvBuffer.Amount;
+                  SalesInvLine."Line Amount" := PrepmtInvBuffer.Amount;
+                END;
+                SalesInvLine."Gen. Bus. Posting Group" := PrepmtInvBuffer."Gen. Bus. Posting Group";
+                SalesInvLine."Gen. Prod. Posting Group" := PrepmtInvBuffer."Gen. Prod. Posting Group";
+                SalesInvLine."VAT Bus. Posting Group" := PrepmtInvBuffer."VAT Bus. Posting Group";
+                SalesInvLine."VAT Prod. Posting Group" := PrepmtInvBuffer."VAT Prod. Posting Group";
+                SalesInvLine."VAT %" := PrepmtInvBuffer."VAT %";
+                SalesInvLine.Amount := PrepmtInvBuffer.Amount;
+                SalesInvLine."VAT Difference" := PrepmtInvBuffer."VAT Difference";
+                SalesInvLine."Amount Including VAT" := PrepmtInvBuffer."Amount Incl. VAT";
+                SalesInvLine."VAT Calculation Type" := PrepmtInvBuffer."VAT Calculation Type";
+                SalesInvLine."VAT Base Amount" := PrepmtInvBuffer."VAT Base Amount";
+                SalesInvLine."VAT Identifier" := PrepmtInvBuffer."VAT Identifier";
+                SalesInvLine.INSERT;
+                PostedDocTabNo := DATABASE::"Sales Invoice Line";
+              END;
+            DocumentType::"Credit Memo":
+              BEGIN
+                SalesCrMemoLine.INIT;
+                SalesCrMemoLine."Document No." := SalesCrMemoHeader."No.";
+                SalesCrMemoLine."Line No." := LineNo;
+                SalesCrMemoLine."Sell-to Customer No." := SalesCrMemoHeader."Sell-to Customer No.";
+                SalesCrMemoLine."Bill-to Customer No." := SalesCrMemoHeader."Bill-to Customer No.";
+                SalesCrMemoLine.Type := SalesInvLine.Type::"G/L Account";
+                SalesCrMemoLine."No." := PrepmtInvBuffer."G/L Account No.";
+                SalesCrMemoLine."Posting Date" := "Posting Date";
+                SalesCrMemoLine."Shortcut Dimension 1 Code" := PrepmtInvBuffer."Global Dimension 1 Code";
+                SalesCrMemoLine."Shortcut Dimension 2 Code" := PrepmtInvBuffer."Global Dimension 2 Code";
+                SalesCrMemoLine."Dimension Set ID" := PrepmtInvBuffer."Dimension Set ID";
+                SalesCrMemoLine.Description := PrepmtInvBuffer.Description;
+                SalesCrMemoLine.Quantity := 1;
+                IF "Prices Including VAT" THEN BEGIN
+                  SalesCrMemoLine."Unit Price" := PrepmtInvBuffer."Amount Incl. VAT";
+                  SalesCrMemoLine."Line Amount" := PrepmtInvBuffer."Amount Incl. VAT";
+                END ELSE BEGIN
+                  SalesCrMemoLine."Unit Price" := PrepmtInvBuffer.Amount;
+                  SalesCrMemoLine."Line Amount" := PrepmtInvBuffer.Amount;
+                END;
+                SalesCrMemoLine."Gen. Bus. Posting Group" := PrepmtInvBuffer."Gen. Bus. Posting Group";
+                SalesCrMemoLine."Gen. Prod. Posting Group" := PrepmtInvBuffer."Gen. Prod. Posting Group";
+                SalesCrMemoLine."VAT Bus. Posting Group" := PrepmtInvBuffer."VAT Bus. Posting Group";
+                SalesCrMemoLine."VAT Prod. Posting Group" := PrepmtInvBuffer."VAT Prod. Posting Group";
+                SalesCrMemoLine."VAT %" := PrepmtInvBuffer."VAT %";
+                SalesCrMemoLine.Amount := PrepmtInvBuffer.Amount;
+                SalesCrMemoLine."VAT Difference" := PrepmtInvBuffer."VAT Difference";
+                SalesCrMemoLine."Amount Including VAT" := PrepmtInvBuffer."Amount Incl. VAT";
+                SalesCrMemoLine."VAT Calculation Type" := PrepmtInvBuffer."VAT Calculation Type";
+                SalesCrMemoLine."VAT Base Amount" := PrepmtInvBuffer."VAT Base Amount";
+                SalesCrMemoLine."VAT Identifier" := PrepmtInvBuffer."VAT Identifier";
+                SalesCrMemoLine.INSERT;
+                PostedDocTabNo := DATABASE::"Sales Cr.Memo Line";
+              END;
+          END;
+          PrevLineNo := LineNo;
+          InsertExtendedText(
+            PostedDocTabNo,GenJnlLineDocNo,PrepmtInvBuffer."G/L Account No.","Document Date","Language Code",PrevLineNo);
+        UNTIL PrepmtInvBuffer.NEXT = 0;
+
+        // G/L Posting
+        LineCount := 0;
+        CompressInvLineBuffer(SalesHeader,PrepmtInvBuffer);
+        PrepmtInvBuffer.SETRANGE(Adjustment,FALSE);
+        PrepmtInvBuffer.FINDSET(TRUE);
+        REPEAT
+          IF DocumentType = DocumentType::Invoice THEN
+            PrepmtInvBuffer.ReverseAmounts;
+          RoundAmounts(SalesHeader,PrepmtInvBuffer,TotalPrepmtInvLineBuffer,TotalPrepmtInvLineBufferLCY);
+          IF "Currency Code" = '' THEN BEGIN
+            AdjustInvLineBuffers(SalesHeader,PrepmtInvBuffer,TotalPrepmtInvLineBuffer,DocumentType);
+            TotalPrepmtInvLineBufferLCY := TotalPrepmtInvLineBuffer;
+          END ELSE
+            AdjustInvLineBuffers(SalesHeader,PrepmtInvBuffer,TotalPrepmtInvLineBufferLCY,DocumentType);
+          PrepmtInvBuffer.MODIFY;
+        UNTIL PrepmtInvBuffer.NEXT = 0;
+
+        PrepmtInvBuffer.RESET;
+        PrepmtInvBuffer.SETCURRENTKEY(Adjustment);
+        PrepmtInvBuffer.FIND('+');
+        REPEAT
+          LineCount := LineCount + 1;
+          Window.UPDATE(3,LineCount);
+
+          GenJnlLine.INIT;
+          GenJnlLine."Posting Date" := "Posting Date";
+          GenJnlLine."Document Date" := "Document Date";
+          GenJnlLine.Description := PostingDescription;
+          GenJnlLine."Reason Code" := "Reason Code";
+          GenJnlLine."Document Type" := GenJnlLineDocType;
+          GenJnlLine."Document No." := GenJnlLineDocNo;
+          GenJnlLine."External Document No." := GenJnlLineExtDocNo;
+          GenJnlLine."Account No." := PrepmtInvBuffer."G/L Account No.";
+          GenJnlLine."System-Created Entry" := TRUE;
+          GenJnlLine.Amount := PrepmtInvBuffer.Amount;
+          GenJnlLine."Source Currency Code" := "Currency Code";
+          GenJnlLine."Source Currency Amount" := PrepmtInvBuffer."Amount (ACY)";
+          GenJnlLine.Correction :=
+            (DocumentType = DocumentType::"Credit Memo") AND GLSetup."Mark Cr. Memos as Corrections";
+          IF NOT PrepmtInvBuffer.Adjustment THEN
+            GenJnlLine."Gen. Posting Type" := GenJnlLine."Gen. Posting Type"::Sale;
+          GenJnlLine."Gen. Bus. Posting Group" := PrepmtInvBuffer."Gen. Bus. Posting Group";
+          GenJnlLine."Gen. Prod. Posting Group" := PrepmtInvBuffer."Gen. Prod. Posting Group";
+          GenJnlLine."VAT Bus. Posting Group" := PrepmtInvBuffer."VAT Bus. Posting Group";
+          GenJnlLine."VAT Prod. Posting Group" := PrepmtInvBuffer."VAT Prod. Posting Group";
+          GenJnlLine."Tax Area Code" := PrepmtInvBuffer."Tax Area Code";
+          GenJnlLine."Tax Liable" := PrepmtInvBuffer."Tax Liable";
+          GenJnlLine."Tax Group Code" := PrepmtInvBuffer."Tax Group Code";
+          GenJnlLine."VAT Calculation Type" := PrepmtInvBuffer."VAT Calculation Type";
+          GenJnlLine."VAT Base Amount" := PrepmtInvBuffer."VAT Base Amount";
+          GenJnlLine."VAT Base Discount %" := "VAT Base Discount %";
+          GenJnlLine."Source Curr. VAT Base Amount" := PrepmtInvBuffer."VAT Base Amount (ACY)";
+          GenJnlLine."VAT Amount" := PrepmtInvBuffer."VAT Amount";
+          GenJnlLine."Source Curr. VAT Amount" := PrepmtInvBuffer."VAT Amount (ACY)";
+          GenJnlLine."VAT Difference" := PrepmtInvBuffer."VAT Difference";
+          GenJnlLine."VAT Posting" := GenJnlLine."VAT Posting"::"Manual VAT Entry";
+          GenJnlLine."Shortcut Dimension 1 Code" := PrepmtInvBuffer."Global Dimension 1 Code";
+          GenJnlLine."Shortcut Dimension 2 Code" := PrepmtInvBuffer."Global Dimension 2 Code";
+          GenJnlLine."Dimension Set ID" := PrepmtInvBuffer."Dimension Set ID";
+          GenJnlLine."Job No." := PrepmtInvBuffer."Job No.";
+          GenJnlLine."Source Code" := SrcCode;
+          GenJnlLine."EU 3-Party Trade" := "EU 3-Party Trade";
+          GenJnlLine."Bill-to/Pay-to No." := "Bill-to Customer No.";
+          GenJnlLine."Country/Region Code" := "VAT Country/Region Code";
+          GenJnlLine."VAT Registration No." := "VAT Registration No.";
+          GenJnlLine."Source Type" := GenJnlLine."Source Type"::Customer;
+          GenJnlLine."Source No." := "Bill-to Customer No.";
+          GenJnlLine."Posting No. Series" := PostingNoSeriesCode;
+          GenJnlLine."IC Partner Code" := "Sell-to IC Partner Code";
+          GenJnlLine.Prepayment := TRUE;
+          RunGenJnlPostLine(GenJnlLine);
+        UNTIL PrepmtInvBuffer.NEXT(-1) = 0;
+
+        // Post customer entry
+        Window.UPDATE(4,1);
+        GenJnlLine.INIT;
+        GenJnlLine."Posting Date" := "Posting Date";
+        GenJnlLine."Document Date" := "Document Date";
+        GenJnlLine.Description := PostingDescription;
+        GenJnlLine."Shortcut Dimension 1 Code" := "Shortcut Dimension 1 Code";
+        GenJnlLine."Shortcut Dimension 2 Code" := "Shortcut Dimension 2 Code";
+        GenJnlLine."Dimension Set ID" := "Dimension Set ID";
+        GenJnlLine."Reason Code" := "Reason Code";
+        GenJnlLine."Account Type" := GenJnlLine."Account Type"::Customer;
+        GenJnlLine."Account No." := "Bill-to Customer No.";
+        GenJnlLine."Document Type" := GenJnlLineDocType;
+        GenJnlLine."Document No." := GenJnlLineDocNo;
+        GenJnlLine."External Document No." := GenJnlLineExtDocNo;
+        GenJnlLine."Currency Code" := "Currency Code";
+        GenJnlLine.Amount := -TotalPrepmtInvLineBuffer."Amount Incl. VAT";
+        GenJnlLine."Source Currency Code" := "Currency Code";
+        GenJnlLine."Source Currency Amount" := -TotalPrepmtInvLineBuffer."Amount Incl. VAT";
+        GenJnlLine."Amount (LCY)" := -TotalPrepmtInvLineBufferLCY."Amount Incl. VAT";
+        IF "Currency Code" = '' THEN
+          GenJnlLine."Currency Factor" := 1
+        ELSE
+          GenJnlLine."Currency Factor" := "Currency Factor";
+        GenJnlLine.Correction :=
+          (DocumentType = DocumentType::"Credit Memo") AND GLSetup."Mark Cr. Memos as Corrections";
+        GenJnlLine."Sales/Purch. (LCY)" := -TotalPrepmtInvLineBufferLCY.Amount;
+        GenJnlLine."Profit (LCY)" := -TotalPrepmtInvLineBufferLCY.Amount;
+        GenJnlLine."Sell-to/Buy-from No." := "Sell-to Customer No.";
+        GenJnlLine."Bill-to/Pay-to No." := "Bill-to Customer No.";
+        GenJnlLine."Salespers./Purch. Code" := "Salesperson Code";
+        GenJnlLine."System-Created Entry" := TRUE;
+        GenJnlLine."Due Date" := "Prepayment Due Date";
+        GenJnlLine."Payment Terms Code" := "Prepmt. Payment Terms Code";
+        IF (DocumentType = DocumentType::Invoice) OR
+           CalcPmtDiscOnCrMemos
+        THEN BEGIN
+          GenJnlLine."Pmt. Discount Date" := "Prepmt. Pmt. Discount Date";
+          GenJnlLine."Payment Discount %" := "Prepmt. Payment Discount %";
+        END;
+        GenJnlLine."Source Type" := GenJnlLine."Source Type"::Customer;
+        GenJnlLine."Source No." := "Bill-to Customer No.";
+        GenJnlLine."Source Code" := SrcCode;
+        GenJnlLine."Posting No. Series" := PostingNoSeriesCode;
+        GenJnlLine."IC Partner Code" := "Sell-to IC Partner Code";
+        GenJnlLine.Prepayment := TRUE;
+        GenJnlPostLine.RunWithCheck(GenJnlLine);
+
+        // Balancing account
+        IF "Bal. Account No." <> '' THEN BEGIN
+          Window.UPDATE(5,1);
+          CustLedgEntry.FINDLAST;
+          GenJnlLine.INIT;
+          GenJnlLine."Posting Date" := "Posting Date";
+          GenJnlLine."Document Date" := "Document Date";
+          GenJnlLine.Description := PostingDescription;
+          GenJnlLine."Shortcut Dimension 1 Code" := "Shortcut Dimension 1 Code";
+          GenJnlLine."Shortcut Dimension 2 Code" := "Shortcut Dimension 2 Code";
+          GenJnlLine."Dimension Set ID" := "Dimension Set ID";
+          GenJnlLine."Reason Code" := "Reason Code";
+          GenJnlLine."Account Type" := GenJnlLine."Account Type"::Customer;
+          GenJnlLine."Account No." := "Bill-to Customer No.";
+          IF GenJnlLineDocType = GenJnlLine."Document Type"::"Credit Memo" THEN
+            GenJnlLine."Document Type" := GenJnlLine."Document Type"::Refund
+          ELSE
+            GenJnlLine."Document Type" := GenJnlLine."Document Type"::Payment;
+          GenJnlLine."Document No." := GenJnlLineDocNo;
+          GenJnlLine."External Document No." := GenJnlLineExtDocNo;
+          IF "Bal. Account Type" = "Bal. Account Type"::"Bank Account" THEN
+            GenJnlLine."Bal. Account Type" := GenJnlLine."Bal. Account Type"::"Bank Account";
+          GenJnlLine."Bal. Account No." := "Bal. Account No.";
+          GenJnlLine."Currency Code" := "Currency Code";
+          GenJnlLine.Amount :=
+            TotalPrepmtInvLineBuffer."Amount Incl. VAT" + CustLedgEntry."Remaining Pmt. Disc. Possible";
+          GenJnlLine."Source Currency Code" := "Currency Code";
+          GenJnlLine."Source Currency Amount" := GenJnlLine.Amount;
+          GenJnlLine.Correction :=
+            (DocumentType = DocumentType::"Credit Memo") AND GLSetup."Mark Cr. Memos as Corrections";
+          CustLedgEntry.CALCFIELDS(Amount);
+          IF CustLedgEntry.Amount = 0 THEN
+            GenJnlLine."Amount (LCY)" := TotalPrepmtInvLineBufferLCY."Amount Incl. VAT"
+          ELSE
+            GenJnlLine."Amount (LCY)" :=
+              TotalPrepmtInvLineBufferLCY."Amount Incl. VAT" +
+              ROUND(
+                CustLedgEntry."Remaining Pmt. Disc. Possible" / CustLedgEntry."Adjusted Currency Factor");
+          IF "Currency Code" = '' THEN
+            GenJnlLine."Currency Factor" := 1
+          ELSE
+            GenJnlLine."Currency Factor" := "Currency Factor";
+          GenJnlLine."Applies-to Doc. Type" := GenJnlLineDocType;
+          GenJnlLine."Applies-to Doc. No." := GenJnlLineDocNo;
+          GenJnlLine."Source Type" := GenJnlLine."Source Type"::Customer;
+          GenJnlLine."Source No." := "Bill-to Customer No.";
+          GenJnlLine."Source Code" := SrcCode;
+          GenJnlLine."Posting No. Series" := PostingNoSeriesCode;
+          GenJnlLine."IC Partner Code" := "Sell-to IC Partner Code";
+          GenJnlLine."System-Created Entry" := TRUE;
+          GenJnlPostLine.RunWithCheck(GenJnlLine);
+        END;
+
+        // Update lines & header
+        UpdateSalesDocument(SalesHeader,SalesLine,DocumentType,GenJnlLineDocNo);
+        IF Status <> Status::"Pending Prepayment" THEN
+          Status := Status::"Pending Prepayment";
+        MODIFY;
+      END;
+
+      SalesHeader2 := SalesHeader;
+    END;
+
+    PROCEDURE CheckOpenPrepaymentLines@1(SalesHeader@1000 : Record 36;DocumentType@1003 : Option) Found : Boolean;
+    VAR
+      SalesLine@1001 : Record 37;
+    BEGIN
+      WITH SalesLine DO BEGIN
+        ApplyFilter(SalesHeader,DocumentType,SalesLine);
+        IF FIND('-') THEN
+          REPEAT
+            Found := PrepmtAmount(SalesLine,DocumentType) <> 0;
+            IF ("Prepayment VAT Identifier" = '') AND ("Prepmt. Amt. Inv." = 0) THEN BEGIN
+              UpdatePrepmtSetupFields;
+              MODIFY;
+            END;
+          UNTIL NEXT = 0;
+      END;
+      EXIT(Found);
+    END;
+
+    LOCAL PROCEDURE RoundAmounts@5(SalesHeader@1001 : Record 36;VAR PrepmtInvLineBuf@1000 : Record 461;VAR TotalPrepmtInvLineBuf@1002 : Record 461;VAR TotalPrepmtInvLineBufLCY@1003 : Record 461);
+    VAR
+      VAT@1004 : Boolean;
+    BEGIN
+      TotalPrepmtInvLineBuf.IncrAmounts(PrepmtInvLineBuf);
+
+      IF SalesHeader."Currency Code" <> '' THEN BEGIN
+        VAT := PrepmtInvLineBuf.Amount <> PrepmtInvLineBuf."Amount Incl. VAT";
+
+        PrepmtInvLineBuf."Amount Incl. VAT" :=
+          AmountToLCY(
+            SalesHeader,TotalPrepmtInvLineBuf."Amount Incl. VAT",TotalPrepmtInvLineBufLCY."Amount Incl. VAT");
+        IF VAT THEN
+          PrepmtInvLineBuf.Amount := ROUND(PrepmtInvLineBuf."Amount Incl. VAT" / (1 + PrepmtInvLineBuf."VAT %" / 100))
+        ELSE
+          PrepmtInvLineBuf.Amount := PrepmtInvLineBuf."Amount Incl. VAT";
+        PrepmtInvLineBuf."VAT Amount" := PrepmtInvLineBuf."Amount Incl. VAT" - PrepmtInvLineBuf.Amount;
+        IF PrepmtInvLineBuf."VAT Base Amount" <> 0 THEN
+          PrepmtInvLineBuf."VAT Base Amount" := PrepmtInvLineBuf.Amount;
+      END;
+
+      TotalPrepmtInvLineBufLCY.IncrAmounts(PrepmtInvLineBuf);
+    END;
+
+    LOCAL PROCEDURE AmountToLCY@6(SalesHeader@1001 : Record 36;TotalAmt@1000 : Decimal;PrevTotalAmt@1002 : Decimal) : Decimal;
+    VAR
+      CurrExchRate@1003 : Record 330;
+    BEGIN
+      CurrExchRate.INIT;
+      WITH SalesHeader DO
+        EXIT(
+          ROUND(
+            CurrExchRate.ExchangeAmtFCYToLCY(
+      //      "Posting Date","Currency Code",TotalAmt,"Currency Factor")) - //**4PS.o
+              0, '', "Posting Date","Currency Code",TotalAmt,"Currency Factor",TRUE)) - //**4PS.n
+          PrevTotalAmt);
+    END;
+
+    LOCAL PROCEDURE BuildInvLineBuffer@3(SalesHeader@1000 : Record 36;VAR SalesLine@1001 : Record 37;DocumentType@1005 : Option;VAR PrepmtInvBuf@1002 : Record 461;UpdateLines@1010 : Boolean);
+    VAR
+      PrepmtInvBuf2@1003 : Record 461;
+      TotalPrepmtInvLineBuffer@1009 : Record 461;
+      TotalPrepmtInvLineBufferDummy@1008 : Record 461;
+      SalesSetup@1011 : Record 311;
+    BEGIN
+      WITH SalesHeader DO BEGIN
+        TempPrepmtInvLineBuf.RESET;
+        TempPrepmtInvLineBuf.DELETEALL;
+        SalesSetup.GET;
+        ApplyFilter(SalesHeader,DocumentType,SalesLine);
+        SalesLine.SETRANGE("System-Created Entry",FALSE);
+        IF SalesLine.FIND('-') THEN
+          REPEAT
+            IF PrepmtAmount(SalesLine,DocumentType) <> 0 THEN BEGIN
+              IF SalesLine.Quantity < 0 THEN
+                SalesLine.FIELDERROR(Quantity,STRSUBSTNO(Text018,FIELDCAPTION("Prepayment %")));
+              IF SalesLine."Unit Price" < 0 THEN
+                SalesLine.FIELDERROR("Unit Price",STRSUBSTNO(Text018,FIELDCAPTION("Prepayment %")));
+
+              FillInvLineBuffer(SalesHeader,SalesLine,PrepmtInvBuf2);
+              IF UpdateLines THEN
+                TempPrepmtInvLineBuf.CopyWithLineNo(PrepmtInvBuf2,SalesLine."Line No.");
+              PrepmtInvBuf.InsertInvLineBuffer(PrepmtInvBuf2);
+              IF SalesSetup."Invoice Rounding" THEN
+                RoundAmounts(
+                  SalesHeader,PrepmtInvBuf2,TotalPrepmtInvLineBuffer,TotalPrepmtInvLineBufferDummy);
+            END;
+          UNTIL SalesLine.NEXT = 0;
+        IF SalesSetup."Invoice Rounding" THEN
+          IF InsertInvoiceRounding(
+               SalesHeader,PrepmtInvBuf2,TotalPrepmtInvLineBuffer,SalesLine."Line No.")
+          THEN
+            PrepmtInvBuf.InsertInvLineBuffer(PrepmtInvBuf2);
+      END;
+    END;
+
+    PROCEDURE BuildInvLineBuffer2@19(SalesHeader@1000 : Record 36;VAR SalesLine@1001 : Record 37;DocumentType@1005 : 'Invoice,Credit Memo,Statistic';VAR PrepmtInvBuf@1002 : Record 461);
+    BEGIN
+      BuildInvLineBuffer(
+        SalesHeader,SalesLine,DocumentType,PrepmtInvBuf,FALSE);
+    END;
+
+    LOCAL PROCEDURE AdjustInvLineBuffers@41(SalesHeader@1003 : Record 36;VAR PrepmtInvLineBuf@1002 : Record 461;VAR TotalPrepmtInvLineBuf@1001 : Record 461;DocumentType@1000 : 'Invoice,Credit Memo');
+    VAR
+      VATAdjustment@1004 : ARRAY [2] OF Decimal;
+      VAT@1005 : ',Base,Amount';
+    BEGIN
+      CalcPrepmtAmtInvLCYInLines(SalesHeader,PrepmtInvLineBuf,DocumentType,VATAdjustment);
+      IF ABS(VATAdjustment[VAT::Base]) > GLSetup."Amount Rounding Precision" THEN
+        InsertCorrInvLineBuffer(PrepmtInvLineBuf,SalesHeader,VATAdjustment[VAT::Base])
+      ELSE
+        IF (VATAdjustment[VAT::Base] <> 0) OR (VATAdjustment[VAT::Amount] <> 0) THEN BEGIN
+          PrepmtInvLineBuf.AdjustVATBase(VATAdjustment);
+          TotalPrepmtInvLineBuf.AdjustVATBase(VATAdjustment);
+        END;
+    END;
+
+    LOCAL PROCEDURE CalcPrepmtAmtInvLCYInLines@42(SalesHeader@1002 : Record 36;VAR PrepmtInvLineBuf@1003 : Record 461;DocumentType@1001 : 'Invoice,Credit Memo';VAR VATAdjustment@1006 : ARRAY [2] OF Decimal);
+    VAR
+      SalesLine@1000 : Record 37;
+      PrepmtInvBufAmount@1004 : ARRAY [2] OF Decimal;
+      TotalAmount@1005 : ARRAY [2] OF Decimal;
+      LineAmount@1007 : ARRAY [2] OF Decimal;
+      Ratio@1010 : ARRAY [2] OF Decimal;
+      PrepmtAmtReminder@1008 : ARRAY [2] OF Decimal;
+      PrepmtAmountRnded@1009 : ARRAY [2] OF Decimal;
+      VAT@1011 : ',Base,Amount';
+    BEGIN
+      PrepmtInvLineBuf.AmountsToArray(PrepmtInvBufAmount);
+      IF DocumentType = DocumentType::Invoice THEN
+        ReverseDecArray(PrepmtInvBufAmount);
+
+      TempPrepmtInvLineBuf.SetFilterOnPKey(PrepmtInvLineBuf);
+      TempPrepmtInvLineBuf.CALCSUMS(Amount,"Amount Incl. VAT");
+      TempPrepmtInvLineBuf.AmountsToArray(TotalAmount);
+      FOR VAT := VAT::Base TO VAT::Amount DO
+        IF TotalAmount[VAT] = 0 THEN
+          Ratio[VAT] := 0
+        ELSE
+          Ratio[VAT] := PrepmtInvBufAmount[VAT] / TotalAmount[VAT];
+      IF TempPrepmtInvLineBuf.FINDSET THEN
+        REPEAT
+          TempPrepmtInvLineBuf.AmountsToArray(LineAmount);
+          PrepmtAmountRnded[VAT::Base] := CalcRndedAmount(LineAmount[VAT::Base],Ratio[VAT::Base],PrepmtAmtReminder[VAT::Base]);
+          PrepmtAmountRnded[VAT::Amount] := CalcRndedAmount(LineAmount[VAT::Amount],Ratio[VAT::Amount],PrepmtAmtReminder[VAT::Amount]);
+
+          SalesLine.GET(SalesHeader."Document Type",SalesHeader."No.",TempPrepmtInvLineBuf."Line No.");
+          IF DocumentType = DocumentType::"Credit Memo" THEN BEGIN
+            VATAdjustment[VAT::Base] :=
+              VATAdjustment[VAT::Base] + SalesLine."Prepmt. Amount Inv. (LCY)" - PrepmtAmountRnded[VAT::Base];
+            SalesLine."Prepmt. Amount Inv. (LCY)" := 0;
+            VATAdjustment[VAT::Amount] :=
+              VATAdjustment[VAT::Amount] + SalesLine."Prepmt. VAT Amount Inv. (LCY)" - PrepmtAmountRnded[VAT::Amount];
+            SalesLine."Prepmt. VAT Amount Inv. (LCY)" := 0;
+          END ELSE BEGIN
+            SalesLine."Prepmt. Amount Inv. (LCY)" := SalesLine."Prepmt. Amount Inv. (LCY)" + PrepmtAmountRnded[VAT::Base];
+            SalesLine."Prepmt. VAT Amount Inv. (LCY)" := SalesLine."Prepmt. VAT Amount Inv. (LCY)" + PrepmtAmountRnded[VAT::Amount];
+          END;
+          SalesLine.MODIFY;
+        UNTIL TempPrepmtInvLineBuf.NEXT = 0;
+      TempPrepmtInvLineBuf.DELETEALL;
+    END;
+
+    LOCAL PROCEDURE CalcRndedAmount@51(LineAmount@1000 : Decimal;Ratio@1001 : Decimal;VAR Reminder@1002 : Decimal) RndedAmount : Decimal;
+    VAR
+      Amount@1003 : Decimal;
+    BEGIN
+      Amount := Reminder + LineAmount * Ratio;
+      RndedAmount := ROUND(Amount);
+      Reminder := Amount - RndedAmount;
+    END;
+
+    LOCAL PROCEDURE ReverseDecArray@53(VAR DecArray@1000 : ARRAY [2] OF Decimal);
+    VAR
+      Idx@1001 : Integer;
+    BEGIN
+      FOR Idx := 1 TO ARRAYLEN(DecArray) DO
+        DecArray[Idx] := -DecArray[Idx];
+    END;
+
+    LOCAL PROCEDURE InsertCorrInvLineBuffer@43(VAR PrepmtInvLineBuf@1001 : Record 461;SalesHeader@1002 : Record 36;VATBaseAdjustment@1003 : Decimal);
+    VAR
+      NewPrepmtInvLineBuf@1000 : Record 461;
+      SavedPrepmtInvLineBuf@1004 : Record 461;
+      AdjmtAmountACY@1005 : Decimal;
+    BEGIN
+      SavedPrepmtInvLineBuf := PrepmtInvLineBuf;
+
+      IF SalesHeader."Currency Code" = '' THEN
+        AdjmtAmountACY := VATBaseAdjustment
+      ELSE
+        AdjmtAmountACY := 0;
+
+      NewPrepmtInvLineBuf.FillAdjInvLineBuffer(
+        PrepmtInvLineBuf,
+        GetPrepmtAccNo(PrepmtInvLineBuf."Gen. Bus. Posting Group",PrepmtInvLineBuf."Gen. Prod. Posting Group"),
+        VATBaseAdjustment,AdjmtAmountACY);
+      PrepmtInvLineBuf.InsertInvLineBuffer(NewPrepmtInvLineBuf);
+
+      NewPrepmtInvLineBuf.FillAdjInvLineBuffer(
+        PrepmtInvLineBuf,
+        GetCorrBalAccNo(SalesHeader,VATBaseAdjustment > 0),
+        -VATBaseAdjustment,-AdjmtAmountACY);
+      PrepmtInvLineBuf.InsertInvLineBuffer(NewPrepmtInvLineBuf);
+
+      PrepmtInvLineBuf := SavedPrepmtInvLineBuf;
+    END;
+
+    LOCAL PROCEDURE GetPrepmtAccNo@47(GenBusPostingGroup@1000 : Code[10];GenProdPostingGroup@1001 : Code[10]) : Code[20];
+    BEGIN
+      IF (GenBusPostingGroup <> GenPostingSetup."Gen. Bus. Posting Group") OR
+         (GenProdPostingGroup <> GenPostingSetup."Gen. Prod. Posting Group")
+      THEN BEGIN
+        GenPostingSetup.GET(GenBusPostingGroup,GenProdPostingGroup);
+        GenPostingSetup.TESTFIELD("Sales Prepayments Account");
+      END;
+      EXIT(GenPostingSetup."Sales Prepayments Account");
+    END;
+
+    PROCEDURE GetCorrBalAccNo@48(SalesHeader@1000 : Record 36;PositiveAmount@1001 : Boolean) : Code[20];
+    VAR
+      BalAccNo@1002 : Code[20];
+    BEGIN
+      IF SalesHeader."Currency Code" = '' THEN
+        BalAccNo := GetInvRoundingAccNo(SalesHeader."Customer Posting Group")
+      ELSE
+        BalAccNo := GetGainLossGLAcc(SalesHeader."Currency Code",PositiveAmount);
+      EXIT(BalAccNo);
+    END;
+
+    PROCEDURE GetInvRoundingAccNo@49(CustomerPostingGroup@1000 : Code[10]) : Code[20];
+    VAR
+      CustPostingGr@1002 : Record 92;
+      GLAcc@1001 : Record 15;
+    BEGIN
+      CustPostingGr.GET(CustomerPostingGroup);
+      CustPostingGr.TESTFIELD("Invoice Rounding Account");
+      GLAcc.GET(CustPostingGr."Invoice Rounding Account");
+      EXIT(CustPostingGr."Invoice Rounding Account");
+    END;
+
+    LOCAL PROCEDURE GetGainLossGLAcc@50(CurrencyCode@1000 : Code[10];PositiveAmount@1002 : Boolean) : Code[20];
+    VAR
+      Currency@1001 : Record 4;
+    BEGIN
+      Currency.GET(CurrencyCode);
+      IF PositiveAmount THEN BEGIN
+        Currency.TESTFIELD("Realized Gains Acc.");
+        EXIT(Currency."Realized Gains Acc.");
+      END;
+      Currency.TESTFIELD("Realized Losses Acc.");
+      EXIT(Currency."Realized Losses Acc.");
+    END;
+
+    LOCAL PROCEDURE GetCurrencyAmountRoundingPrecision@7(CurrencyCode@1000 : Code[10]) : Decimal;
+    VAR
+      Currency@1001 : Record 4;
+    BEGIN
+      Currency.Initialize(CurrencyCode);
+      Currency.TESTFIELD("Amount Rounding Precision");
+      EXIT(Currency."Amount Rounding Precision");
+    END;
+
+    PROCEDURE FillInvLineBuffer@4(SalesHeader@1001 : Record 36;SalesLine@1002 : Record 37;VAR PrepmtInvBuf@1000 : Record 461);
+    BEGIN
+      WITH PrepmtInvBuf DO BEGIN
+        CLEAR(PrepmtInvBuf);
+
+        FillInvLineBufKey(SalesLine,PrepmtInvBuf);
+        IF NOT SalesHeader."Compress Prepayment" THEN BEGIN
+          "Line No." := SalesLine."Line No.";
+          Description := SalesLine.Description;
+        END;
+        FillFromGLAcc(SalesHeader."Compress Prepayment");
+        "Gen. Bus. Posting Group" := SalesLine."Gen. Bus. Posting Group";
+        "VAT Bus. Posting Group" := SalesLine."VAT Bus. Posting Group";
+        "VAT Calculation Type" := SalesLine."Prepmt. VAT Calc. Type";
+        "Global Dimension 1 Code" := SalesLine."Shortcut Dimension 1 Code";
+        "Global Dimension 2 Code" := SalesLine."Shortcut Dimension 2 Code";
+        Amount := SalesLine."Prepayment Amount";
+        "Amount Incl. VAT" := SalesLine."Prepmt. Amt. Incl. VAT";
+        "VAT Base Amount" := SalesLine."Prepayment Amount";
+        "VAT Amount" := SalesLine."Prepmt. Amt. Incl. VAT" - SalesLine."Prepayment Amount";
+        "Amount (ACY)" := SalesLine."Prepayment Amount";
+        "VAT Base Amount (ACY)" := SalesLine."Prepayment Amount";
+        "VAT Amount (ACY)" := SalesLine."Prepmt. Amt. Incl. VAT" - SalesLine."Prepayment Amount";
+        "VAT %" := SalesLine."Prepayment VAT %";
+        "VAT Identifier" := SalesLine."Prepayment VAT Identifier";
+        "VAT Difference" := SalesLine."Prepayment VAT Difference";
+      END;
+    END;
+
+    LOCAL PROCEDURE FillInvLineBufKey@52(SalesLine@1002 : Record 37;VAR PrepmtInvLineBuf@1001 : Record 461);
+    BEGIN
+      WITH PrepmtInvLineBuf DO BEGIN
+        "G/L Account No." := GetPrepmtAccNo(SalesLine."Gen. Bus. Posting Group",SalesLine."Gen. Prod. Posting Group");
+        "Dimension Set ID" := SalesLine."Dimension Set ID";
+        "Job No." := SalesLine."Job No.";
+        "Tax Area Code" := SalesLine."Tax Area Code";
+        "Tax Liable" := SalesLine."Tax Liable";
+        "Tax Group Code" := SalesLine."Tax Group Code";
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertInvoiceRounding@25(SalesHeader@1002 : Record 36;VAR PrepmtInvBuf@1000 : Record 461;TotalPrepmtInvBuf@1001 : Record 461;PrevLineNo@1008 : Integer) : Boolean;
+    VAR
+      SalesLine@1007 : Record 37;
+    BEGIN
+      IF InitInvoiceRoundingLine(SalesHeader,TotalPrepmtInvBuf."Amount Incl. VAT",SalesLine) THEN BEGIN
+        CreateDimensions(SalesLine);
+        WITH PrepmtInvBuf DO BEGIN
+          CLEAR(PrepmtInvBuf);
+          "Invoice Rounding" := TRUE;
+          "G/L Account No." := SalesLine."No.";
+          "Gen. Bus. Posting Group" := SalesHeader."Gen. Bus. Posting Group";
+          "VAT Bus. Posting Group" := SalesHeader."VAT Bus. Posting Group";
+          "Gen. Prod. Posting Group" := SalesLine."Gen. Prod. Posting Group";
+          "VAT Prod. Posting Group" := SalesLine."VAT Prod. Posting Group";
+          "VAT Calculation Type" := SalesLine."VAT Calculation Type";
+          "Global Dimension 1 Code" := SalesLine."Shortcut Dimension 1 Code";
+          "Global Dimension 2 Code" := SalesLine."Shortcut Dimension 2 Code";
+          "Dimension Set ID" := SalesLine."Dimension Set ID";
+          Amount := SalesLine."Line Amount";
+          "Amount Incl. VAT" := SalesLine."Amount Including VAT";
+          "VAT Base Amount" := SalesLine."Line Amount";
+          "VAT Amount" := SalesLine."Amount Including VAT" - SalesLine."Line Amount";
+          "Amount (ACY)" := SalesLine."Prepayment Amount";
+          "VAT Base Amount (ACY)" := SalesLine."Line Amount";
+          "VAT Amount (ACY)" := SalesLine."Amount Including VAT" - SalesLine."Line Amount";
+          "VAT %" := SalesLine."VAT %";
+          "VAT Identifier" := SalesLine."VAT Identifier";
+          "Tax Area Code" := SalesLine."Tax Area Code";
+          "Tax Liable" := SalesLine."Tax Liable";
+          "Tax Group Code" := SalesLine."Tax Group Code";
+          "Line No." := PrevLineNo + 10000;
+        END;
+        EXIT(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE InitInvoiceRoundingLine@29(SalesHeader@1000 : Record 36;TotalAmount@1004 : Decimal;VAR SalesLine@1001 : Record 37) : Boolean;
+    VAR
+      Currency@1007 : Record 4;
+      InvoiceRoundingAmount@1002 : Decimal;
+    BEGIN
+      Currency.Initialize(SalesHeader."Currency Code");
+      Currency.TESTFIELD("Invoice Rounding Precision");
+      InvoiceRoundingAmount :=
+        -ROUND(
+          TotalAmount -
+          ROUND(
+            TotalAmount,
+            Currency."Invoice Rounding Precision",
+            Currency.InvoiceRoundingDirection),
+          Currency."Amount Rounding Precision");
+
+      IF InvoiceRoundingAmount = 0 THEN
+        EXIT(FALSE);
+
+      WITH SalesLine DO BEGIN
+        SetHideValidationDialog(TRUE);
+        "Document Type" := SalesHeader."Document Type";
+        "Document No." := SalesHeader."No.";
+        "System-Created Entry" := TRUE;
+        Type := Type::"G/L Account";
+        VALIDATE("No.",GetInvRoundingAccNo(SalesHeader."Customer Posting Group"));
+        VALIDATE(Quantity,1);
+        IF SalesHeader."Prices Including VAT" THEN
+          VALIDATE("Unit Price",InvoiceRoundingAmount)
+        ELSE
+          VALIDATE(
+            "Unit Price",
+            ROUND(
+              InvoiceRoundingAmount /
+              (1 + (1 - SalesHeader."VAT Base Discount %" / 100) * "VAT %" / 100),
+              Currency."Amount Rounding Precision"));
+        "Prepayment Amount" := "Unit Price";
+        VALIDATE("Amount Including VAT",InvoiceRoundingAmount);
+      END;
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE CompressInvLineBuffer@1000000000(SalesHeader@1000000001 : Record 36;VAR PrepmtInvBuffer@1000000000 : Record 461);
+    VAR
+      PrepmtInvBuffer2@1000 : TEMPORARY Record 461;
+    BEGIN
+      IF SalesHeader."Compress Prepayment" THEN
+        EXIT;
+
+      WITH PrepmtInvBuffer2 DO BEGIN
+        PrepmtInvBuffer.FIND('-');
+        REPEAT
+          PrepmtInvBuffer2 := PrepmtInvBuffer;
+          "Line No." := 0;
+          IF FIND THEN BEGIN
+            IncrAmounts(PrepmtInvBuffer);
+            MODIFY;
+          END ELSE
+            INSERT;
+        UNTIL PrepmtInvBuffer.NEXT = 0;
+
+        PrepmtInvBuffer.DELETEALL;
+
+        FIND('-');
+        REPEAT
+          PrepmtInvBuffer := PrepmtInvBuffer2;
+          PrepmtInvBuffer.INSERT;
+        UNTIL NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE CopyCommentLines@22(FromNumber@1002 : Code[20];ToDocType@1000 : Integer;ToNumber@1003 : Code[20]);
+    VAR
+      SalesCommentLine@1004 : Record 44;
+      SalesCommentLine2@1005 : Record 44;
+    BEGIN
+      WITH SalesCommentLine DO BEGIN
+        SETRANGE("Document Type","Document Type"::Order);
+        SETRANGE("No.",FromNumber);
+        IF FIND('-') THEN
+          REPEAT
+            SalesCommentLine2 := SalesCommentLine;
+            CASE ToDocType OF
+              DATABASE::"Sales Invoice Header":
+                SalesCommentLine2."Document Type" :=
+                  SalesCommentLine2."Document Type"::"Posted Invoice";
+              DATABASE::"Sales Cr.Memo Header":
+                SalesCommentLine2."Document Type" :=
+                  SalesCommentLine2."Document Type"::"Posted Credit Memo";
+            END;
+            SalesCommentLine2."No." := ToNumber;
+            SalesCommentLine2.INSERT;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertExtendedText@17(TabNo@1000 : Integer;DocNo@1003 : Code[20];GLAccNo@1006 : Code[20];DocDate@1001 : Date;LanguageCode@1009 : Code[10];VAR PrevLineNo@1002 : Integer);
+    VAR
+      TempExtTextLine@1005 : TEMPORARY Record 280;
+      SalesInvLine@1007 : Record 113;
+      SalesCrMemoLine@1008 : Record 115;
+      TransferExtText@1004 : Codeunit 378;
+      NextLineNo@1010 : Integer;
+    BEGIN
+      TransferExtText.PrepmtGetAnyExtText(GLAccNo,TabNo,DocDate,LanguageCode,TempExtTextLine);
+      IF TempExtTextLine.FIND('-') THEN BEGIN
+        NextLineNo := PrevLineNo + 10000;
+        REPEAT
+          CASE TabNo OF
+            DATABASE::"Sales Invoice Line":
+              BEGIN
+                SalesInvLine."Document No." := DocNo;
+                SalesInvLine."Line No." := NextLineNo;
+                SalesInvLine.Description := TempExtTextLine.Text;
+                SalesInvLine.INSERT;
+              END;
+            DATABASE::"Sales Cr.Memo Line":
+              BEGIN
+                SalesCrMemoLine."Document No." := DocNo;
+                SalesCrMemoLine."Line No." := NextLineNo;
+                SalesCrMemoLine.Description := TempExtTextLine.Text;
+                SalesCrMemoLine.INSERT;
+              END;
+          END;
+          PrevLineNo := NextLineNo;
+          NextLineNo := NextLineNo + 10000;
+        UNTIL TempExtTextLine.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE UpdateVATOnLines@36(SalesHeader@1001 : Record 36;VAR SalesLine@1011 : Record 37;VAR VATAmountLine@1003 : Record 290;DocumentType@1000 : 'Invoice,Credit Memo,Statistic');
+    VAR
+      TempVATAmountLineRemainder@1004 : TEMPORARY Record 290;
+      Currency@1005 : Record 4;
+      PrepmtAmt@1002 : Decimal;
+      NewAmount@1006 : Decimal;
+      NewAmountIncludingVAT@1007 : Decimal;
+      NewVATBaseAmount@1008 : Decimal;
+      VATAmount@1009 : Decimal;
+      VATDifference@1010 : Decimal;
+      PrepmtAmtToInvTotal@1013 : Decimal;
+    BEGIN
+      Currency.Initialize(SalesHeader."Currency Code");
+
+      WITH SalesLine DO BEGIN
+        ApplyFilter(SalesHeader,DocumentType,SalesLine);
+        LOCKTABLE;
+        CALCSUMS("Prepmt. Line Amount","Prepmt. Amt. Inv.");
+        PrepmtAmtToInvTotal := "Prepmt. Line Amount" - "Prepmt. Amt. Inv.";
+        IF FINDSET THEN
+          REPEAT
+            PrepmtAmt := PrepmtAmount(SalesLine,DocumentType);
+            IF PrepmtAmt <> 0 THEN BEGIN
+              VATAmountLine.GET(
+                "Prepayment VAT Identifier",
+                "Prepmt. VAT Calc. Type",
+                "Prepayment Tax Group Code",
+                FALSE,
+                PrepmtAmt >= 0);
+              IF VATAmountLine.Modified THEN BEGIN
+                IF NOT TempVATAmountLineRemainder.GET(
+                     "Prepayment VAT Identifier",
+                     "Prepmt. VAT Calc. Type",
+                     "Prepayment Tax Group Code",
+                     FALSE,
+                     PrepmtAmt >= 0)
+                THEN BEGIN
+                  TempVATAmountLineRemainder := VATAmountLine;
+                  TempVATAmountLineRemainder.INIT;
+                  TempVATAmountLineRemainder.INSERT;
+                END;
+
+                IF SalesHeader."Prices Including VAT" THEN BEGIN
+                  IF PrepmtAmt = 0 THEN BEGIN
+                    VATAmount := 0;
+                    NewAmountIncludingVAT := 0;
+                  END ELSE BEGIN
+                    VATAmount :=
+                      TempVATAmountLineRemainder."VAT Amount" +
+                      VATAmountLine."VAT Amount" * PrepmtAmt / VATAmountLine."Line Amount";
+                    NewAmountIncludingVAT :=
+                      TempVATAmountLineRemainder."Amount Including VAT" +
+                      VATAmountLine."Amount Including VAT" * PrepmtAmt / VATAmountLine."Line Amount";
+                  END;
+                  NewAmount :=
+                    ROUND(NewAmountIncludingVAT,Currency."Amount Rounding Precision") -
+                    ROUND(VATAmount,Currency."Amount Rounding Precision");
+                  NewVATBaseAmount :=
+                    ROUND(
+                      NewAmount * (1 - SalesHeader."VAT Base Discount %" / 100),
+                      Currency."Amount Rounding Precision");
+                END ELSE BEGIN
+                  IF "VAT Calculation Type" = "VAT Calculation Type"::"Full VAT" THEN BEGIN
+                    VATAmount := PrepmtAmt;
+                    NewAmount := 0;
+                    NewVATBaseAmount := 0;
+                  END ELSE BEGIN
+                    NewAmount := PrepmtAmt;
+                    NewVATBaseAmount :=
+                      ROUND(
+                        NewAmount * (1 - SalesHeader."VAT Base Discount %" / 100),
+                        Currency."Amount Rounding Precision");
+                    IF VATAmountLine."VAT Base" = 0 THEN
+                      VATAmount := 0
+                    ELSE
+                      VATAmount :=
+                        TempVATAmountLineRemainder."VAT Amount" +
+                        VATAmountLine."VAT Amount" * NewAmount / VATAmountLine."VAT Base";
+                  END;
+                  NewAmountIncludingVAT := NewAmount + ROUND(VATAmount,Currency."Amount Rounding Precision");
+                END;
+
+                "Prepayment Amount" := NewAmount;
+                "Prepmt. Amt. Incl. VAT" :=
+                  ROUND(NewAmountIncludingVAT,Currency."Amount Rounding Precision");
+                "Prepmt. VAT Base Amt." := NewVATBaseAmount;
+
+                IF (VATAmountLine."Line Amount" - VATAmountLine."Invoice Discount Amount") = 0 THEN
+                  VATDifference := 0
+                ELSE
+                  IF PrepmtAmtToInvTotal = 0 THEN
+                    VATDifference :=
+                      VATAmountLine."VAT Difference" * ("Prepmt. Line Amount" - "Prepmt. Amt. Inv.") /
+                      (VATAmountLine."Line Amount" - VATAmountLine."Invoice Discount Amount")
+                  ELSE
+                    VATDifference :=
+                      VATAmountLine."VAT Difference" * ("Prepmt. Line Amount" - "Prepmt. Amt. Inv.") /
+                      PrepmtAmtToInvTotal;
+
+                "Prepayment VAT Difference" := ROUND(VATDifference,Currency."Amount Rounding Precision");
+
+                MODIFY;
+
+                TempVATAmountLineRemainder."Amount Including VAT" :=
+                  NewAmountIncludingVAT - ROUND(NewAmountIncludingVAT,Currency."Amount Rounding Precision");
+                TempVATAmountLineRemainder."VAT Amount" := VATAmount - NewAmountIncludingVAT + NewAmount;
+                TempVATAmountLineRemainder."VAT Difference" := VATDifference - "Prepayment VAT Difference";
+                TempVATAmountLineRemainder.MODIFY;
+              END;
+            END;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE CalcVATAmountLines@35(VAR SalesHeader@1001 : Record 36;VAR SalesLine@1009 : Record 37;VAR VATAmountLine@1003 : Record 290;DocumentType@1008 : 'Invoice,Credit Memo,Statistic');
+    VAR
+      PrevVatAmountLine@1007 : Record 290;
+      Currency@1004 : Record 4;
+      SalesTaxCalculate@1005 : Codeunit 398;
+      NewAmount@1002 : Decimal;
+      NewPrepmtVATDiffAmt@1010 : Decimal;
+    BEGIN
+      Currency.Initialize(SalesHeader."Currency Code");
+
+      VATAmountLine.DELETEALL;
+
+      WITH SalesLine DO BEGIN
+        ApplyFilter(SalesHeader,DocumentType,SalesLine);
+        IF FIND('-') THEN
+          REPEAT
+            NewAmount := PrepmtAmount(SalesLine,DocumentType);
+            IF NewAmount <> 0 THEN BEGIN
+              IF DocumentType = DocumentType::Invoice THEN
+                NewAmount := "Prepmt. Line Amount";
+              IF "Prepmt. VAT Calc. Type" IN
+                 ["VAT Calculation Type"::"Reverse Charge VAT","VAT Calculation Type"::"Sales Tax"]
+              THEN
+                "VAT %" := 0;
+              IF NOT VATAmountLine.GET(
+                   "Prepayment VAT Identifier",
+                   "Prepmt. VAT Calc. Type","Prepayment Tax Group Code",
+                   FALSE,NewAmount >= 0)
+              THEN BEGIN
+                VATAmountLine.INIT;
+                VATAmountLine."VAT Identifier" := "Prepayment VAT Identifier";
+                VATAmountLine."VAT Calculation Type" := "Prepmt. VAT Calc. Type";
+                VATAmountLine."Tax Group Code" := "Prepayment Tax Group Code";
+                VATAmountLine."VAT %" := "Prepayment VAT %";
+                VATAmountLine.Modified := TRUE;
+                VATAmountLine.Positive := NewAmount >= 0;
+                VATAmountLine."Includes Prepayment" := TRUE;
+                VATAmountLine.INSERT;
+              END;
+              VATAmountLine."Line Amount" := VATAmountLine."Line Amount" + NewAmount;
+              NewPrepmtVATDiffAmt := PrepmtVATDiffAmount(SalesLine,DocumentType);
+              IF DocumentType = DocumentType::Invoice THEN
+                NewPrepmtVATDiffAmt := "Prepayment VAT Difference" + "Prepmt VAT Diff. to Deduct" +
+                  "Prepmt VAT Diff. Deducted";
+              VATAmountLine."VAT Difference" := VATAmountLine."VAT Difference" + NewPrepmtVATDiffAmt;
+              VATAmountLine.MODIFY;
+            END;
+          UNTIL NEXT = 0;
+      END;
+
+      WITH VATAmountLine DO
+        IF FIND('-') THEN
+          REPEAT
+            IF (PrevVatAmountLine."VAT Identifier" <> "VAT Identifier") OR
+               (PrevVatAmountLine."VAT Calculation Type" <> "VAT Calculation Type") OR
+               (PrevVatAmountLine."Tax Group Code" <> "Tax Group Code") OR
+               (PrevVatAmountLine."Use Tax" <> "Use Tax")
+            THEN
+              PrevVatAmountLine.INIT;
+            IF SalesHeader."Prices Including VAT" THEN BEGIN
+              CASE "VAT Calculation Type" OF
+                "VAT Calculation Type"::"Normal VAT",
+                "VAT Calculation Type"::"Reverse Charge VAT":
+                  BEGIN
+                    "VAT Base" :=
+                      ROUND(
+                        ("Line Amount" - "Invoice Discount Amount") / (1 + "VAT %" / 100),
+                        Currency."Amount Rounding Precision") - "VAT Difference";
+                    "VAT Amount" :=
+                      "VAT Difference" +
+                      ROUND(
+                        PrevVatAmountLine."VAT Amount" +
+                        ("Line Amount" - "VAT Base" - "VAT Difference") *
+                        (1 - SalesHeader."VAT Base Discount %" / 100),
+                        Currency."Amount Rounding Precision",Currency.VATRoundingDirection);
+                    "Amount Including VAT" := "VAT Base" + "VAT Amount";
+                    IF Positive THEN
+                      PrevVatAmountLine.INIT
+                    ELSE BEGIN
+                      PrevVatAmountLine := VATAmountLine;
+                      PrevVatAmountLine."VAT Amount" :=
+                        ("Line Amount" - "VAT Base" - "VAT Difference") *
+                        (1 - SalesHeader."VAT Base Discount %" / 100);
+                      PrevVatAmountLine."VAT Amount" :=
+                        PrevVatAmountLine."VAT Amount" -
+                        ROUND(PrevVatAmountLine."VAT Amount",Currency."Amount Rounding Precision",Currency.VATRoundingDirection);
+                    END;
+                  END;
+                "VAT Calculation Type"::"Full VAT":
+                  BEGIN
+                    "VAT Base" := 0;
+                    "VAT Amount" := "VAT Difference" + "Line Amount" - "Invoice Discount Amount";
+                    "Amount Including VAT" := "VAT Amount";
+                  END;
+                "VAT Calculation Type"::"Sales Tax":
+                  BEGIN
+                    "Amount Including VAT" := "Line Amount" - "Invoice Discount Amount";
+                    "VAT Base" :=
+                      ROUND(
+                        SalesTaxCalculate.ReverseCalculateTax(
+                          SalesHeader."Tax Area Code","Tax Group Code",SalesHeader."Tax Liable",
+                          SalesHeader."Posting Date","Amount Including VAT",Quantity,SalesHeader."Currency Factor"),
+                        Currency."Amount Rounding Precision");
+                    "VAT Amount" := "VAT Difference" + "Amount Including VAT" - "VAT Base";
+                    IF "VAT Base" = 0 THEN
+                      "VAT %" := 0
+                    ELSE
+                      "VAT %" := ROUND(100 * "VAT Amount" / "VAT Base",0.00001);
+                  END;
+              END;
+            END ELSE
+              CASE "VAT Calculation Type" OF
+                "VAT Calculation Type"::"Normal VAT",
+                "VAT Calculation Type"::"Reverse Charge VAT":
+                  BEGIN
+                    "VAT Base" := "Line Amount" - "Invoice Discount Amount";
+                    "VAT Amount" :=
+                      "VAT Difference" +
+                      ROUND(
+                        PrevVatAmountLine."VAT Amount" +
+                        "VAT Base" * "VAT %" / 100 * (1 - SalesHeader."VAT Base Discount %" / 100),
+                        Currency."Amount Rounding Precision",Currency.VATRoundingDirection);
+                    "Amount Including VAT" := "Line Amount" - "Invoice Discount Amount" + "VAT Amount";
+                    IF Positive THEN
+                      PrevVatAmountLine.INIT
+                    ELSE BEGIN
+                      PrevVatAmountLine := VATAmountLine;
+                      PrevVatAmountLine."VAT Amount" :=
+                        "VAT Base" * "VAT %" / 100 * (1 - SalesHeader."VAT Base Discount %" / 100);
+                      PrevVatAmountLine."VAT Amount" :=
+                        PrevVatAmountLine."VAT Amount" -
+                        ROUND(PrevVatAmountLine."VAT Amount",Currency."Amount Rounding Precision",Currency.VATRoundingDirection);
+                    END;
+                  END;
+                "VAT Calculation Type"::"Full VAT":
+                  BEGIN
+                    "VAT Base" := 0;
+                    "VAT Amount" := "VAT Difference" + "Line Amount" - "Invoice Discount Amount";
+                    "Amount Including VAT" := "VAT Amount";
+                  END;
+                "VAT Calculation Type"::"Sales Tax":
+                  BEGIN
+                    "VAT Base" := "Line Amount" - "Invoice Discount Amount";
+                    "VAT Amount" :=
+                      SalesTaxCalculate.CalculateTax(
+                        SalesHeader."Tax Area Code","Tax Group Code",SalesHeader."Tax Liable",
+                        SalesHeader."Posting Date","VAT Base",Quantity,SalesHeader."Currency Factor");
+                    IF "VAT Base" = 0 THEN
+                      "VAT %" := 0
+                    ELSE
+                      "VAT %" := ROUND(100 * "VAT Amount" / "VAT Base",0.00001);
+                    "VAT Amount" :=
+                      "VAT Difference" +
+                      ROUND("VAT Amount",Currency."Amount Rounding Precision",Currency.VATRoundingDirection);
+                    "Amount Including VAT" := "VAT Base" + "VAT Amount";
+                  END;
+              END;
+
+            "Calculated VAT Amount" := "VAT Amount" - "VAT Difference";
+            MODIFY;
+          UNTIL NEXT = 0;
+    END;
+
+    PROCEDURE SumPrepmt@15(SalesHeader@1000 : Record 36;VAR SalesLine@1011 : Record 37;VAR VATAmountLine@1003 : Record 290;VAR TotalAmount@1001 : Decimal;VAR TotalVATAmount@1002 : Decimal;VAR VATAmountText@1004 : Text[30]);
+    VAR
+      PrepmtInvBuf@1005 : TEMPORARY Record 461;
+      TotalPrepmtBuf@1007 : Record 461;
+      TotalPrepmtBufLCY@1008 : Record 461;
+      DifVATPct@1009 : Boolean;
+      PrevVATPct@1010 : Decimal;
+    BEGIN
+      CalcVATAmountLines(SalesHeader,SalesLine,VATAmountLine,2);
+      UpdateVATOnLines(SalesHeader,SalesLine,VATAmountLine,2);
+      BuildInvLineBuffer(SalesHeader,SalesLine,2,PrepmtInvBuf,FALSE);
+      IF PrepmtInvBuf.FIND('-') THEN BEGIN
+        PrevVATPct := PrepmtInvBuf."VAT %";
+        REPEAT
+          RoundAmounts(SalesHeader,PrepmtInvBuf,TotalPrepmtBuf,TotalPrepmtBufLCY);
+          IF PrepmtInvBuf."VAT %" <> PrevVATPct THEN
+            DifVATPct := TRUE;
+        UNTIL PrepmtInvBuf.NEXT = 0;
+      END;
+
+      TotalAmount := TotalPrepmtBuf.Amount;
+      TotalVATAmount := TotalPrepmtBuf."VAT Amount";
+      IF DifVATPct OR (PrepmtInvBuf."VAT %" = 0) THEN
+        VATAmountText := Text014
+      ELSE
+        VATAmountText := STRSUBSTNO(Text015,PrevVATPct);
+    END;
+
+    PROCEDURE GetSalesLines@16(SalesHeader@1000 : Record 36;DocumentType@1003 : 'Invoice,Credit Memo,Statistic';VAR ToSalesLine@1001 : Record 37);
+    VAR
+      SalesSetup@1004 : Record 311;
+      FromSalesLine@1002 : Record 37;
+      InvRoundingSalesLine@1007 : Record 37;
+      TempVATAmountLine@1005 : TEMPORARY Record 290;
+      TotalAmt@1006 : Decimal;
+      NextLineNo@1008 : Integer;
+    BEGIN
+      ApplyFilter(SalesHeader,DocumentType,FromSalesLine);
+      IF FromSalesLine.FIND('-') THEN BEGIN
+        REPEAT
+          ToSalesLine := FromSalesLine;
+          ToSalesLine.INSERT;
+        UNTIL FromSalesLine.NEXT = 0;
+
+        SalesSetup.GET;
+        IF SalesSetup."Invoice Rounding" THEN BEGIN
+          CalcVATAmountLines(SalesHeader,ToSalesLine,TempVATAmountLine,2);
+          UpdateVATOnLines(SalesHeader,ToSalesLine,TempVATAmountLine,2);
+          ToSalesLine.CALCSUMS("Prepmt. Amt. Incl. VAT");
+          TotalAmt := ToSalesLine."Prepmt. Amt. Incl. VAT";
+          ToSalesLine.FINDLAST;
+          IF InitInvoiceRoundingLine(SalesHeader,TotalAmt,InvRoundingSalesLine) THEN
+            WITH ToSalesLine DO BEGIN
+              NextLineNo := "Line No." + 1;
+              ToSalesLine := InvRoundingSalesLine;
+              "Line No." := NextLineNo;
+
+              IF DocumentType <> DocumentType::"Credit Memo" THEN
+                "Prepmt. Line Amount" := "Line Amount"
+              ELSE
+                "Prepmt. Amt. Inv." := "Line Amount";
+              "Prepmt. VAT Calc. Type" := "VAT Calculation Type";
+              "Prepayment VAT Identifier" := "VAT Identifier";
+              "Prepayment Tax Group Code" := "Tax Group Code";
+              "Prepayment VAT Identifier" := "VAT Identifier";
+              "Prepayment Tax Group Code" := "Tax Group Code";
+              "Prepayment VAT %" := "VAT %";
+              INSERT;
+            END;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckDim@34(SalesHeader@1001 : Record 36);
+    VAR
+      SalesLine@1003 : Record 37;
+    BEGIN
+      SalesLine."Line No." := 0;
+      CheckDimValuePosting(SalesHeader,SalesLine);
+      CheckDimComb(SalesHeader,SalesLine);
+
+      SalesLine.SETRANGE("Document Type",SalesHeader."Document Type");
+      SalesLine.SETRANGE("Document No.",SalesHeader."No.");
+      SalesLine.SETFILTER(Type,'<>%1',SalesLine.Type::" ");
+      IF SalesLine.FIND('-') THEN
+        REPEAT
+          CheckDimComb(SalesHeader,SalesLine);
+          CheckDimValuePosting(SalesHeader,SalesLine);
+        UNTIL SalesLine.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE ApplyFilter@20(SalesHeader@1000 : Record 36;DocumentType@1001 : 'Invoice,Credit Memo,Statistic';VAR SalesLine@1002 : Record 37);
+    BEGIN
+      WITH SalesLine DO BEGIN
+        RESET;
+        SETRANGE("Document Type",SalesHeader."Document Type");
+        SETRANGE("Document No.",SalesHeader."No.");
+        SETFILTER(Type,'<>%1',Type::" ");
+        IF DocumentType IN [DocumentType::Invoice,DocumentType::Statistic] THEN
+          SETFILTER("Prepmt. Line Amount",'<>0')
+        ELSE
+          SETFILTER("Prepmt. Amt. Inv.",'<>0');
+      END;
+    END;
+
+    PROCEDURE PrepmtAmount@12(SalesLine@1000 : Record 37;DocumentType@1001 : 'Invoice,Credit Memo,Statistic') : Decimal;
+    BEGIN
+      WITH SalesLine DO
+        CASE DocumentType OF
+          DocumentType::Statistic:
+            EXIT("Prepmt. Line Amount");
+          DocumentType::Invoice:
+            EXIT("Prepmt. Line Amount" - "Prepmt. Amt. Inv.");
+          ELSE
+            EXIT("Prepmt. Amt. Inv." - "Prepmt Amt Deducted");
+        END;
+    END;
+
+    LOCAL PROCEDURE CheckDimComb@30(SalesHeader@1001 : Record 36;SalesLine@1000 : Record 37);
+    VAR
+      DimMgt@1002 : Codeunit 408;
+    BEGIN
+      IF SalesLine."Line No." = 0 THEN
+        IF NOT DimMgt.CheckDimIDComb(SalesHeader."Dimension Set ID") THEN
+          ERROR(Text007,SalesHeader."Document Type",SalesHeader."No.",DimMgt.GetDimCombErr);
+
+      IF SalesLine."Line No." <> 0 THEN
+        IF NOT DimMgt.CheckDimIDComb(SalesLine."Dimension Set ID") THEN
+          ERROR(Text008,SalesHeader."Document Type",SalesHeader."No.",SalesLine."Line No.",DimMgt.GetDimCombErr);
+    END;
+
+    LOCAL PROCEDURE CheckDimValuePosting@28(SalesHeader@1004 : Record 36;VAR SalesLine@1000 : Record 37);
+    VAR
+      DimMgt@1005 : Codeunit 408;
+      TableIDArr@1002 : ARRAY [10] OF Integer;
+      NumberArr@1003 : ARRAY [10] OF Code[20];
+    BEGIN
+      IF SalesLine."Line No." = 0 THEN BEGIN
+        TableIDArr[1] := DATABASE::Customer;
+        NumberArr[1] := SalesHeader."Bill-to Customer No.";
+        TableIDArr[2] := DATABASE::Job;
+        // NumberArr[2] := SalesHeader."Job No.";
+        TableIDArr[3] := DATABASE::"Salesperson/Purchaser";
+        NumberArr[3] := SalesHeader."Salesperson Code";
+        TableIDArr[4] := DATABASE::Campaign;
+        NumberArr[4] := SalesHeader."Campaign No.";
+        TableIDArr[5] := DATABASE::"Responsibility Center";
+        NumberArr[5] := SalesHeader."Responsibility Center";
+        IF NOT DimMgt.CheckDimValuePosting(TableIDArr,NumberArr,SalesHeader."Dimension Set ID") THEN
+          ERROR(
+            Text009,
+            SalesHeader."Document Type",SalesHeader."No.",DimMgt.GetDimValuePostingErr);
+      END ELSE BEGIN
+        TableIDArr[1] := DimMgt.TypeToTableID3(SalesLine.Type);
+        NumberArr[1] := SalesLine."No.";
+        TableIDArr[2] := DATABASE::Job;
+        NumberArr[2] := SalesLine."Job No.";
+        IF NOT DimMgt.CheckDimValuePosting(TableIDArr,NumberArr,SalesLine."Dimension Set ID") THEN
+          ERROR(
+            Text010,
+            SalesHeader."Document Type",SalesHeader."No.",SalesLine."Line No.",DimMgt.GetDimValuePostingErr);
+      END;
+    END;
+
+    LOCAL PROCEDURE RunGenJnlPostLine@23(VAR GenJnlLine@1000 : Record 81);
+    BEGIN
+      GenJnlPostLine.RunWithCheck(GenJnlLine);
+    END;
+
+    PROCEDURE UpdatePrepmtAmountOnSaleslines@13(SalesHeader@1001 : Record 36;NewTotalPrepmtAmount@1000 : Decimal);
+    VAR
+      Currency@1004 : Record 4;
+      SalesLine@1002 : Record 37;
+      TotalLineAmount@1003 : Decimal;
+      TotalPrepmtAmount@1008 : Decimal;
+      TotalPrepmtAmtInv@1010 : Decimal;
+      LastLineNo@1009 : Integer;
+    BEGIN
+      Currency.Initialize(SalesHeader."Currency Code");
+
+      WITH SalesLine DO BEGIN
+        SETRANGE("Document Type",SalesHeader."Document Type");
+        SETRANGE("Document No.",SalesHeader."No.");
+        SETFILTER(Type,'<>%1',Type::" ");
+        SETFILTER("Line Amount",'<>0');
+        SETFILTER("Prepayment %",'<>0');
+        LOCKTABLE;
+        IF FIND('-') THEN
+          REPEAT
+            TotalLineAmount := TotalLineAmount + "Line Amount";
+            TotalPrepmtAmtInv := TotalPrepmtAmtInv + "Prepmt. Amt. Inv.";
+            LastLineNo := "Line No.";
+          UNTIL NEXT = 0
+        ELSE
+          ERROR(Text017,FIELDCAPTION("Prepayment %"));
+        IF TotalLineAmount = 0 THEN
+          ERROR(Text013,NewTotalPrepmtAmount);
+        IF NOT (NewTotalPrepmtAmount IN [TotalPrepmtAmtInv ..TotalLineAmount]) THEN
+          ERROR(Text016,TotalPrepmtAmtInv,TotalLineAmount);
+        IF FIND('-') THEN
+          REPEAT
+            IF "Line No." <> LastLineNo THEN
+              VALIDATE(
+                "Prepmt. Line Amount",
+                ROUND(
+                  NewTotalPrepmtAmount * "Line Amount" / TotalLineAmount,
+                  Currency."Amount Rounding Precision"))
+            ELSE
+              VALIDATE("Prepmt. Line Amount",NewTotalPrepmtAmount - TotalPrepmtAmount);
+            TotalPrepmtAmount := TotalPrepmtAmount + "Prepmt. Line Amount";
+            MODIFY;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE CreateDimensions@26(VAR SalesLine@1009 : Record 37);
+    VAR
+      SourceCodeSetup@1006 : Record 242;
+      DimMgt@1010 : Codeunit 408;
+      TableID@1007 : ARRAY [10] OF Integer;
+      No@1008 : ARRAY [10] OF Code[20];
+    BEGIN
+      SourceCodeSetup.GET;
+      TableID[1] := DATABASE::"G/L Account";
+      No[1] := SalesLine."No.";
+      TableID[2] := DATABASE::Job;
+      No[2] := SalesLine."Job No.";
+      //**4PS.so
+      //TableID[3] := DATABASE::"Responsibility Center"; //**4PS 10-06-2010
+      //No[3] := SalesLine."Responsibility Center"; //**4PS 10-06-2010
+      //**4PS.eo
+      //**4PS.sn
+      TableID[3] := DATABASE::"Service Order";
+      No[3] := SalesLine."Service Order No.";
+      TableID[4] := DATABASE::"Responsibility Center";
+      No[4] := SalesLine."Responsibility Center";
+      //**4PS.en
+      SalesLine."Shortcut Dimension 1 Code" := '';
+      SalesLine."Shortcut Dimension 2 Code" := '';
+      SalesLine."Dimension Set ID" :=
+        DimMgt.GetDefaultDimID(
+          TableID,No,SourceCodeSetup.Sales,
+          SalesLine."Shortcut Dimension 1 Code",SalesLine."Shortcut Dimension 2 Code",SalesLine."Dimension Set ID",DATABASE::Customer);
+    END;
+
+    LOCAL PROCEDURE PrepmtDocTypeToDocType@21(DocumentType@1000 : 'Invoice,Credit Memo') : Integer;
+    BEGIN
+      CASE DocumentType OF
+        DocumentType::Invoice:
+          EXIT(2);
+        DocumentType::"Credit Memo":
+          EXIT(3);
+      END;
+      EXIT(2);
+    END;
+
+    PROCEDURE GetSalesLinesToDeduct@24(SalesHeader@1000 : Record 36;VAR SalesLines@1002 : Record 37);
+    VAR
+      SalesLine@1001 : Record 37;
+    BEGIN
+      ApplyFilter(SalesHeader,1,SalesLine);
+      IF SalesLine.FINDSET THEN
+        REPEAT
+          IF (PrepmtAmount(SalesLine,0) <> 0) AND (PrepmtAmount(SalesLine,1) <> 0) THEN BEGIN
+            SalesLines := SalesLine;
+            SalesLines.INSERT;
+          END;
+        UNTIL SalesLine.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE ValidatePaymentMethod@31(SalesHeader@1000 : Record 36);
+    VAR
+      PaymentMethod@1034 : Record 289;
+    BEGIN
+      IF SalesHeader."Payment Method Code" <> '' THEN
+        IF PaymentMethod.GET(SalesHeader."Payment Method Code") THEN BEGIN
+          IF PaymentMethod."Payment Processor" = PaymentMethod."Payment Processor"::"Dynamics Online" THEN
+            PaymentMethod.FIELDERROR("Payment Processor");
+        END;
+    END;
+
+    LOCAL PROCEDURE PrepmtVATDiffAmount@37(SalesLine@1000 : Record 37;DocumentType@1001 : 'Invoice,Credit Memo,Statistic') : Decimal;
+    BEGIN
+      WITH SalesLine DO
+        CASE DocumentType OF
+          DocumentType::Statistic:
+            EXIT("Prepayment VAT Difference");
+          DocumentType::Invoice:
+            EXIT("Prepayment VAT Difference");
+          ELSE
+            EXIT("Prepmt VAT Diff. to Deduct");
+        END;
+    END;
+
+    LOCAL PROCEDURE UpdateSalesDocument@8(VAR SalesHeader@1001 : Record 36;VAR SalesLine@1000 : Record 37;DocumentType@1002 : 'Invoice,Credit Memo';GenJnlLineDocNo@1003 : Code[20]);
+    BEGIN
+      WITH SalesHeader DO BEGIN
+        SalesLine.RESET;
+        SalesLine.SETRANGE("Document Type","Document Type");
+        SalesLine.SETRANGE("Document No.","No.");
+        IF DocumentType = DocumentType::Invoice THEN BEGIN
+          "Last Prepayment No." := GenJnlLineDocNo;
+          "Prepayment No." := '';
+          SalesLine.SETFILTER("Prepmt. Line Amount",'<>0');
+          IF SalesLine.FINDSET(TRUE) THEN
+            REPEAT
+              IF SalesLine."Prepmt. Line Amount" <> SalesLine."Prepmt. Amt. Inv." THEN BEGIN
+                SalesLine."Prepmt. Amt. Inv." := SalesLine."Prepmt. Line Amount";
+                SalesLine."Prepmt. Amount Inv. Incl. VAT" := SalesLine."Prepmt. Amt. Incl. VAT";
+                SalesLine.CalcPrepaymentToDeduct;
+                SalesLine."Prepmt VAT Diff. to Deduct" :=
+                  SalesLine."Prepmt VAT Diff. to Deduct" + SalesLine."Prepayment VAT Difference";
+                SalesLine."Prepayment VAT Difference" := 0;
+                SalesLine.MODIFY;
+              END;
+            UNTIL SalesLine.NEXT = 0;
+        END ELSE BEGIN
+          "Last Prepmt. Cr. Memo No." := GenJnlLineDocNo;
+          "Prepmt. Cr. Memo No." := '';
+          SalesLine.SETFILTER("Prepmt. Amt. Inv.",'<>0');
+          IF SalesLine.FINDSET(TRUE) THEN
+            REPEAT
+              SalesLine."Prepmt. Amt. Inv." := SalesLine."Prepmt Amt Deducted";
+              IF "Prices Including VAT" THEN
+                SalesLine."Prepmt. Amount Inv. Incl. VAT" := SalesLine."Prepmt. Amt. Inv."
+              ELSE
+                SalesLine."Prepmt. Amount Inv. Incl. VAT" :=
+                  ROUND(
+                    SalesLine."Prepmt. Amt. Inv." * (100 + SalesLine."Prepayment VAT %") / 100,
+                    GetCurrencyAmountRoundingPrecision(SalesLine."Currency Code"));
+              SalesLine."Prepmt. Amt. Incl. VAT" := SalesLine."Prepmt. Amount Inv. Incl. VAT";
+              SalesLine."Prepayment Amount" := SalesLine."Prepmt. Amt. Inv.";
+              SalesLine."Prepmt Amt to Deduct" := 0;
+              SalesLine."Prepmt VAT Diff. to Deduct" := 0;
+              SalesLine."Prepayment VAT Difference" := 0;
+              SalesLine.MODIFY;
+            UNTIL SalesLine.NEXT = 0;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertSalesInvHeader@11(VAR SalesInvHeader@1001 : Record 112;SalesHeader@1002 : Record 36;PostingDescription@1003 : Text[50];GenJnlLineDocNo@1004 : Code[20];SrcCode@1005 : Code[10];PostingNoSeriesCode@1000 : Code[10]);
+    BEGIN
+      WITH SalesHeader DO BEGIN
+        SalesInvHeader.INIT;
+        SalesInvHeader.TRANSFERFIELDS(SalesHeader);
+        SalesInvHeader."Posting Description" := PostingDescription;
+        SalesInvHeader."Payment Terms Code" := "Prepmt. Payment Terms Code";
+        SalesInvHeader."Due Date" := "Prepayment Due Date";
+        SalesInvHeader."Pmt. Discount Date" := "Prepmt. Pmt. Discount Date";
+        SalesInvHeader."Payment Discount %" := "Prepmt. Payment Discount %";
+        SalesInvHeader."No." := GenJnlLineDocNo;
+        SalesInvHeader."Pre-Assigned No. Series" := '';
+        SalesInvHeader."Source Code" := SrcCode;
+        SalesInvHeader."User ID" := USERID;
+        SalesInvHeader."No. Printed" := 0;
+        SalesInvHeader."Prepayment Invoice" := TRUE;
+        SalesInvHeader."Prepayment Order No." := "No.";
+        SalesInvHeader."No. Series" := PostingNoSeriesCode;
+        SalesInvHeader.INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertSalesCrMemoHeader@27(VAR SalesCrMemoHeader@1001 : Record 114;SalesHeader@1002 : Record 36;PostingDescription@1003 : Text[50];GenJnlLineDocNo@1004 : Code[20];SrcCode@1005 : Code[10];PostingNoSeriesCode@1000 : Code[10];CalcPmtDiscOnCrMemos@1006 : Boolean);
+    BEGIN
+      WITH SalesHeader DO BEGIN
+        SalesCrMemoHeader.INIT;
+        SalesCrMemoHeader.TRANSFERFIELDS(SalesHeader);
+        SalesCrMemoHeader."Payment Terms Code" := "Prepmt. Payment Terms Code";
+        SalesCrMemoHeader."Pmt. Discount Date" := "Prepmt. Pmt. Discount Date";
+        SalesCrMemoHeader."Payment Discount %" := "Prepmt. Payment Discount %";
+        IF ("Prepmt. Payment Terms Code" <> '') AND NOT CalcPmtDiscOnCrMemos THEN BEGIN
+          SalesCrMemoHeader."Payment Discount %" := 0;
+          SalesCrMemoHeader."Pmt. Discount Date" := 0D;
+        END;
+        SalesCrMemoHeader."Posting Description" := PostingDescription;
+        SalesCrMemoHeader."Due Date" := "Prepayment Due Date";
+        SalesCrMemoHeader."No." := GenJnlLineDocNo;
+        SalesCrMemoHeader."Pre-Assigned No. Series" := '';
+        SalesCrMemoHeader."Source Code" := SrcCode;
+        SalesCrMemoHeader."User ID" := USERID;
+        SalesCrMemoHeader."No. Printed" := 0;
+        SalesCrMemoHeader."Prepayment Credit Memo" := TRUE;
+        SalesCrMemoHeader."Prepayment Order No." := "No.";
+        SalesCrMemoHeader.Correction := GLSetup."Mark Cr. Memos as Corrections";
+        SalesCrMemoHeader."No. Series" := PostingNoSeriesCode;
+        SalesCrMemoHeader.INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE GetCalcPmtDiscOnCrMemos@14(PrepmtPmtTermsCode@1000 : Code[10]) : Boolean;
+    VAR
+      PaymentTerms@1001 : Record 3;
+    BEGIN
+      IF PrepmtPmtTermsCode = '' THEN
+        EXIT(FALSE);
+      PaymentTerms.GET(PrepmtPmtTermsCode);
+      EXIT(PaymentTerms."Calc. Pmt. Disc. on Cr. Memos");
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

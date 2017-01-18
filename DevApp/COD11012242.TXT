@@ -1,0 +1,441 @@
+OBJECT Codeunit 11012242 Purchase Plan Management
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 11020418=rimd;
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text001@1100525000 : TextConst 'ENU=%1 %2 %3 must be finished first.';
+      Text002@1100525001 : TextConst 'ENU=No Open Manual Phase found.';
+      Text003@1100409000 : TextConst 'ENU=To this order a %1 is attached. To reopen the order you you have to go back one or more phases in the Document Phase List.';
+
+    PROCEDURE CreateDocPhases@1100525002(PurchHeader@1100525000 : Record 38);
+    VAR
+      DocumentPhase@1100525001 : Record 11020418;
+      PurchasePlanPhase@1100525002 : Record 11020417;
+      FirstPhase@1100525004 : Boolean;
+    BEGIN
+      //Remove Former Plan
+      DocumentPhase.SETRANGE("Document Type", PurchHeader."Document Type");
+      DocumentPhase.SETRANGE("Document No.", PurchHeader."No.");
+      DocumentPhase.SETFILTER("Purchase Plan", '<>%1',PurchHeader."Purchase Plan");
+      DocumentPhase.DELETEALL;
+      DocumentPhase.SETRANGE("Purchase Plan", PurchHeader."Purchase Plan");
+      IF NOT DocumentPhase.ISEMPTY THEN
+        EXIT; //Document Phase Plan already exists
+
+      PurchasePlanPhase.SETRANGE("Purchase Plan", PurchHeader."Purchase Plan");
+      IF PurchasePlanPhase.FINDSET THEN BEGIN
+        FirstPhase := TRUE;
+        REPEAT
+          DocumentPhase.INIT;
+          DocumentPhase."Document Type" := PurchHeader."Document Type";
+          DocumentPhase."Document No." := PurchHeader."No.";
+          DocumentPhase."Purchase Plan" := PurchHeader."Purchase Plan";
+          DocumentPhase."Phase No." := PurchasePlanPhase."Phase No.";
+          IF FirstPhase THEN BEGIN
+            DocumentPhase.Status := DocumentPhase.Status::Current;
+            FirstPhase := FALSE;
+          END;
+          DocumentPhase.INSERT;
+        UNTIL PurchasePlanPhase.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE FinishPhaseCheck@1100525006(PurchHeader@1100525000 : Record 38;CurrFieldOrProcessID@1100525001 : Integer);
+    VAR
+      Action@1100525002 : 'Consent,Print,ICMStatus,Word,Confirm,OrderStatus,QuoteStatus,Manual,E-mail,GS1';
+    BEGIN
+      CASE CurrFieldOrProcessID OF
+        PurchHeader.FIELDNO("Document Confirmation Received"):
+          IF PurchHeader."Document Confirmation Received" THEN
+            FinishPhase(PurchHeader,Action::Confirm,1);
+        PurchHeader.FIELDNO("Quote Status"):
+          FinishPhase(PurchHeader,Action::QuoteStatus,1);
+        PurchHeader.FIELDNO("ICM Status"):
+          FinishPhase(PurchHeader,Action::ICMStatus,1);
+        -1:
+          FinishPhase(PurchHeader,Action::Manual,1);
+        -2:
+          FinishPhase(PurchHeader,Action::Consent,1);
+      END;
+    END;
+
+    PROCEDURE FinishPhase@1100525007(PurchHeader@1100525004 : Record 38;Action@1100525003 : 'Consent,Print,ICMStatus,Word,Confirm,OrderStatus,QuoteStatus,Manual,E-mail,GS1,GS1Posting';MessageHandling@1100525002 : 'Message,Error');
+    VAR
+      DocumentPhase@1100525001 : Record 11020418;
+      PurchasePlanPhase@1100525000 : Record 11020417;
+      Consent@1100525005 : Record 11012226;
+    BEGIN
+      IF NOT TestPhaseCanBeFinished(PurchHeader, Action, MessageHandling, PurchasePlanPhase) THEN
+        EXIT;
+
+      IF DocumentPhase.GET(
+           PurchHeader."Document Type", PurchHeader."No.", PurchHeader."Purchase Plan", PurchasePlanPhase."Phase No.") THEN
+        IF DocumentPhase.Status <> DocumentPhase.Status::Finished THEN BEGIN
+          DocumentPhase.Status := DocumentPhase.Status::Finished;
+          DocumentPhase."Finished by" := USERID;
+          DocumentPhase."Finished on" := CURRENTDATETIME;
+          DocumentPhase.MODIFY;
+          //Set Skipped Phases
+          DocumentPhase.SETRANGE("Document Type", PurchHeader."Document Type");
+          DocumentPhase.SETRANGE("Document No.", PurchHeader."No.");
+          DocumentPhase.SETRANGE("Purchase Plan", PurchHeader."Purchase Plan");
+          DocumentPhase.SETFILTER("Phase No.", '<%1', PurchasePlanPhase."Phase No.");
+          DocumentPhase.SETFILTER(Status, '<%1', DocumentPhase.Status::Finished);
+          DocumentPhase.MODIFYALL(Status, DocumentPhase.Status::Skipped);
+          //Create Consent
+          IF PurchasePlanPhase."Activates Consent" THEN
+            PurchHeader.UpdateConsentLines(TRUE);
+
+          //Set Next Phase Current
+          DocumentPhase.RESET;
+          DocumentPhase.SETRANGE("Document Type", PurchHeader."Document Type");
+          DocumentPhase.SETRANGE("Document No.", PurchHeader."No.");
+          DocumentPhase.SETRANGE("Purchase Plan", PurchHeader."Purchase Plan");
+          DocumentPhase.SETFILTER("Phase No.", '>%1', PurchasePlanPhase."Phase No.");
+          //Maybe next phase already has been finished due to automatic consent.
+          DocumentPhase.SETFILTER(Status, '<>%1', DocumentPhase.Status::Finished);
+          IF DocumentPhase.FINDFIRST THEN BEGIN
+            DocumentPhase.Status := DocumentPhase.Status::Current;
+            DocumentPhase.MODIFY;
+          END;
+          //IF Next Phase is triggered by Consent but No Consent Lines are present then finish this fase too
+          PurchasePlanPhase.RESET;
+          PurchasePlanPhase.SETRANGE("Purchase Plan", PurchasePlanPhase."Purchase Plan");
+          IF PurchasePlanPhase.NEXT <> 0 THEN
+            IF PurchasePlanPhase."Triggered by Consent" THEN BEGIN
+              Consent.SETRANGE("Document Type", Consent."Document Type"::Order);
+              Consent.SETRANGE("Document No.", PurchHeader."No.");
+              IF Consent.ISEMPTY THEN
+                FinishPhase(PurchHeader, Action::Consent,1);
+            END;
+
+        END;
+    END;
+
+    PROCEDURE FinishConsentPhase@1100525001(Consent@1100525000 : Record 11012226);
+    VAR
+      PurchHeader@1100525001 : Record 38;
+    BEGIN
+      IF NOT Consent.Consent OR (Consent."Document Type" <> Consent."Document Type"::Order) THEN
+        EXIT;
+
+      IF NOT PurchHeader.GET(PurchHeader."Document Type"::Order, Consent."Document No.") THEN
+        EXIT;
+
+      IF PurchHeader."Purchase Plan" = '' THEN
+        EXIT;
+
+      Consent.RESET; //call 30977
+      Consent.SETRANGE("Document Type", Consent."Document Type");
+      Consent.SETRANGE("Document No.", Consent."Document No.");
+      //Consent.SETFILTER("Document Line No.", '<>%1', Consent."Document Line No."); //call 30977
+      Consent.SETRANGE(Consent, FALSE);
+      IF NOT Consent.ISEMPTY THEN
+        EXIT;
+
+      FinishPhaseCheck(PurchHeader, -2);
+    END;
+
+    PROCEDURE TestPhaseCanBeFinished@1100525000(PurchHeader@1100525000 : Record 38;Action@1100525001 : 'Consent,Print,ICMStatus,Word,Confirm,OrderStatus,QuoteStatus,Manual,E-mail,GS1,GS1Posting';MessageHandling@1100525004 : 'Message,Error';VAR PurchasePlanPhase@1100525006 : Record 11020417) : Boolean;
+    VAR
+      DocumentPhase@1100525003 : Record 11020418;
+      PurchasePlanPhase2@1100525002 : Record 11020417;
+      MessageTxt@1100525005 : Text[250];
+    BEGIN
+      IF PurchHeader."Purchase Plan" = '' THEN
+        EXIT(FALSE);
+
+      IF NOT (PurchHeader."Document Type" IN [PurchHeader."Document Type"::Quote, PurchHeader."Document Type"::Order]) THEN
+        EXIT(FALSE);
+
+      //Find Phase
+      PurchasePlanPhase.SETRANGE("Purchase Plan", PurchHeader."Purchase Plan");
+      CASE Action OF
+        Action::Consent:
+          PurchasePlanPhase.SETRANGE("Triggered by Consent", TRUE);
+        Action::Print:
+          PurchasePlanPhase.SETRANGE("Triggered by Printing", TRUE);
+        Action::"E-mail":
+          PurchasePlanPhase.SETRANGE("Triggered by E-mail", TRUE);
+        Action::ICMStatus:
+          PurchasePlanPhase.SETRANGE("Triggered by ICM Status", PurchHeader."ICM Status" + 1);
+        Action::GS1:
+          PurchasePlanPhase.SETRANGE("Triggered by GS1", TRUE);
+        Action::Word:
+          PurchasePlanPhase.SETRANGE("Triggered by Word Document", TRUE);
+        Action::Confirm:
+          PurchasePlanPhase.SETRANGE("Triggered by Confirm. Received", TRUE);
+        Action::OrderStatus:
+          PurchasePlanPhase.SETRANGE("Triggered by Order Status",PurchHeader.Status + 1);
+        Action::QuoteStatus:
+          PurchasePlanPhase.SETRANGE("Triggered by Quote Status",PurchHeader."Quote Status" + 1);
+        //C015346.sn
+        Action::GS1Posting:
+          PurchasePlanPhase.SETRANGE("Activates Posting GS1 Confirm.",TRUE);
+        //C015346.en
+        Action::Manual:
+          PurchasePlanPhase.SETRANGE(Manual, TRUE);
+      END;
+
+      IF Action = Action::Manual THEN BEGIN
+        //Find First Manual Open Phase
+        //Manual Steps can occur in multiple phases
+        IF PurchasePlanPhase.FINDSET THEN
+          REPEAT
+            PurchasePlanPhase2 := PurchasePlanPhase;
+            IF DocumentPhase.GET(
+               PurchHeader."Document Type", PurchHeader."No.", PurchHeader."Purchase Plan", PurchasePlanPhase."Phase No.") THEN;
+          UNTIL (PurchasePlanPhase.NEXT = 0) OR (DocumentPhase.Status < DocumentPhase.Status::Finished);
+        IF DocumentPhase.Status < DocumentPhase.Status::Finished THEN
+          PurchasePlanPhase := PurchasePlanPhase2
+        ELSE
+          MessageTxt := Text002
+      END ELSE
+        IF NOT PurchasePlanPhase.FINDFIRST THEN
+          EXIT(FALSE);
+
+      //C015346.sn
+      IF Action = Action::GS1Posting THEN
+        IF NOT CheckEverythingReceived(PurchHeader) THEN
+          EXIT(FALSE);
+      //C015346.en
+
+      IF MessageTxt = '' THEN BEGIN
+        //Check Previous Obligatory Phases
+        IF NOT PurchasePlanPhase."Ignore Obligatory Phases" THEN BEGIN
+          PurchasePlanPhase2.RESET;
+          PurchasePlanPhase2.SETRANGE("Purchase Plan", PurchHeader."Purchase Plan");
+          PurchasePlanPhase2.SETFILTER("Phase No.", '<%1', PurchasePlanPhase."Phase No.");
+          PurchasePlanPhase2.SETRANGE("Obligatory Phase", TRUE);
+          IF PurchasePlanPhase2.FINDSET THEN
+            REPEAT
+              IF DocumentPhase.GET(
+                 PurchHeader."Document Type", PurchHeader."No.", PurchHeader."Purchase Plan", PurchasePlanPhase2."Phase No.") THEN
+                IF DocumentPhase.Status < DocumentPhase.Status::Finished THEN
+                  MessageTxt := STRSUBSTNO(
+                    Text001, PurchasePlanPhase2.FIELDCAPTION("Obligatory Phase"),
+                    PurchasePlanPhase2."Phase No.", PurchasePlanPhase2.Description);
+            UNTIL (PurchasePlanPhase2.NEXT = 0) OR (MessageTxt <> '');
+        END;
+      END;
+
+      //Message handling
+      IF (MessageTxt <> '') THEN BEGIN
+        CASE MessageHandling OF
+          MessageHandling::Message:
+            MESSAGE(MessageTxt);
+          MessageHandling::Error:
+            ERROR(MessageTxt);
+        END;
+        EXIT(FALSE);
+      END;
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE ShowPlanStatus@1100525003(PurchHeader@1100525000 : Record 38) MessTxt : Text[80];
+    VAR
+      DocumentPhase@1100525001 : Record 11020418;
+    BEGIN
+      DocumentPhase.SETRANGE("Document Type", PurchHeader."Document Type");
+      DocumentPhase.SETRANGE("Document No.", PurchHeader."No.");
+      DocumentPhase.SETRANGE("Purchase Plan", PurchHeader."Purchase Plan");
+      DocumentPhase.SETFILTER(Status, '>%1', DocumentPhase.Status::"Not Active");
+      IF DocumentPhase.FINDLAST THEN BEGIN
+        DocumentPhase.CALCFIELDS(Description);
+        MessTxt := DocumentPhase.Description;
+        IF DocumentPhase.Status = DocumentPhase.Status::Finished THEN
+          MessTxt := MessTxt + ' ' + FORMAT(DocumentPhase.Status);
+      END;
+    END;
+
+    PROCEDURE MapPhaseWithCurrentSituation@1100525005(PurchHeader@1100525000 : Record 38);
+    VAR
+      DocumentPhase@1100525001 : Record 11020418;
+      TempDocumentPhase@1100525004 : TEMPORARY Record 11020418;
+      PurchasePlanPhase@1100525002 : Record 11020417;
+      Action@1100525003 : 'Consent,Print,ICMStatus,Word,Confirm,OrderStatus,QuoteStatus,Manual,E-mail,GS1,GS1Posting';
+    BEGIN
+      //Save Finished Data
+      DocumentPhase.SETRANGE("Document Type", PurchHeader."Document Type");
+      DocumentPhase.SETRANGE("Document No.", PurchHeader."No.");
+      DocumentPhase.SETRANGE("Purchase Plan", PurchHeader."Purchase Plan");
+      IF DocumentPhase.FINDSET THEN
+        REPEAT
+          TempDocumentPhase := DocumentPhase;
+          TempDocumentPhase.INSERT;
+        UNTIL DocumentPhase.NEXT = 0;
+
+      //Map Phases
+      DocumentPhase.RESET;
+      DocumentPhase.SETRANGE("Document Type", PurchHeader."Document Type");
+      DocumentPhase.SETRANGE("Document No.", PurchHeader."No.");
+      DocumentPhase.DELETEALL;
+      CreateDocPhases(PurchHeader);
+      DocumentPhase.SETRANGE("Purchase Plan", PurchHeader."Purchase Plan");
+      IF DocumentPhase.FINDSET(TRUE, FALSE) THEN
+        REPEAT
+          IF PurchasePlanPhase.GET(DocumentPhase."Purchase Plan", DocumentPhase."Phase No.") THEN BEGIN
+            //C015346.sn
+            IF PurchasePlanPhase."Activates Posting GS1 Confirm." THEN
+              FinishPhase(PurchHeader,Action::GS1Posting,0);
+            //C015346.en
+            IF PurchasePlanPhase."Triggered by Consent" THEN
+              FinishPhase(PurchHeader,Action::Consent,0);
+            IF PurchasePlanPhase."Triggered by Printing" THEN
+              IF PurchHeader."No. Printed" > 0 THEN
+                FinishPhase(PurchHeader,Action::Print,0);
+            IF PurchasePlanPhase."Triggered by E-mail" THEN
+              IF PurchHeader."E-Mail Sent on" > 0D THEN
+                FinishPhase(PurchHeader,Action::"E-mail",0);
+            IF PurchasePlanPhase."Triggered by ICM Status" > 0 THEN
+              IF PurchHeader."ICM Status" + 1 = PurchasePlanPhase."Triggered by ICM Status" THEN
+                FinishPhase(PurchHeader,Action::ICMStatus,0);
+            IF PurchasePlanPhase."Triggered by GS1" THEN
+              FinishPhase(PurchHeader,Action::GS1,0);
+            IF PurchasePlanPhase."Triggered by Confirm. Received" THEN
+              IF PurchHeader."Document Confirmation Received" THEN
+                FinishPhase(PurchHeader,Action::Confirm,0);
+            IF PurchasePlanPhase."Triggered by Order Status" > 0 THEN
+              IF PurchHeader.Status + 1 = PurchasePlanPhase."Triggered by Order Status" THEN
+                FinishPhase(PurchHeader,Action::OrderStatus,0);
+            IF PurchasePlanPhase."Triggered by Quote Status" > 0 THEN
+              IF PurchHeader."Quote Status" + 1 = PurchasePlanPhase."Triggered by Quote Status" THEN
+                FinishPhase(PurchHeader,Action::QuoteStatus,0);
+          END;
+        UNTIL DocumentPhase.NEXT = 0;
+
+      //Retrieve Finished Data
+      DocumentPhase.SETRANGE(Status, DocumentPhase.Status::Finished, DocumentPhase.Status::Skipped);
+      IF DocumentPhase.FINDSET(TRUE, FALSE) THEN
+        REPEAT
+          TempDocumentPhase := DocumentPhase;
+          IF TempDocumentPhase.FIND THEN BEGIN
+            IF TempDocumentPhase.Status >= DocumentPhase.Status::Finished THEN BEGIN
+              DocumentPhase := TempDocumentPhase;
+              DocumentPhase.MODIFY;
+            END;
+          END;
+        UNTIL DocumentPhase.NEXT = 0;
+    END;
+
+    PROCEDURE OnePhaseBack@1210190000(PurchHeader@1210190003 : Record 38);
+    VAR
+      DocumentPhase@1210190001 : Record 11020418;
+      PurchasePlanPhase@1210190002 : Record 11020417;
+      ReleasePurchDoc@1210190000 : Codeunit 415;
+    BEGIN
+      DocumentPhase.SETRANGE("Document Type", PurchHeader."Document Type");
+      DocumentPhase.SETRANGE("Document No.", PurchHeader."No.");
+      DocumentPhase.SETRANGE("Purchase Plan", PurchHeader."Purchase Plan");
+      DocumentPhase.SETFILTER(Status, '%1..', DocumentPhase.Status::Finished);
+      IF NOT DocumentPhase.FINDLAST THEN
+        EXIT;
+
+      DocumentPhase.Status := DocumentPhase.Status::Current;
+      DocumentPhase."Finished by" := '';
+      DocumentPhase."Finished on" := 0DT;
+      DocumentPhase.MODIFY;
+
+      IF PurchasePlanPhase.GET( PurchHeader."Purchase Plan", DocumentPhase."Phase No.") THEN BEGIN
+        IF PurchasePlanPhase."Activates Consent" THEN BEGIN
+          PurchHeader.DeleteConsentLines(FALSE);
+          PurchHeader."Consented Date-Time" := 0DT;
+          PurchHeader.MODIFY;
+        END;
+        IF PurchasePlanPhase."Triggered by Consent" THEN BEGIN
+          PurchHeader."Consented Date-Time" := 0DT;
+          PurchHeader.MODIFY;
+          PurchHeader.UpdateConsentLines(TRUE);
+        END;
+        IF (PurchasePlanPhase."Triggered by Order Status" = PurchasePlanPhase."Triggered by Order Status"::Released) AND
+           (PurchHeader.Status >= PurchHeader.Status::Released) THEN
+          ReleasePurchDoc.Reopen(PurchHeader);
+        IF PurchasePlanPhase."Triggered by Confirm. Received" THEN
+          IF PurchHeader."Document Confirmation Received" THEN BEGIN
+            PurchHeader."Document Confirmation Received" := FALSE;
+            PurchHeader.MODIFY(TRUE);
+          END;
+      END;
+
+      DocumentPhase.SETRANGE(Status);
+      IF DocumentPhase.NEXT <> 0 THEN BEGIN
+        DocumentPhase.Status := DocumentPhase.Status::"Not Active";
+        DocumentPhase.MODIFY;
+      END;
+    END;
+
+    PROCEDURE CheckReopenAllowed@1100409000(PurchHeader@1100409000 : Record 38);
+    VAR
+      DocumentPhase@1100409001 : Record 11020418;
+      PurchasePlanPhase@1100409002 : Record 11020417;
+      PhaseNoRelease@1100409003 : Integer;
+      PhaseNoConsent@1100409004 : Integer;
+    BEGIN
+      //C002364
+      DocumentPhase.SETRANGE("Document Type", PurchHeader."Document Type");
+      DocumentPhase.SETRANGE("Document No.", PurchHeader."No.");
+      DocumentPhase.SETRANGE("Purchase Plan", PurchHeader."Purchase Plan");
+      DocumentPhase.SETRANGE(Status,  DocumentPhase.Status::Finished);
+      IF DocumentPhase.FINDSET THEN
+        REPEAT
+          IF PurchasePlanPhase.GET(DocumentPhase."Purchase Plan", DocumentPhase."Phase No.") THEN BEGIN
+            //Find first release phase
+            IF PhaseNoRelease = 0 THEN
+              IF PurchasePlanPhase."Triggered by Order Status" >= PurchasePlanPhase."Triggered by Order Status"::Released THEN
+                PhaseNoRelease := PurchasePlanPhase."Phase No.";
+
+            IF PurchasePlanPhase."Triggered by Consent" THEN
+              PhaseNoConsent := PurchasePlanPhase."Phase No.";
+          END;
+        UNTIL DocumentPhase.NEXT = 0;
+
+      IF (PhaseNoRelease > 0) AND (PhaseNoRelease <= PhaseNoConsent) THEN
+        ERROR(Text003, PurchHeader.FIELDCAPTION("Purchase Plan"));
+    END;
+
+    PROCEDURE CheckEverythingReceived@1210190004(PurchHeader@1210190000 : Record 38) : Boolean;
+    VAR
+      PurchLine@1100528500 : Record 39;
+      EverythingReceived@1100528501 : Boolean;
+    BEGIN
+      //C015346
+      IF PurchHeader."Document Type" <> PurchHeader."Document Type"::Order THEN
+        EXIT;
+
+      PurchLine.SETRANGE("Document Type", PurchHeader."Document Type");
+      PurchLine.SETRANGE("Document No.", PurchHeader."No.");
+
+      IF PurchLine.FINDSET THEN BEGIN
+        EverythingReceived := TRUE;
+        REPEAT
+          IF NOT PurchHeader."Amounts only" THEN BEGIN
+            IF ABS(PurchLine."Quantity Received") < ABS(PurchLine.Quantity) THEN
+              EverythingReceived := FALSE;
+          END ELSE BEGIN
+            IF ABS(PurchLine."Amnt. Received") < ABS(PurchLine.Amount) THEN
+              EverythingReceived := FALSE;
+          END;
+        UNTIL (PurchLine.NEXT = 0) OR (NOT EverythingReceived);
+      END;
+
+      EXIT(EverythingReceived);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

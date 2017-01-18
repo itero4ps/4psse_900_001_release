@@ -1,0 +1,1076 @@
+OBJECT Codeunit 11012903 Project Development Functions
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      TmpEPVCalcRec@1100485000 : TEMPORARY Record 11012906;
+      MathFuncCU@1100485007 : Codeunit 11020204;
+      gCalcEPV_RefDate@1100485003 : Date;
+      PeriodType@1100485005 : 'Day,Week,Month,Quarter,Year';
+      SplitType@1210190001 : 'Actual,Budget,Both';
+      gCalcEPV_PeriodType@1100485004 : Option;
+      gCalcEPV_ProjectNo@1100485001 : Code[20];
+      gCalcEPV_Version@1100485002 : Code[10];
+
+    PROCEDURE CalculateTotalRos@1210190017(IProject@1100485001 : Code[20];IVersion@1100485000 : Code[10];IRefDate@1210190004 : Date;IFromInvProp@1210190005 : Boolean) : Decimal;
+    VAR
+      lvInvPropRubricRec@1210190001 : Record 11012913;
+      lvTotalCost@1210190002 : Decimal;
+      lvTotalRevenue@1210190003 : Decimal;
+    BEGIN
+      lvTotalCost := 0;
+      lvTotalRevenue :=0;
+
+      WITH lvInvPropRubricRec DO BEGIN
+        SETRANGE("Project No.", IProject);
+        SETRANGE(Version, IVersion);
+        SETFILTER(Type, '%1|%2|%3|%4|%5|%6|%7',
+         Type::Costs, Type::Revenues,
+         Type::"Percentage Costs", Type::"Percentage Revenues",
+         Type::"Costs as Perc. Revenues", Type::"Revenues as Perc. Costs",
+         Type::"Costs to Distr. as Perc. Rev.");
+        IF NOT FINDFIRST THEN
+          EXIT(0);
+
+        //* Calculate Investment Proposal Budget
+        IF SetDateFilterBudget(lvInvPropRubricRec, 0D, 0D, IRefDate) THEN BEGIN
+          CALCFIELDS("Cost Budget", "Revenue Budget");
+          lvTotalCost := lvTotalCost + "Cost Budget";
+          lvTotalRevenue := lvTotalRevenue + "Revenue Budget";
+        END;
+
+        //* Calculate Actual Cost and Revenues (calculate by rubric b.o. 'Cost Object Filter')
+        IF (NOT IFromInvProp) AND SetDateFilterActual(lvInvPropRubricRec, 0D, 0D, IRefDate) THEN BEGIN
+          SETFILTER("Cost Object Filter", '<>%1', '');
+          IF FINDSET THEN BEGIN
+            REPEAT
+              CALCFIELDS("Actual Cost", "Actual Revenues");
+              lvTotalCost := lvTotalCost + "Actual Cost";
+              lvTotalRevenue := lvTotalRevenue + "Actual Revenues";
+            UNTIL NEXT = 0
+          END;
+        END;
+      END;
+
+      EXIT(CalculatePercentageRos(lvTotalCost, lvTotalRevenue));
+    END;
+
+    PROCEDURE CalculatePercentageRos@1210190019(ITotalCost@1210190001 : Decimal;ITotalRevenue@1210190000 : Decimal) : Decimal;
+    BEGIN
+      IF (ITotalRevenue = 0) THEN
+        EXIT(0);
+
+      EXIT(((ITotalRevenue - ITotalCost) / ITotalRevenue) * 100);
+    END;
+
+    PROCEDURE CalculateTotalEPV@1210190014(IProject@1100485002 : Code[20];IVersion@1100485001 : Code[10];IRefDate@1210190012 : Date;IPeriodType@1100485000 : Option;IInvPropMode@1210190008 : Boolean) : Decimal;
+    VAR
+      lvInvPropRec@1210190007 : Record 11012912;
+    BEGIN
+      IF (IRefDate = 0D) THEN
+        EXIT(0);
+
+      IF NOT lvInvPropRec.GET(IProject, IVersion) THEN
+        EXIT(0);
+
+      FillEPVCalculationTable(IProject, IVersion, IRefDate, IPeriodType, IInvPropMode);
+
+      EXIT(CalculateFormulaEPV(lvInvPropRec."WACC Percentage", IPeriodType, 0D, 0D, SplitType::Both));
+    END;
+
+    PROCEDURE CalculatePeriodEPV@1210190024(IProject@1100485001 : Code[20];IVersion@1100485000 : Code[10];IRefDate@1210190012 : Date;IPeriodType@1100485002 : Option;IDate_StartPeriod@1100485003 : Date;IDate_EndPeriod@1100485005 : Date;ISplitType@1100485004 : Option;IInvPropMode@1210190009 : Boolean) : Decimal;
+    VAR
+      lvInvPropRec@1210190007 : Record 11012912;
+    BEGIN
+      IF (IRefDate = 0D) THEN
+        EXIT(0);
+
+      IF NOT lvInvPropRec.GET(IProject, IVersion) THEN
+        EXIT(0);
+
+      FillEPVCalculationTable(IProject, IVersion, IRefDate, IPeriodType, IInvPropMode);
+
+      EXIT(CalculateFormulaEPV(lvInvPropRec."WACC Percentage", IPeriodType, IDate_StartPeriod, IDate_EndPeriod, ISplitType));
+    END;
+
+    PROCEDURE CalculateTotalPRI@1210190013(IProject@1100485001 : Code[20];IVersion@1100485000 : Code[10];IRefDate@1210190012 : Date;IPeriodType@1100485003 : Option;IInvPropMode@1210190008 : Boolean) : Decimal;
+    VAR
+      lvInvPropRec@1100485002 : Record 11012912;
+      lvStep@1210190002 : Decimal;
+      lvPerc@1210190001 : Decimal;
+      lvAmnt@1210190003 : Decimal;
+      lvPrevPerc@1210190005 : Decimal;
+      lvPrevAmnt@1210190004 : Decimal;
+    BEGIN
+      IF (IRefDate = 0D) THEN
+        EXIT(0);
+
+      IF NOT lvInvPropRec.GET(IProject, IVersion) THEN
+        EXIT(0);
+
+      FillEPVCalculationTable(IProject, IVersion, IRefDate, IPeriodType, IInvPropMode);
+
+      //* There must be at least one positive and one negative amount
+      WITH TmpEPVCalcRec DO BEGIN
+        RESET;
+        SETRANGE("Balance Type", "Balance Type"::Positive);
+        IF NOT FINDFIRST THEN
+          EXIT(0);
+        //
+        SETRANGE("Balance Type", "Balance Type"::Negative);
+        IF NOT FINDFIRST THEN
+          EXIT(0);
+      END;
+
+      lvPerc := 0;
+      lvStep := 10;
+      lvAmnt := CalculateFormulaEPV(lvPerc, IPeriodType, 0D, 0D, SplitType::Both);
+      REPEAT
+        lvPrevPerc := lvPerc;
+        lvPrevAmnt := lvAmnt;
+        lvPerc := lvPerc + lvStep;
+        lvAmnt := CalculateFormulaEPV(lvPerc, IPeriodType, 0D, 0D, SplitType::Both);
+        IF ABS(lvAmnt) < 0.005 THEN
+          EXIT(lvPerc);
+        IF ((lvPrevAmnt > 0) AND (lvAmnt < 0)) OR
+           ((lvPrevAmnt < 0) AND (lvAmnt > 0)) THEN BEGIN
+          IF (lvStep > 0.01) THEN BEGIN
+            lvStep := lvStep / 10;
+            lvPerc := lvPrevPerc;
+            lvAmnt := lvPrevAmnt;
+          END ELSE BEGIN
+            IF (ABS(lvPrevAmnt) < ABS(lvAmnt)) THEN
+              EXIT(lvPrevPerc)
+            ELSE
+              EXIT(lvPerc);
+          END;
+        END;
+      UNTIL (lvPerc >= 400); //* Gewijzigd van 100 naar 200: Theoretisch kan PRI heel goed hoger zijn dan 100%, in de praktijk
+                             //* zal dit niet vaak voorkomen. NB: ivm performance niet verder zoeken dan 200%
+                             //* Melding 10681, 200% blijkt niet genoeg daarom nu maar tot 400.
+      EXIT(0);
+    END;
+
+    LOCAL PROCEDURE FillEPVCalculationTable@1210190018(IProject@1210190000 : Code[20];IVersion@1210190001 : Code[10];IRefDate@1210190002 : Date;IPeriodType@1100485002 : Option;IInvPropMode@1210190015 : Boolean);
+    VAR
+      lvInvPropRubricRec@1210190013 : Record 11012913;
+      lvInvPropBudgetRec@1210190012 : Record 11012914;
+      lvJobLedgEntryRec@1210190010 : Record 11072005;
+      lvDateRec@1210190011 : Record 2000000007;
+      lvDateRec2@1100485013 : Record 2000000007;
+      lvTmpInvPropRubricRec@1100485007 : TEMPORARY Record 11012913;
+      lvMinDate@1100485000 : Date;
+      lvMaxDate@1100485001 : Date;
+      lvOnlyRebuildBudget@1100485009 : Boolean;
+      lvDoBudget@1100485005 : Boolean;
+      lvDoActual@1100485006 : Boolean;
+      lvMod@1100485012 : Boolean;
+      lvDateRangeLimit@1100485008 : Integer;
+      lvRelPeriodNo@1100485011 : Integer;
+      lvBudgetAmt@1100485003 : Decimal;
+      lvActualAmt@1100485004 : Decimal;
+      lvPeriodTxt@1100485010 : Text[10];
+    BEGIN
+      //* Alleen opbouwen als nodig (perfomance).
+      //* Testen of 'IInvPropMode' is gewijzigd niet nodig want is vanuit een (1) programma toch steeds gelijk.
+
+      IF NOT AdjustPeriodTypeForEPV(IPeriodType) THEN  //* Let op: IPeriodType mag alleen binnen deze functie aangepast worden,
+        EXIT;                                          //* dus mag IPeriodType niet 'Var' zijn (aangepaste niet teruggeven).
+
+      IF (IProject = gCalcEPV_ProjectNo) AND (IVersion = gCalcEPV_Version) AND
+         (IRefDate = gCalcEPV_RefDate) AND (IPeriodType = gCalcEPV_PeriodType)
+      THEN
+        EXIT
+      ELSE BEGIN
+        TmpEPVCalcRec.RESET;
+        IF (NOT IInvPropMode) AND (IVersion <> gCalcEPV_Version) AND
+           (IProject = gCalcEPV_ProjectNo) AND (IRefDate = gCalcEPV_RefDate) AND (IPeriodType = gCalcEPV_PeriodType)
+        THEN BEGIN
+          //* Als alleen versie wijzigt (en niet invest.voorstel mode, dan toch alleen EPV over budget) dan hoeft 'Actual' niet
+          //* opnieuw opgebouwd te worden. Dan alleen 'Budget' resetten.
+          IF TmpEPVCalcRec.FIND('-') THEN BEGIN
+            REPEAT
+              IF TmpEPVCalcRec.Actual = 0 THEN
+                TmpEPVCalcRec.DELETE
+              ELSE BEGIN
+                TmpEPVCalcRec.Budget := 0;
+                TmpEPVCalcRec.VALIDATE("Balance Type");
+                TmpEPVCalcRec.MODIFY;
+              END;
+            UNTIL TmpEPVCalcRec.NEXT = 0;
+          END;
+          lvOnlyRebuildBudget := TRUE;  //* Actual laten staan
+        END;
+        IF (NOT lvOnlyRebuildBudget) THEN
+          TmpEPVCalcRec.DELETEALL;
+
+        gCalcEPV_ProjectNo := IProject;
+        gCalcEPV_Version := IVersion;
+        gCalcEPV_RefDate := IRefDate;
+        gCalcEPV_PeriodType := IPeriodType;
+      END;
+
+      IF (IRefDate = 0D) OR (IRefDate < DMY2DATE(1, 1, 1950)) THEN  //* Deze test pas hier ivm opschonen Tmp-tabel
+        EXIT;
+
+      //* Alleen mutatie (budget en projectposten) lezen van ruim 25 jaar voor/na de referentiedatum.
+      //* Dit ivm performance, buiten deze periode zijn er normaal gesproken alleen mutaties als er fouten zijn gemaakt
+      //* bij het invoeren. Ook zou anders wel eens een probleem kunnen ontstaan bij het berekenen van de EPV van mutaties
+      //* die zeer veel periodes van de ref.datum af liggen (overflow bij POWER-functie), hoe kleiner tijdschaal
+      //* hoe groter de kans dat het probleem zal optreden.
+      lvDateRangeLimit := 10000;   //* Bijna 28 jaar
+
+      IF (NOT IInvPropMode) AND (NOT lvOnlyRebuildBudget) THEN BEGIN
+        WITH lvJobLedgEntryRec DO BEGIN
+          SETCURRENTKEY("Job No.", "Posting Date");
+          SETRANGE("Job No.", IProject);
+          SETFILTER("Posting Date", '<%1', IRefDate);                         //* Niet alles tot de referentiedatum,
+          FILTERGROUP(1);
+          SETRANGE("Posting Date", (IRefDate - lvDateRangeLimit), IRefDate);  //* maar alleen vanaf bepaalde min. limiet.
+          FILTERGROUP(0);
+          IF FINDFIRST THEN BEGIN
+            lvDoActual := TRUE;
+            lvMinDate := "Posting Date";
+            FINDLAST;
+            lvMaxDate := "Posting Date";
+          END;
+        END;
+      END;
+      WITH lvInvPropBudgetRec DO BEGIN
+        SETCURRENTKEY("Project No.", Version, Date);
+        SETRANGE("Project No.", IProject);
+        SETRANGE(Version, IVersion);
+        //SETFILTER(Date, '%1..', IRefDate);                      //* Niet alles vanaf de referentiedatum,
+        SETRANGE(Date, IRefDate, (IRefDate + lvDateRangeLimit));  //* maar alleen tot bepaalde max. limiet.
+        IF FINDFIRST THEN BEGIN
+          lvDoBudget := TRUE;
+          IF (NOT lvDoActual) THEN
+            lvMinDate := Date;
+          FINDLAST;
+          lvMaxDate := Date;
+        END;
+      END;
+
+      IF (NOT lvDoBudget) AND (NOT lvDoActual) THEN
+        EXIT;
+
+      IF (lvMinDate = CLOSINGDATE(lvMinDate)) THEN
+        lvMinDate := NORMALDATE(lvMinDate);
+      IF (lvMaxDate = CLOSINGDATE(lvMaxDate)) THEN
+        lvMaxDate := NORMALDATE(lvMaxDate) + 1;
+
+      WITH lvInvPropRubricRec DO BEGIN
+        SETRANGE("Project No.", IProject);
+        SETRANGE(Version, IVersion);
+        SETFILTER(Type, '%1|%2|%3|%4|%5|%6|%7',
+          Type::Costs, Type::Revenues,
+          Type::"Percentage Costs", Type::"Percentage Revenues",
+          Type::"Costs as Perc. Revenues", Type::"Revenues as Perc. Costs",
+          Type::"Costs to Distr. as Perc. Rev.");
+        IF NOT FINDSET THEN
+          EXIT;
+        REPEAT
+          lvTmpInvPropRubricRec := lvInvPropRubricRec;
+          lvTmpInvPropRubricRec.INSERT;
+        UNTIL NEXT = 0;
+      END;
+
+      CASE IPeriodType OF
+        PeriodType::Year:
+          BEGIN
+            lvDateRec.SETRANGE("Period Type", lvDateRec."Period Type"::Year);
+            lvDateRec.SETRANGE("Period Start", DMY2DATE(1,1,DATE2DMY(lvMinDate,3)), lvMaxDate);
+          END;
+        PeriodType::Quarter:
+          BEGIN
+            lvDateRec.SETRANGE("Period Type", lvDateRec."Period Type"::Quarter);
+            CASE DATE2DMY(lvMinDate,2) OF
+              1,2,3:
+                lvDateRec.SETRANGE("Period Start", DMY2DATE(1,1,DATE2DMY(lvMinDate,3)), lvMaxDate);
+              4,5,6:
+                lvDateRec.SETRANGE("Period Start", DMY2DATE(1,4,DATE2DMY(lvMinDate,3)), lvMaxDate);
+              7,8,9:
+                lvDateRec.SETRANGE("Period Start", DMY2DATE(1,7,DATE2DMY(lvMinDate,3)), lvMaxDate);
+              10,11,12:
+                lvDateRec.SETRANGE("Period Start", DMY2DATE(1,10,DATE2DMY(lvMinDate,3)), lvMaxDate);
+            END;
+          END;
+        PeriodType::Month:
+          BEGIN
+            lvDateRec.SETRANGE("Period Type", lvDateRec."Period Type"::Month);
+            lvDateRec.SETRANGE("Period Start", DMY2DATE(1,DATE2DMY(lvMinDate,2),DATE2DMY(lvMinDate,3)), lvMaxDate);
+          END;
+        PeriodType::Week:
+          BEGIN
+            lvDateRec.SETRANGE("Period Type", lvDateRec."Period Type"::Week);
+            lvDateRec.SETRANGE("Period Start", DWY2DATE(1,DATE2DWY(lvMinDate,2),DATE2DWY(lvMinDate,3)), lvMaxDate);
+          END;
+        PeriodType::Day:
+          BEGIN
+            lvDateRec.SETRANGE("Period Type", lvDateRec."Period Type"::Date);
+            lvDateRec.SETRANGE("Period Start", lvMinDate, lvMaxDate);
+          END;
+      END;
+
+      WITH lvTmpInvPropRubricRec DO BEGIN
+        IF lvDoActual THEN BEGIN
+          lvJobLedgEntryRec.RESET;
+          lvJobLedgEntryRec.SETCURRENTKEY("Job No.", "Global Dimension 2 Code", "Entry Type", "Posting Date");
+          lvJobLedgEntryRec.SETRANGE("Job No.", IProject);
+        END;
+
+        IF lvDateRec.FINDSET THEN BEGIN
+          //* Relatief periodnr tov de periode waarin de referentiedatum valt (neg. / 0 / pos.).
+          IF (IRefDate >= lvDateRec."Period Start") AND (IRefDate <= lvDateRec."Period End") THEN
+            lvRelPeriodNo := 0   //* In referentiedatum periode
+          ELSE BEGIN
+            lvDateRec.COPYFILTER("Period Type", lvDateRec2."Period Type");
+            lvDateRec2.SETFILTER("Period Start", '..%1', IRefDate);
+            lvDateRec2.FINDLAST;
+            IF (IRefDate > lvDateRec."Period End") THEN BEGIN  //* Eerste periode voor ref.periode
+              lvDateRec2.SETRANGE("Period Start", lvDateRec."Period Start", lvDateRec2."Period Start");
+              lvRelPeriodNo := -(lvDateRec2.COUNT - 1);
+            END ELSE BEGIN
+              //* Als (IRefDate < lvDateRec."Period Start"), dus eerste periode na ref.periode
+              lvDateRec2.SETRANGE("Period Start", lvDateRec2."Period Start", lvDateRec."Period Start");
+              lvRelPeriodNo := lvDateRec2.COUNT - 1;
+            END;
+          END;
+          lvRelPeriodNo := lvRelPeriodNo - 1;  //* Correctie omdat direct in repeat lus van 'lvDateRec' weer '+ 1'.
+
+          REPEAT
+            lvActualAmt := 0;
+            lvBudgetAmt := 0;
+            lvRelPeriodNo := lvRelPeriodNo + 1;
+
+            FINDSET;
+            REPEAT
+              IF lvDoActual AND (lvDateRec."Period Start" < IRefDate) AND ("Cost Object Filter" <> '') THEN BEGIN
+                IF SetDateFilterActual(lvTmpInvPropRubricRec,lvDateRec."Period Start",lvDateRec."Period End",IRefDate) THEN BEGIN
+                  COPYFILTER("Date Filter", lvJobLedgEntryRec."Posting Date");
+                //lvJobLedgEntryRec.SETFILTER("Global Dimension 2 Code", '%1', "Cost Object Filter"); //C023635.o
+                  lvJobLedgEntryRec.SETFILTER("Global Dimension 2 Code", "Cost Object Filter"); //C023635.n
+                  IF lvJobLedgEntryRec.FINDFIRST THEN BEGIN
+                    //* Ivm performance van CALCFIELDS op deze tabel eerst testen of er minimaal 1 is.
+                    CALCFIELDS("Actual Cost", "Actual Revenues");
+                    lvActualAmt := lvActualAmt + ("Actual Revenues" - "Actual Cost");
+                  END;
+                END;
+              END;
+              IF lvDoBudget AND (lvDateRec."Period End" >= IRefDate) THEN BEGIN
+                IF SetDateFilterBudget(lvTmpInvPropRubricRec,lvDateRec."Period Start",lvDateRec."Period End",IRefDate) THEN BEGIN
+                  SETFILTER("Rubric Filter", "Rubric Code");
+                  CALCFIELDS("Cost Budget", "Revenue Budget");
+                  lvBudgetAmt := lvBudgetAmt + ("Revenue Budget" - "Cost Budget");
+                END;
+              END;
+            UNTIL NEXT = 0;
+            IF (lvActualAmt <> 0) OR (lvBudgetAmt <> 0) THEN BEGIN
+              lvPeriodTxt := Date2PeriodTxt(IPeriodType, lvDateRec."Period Start");
+              IF (lvPeriodTxt <> '') THEN BEGIN
+                lvMod := FALSE;
+                IF lvOnlyRebuildBudget THEN
+                  lvMod := TmpEPVCalcRec.GET(lvPeriodTxt);
+                IF (NOT lvMod) THEN BEGIN
+                  TmpEPVCalcRec."EPV Period" := lvPeriodTxt;
+                  TmpEPVCalcRec.Budget := lvBudgetAmt;
+                  TmpEPVCalcRec.Actual := lvActualAmt;
+                  TmpEPVCalcRec.VALIDATE("Balance Type");
+                  TmpEPVCalcRec."Relative Period No." := lvRelPeriodNo;
+                  TmpEPVCalcRec.INSERT;
+                END ELSE BEGIN
+                  TmpEPVCalcRec.Budget := lvBudgetAmt;
+                  TmpEPVCalcRec.VALIDATE("Balance Type");
+                  TmpEPVCalcRec.MODIFY;
+                END;
+              END;
+            END;
+          UNTIL lvDateRec.NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE ResetEPVCalcSaveField@1100485009(IFieldName@1100485000 : Code[10]);
+    BEGIN
+      //* Door het resetten van een save variabele kan geforceerd worden dat de EPV-calculatie tabel opnieuw opgebouwd wordt.
+      //* Bijvoorbeeld: Als in/vanuit het 'Projectkasstroom' scherm het budget wordt gewijzigd dan kan door het resetten van
+      //* de save versie (gCalcEPV_Version) afgedwongen worden dat de tabel opnieuw opgebouwd wordt voor de nieuwe budgetten.
+      CASE IFieldName OF
+        'PROJECT': gCalcEPV_ProjectNo := '';
+        'VERSION': gCalcEPV_Version := '';
+        'REFDATE': gCalcEPV_RefDate := 0D;
+        'PERTYPE': gCalcEPV_PeriodType := -1;
+      END;
+    END;
+
+    PROCEDURE CalculateFormulaEPV@1210190034(IWaccPerc@1210190000 : Decimal;IPeriodType@1100485002 : Option;IDate_StartPeriod@1100485006 : Date;IDate_EndPeriod@1100485005 : Date;ISplitType@1210190004 : Option) : Decimal;
+    VAR
+      lvNoOfPeriodsInYear@1100485001 : Integer;
+      lvWaccPerc@1100485000 : Decimal;
+      lvAmntEPV@1210190003 : Decimal;
+      lvBalance@1210190005 : Decimal;
+      lvStartPeriod@1100485004 : Text[10];
+      lvEndPeriod@1100485003 : Text[10];
+    BEGIN
+      WITH TmpEPVCalcRec DO BEGIN
+        IF (IWaccPerc < 0) THEN
+          EXIT(0);
+        IF NOT AdjustPeriodTypeForEPV(IPeriodType) THEN  //* Let op: IPeriodType mag alleen binnen deze functie aangepast worden,
+          EXIT(0);                                       //* dus mag IPeriodType niet 'Var' zijn (aangepaste niet teruggeven).
+
+        lvStartPeriod := Date2PeriodTxt(IPeriodType, IDate_StartPeriod);
+        lvEndPeriod   := Date2PeriodTxt(IPeriodType, IDate_EndPeriod);
+
+        RESET;
+        IF (lvStartPeriod <> '') OR (lvEndPeriod <> '') THEN BEGIN
+          IF (lvStartPeriod <> '') AND (lvEndPeriod <> '') THEN
+            SETRANGE("EPV Period", lvStartPeriod, lvEndPeriod)
+          ELSE BEGIN
+            IF (lvStartPeriod <> '') THEN
+              SETFILTER("EPV Period", '%1..', lvStartPeriod)
+            ELSE
+              SETFILTER("EPV Period", '..%1', lvEndPeriod);
+          END;
+        END;
+        IF FINDSET THEN BEGIN
+          CASE IPeriodType OF
+            PeriodType::Year:    lvNoOfPeriodsInYear := 1;
+            PeriodType::Quarter: lvNoOfPeriodsInYear := 4;
+            PeriodType::Month:   lvNoOfPeriodsInYear := 12;
+            PeriodType::Week:    lvNoOfPeriodsInYear := 52;
+            PeriodType::Day:     lvNoOfPeriodsInYear := 365;
+            ELSE
+              EXIT(0);
+          END;
+
+          IF lvNoOfPeriodsInYear = 1 THEN
+            lvWaccPerc := IWaccPerc
+          ELSE BEGIN
+            //* Percentage voor tijdschaal = (10^(Log(1+(percentage op jaarbasis/100)) / aantal periodes in jaar) - 1) * 100
+            lvWaccPerc := (POWER(10, MathFuncCU.Log(1 + IWaccPerc/100) / lvNoOfPeriodsInYear) - 1) * 100;
+            IF (lvWaccPerc < 0) THEN
+              EXIT(0);
+          END;
+
+          REPEAT
+            CASE ISplitType OF
+              SplitType::Actual: lvBalance := Actual;
+              SplitType::Budget: lvBalance := Budget;
+              SplitType::Both:   lvBalance := Actual + Budget;
+            ELSE
+              lvBalance := 0;
+            END;
+            IF (lvBalance <> 0) THEN BEGIN
+              IF ("Relative Period No.") >= 0 THEN
+                lvAmntEPV := lvAmntEPV + (lvBalance / POWER(1 + (lvWaccPerc / 100), ABS("Relative Period No.")))
+              ELSE
+                lvAmntEPV := lvAmntEPV + (lvBalance * POWER(1 + (lvWaccPerc / 100), ABS("Relative Period No.")));
+            END;
+          UNTIL NEXT = 0;
+        END;
+
+        EXIT(lvAmntEPV)
+      END;
+    END;
+
+    PROCEDURE AdjustPeriodTypeForEPV@1100485006(VAR IPeriodType@1100485000 : Option) : Boolean;
+    BEGIN
+      //* Bij EPV (en PRI) berekening voor jaar, maand en kwartaal waren er grote verschillen in de berekende bedragen.
+      //* Hoe verder van de referentiedatum hoe groter de verschillen. Het berekenen op basis van de bedragen per jaar of
+      //* kwartaal is dus een te grove berekenmethode. Daarom wordt bij de tijdschaal jaar en kwartaal de EPV nu berekend
+      //* op basis van de bedragen per maand.
+      //*
+      //* Voor dag en week wordt (nog) geen EPV berekend dit ivm met de performance. Per maand is al traag, per week nog
+      //* veel dramatischer, per dag is helemaal niet te doen. Mocht later toch besloten worden om de EPV ook per week
+      //* te gaan berekenen, dan zou eigenlijk ook voor jaar/kwartaal/maand de EPV berekend moeten worden op basis van de
+      //* week bedragen. Doe dit niet ivm performance maar ook omdat een week niet altijd precies in 1 jaar/kwartaal/maand
+      //* ligt. Men moet dan maar (kleine) verschillen accepteren. Aan EPV per dag moet je al helemaal niet beginnen.
+      //* NB:
+      //* - Week/dag is al wel overal ingebouwd maar hier geblokkeerd (ook nog niet getest).
+      //* - Tijdschaal week/dag zit op dit moment alleen in de schermen 'Invest.voorstel' en 'Projectkasstroom', in de
+      //*   overzichten (reports) zijn deze tijdschalen toch al niet beschikbaar.
+
+      CASE IPeriodType OF
+        PeriodType::Year,
+        PeriodType::Quarter:
+          BEGIN
+            IPeriodType := PeriodType::Month;
+            EXIT(TRUE);
+          END;
+        PeriodType::Month:
+          EXIT(TRUE);
+        PeriodType::Week:
+          EXIT(FALSE);
+        PeriodType::Day:
+          EXIT(FALSE);
+      END;
+
+      EXIT(FALSE);  //* Onbekende tijdschaal
+    END;
+
+    PROCEDURE AddFromEPVCalcTableToTotal@1210190007(VAR IOTmpEPVCalcTotalRec@1210190000 : Record 11012906);
+    BEGIN
+      //* NOTE: Table 'IOTmpEPVCalcTotalRec' must be declared as 'Temporary' in the calling process !
+
+      WITH TmpEPVCalcRec DO BEGIN
+        RESET;
+        IF NOT FINDSET THEN
+          EXIT;
+
+        REPEAT
+          IF NOT IOTmpEPVCalcTotalRec.GET("EPV Period") THEN BEGIN
+            IOTmpEPVCalcTotalRec := TmpEPVCalcRec;
+            IOTmpEPVCalcTotalRec.INSERT;
+          END ELSE BEGIN
+            IOTmpEPVCalcTotalRec.Budget := IOTmpEPVCalcTotalRec.Budget + Budget;
+            IOTmpEPVCalcTotalRec.Actual := IOTmpEPVCalcTotalRec.Actual + Actual;
+            IOTmpEPVCalcTotalRec.VALIDATE("Balance Type");
+            IOTmpEPVCalcTotalRec.MODIFY;
+          END;
+        UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE FillEPVCalcTableWithTotal@1210190008(VAR ITmpEPVCalcTotalRec@1210190000 : Record 11012906);
+    BEGIN
+      //* NOTES:
+      //* - Table 'ITmpEPVCalcTotalRec' must be declared as 'Temporary' in the calling process !
+      //* - Hier wordt de 'Tmp-EPV-Calculation' tabel aangepast, op deze tabel wordt steeds bijgehouden of deze opnieuw opgebouwd
+      //*   moet worden. Dit gaat hierdoor fout, kan zijn dat bij volgende 'normale' niet (alles) opgebouwd wordt. Het kan ook
+      //*   zijn dat hier de tabel met de total gevuld wordt maar dat dit toch later weer overschreven wordt met de waarden per
+      //*   inversteringsvoorstel. Dus in aanroepende proces moet je heel goed weten wat je aan het doen bent.
+      //*   Bijvoorbeeld:
+      //*    Update 'TmpEPVCalcRec' met totalen, doe er dan direct iets mee, bv. PRI over meerdere projecten berekenen (hierbij
+      //*    moet je er dan wel zeker van zijn dat de hulptabel niet opnieuw opgebouwd wordt dus project, versie, ref.datum en
+      //*    tijdschaal moeten gelijk zijn aan de 'gCalcEPV_...' velden). Daarna er voor zorgen dat de tabel 'TmpEPVCalcRec' bij
+      //*    volgende actie weer opgebouwd wordt door aanroep functie 'ResetEPVCalcSaveField("Project")'.
+
+      WITH TmpEPVCalcRec DO BEGIN
+        RESET;
+        DELETEALL;
+        IF NOT ITmpEPVCalcTotalRec.FIND('-') THEN
+          EXIT;
+        REPEAT
+          TmpEPVCalcRec := ITmpEPVCalcTotalRec;
+          INSERT;
+        UNTIL ITmpEPVCalcTotalRec.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE CalculateActualByRubric@1210190000(IInvPropRubricRec@1210190000 : Record 11012913;IStartDate@1210190005 : Date;IEndDate@1210190004 : Date;IRefDate@1210190003 : Date) : Decimal;
+    VAR
+      lvInvPropRubricRec@1210190001 : Record 11012913;
+      lvTotalActual@1210190002 : Decimal;
+      Amt1@1100525000 : Decimal;
+      Amt2@1100525001 : Decimal;
+    BEGIN
+      WITH IInvPropRubricRec DO BEGIN
+        IF NOT SetDateFilterActual(IInvPropRubricRec, IStartDate, IEndDate, IRefDate) THEN
+          EXIT(0);
+
+        CASE Type OF
+          Type::Costs,
+          Type::"Percentage Costs",
+          Type::"Costs as Perc. Revenues",
+          Type::"Costs to Distr. as Perc. Rev.":
+            BEGIN
+              IF ("Cost Object Filter" <> '') THEN BEGIN
+                CALCFIELDS("Actual Cost");
+                EXIT("Actual Cost");
+              END;
+            END;
+          Type::Revenues,
+          Type::"Percentage Revenues",
+          Type::"Revenues as Perc. Costs":
+            BEGIN
+              IF ("Cost Object Filter" <> '') THEN BEGIN
+                CALCFIELDS("Actual Revenues");
+                EXIT("Actual Revenues");
+              END;
+            END;
+          Type::"Perc. (Sub)Totals":  //*15625.n
+            BEGIN
+              ReplaceFldsForPercSubTotalCalc(IInvPropRubricRec, lvInvPropRubricRec, 1);
+              Amt1 := CalculateActualByRubric(lvInvPropRubricRec, IStartDate, IEndDate, IRefDate);
+              IF Amt1 = 0 THEN
+                EXIT(0);
+              ReplaceFldsForPercSubTotalCalc(IInvPropRubricRec, lvInvPropRubricRec, 2);
+              Amt2 := CalculateActualByRubric(lvInvPropRubricRec, IStartDate, IEndDate, IRefDate);
+              IF Amt2 = 0 THEN
+                EXIT(0);
+              EXIT(Amt1 / Amt2 * 100);
+            END;
+          Type::Subtotal,
+          Type::Balance:
+            BEGIN
+              WITH lvInvPropRubricRec DO BEGIN
+                //* Calculate Total Actual Cost and Revenues (calculate by rubric b.o. 'Cost Object Filter')
+                lvTotalActual := 0;
+                SETRANGE("Project No.", IInvPropRubricRec."Project No.");
+                SETRANGE(Version, IInvPropRubricRec.Version);
+                SETFILTER("Rubric Code", IInvPropRubricRec.Totaling);
+                SETFILTER(Type, '%1|%2|%3|%4|%5|%6|%7',
+                  Type::Costs, Type::Revenues,
+                  Type::"Percentage Costs", Type::"Percentage Revenues",
+                  Type::"Costs as Perc. Revenues", Type::"Revenues as Perc. Costs",
+                  Type::"Costs to Distr. as Perc. Rev.");
+                SETFILTER("Cost Object Filter", '<>%1', '');
+                SETFILTER("Date Filter", IInvPropRubricRec.GETFILTER("Date Filter"));
+                IF FINDSET THEN BEGIN
+                  REPEAT
+                    CALCFIELDS("Actual Cost", "Actual Revenues");
+                    IF (IInvPropRubricRec.Type = Type::Balance) THEN
+                      lvTotalActual := lvTotalActual + "Actual Revenues" - "Actual Cost"
+                    ELSE
+                      lvTotalActual := lvTotalActual + "Actual Revenues" + "Actual Cost";
+                      //* Subtotal should be only Cost or only Revenues (otherwhise use 'Balance').
+                      //* It is the responsibility of the user to fill the field 'Totaling' correct.
+                  UNTIL NEXT = 0;
+                END;
+                EXIT(lvTotalActual);
+              END;
+            END;
+        END;
+      END;
+      EXIT(0);
+    END;
+
+    PROCEDURE CalculateActualByRubricCostRev@1210190001(IInvPropRubricRec@1210190000 : Record 11012913;IStartDate@1210190005 : Date;IEndDate@1210190004 : Date;IRefDate@1210190003 : Date;ICalcCost@1210190006 : Boolean) : Decimal;
+    VAR
+      lvInvPropRubricRec@1210190001 : Record 11012913;
+      lvTotalActual@1210190002 : Decimal;
+    BEGIN
+      WITH IInvPropRubricRec DO BEGIN
+        IF NOT SetDateFilterActual(IInvPropRubricRec, IStartDate, IEndDate, IRefDate) THEN
+          EXIT(0);
+
+        IF (Totaling <> '') THEN
+          SETFILTER("Rubric Filter", Totaling)
+        ELSE
+          SETFILTER("Rubric Filter", "Rubric Code");
+      END;
+
+      WITH lvInvPropRubricRec DO BEGIN
+        //* Calculate Total Actual Cost and Revenues (calculate by rubric b.o. 'Cost Object Filter')
+        lvTotalActual := 0;
+        SETRANGE("Project No.", IInvPropRubricRec."Project No.");
+        SETRANGE(Version, IInvPropRubricRec.Version);
+        SETFILTER("Rubric Code", IInvPropRubricRec.Totaling);
+        IF ICalcCost THEN
+          SETFILTER(Type, '%1|%2|%3|%4',
+            Type::Costs, Type::"Percentage Costs", Type::"Costs as Perc. Revenues", Type::"Costs to Distr. as Perc. Rev.")
+        ELSE
+          SETFILTER(Type, '%1|%2|%3', Type::Revenues, Type::"Percentage Revenues", Type::"Revenues as Perc. Costs");
+        SETFILTER("Cost Object Filter", '<>%1', '');
+        SETFILTER("Date Filter", IInvPropRubricRec.GETFILTER("Date Filter"));
+        IF FINDSET THEN BEGIN
+          REPEAT
+            IF ICalcCost THEN BEGIN
+              CALCFIELDS("Actual Cost");
+              lvTotalActual := lvTotalActual + "Actual Cost";
+            END ELSE BEGIN
+              CALCFIELDS("Actual Revenues");
+              lvTotalActual := lvTotalActual + "Actual Revenues";
+            END;
+          UNTIL NEXT = 0;
+        END;
+        EXIT(lvTotalActual);
+      END;
+      EXIT(0);
+    END;
+
+    PROCEDURE CalculateBudgetByRubric@1210190012(IInvPropRubricRec@1210190000 : Record 11012913;IStartDate@1210190001 : Date;IEndDate@1210190002 : Date;IRefDate@1210190003 : Date) : Decimal;
+    VAR
+      lvInvPropRubricRec@1100525000 : Record 11012913;
+      Amt1@1100525001 : Decimal;
+      Amt2@1100525002 : Decimal;
+    BEGIN
+      WITH IInvPropRubricRec DO BEGIN
+        IF NOT SetDateFilterBudget(IInvPropRubricRec, IStartDate, IEndDate, IRefDate) THEN
+          EXIT(0);
+
+        CASE Type OF
+          Type::Costs,
+          Type::Revenues,
+          Type::"Percentage Costs",
+          Type::"Percentage Revenues",
+          Type::"Costs as Perc. Revenues",
+          Type::"Revenues as Perc. Costs",
+          Type::"Costs to Distr. as Perc. Rev.":
+            BEGIN
+              CALCFIELDS("Budget Amount");
+              EXIT("Budget Amount");
+            END;
+          Type::"Perc. (Sub)Totals":  //*15625.n
+            BEGIN
+              ReplaceFldsForPercSubTotalCalc(IInvPropRubricRec, lvInvPropRubricRec, 1);
+              Amt1 := CalculateBudgetByRubric(lvInvPropRubricRec, IStartDate, IEndDate, IRefDate);
+              IF Amt1 = 0 THEN
+                EXIT(0);
+              ReplaceFldsForPercSubTotalCalc(IInvPropRubricRec, lvInvPropRubricRec, 2);
+              Amt2 := CalculateBudgetByRubric(lvInvPropRubricRec, IStartDate, IEndDate, IRefDate);
+              IF Amt2 = 0 THEN
+                EXIT(0);
+              EXIT(Amt1 / Amt2 * 100);
+            END;
+          Type::Subtotal,
+          Type::Balance:
+            BEGIN
+              SETFILTER("Rubric Filter", Totaling);
+              CALCFIELDS("Revenue Budget", "Cost Budget");
+              IF (Type = Type::Balance) THEN
+                EXIT("Revenue Budget" - "Cost Budget")
+              ELSE
+                EXIT("Revenue Budget" + "Cost Budget"); // Subtotal should be only Cost or only Revenues (otherwhise use 'Balance').
+                                                        // It is the responsibility of the user to fill the field 'Totaling' correct.
+            END;
+        END;
+      END;
+      EXIT(0);
+    END;
+
+    PROCEDURE CalculateBudgetByRubricCostRev@1210190002(IInvPropRubricRec@1210190000 : Record 11012913;IStartDate@1210190001 : Date;IEndDate@1210190002 : Date;IRefDate@1210190003 : Date;ICalcCost@1210190004 : Boolean) : Decimal;
+    BEGIN
+      WITH IInvPropRubricRec DO BEGIN
+        IF NOT SetDateFilterBudget(IInvPropRubricRec, IStartDate, IEndDate, IRefDate) THEN
+          EXIT(0);
+
+        IF (Totaling <> '') THEN
+          SETFILTER("Rubric Filter", Totaling)
+        ELSE
+          SETFILTER("Rubric Filter", "Rubric Code");
+        IF ICalcCost THEN BEGIN
+          CALCFIELDS("Cost Budget");
+          EXIT("Cost Budget");
+        END ELSE BEGIN
+          CALCFIELDS("Revenue Budget");
+          EXIT("Revenue Budget");
+        END;
+      END;
+      EXIT(0);
+    END;
+
+    PROCEDURE CalculatePercRubricsTotActBudg@1100525000(IInvPropRubricRec@1100525000 : Record 11012913;IStartDate@1100525001 : Date;IEndDate@1100525002 : Date;IRefDate@1100525003 : Date) : Decimal;
+    VAR
+      lvInvPropRubricRec@1100525004 : Record 11012913;
+      Amt1@1100525005 : Decimal;
+      Amt2@1100525006 : Decimal;
+    BEGIN
+      //*15625
+      WITH IInvPropRubricRec DO BEGIN
+        IF  Type = Type::"Perc. (Sub)Totals" THEN BEGIN
+          ReplaceFldsForPercSubTotalCalc(IInvPropRubricRec, lvInvPropRubricRec, 1);
+          Amt1 := CalculateActualByRubric(lvInvPropRubricRec, IStartDate, IEndDate, IRefDate);
+          Amt1 := Amt1 + CalculateBudgetByRubric(lvInvPropRubricRec, IStartDate, IEndDate, IRefDate);
+          IF Amt1 = 0 THEN
+            EXIT(0);
+          ReplaceFldsForPercSubTotalCalc(IInvPropRubricRec, lvInvPropRubricRec, 2);
+          Amt2 := CalculateActualByRubric(lvInvPropRubricRec, IStartDate, IEndDate, IRefDate);
+          Amt2 := Amt2 + CalculateBudgetByRubric(lvInvPropRubricRec, IStartDate, IEndDate, IRefDate);
+          IF Amt2 = 0 THEN
+            EXIT(0);
+          EXIT(Amt1 / Amt2 * 100);
+        END;
+      END;
+      EXIT(0);
+    END;
+
+    PROCEDURE ReplaceFldsForPercSubTotalCalc@1100525001(InvPropRubricOrg@1100525000 : Record 11012913;VAR InvPropRubricDest@1100525002 : Record 11012913;Mode@1100525001 : Integer);
+    BEGIN
+      //*15625
+      //* Mode: 1=Perc. Filter, 2=Totaling
+      WITH InvPropRubricOrg DO BEGIN
+        InvPropRubricDest := InvPropRubricOrg;
+        IF Mode = 1 THEN BEGIN
+          InvPropRubricDest.Totaling := "Percentage Filter";
+          IF ("Tot.Type for Perc. (Sub)Totals" = "Tot.Type for Perc. (Sub)Totals"::"Subtotal (P) - Subtotal (T)") OR
+             ("Tot.Type for Perc. (Sub)Totals" = "Tot.Type for Perc. (Sub)Totals"::"Subtotal (P) - Balance (T)")
+          THEN
+            InvPropRubricDest.Type := Type::Subtotal
+          ELSE
+            InvPropRubricDest.Type := Type::Balance;
+        END ELSE BEGIN
+          IF ("Tot.Type for Perc. (Sub)Totals" = "Tot.Type for Perc. (Sub)Totals"::"Subtotal (P) - Subtotal (T)") OR
+             ("Tot.Type for Perc. (Sub)Totals" = "Tot.Type for Perc. (Sub)Totals"::"Balance (P) - Subtotal (T)")
+          THEN
+            InvPropRubricDest.Type := Type::Subtotal
+          ELSE
+            InvPropRubricDest.Type := Type::Balance;
+
+        END;
+        InvPropRubricDest."Percentage Filter" := '';
+        InvPropRubricDest."Tot.Type for Perc. (Sub)Totals" := 0;
+      END
+    END;
+
+    PROCEDURE SetDateFilterActual@1210190010(VAR IOInvPropRubricRec@1210190003 : Record 11012913;IStartDate@1210190002 : Date;IEndDate@1210190001 : Date;IRefDate@1210190000 : Date) : Boolean;
+    VAR
+      lvRefDate@1210190004 : Date;
+    BEGIN
+      WITH IOInvPropRubricRec DO BEGIN
+        SETRANGE("Date Filter", 0D);
+
+        IF (IRefDate = 0D) THEN
+          EXIT(FALSE);
+
+        IF (IRefDate = CLOSINGDATE(IRefDate)) THEN
+          lvRefDate := NORMALDATE(IRefDate)
+        ELSE
+          lvRefDate := CLOSINGDATE(IRefDate - 1);
+
+        IF (IEndDate <> 0D) THEN BEGIN
+          IF (lvRefDate < IStartDate) THEN
+            EXIT(FALSE);
+          IF (lvRefDate <= IEndDate) AND (lvRefDate >= IStartDate) THEN
+            SETRANGE("Date Filter", IStartDate, lvRefDate)
+          ELSE
+            SETRANGE("Date Filter", IStartDate, IEndDate);
+          EXIT(TRUE);
+        END;
+
+        SETFILTER("Date Filter", '..%1', lvRefDate);
+        EXIT(TRUE);
+      END;
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE SetDateFilterBudget@1210190020(VAR IOInvPropRubricRec@1210190003 : Record 11012913;IStartDate@1210190002 : Date;IEndDate@1210190001 : Date;IRefDate@1210190000 : Date) : Boolean;
+    BEGIN
+      WITH IOInvPropRubricRec DO BEGIN
+        SETRANGE("Date Filter", 0D);
+
+        IF (IStartDate = 0D) AND (IEndDate = 0D) AND (IRefDate = 0D) THEN BEGIN
+          SETRANGE("Date Filter");  // Reset 'Date Filter'
+          EXIT(TRUE);
+        END;
+
+        IF (IEndDate <> 0D) THEN BEGIN
+          IF (IRefDate > IEndDate) THEN
+            EXIT(FALSE);
+          IF (IRefDate <= IEndDate) AND (IRefDate >= IStartDate) THEN
+            SETRANGE("Date Filter", IRefDate, IEndDate)
+          ELSE
+            SETRANGE("Date Filter", IStartDate, IEndDate);
+          EXIT(TRUE);
+        END;
+
+        IF (IRefDate <> 0D) THEN BEGIN
+          SETFILTER("Date Filter", '%1..', IRefDate);
+          EXIT(TRUE);
+        END;
+      END;
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE EvaluateAmount@1210190006(VAR IOText@1210190000 : Text[250];IRoundFactor@1210190001 : 'None,1,1000,1000000');
+    VAR
+      lvAmount@1210190002 : Decimal;
+    BEGIN
+      IF EVALUATE(lvAmount,IOText) THEN BEGIN
+        CASE IRoundFactor OF
+          IRoundFactor::"1000":
+            lvAmount := lvAmount * 1000;
+          IRoundFactor::"1000000":
+            lvAmount := lvAmount * 1000000;
+        END;
+        IOText := FORMAT(lvAmount);
+      END;
+    END;
+
+    PROCEDURE FromRoundedValue@1100528701(OrgValue@1100528700 : Decimal;RoundingFactor@1100528702 : 'None,1,1000,1000000') : Decimal;
+    VAR
+      NewValue@1100528701 : Decimal;
+    BEGIN
+      NewValue := OrgValue;
+      CASE RoundingFactor OF
+        RoundingFactor::"1000":
+          NewValue := OrgValue * 1000;
+        RoundingFactor::"1000000":
+          NewValue := OrgValue * 1000000;
+      END;
+      EXIT(NewValue);
+    END;
+
+    PROCEDURE ToRoundedValue@2(OrgValue@1000 : Decimal;RoundingFactor@1100528700 : 'None,1,1000,1000000') : Decimal;
+    VAR
+      NewValue@1001 : Decimal;
+    BEGIN
+      NewValue := OrgValue;
+      CASE RoundingFactor OF
+        RoundingFactor::"1":
+          NewValue := ROUND(OrgValue, 1);
+        RoundingFactor::"1000":
+          NewValue := ROUND(OrgValue / 1000);
+        RoundingFactor::"1000000":
+          NewValue := ROUND(OrgValue / 1000000);
+      END;
+      EXIT(NewValue);
+    END;
+
+    PROCEDURE FormatPercentage@1210190016(VAR IOText@1210190000 : Text[250]);
+    VAR
+      lvPercentage@1210190001 : Decimal;
+    BEGIN
+      IF (IOText = '') THEN
+        EXIT;
+
+      EVALUATE(lvPercentage, IOText);
+      lvPercentage := ROUND(lvPercentage, 0.01);
+
+      IF lvPercentage = 0 THEN
+        IOText := ''
+      ELSE
+        IOText := FORMAT(lvPercentage) + '%';
+    END;
+
+    PROCEDURE FormatAmount@1210190004(VAR IOText@1210190000 : Text[250];IRoundFactor@1210190002 : 'None,1,1000,1000000';ISuppressRoundedZeroAmount@1100485000 : Boolean);
+    VAR
+      lvOrigAmount@1210190001 : Decimal;
+      lvAmount@1100485001 : Decimal;
+    BEGIN
+      //* ISuppressRoundedZeroAmount: Als bedrag <> 0 en afgerond bedrag is nul dan leeg (ipv 0)
+
+      IF (IOText = '') OR (IRoundFactor = IRoundFactor::None) THEN
+        EXIT;
+
+      EVALUATE(lvAmount, IOText);
+      lvOrigAmount := lvAmount;
+      CASE IRoundFactor OF
+        IRoundFactor::"1":
+          lvAmount := ROUND(lvAmount, 1);
+        IRoundFactor::"1000":
+          lvAmount := ROUND(lvAmount / 1000, 0.1);
+        IRoundFactor::"1000000":
+          lvAmount := ROUND(lvAmount / 1000000, 0.1);
+      END;
+
+      IF (lvAmount = 0) AND (ISuppressRoundedZeroAmount OR (lvOrigAmount = 0)) THEN
+        IOText := ''
+      ELSE
+        CASE IRoundFactor OF
+          IRoundFactor::"1":
+            IOText := FORMAT(lvAmount);
+          IRoundFactor::"1000",
+          IRoundFactor::"1000000":
+            IOText := FORMAT(lvAmount,0,'<Sign><Integer Thousand><Decimals,2>');
+        END;
+    END;
+
+    PROCEDURE RoundAmountForPrinting@1210190023(VAR IOAmount@1210190000 : Decimal;IRoundFactor@1210190002 : 'None,1,1000,1000000');
+    BEGIN
+      IF (IOAmount = 0) OR (IRoundFactor = IRoundFactor::None) THEN
+        EXIT;
+
+      CASE IRoundFactor OF
+        IRoundFactor::"1":
+          IOAmount := ROUND(IOAmount, 1);
+        IRoundFactor::"1000":
+          IOAmount := ROUND(IOAmount / 1000, 0.1);
+        IRoundFactor::"1000000":
+          IOAmount := ROUND(IOAmount / 1000000, 0.1);
+      END;
+
+      IF IOAmount = 0 THEN      // Input amount was not equal to '0' and new amount is '0', force printing a '0'
+        IOAmount := 0.0000001;
+    END;
+
+    PROCEDURE Date2PeriodTxt@1100485002(IPeriodType@1100485003 : Option;IDate@1100485000 : Date) : Text[10];
+    VAR
+      lvYear@1100485004 : Integer;
+      lvPeriodNo@1100485005 : Integer;
+      lvPeriodTxt@1100485002 : Text[10];
+      lvText@1100485006 : Text[10];
+    BEGIN
+      IF (IDate = 0D) THEN
+        EXIT('');
+
+      IF IPeriodType <> PeriodType::Week THEN
+        lvYear := DATE2DMY(IDate, 3)   //* dMy
+      ELSE
+        lvYear := DATE2DWY(IDate, 3);  //* dWy
+
+      lvPeriodTxt := FORMAT(lvYear);
+
+      CASE IPeriodType OF
+        PeriodType::Year:
+          EXIT(lvPeriodTxt);
+        PeriodType::Quarter:
+          BEGIN
+            CASE DATE2DMY(IDate,2) OF
+              1,2,3:    lvPeriodNo := 1;
+              4,5,6:    lvPeriodNo := 2;
+              7,8,9:    lvPeriodNo := 3;
+              10,11,12: lvPeriodNo := 4;
+            END;
+          END;
+        PeriodType::Month:
+          lvPeriodNo := DATE2DMY(IDate,2);
+        PeriodType::Week:
+          lvPeriodNo := DATE2DWY(IDate,2);
+        PeriodType::Day:
+          lvPeriodNo := IDate - DMY2DATE(1, 1, lvYear) + 1;
+        ELSE
+          EXIT('');
+      END;
+
+      lvText := FORMAT(lvPeriodNo);
+      CASE STRLEN(lvText) OF
+        1: lvText := '00' + lvText;
+        2: lvText := '0'  + lvText;
+      END;
+      lvPeriodTxt := lvPeriodTxt + '-' + lvText;
+
+      EXIT(lvPeriodTxt);
+    END;
+
+    PROCEDURE GetAmntFormatExprForPrinting@1100528700(RoundFactor@1100525001 : 'None,1,1000,1000000') : Text[30];
+    VAR
+      GLSetup@1100525002 : Record 98;
+      P@1100525000 : Integer;
+      DecimalPlaces@1100525003 : Integer;
+    BEGIN
+      GLSetup.GET;
+
+      CASE RoundFactor OF
+        RoundFactor::"1":
+          EXIT('#,##0');
+        RoundFactor::"1000":
+          EXIT('#,##0.0');
+        RoundFactor::"1000000":
+          EXIT('#,##0.0');
+        ELSE BEGIN
+          P := STRPOS(GLSetup."Amount Decimal Places", ':');
+          IF P > 0 THEN BEGIN
+            IF NOT EVALUATE(DecimalPlaces, COPYSTR(GLSetup."Amount Decimal Places", P + 1)) THEN
+              EXIT;
+          END ELSE BEGIN
+            IF NOT EVALUATE(DecimalPlaces, GLSetup."Amount Decimal Places") THEN
+              EXIT;
+          END;
+          IF DecimalPlaces > 0 THEN
+            EXIT('#,##0.' + PADSTR('', DecimalPlaces, '0'))
+          ELSE
+            EXIT('#,##0');
+        END;
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

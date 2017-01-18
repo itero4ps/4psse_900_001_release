@@ -1,0 +1,1059 @@
+OBJECT Report 594 Get Item Ledger Entries
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00.00.45480,4PS9.00;
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 252=imd;
+    CaptionML=ENU=Get Item Ledger Entries;
+    ProcessingOnly=Yes;
+    OnInitReport=BEGIN
+                   CompanyInfo.FINDFIRST;
+                 END;
+
+    OnPreReport=BEGIN
+                  IntrastatJnlLine.SETRANGE("Journal Template Name",IntrastatJnlLine."Journal Template Name");
+                  IntrastatJnlLine.SETRANGE("Journal Batch Name",IntrastatJnlLine."Journal Batch Name");
+                  IntrastatJnlLine.LOCKTABLE;
+                  IF IntrastatJnlLine.FINDLAST THEN;
+
+                  IntrastatJnlBatch.GET(IntrastatJnlLine."Journal Template Name",IntrastatJnlLine."Journal Batch Name");
+                  IntrastatJnlBatch.TESTFIELD(Reported,FALSE);
+
+                  GetGLSetup;
+                  IF IntrastatJnlBatch."Amounts in Add. Currency" THEN BEGIN
+                    GLSetup.TESTFIELD("Additional Reporting Currency");
+                    AddCurrencyFactor :=
+                      //CurrExchRate.ExchangeRate(EndDate,GLSetup."Additional Reporting Currency"); //**4PS.o
+                      CurrExchRate.ExchangeRate(0, '', EndDate,GLSetup."Additional Reporting Currency",TRUE); //**4PS.n
+                  END;
+                END;
+
+  }
+  DATASET
+  {
+    { 4153;    ;DataItem;                    ;
+               DataItemTable=Table9;
+               DataItemTableView=SORTING(Intrastat Code)
+                                 WHERE(Intrastat Code=FILTER(<>'')) }
+
+    { 7209;1   ;DataItem;                    ;
+               DataItemTable=Table32;
+               DataItemTableView=SORTING(Country/Region Code,Entry Type,Posting Date)
+                                 WHERE(Entry Type=FILTER(Purchase|Sale|Transfer),
+                                       Correction=CONST(No));
+               OnPreDataItem=BEGIN
+                               SETRANGE("Posting Date",StartDate,EndDate);
+
+                               //**4PS.sn hs
+                               IF PerCountryOfOrigin THEN
+                                 SETRANGE("Country of Origin/Destination",CountryOfOrigDest);
+                               //**4PS.en
+
+                               IF ("Country/Region".Code = CompanyInfo."Country/Region Code") OR
+                                  ((CompanyInfo."Country/Region Code" = '') AND NOT ShowBlank)
+                               THEN BEGIN
+                                 ShowBlank := TRUE;
+                                 SETFILTER("Country/Region Code",'%1|%2',"Country/Region".Code,'');
+                               END ELSE
+                                 SETRANGE("Country/Region Code","Country/Region".Code);
+
+                               IntrastatJnlLine2.SETRANGE("Journal Batch Name",IntrastatJnlBatch.Name);
+                               IntrastatJnlLine2.SETCURRENTKEY("Source Type","Source Entry No.");
+                               IntrastatJnlLine2.SETRANGE("Source Type",IntrastatJnlLine2."Source Type"::"Item Entry");
+
+                               WITH ValueEntry DO BEGIN
+                                 SETCURRENTKEY("Item Ledger Entry No.");
+                                 SETRANGE("Entry Type","Entry Type"::"Direct Cost");
+                                 SETFILTER(
+                                   "Item Ledger Entry Type",'%1|%2|%3',
+                                   "Item Ledger Entry Type"::Sale,
+                                   "Item Ledger Entry Type"::Purchase,
+                                   "Item Ledger Entry Type"::Transfer);
+                               END;
+                             END;
+
+               OnAfterGetRecord=VAR
+                                  ItemLedgEntry@1001 : Record 32;
+                                BEGIN
+                                  IntrastatJnlLine2.SETRANGE("Source Entry No.","Entry No.");
+                                  IF IntrastatJnlLine2.FINDFIRST THEN
+                                    CurrReport.SKIP;
+
+                                  IF "Entry Type" IN ["Entry Type"::Sale,"Entry Type"::Purchase] THEN BEGIN
+                                    ItemLedgEntry.RESET;
+                                    ItemLedgEntry.SETCURRENTKEY("Document No.","Document Type");
+                                    ItemLedgEntry.SETRANGE("Document No.","Document No.");
+                                    ItemLedgEntry.SETRANGE("Item No.","Item No.");
+                                    ItemLedgEntry.SETRANGE(Correction,TRUE);
+                                    IF "Document Type" IN ["Document Type"::"Sales Shipment","Document Type"::"Sales Return Receipt",
+                                                           "Document Type"::"Purchase Receipt","Document Type"::"Purchase Return Shipment"]
+                                    THEN BEGIN
+                                      ItemLedgEntry.SETRANGE("Document Type","Document Type");
+                                      IF ItemLedgEntry.FINDSET THEN
+                                        REPEAT
+                                          IF IsItemLedgerEntryCorrected(ItemLedgEntry,"Entry No.") THEN
+                                            CurrReport.SKIP;
+                                        UNTIL ItemLedgEntry.NEXT = 0;
+                                    END;
+                                  END;
+
+                                  IF NOT HasCrossedBorder("Item Ledger Entry") OR IsService("Item Ledger Entry") THEN
+                                    CurrReport.SKIP;
+
+                                  CalculateTotals("Item Ledger Entry");
+
+                                  IF (TotalAmt = 0) AND SkipZeroAmounts THEN
+                                    CurrReport.SKIP;
+
+                                  InsertItemJnlLine;
+                                END;
+                                 }
+
+    { 5612;1   ;DataItem;                    ;
+               DataItemTable=Table11072005;
+               DataItemTableView=SORTING(Type,Entry Type,Country/Region Code,Source Code,Posting Date)
+                                 WHERE(Surcharge=CONST(No));
+               OnPreDataItem=BEGIN
+                               //FieldFilter on Entry Type removed 4PS call 26343
+                               //Fieldfilters on Type and Source removed
+
+                               //**4PS.sn
+                               IF PerCountryOfOrigin THEN //hs
+                                 SETRANGE("Country of Origin/Destination",CountryOfOrigDest);
+
+                               IF "Country/Region".Code = CompanyInfo."Country/Region Code" THEN
+                                 SETFILTER("Country/Region Code",'%1|%2',"Country/Region".Code,'')
+                               ELSE
+                                 SETRANGE("Country/Region Code","Country/Region".Code);
+                               //**4PS.en
+
+                               SETRANGE("Posting Date",StartDate,EndDate);
+                               IntrastatJnlLine2.SETCURRENTKEY("Source Type","Source Entry No.");
+                               IntrastatJnlLine2.SETRANGE("Source Type",IntrastatJnlLine2."Source Type"::"Job Entry");
+                             END;
+
+               OnAfterGetRecord=BEGIN
+                                  //**4PS.sn
+                                  IF ("Item No." = '') AND ("Trade Item"= '') AND ("Tariff No." = '') THEN
+                                    CurrReport.SKIP;
+                                  //**4PS.en
+
+                                  IntrastatJnlLine2.SETRANGE("Source Entry No.","Entry No.");
+                                  //IF IntrastatJnlLine2.FINDFIRST OR (CompanyInfo."Country/Region Code" = "Country/Region Code") THEN //**4PS.o
+                                  //**4PS.sn
+                                  IF IntrastatJnlLine2.FINDFIRST OR
+                                    ("Country/Region Code" = '') OR
+                                    ("Country of Origin/Destination" = "Country/Region Code")
+                                  THEN
+                                    CurrReport.SKIP;
+
+                                  IF NOT Country2.GET("Country/Region Code") OR (Country2."Intrastat Code" = '') THEN
+                                  //**4PS.en
+                                    CurrReport.SKIP;
+
+                                  IF IsJobService("Job Ledger Entry") THEN
+                                    CurrReport.SKIP;
+
+                                  InsertJobLedgerLine;
+                                END;
+
+               DataItemLink=Country/Region Code=FIELD(Code) }
+
+    { 1100525000;1;DataItem;                 ;
+               DataItemTable=Table11012819;
+               OnPreDataItem=BEGIN
+                               //**4PS01
+                               SETRANGE("Posting Date",StartDate,EndDate);
+
+                               IF PerCountryOfOrigin THEN //hs
+                                 SETRANGE("Country/Region of Origin/Dest.",CountryOfOrigDest);
+
+                               IntrastatJnlLine2.SETCURRENTKEY("Source Type","Source Entry No.");
+                               IntrastatJnlLine2.SETRANGE("Source Type",IntrastatJnlLine2."Source Type"::"Service Entry");
+                             END;
+
+               OnAfterGetRecord=BEGIN
+                                  //**4PS01
+                                  IF ("Item No." = '') AND ("Trade Item"= '') AND ("Tariff No." = '') THEN
+                                    CurrReport.SKIP;
+
+                                  IntrastatJnlLine2.SETRANGE("Source Entry No.","Entry No.");
+                                  IF IntrastatJnlLine2.FINDFIRST OR
+                                     ("Country/Region Code" = '') OR
+                                     ("Country/Region of Origin/Dest." = "Country/Region Code")
+                                  THEN
+                                    CurrReport.SKIP;
+
+                                  IF NOT Country2.GET("Country/Region Code") OR (Country2."Intrastat Code" = '') THEN
+                                    CurrReport.SKIP;
+
+                                  IF "Item No." <> '' THEN BEGIN
+                                    ValueEntry.RESET;
+                                  //  ValueEntry.SETCURRENTKEY("Document No.","Posting Date");
+                                    ValueEntry.SETCURRENTKEY("Document No.");  //jth 08-09-2011
+                                    ValueEntry.SETRANGE("Document No.","Document No.");
+                                    ValueEntry.SETRANGE("Posting Date","Posting Date");
+                                    ValueEntry.SETRANGE("Item No.","Item No.");
+                                    IF ValueEntry.FINDFIRST THEN BEGIN
+                                      IntrastatJnlLine2.SETRANGE("Source Type",IntrastatJnlLine2."Source Type"::"Item Entry");
+                                      IntrastatJnlLine2.SETRANGE("Source Entry No.",ValueEntry."Item Ledger Entry No.");
+                                      IF IntrastatJnlLine2.FINDFIRST THEN BEGIN
+                                        IntrastatJnlLine2.SETRANGE("Source Type",IntrastatJnlLine2."Source Type"::"Service Entry");
+                                        ValueEntry.RESET;
+                                        CurrReport.SKIP;
+                                      END;
+                                      IntrastatJnlLine2.SETRANGE("Source Type",IntrastatJnlLine2."Source Type"::"Service Entry");
+                                    END;
+                                  END;
+                                  ValueEntry.RESET;
+
+                                  InsertServiceLedgerLine;
+                                END;
+                                 }
+
+    { 8894;    ;DataItem;                    ;
+               DataItemTable=Table5802;
+               DataItemTableView=SORTING(Entry No.);
+               OnPreDataItem=BEGIN
+                               SETRANGE("Posting Date",StartDate,EndDate);
+                               SETFILTER("Item Charge No.",'<> %1','');
+                               "Item Ledger Entry".SETRANGE("Posting Date");
+
+                               IntrastatJnlLine2.SETRANGE("Journal Batch Name",IntrastatJnlBatch.Name);
+                               IntrastatJnlLine2.SETCURRENTKEY("Source Type","Source Entry No.");
+                               IntrastatJnlLine2.SETRANGE("Source Type",IntrastatJnlLine2."Source Type"::"Item Entry");
+                             END;
+
+               OnAfterGetRecord=BEGIN
+                                  IF ShowItemCharges THEN BEGIN
+                                    IntrastatJnlLine2.SETRANGE("Source Entry No.","Item Ledger Entry No.");
+                                    IF IntrastatJnlLine2.FINDFIRST THEN
+                                      CurrReport.SKIP;
+
+                                    IF "Item Ledger Entry".GET("Item Ledger Entry No.")
+                                    THEN BEGIN
+                                      IF "Item Ledger Entry"."Posting Date" IN [StartDate..EndDate] THEN
+                                        CurrReport.SKIP;
+                                      IF "Country/Region".GET("Item Ledger Entry"."Country/Region Code") THEN
+                                        IF "Country/Region"."EU Country/Region Code" = '' THEN
+                                          CurrReport.SKIP;
+                                      IF NOT HasCrossedBorder("Item Ledger Entry") THEN
+                                        CurrReport.SKIP;
+                                      InsertValueEntryLine;
+                                    END;
+                                  END;
+                                END;
+                                 }
+
+  }
+  REQUESTPAGE
+  {
+    PROPERTIES
+    {
+      SaveValues=Yes;
+      OnOpenPage=BEGIN
+                   IntraJnlTemplate.GET(IntrastatJnlLine."Journal Template Name");
+                   IntrastatJnlBatch.GET(IntrastatJnlLine."Journal Template Name",IntrastatJnlLine."Journal Batch Name");
+                   IntrastatJnlBatch.TESTFIELD("Statistics Period");
+                   Century := DATE2DMY(WORKDATE,3) DIV 100;
+                   EVALUATE(Year,COPYSTR(IntrastatJnlBatch."Statistics Period",1,2));
+                   Year := Year + Century * 100;
+                   EVALUATE(Month,COPYSTR(IntrastatJnlBatch."Statistics Period",3,2));
+                   StartDate := DMY2DATE(1,Month,Year);
+                   EndDate := CALCDATE('<+1M-1D>',StartDate);
+
+                   CountryOfOrigDestEditable := PerCountryOfOrigin ; //**4PS.n
+                 END;
+
+    }
+    CONTROLS
+    {
+      { 1900000001;0;Container;
+                  ContainerType=ContentArea }
+
+      { 1900000002;1;Group  ;
+                  CaptionML=ENU=Options }
+
+      { 1100525000;2;Field  ;
+                  CaptionML=ENU=Per Country of Origin/Destination;
+                  SourceExpr=PerCountryOfOrigin;
+                  OnValidate=BEGIN
+                                //**4PS
+                               CountryOfOrigDestEditable := PerCountryOfOrigin;
+                             END;
+                              }
+
+      { 1100525001;2;Field  ;
+                  CaptionML=ENU=Country of Origin/Destination;
+                  SourceExpr=CountryOfOrigDest }
+
+      { 1   ;2   ;Field     ;
+                  Name=StartingDate;
+                  CaptionML=ENU=Starting Date;
+                  SourceExpr=StartDate }
+
+      { 2   ;2   ;Field     ;
+                  Name=EndingDate;
+                  CaptionML=ENU=Ending Date;
+                  SourceExpr=EndDate }
+
+      { 3   ;2   ;Field     ;
+                  CaptionML=ENU=Cost Regulation %;
+                  DecimalPlaces=0:5;
+                  SourceExpr=IndirectCostPctReq }
+
+      { 6   ;1   ;Group     ;
+                  CaptionML=ENU=Additional;
+                  GroupType=Group }
+
+      { 4   ;2   ;Field     ;
+                  Name=SkipRecalcForZeros;
+                  CaptionML=ENU=Skip Recalculation for Zero Amounts;
+                  SourceExpr=SkipRecalcZeroAmounts }
+
+      { 5   ;2   ;Field     ;
+                  Name=SkipZeros;
+                  CaptionML=ENU=Skip Zero Amounts;
+                  SourceExpr=SkipZeroAmounts }
+
+      { 7   ;2   ;Field     ;
+                  Name=ShowingItemCharges;
+                  CaptionML=ENU=Show Item Charge Entries;
+                  SourceExpr=ShowItemCharges }
+
+    }
+  }
+  LABELS
+  {
+  }
+  CODE
+  {
+    VAR
+      Text000@1000 : TextConst 'ENU=Prices including VAT cannot be calculated when %1 is %2.';
+      IntraJnlTemplate@1002 : Record 261;
+      IntrastatJnlBatch@1003 : Record 262;
+      IntrastatJnlLine@1004 : Record 263;
+      IntrastatJnlLine2@1005 : Record 263;
+      Item@1006 : Record 27;
+      ValueEntry@1007 : Record 5802;
+      GLSetup@1009 : Record 98;
+      CurrExchRate@1010 : Record 330;
+      CompanyInfo@1011 : Record 79;
+      Currency@1024 : Record 4;
+      StartDate@1013 : Date;
+      EndDate@1014 : Date;
+      IndirectCostPctReq@1015 : Decimal;
+      TotalAmt@1017 : Decimal;
+      Century@1018 : Integer;
+      Year@1019 : Integer;
+      Month@1020 : Integer;
+      AddCurrencyFactor@1021 : Decimal;
+      AverageCost@1022 : Decimal;
+      AverageCostACY@1023 : Decimal;
+      GLSetupRead@1001 : Boolean;
+      ShowBlank@1012 : Boolean;
+      SkipRecalcZeroAmounts@1008 : Boolean;
+      SkipZeroAmounts@1016 : Boolean;
+      ShowItemCharges@1025 : Boolean;
+      Country2@1100485002 : Record 9;
+      PerCountryOfOrigin@1100485000 : Boolean;
+      CountryOfOrigDest@1100485001 : Code[10];
+      CountryOfOrigDestEditable@1100525000 : Boolean;
+
+    PROCEDURE SetIntrastatJnlLine@1(NewIntrastatJnlLine@1000 : Record 263);
+    BEGIN
+      IntrastatJnlLine := NewIntrastatJnlLine;
+    END;
+
+    LOCAL PROCEDURE InsertItemJnlLine@2();
+    VAR
+      Location@1000 : Record 14;
+    BEGIN
+      GetGLSetup;
+      WITH IntrastatJnlLine DO BEGIN
+        INIT;
+        "Line No." := "Line No." + 10000;
+        Date := "Item Ledger Entry"."Posting Date";
+        "Country/Region Code" := "Item Ledger Entry"."Country/Region Code";
+        "Transaction Type" := "Item Ledger Entry"."Transaction Type";
+        "Transport Method" := "Item Ledger Entry"."Transport Method";
+        "Source Entry No." := "Item Ledger Entry"."Entry No.";
+        Quantity := "Item Ledger Entry".Quantity;
+        "Document No." := "Item Ledger Entry"."Document No.";
+        "Item No." := "Item Ledger Entry"."Item No.";
+        "Entry/Exit Point" := "Item Ledger Entry"."Entry/Exit Point";
+        Area := "Item Ledger Entry".Area;
+        "Transaction Specification" := "Item Ledger Entry"."Transaction Specification";
+        Amount := ROUND(ABS(TotalAmt),1);
+
+        IF Quantity < 0 THEN
+          Type := Type::Shipment
+        ELSE
+          Type := Type::Receipt;
+
+        IF ("Country/Region Code" = '') OR
+           ("Country/Region Code" = CompanyInfo."Country/Region Code")
+        THEN
+          IF "Item Ledger Entry"."Location Code" = '' THEN
+            "Country/Region Code" := CompanyInfo."Ship-to Country/Region Code"
+          ELSE BEGIN
+            Location.GET("Item Ledger Entry"."Location Code");
+            "Country/Region Code" := Location."Country/Region Code"
+          END;
+
+        VALIDATE("Item No.");
+        "Source Type" := "Source Type"::"Item Entry";
+        VALIDATE(Quantity,ROUND(ABS(Quantity),0.00001));
+        VALIDATE("Cost Regulation %",IndirectCostPctReq);
+
+        //**4PS.sn
+        IntrastatJnlLine."Country of Origin/Destination" := "Item Ledger Entry"."Country of Origin/Destination"; //hs, 12-11-2007
+        //**4PS.en
+
+        INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertJobLedgerLine@3();
+    VAR
+      lvInventorySetupRec@1100525000 : Record 313;
+      lvItemType@1100525001 : 'TradeItem,Item,TariffCode';
+      lvItemRec@1210190000 : Record 27;
+    BEGIN
+      WITH IntrastatJnlLine DO BEGIN
+        INIT;
+        "Line No." := "Line No." + 10000;
+
+        Date := "Job Ledger Entry"."Posting Date";
+        "Country/Region Code" := "Job Ledger Entry"."Country/Region Code";
+        "Transaction Type" := "Job Ledger Entry"."Transaction Type";
+        "Transport Method" := "Job Ledger Entry"."Transport Method";
+        Quantity := "Job Ledger Entry"."Quantity (Base)";
+        //IF Quantity > 0 THEN //**4PS.o call 26343
+        IF Quantity < 0 THEN //**4PS.n
+          Type := Type::Shipment
+        ELSE
+          Type := Type::Receipt;
+        IF IntrastatJnlBatch."Amounts in Add. Currency" THEN
+          Amount := "Job Ledger Entry"."Add.-Currency Line Amount"
+        ELSE
+          //Amount := "Job Ledger Entry"."Line Amount (LCY)"; //**4PS.o
+          //**4PS.sn call 26343
+          IF "Job Ledger Entry"."Entry Type" = "Job Ledger Entry"."Entry Type"::Usage THEN
+            Amount := "Job Ledger Entry"."Total Cost (LCY)"
+          ELSE
+            Amount := "Job Ledger Entry"."Total Price (LCY)";
+          //**4PS.en
+        "Source Entry No." := "Job Ledger Entry"."Entry No.";
+        "Document No." := "Job Ledger Entry"."Document No.";
+        //"Item No." := "Job Ledger Entry"."No."; //**4PS.o
+        "Item No." := "Job Ledger Entry"."Item No."; //**4PS.n
+        "Entry/Exit Point" := "Job Ledger Entry"."Entry/Exit Point";
+        Area := "Job Ledger Entry".Area;
+        "Transaction Specification" := "Job Ledger Entry"."Transaction Specification";
+
+        IF IntrastatJnlBatch."Amounts in Add. Currency" THEN
+          Amount := ROUND(ABS(Amount),Currency."Amount Rounding Precision")
+        ELSE
+          Amount := ROUND(ABS(Amount),GLSetup."Amount Rounding Precision");
+
+        //VALIDATE("Item No."); //**4PS01.o
+        "Source Type" := "Source Type"::"Job Entry";
+        //**4PS01.sn
+        lvInventorySetupRec.GET;
+        IF lvInventorySetupRec."Price Info Trade Item Leading" THEN BEGIN
+          IF "Job Ledger Entry"."Trade Item" <> '' THEN
+            lvItemType := lvItemType::TradeItem
+          ELSE IF "Job Ledger Entry"."Item No." <> '' THEN
+            lvItemType := lvItemType::Item
+          ELSE IF "Job Ledger Entry"."Tariff No." <> '' THEN
+            lvItemType := lvItemType::TariffCode;
+        END ELSE BEGIN
+          IF "Job Ledger Entry"."Item No." <> '' THEN
+            lvItemType := lvItemType::Item
+          ELSE IF "Job Ledger Entry"."Trade Item" <> '' THEN
+            lvItemType := lvItemType::TradeItem
+          ELSE IF "Job Ledger Entry"."Tariff No." <> '' THEN
+            lvItemType := lvItemType::TariffCode;
+        END;
+        CASE lvItemType OF
+          lvItemType::TradeItem:
+            BEGIN
+              "Vendor (Trade Item)" := "Job Ledger Entry"."Vendor (Trade Item)";
+              VALIDATE("Trade Item", "Job Ledger Entry"."Trade Item");  // vult eventueel ook tariff no.
+              IF "Net Weight" = 0 THEN
+                //If no weight specified at the basic item, the user can specify the weight on the
+                //purchase or sales line
+                VALIDATE("Net Weight", "Job Ledger Entry"."Net Weight");
+              lvItemRec.INIT;                                                               //M28178 sn
+              IF ("Tariff No." = '') AND ("Job Ledger Entry"."Item No." <> '')  THEN BEGIN
+                IF lvItemRec.GET("Job Ledger Entry"."Item No.") THEN
+                  "Tariff No." := lvItemRec."Tariff No.";
+                lvItemRec.INIT
+              END;
+              IF "Tariff No." = '' THEN
+                "Tariff No." := "Job Ledger Entry"."Tariff No.";
+              IF "Tariff No." = '' THEN
+                lvItemRec.FIELDERROR("Tariff No.")                                          //M28178 en
+            END;
+          lvItemType::Item:
+            BEGIN
+              VALIDATE("Item No.");
+            END;
+          lvItemType::TariffCode:
+            BEGIN
+              VALIDATE("Tariff No.", "Job Ledger Entry"."Tariff No.");
+              VALIDATE("Net Weight", "Job Ledger Entry"."Net Weight");
+            END;
+          ELSE
+            CurrReport.SKIP;
+        END;
+        //**4PS01.en
+
+        VALIDATE(Quantity,ROUND(ABS(Quantity),0.00001));
+
+        VALIDATE("Cost Regulation %",IndirectCostPctReq);
+
+        "Country of Origin/Destination" := "Job Ledger Entry"."Country of Origin/Destination"; //**4PS.n
+
+        INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertServiceLedgerLine@1100525001();
+    VAR
+      lvInventorySetupRec@1100525000 : Record 313;
+      lvItemType@1100525001 : 'TradeItem,Item,TariffCode';
+      lvItemRec@1210190000 : Record 27;
+    BEGIN
+      //**4PS01.n
+      WITH IntrastatJnlLine DO BEGIN
+        INIT;
+        "Line No." := "Line No." + 10000;
+
+        Date := "Service-Ledger Entry"."Posting Date";
+        "Country/Region Code" := "Service-Ledger Entry"."Country/Region Code";
+        "Transaction Type" := "Service-Ledger Entry"."Transaction Type";
+        "Transport Method" := "Service-Ledger Entry"."Transport Method";
+
+        IF  "Service-Ledger Entry"."Total Cost (LCY)" <> 0 THEN
+          Amount := "Service-Ledger Entry"."Total Cost (LCY)"
+        ELSE
+          Amount := "Service-Ledger Entry"."Total Revenue (LCY)";
+        "Source Entry No." := "Service-Ledger Entry"."Entry No.";
+        Quantity := "Service-Ledger Entry".Quantity;
+        "Document No." := "Service-Ledger Entry"."Document No.";
+        "Item No." := "Service-Ledger Entry"."Item No.";
+        "Entry/Exit Point" := "Service-Ledger Entry"."Entry/Exit Point";
+        "Transaction Specification" := "Service-Ledger Entry"."Transaction Specification";
+        Area := "Service-Ledger Entry".Area;
+
+        IF Quantity < 0 THEN
+          Type := Type::Shipment
+        ELSE
+          Type := Type::Receipt;
+
+        IF IntrastatJnlBatch."Amounts in Add. Currency" THEN
+          Amount := ROUND(ABS(Amount),Currency."Amount Rounding Precision")
+        ELSE
+          Amount := ROUND(ABS(Amount),GLSetup."Amount Rounding Precision");
+
+        "Source Type" := "Source Type"::"Service Entry";
+        VALIDATE(Quantity,ROUND(ABS(Quantity),0.00001));
+
+        lvInventorySetupRec.GET;
+        IF lvInventorySetupRec."Price Info Trade Item Leading" THEN BEGIN
+          IF "Service-Ledger Entry"."Trade Item" <> '' THEN
+            lvItemType := lvItemType::TradeItem
+          ELSE IF "Service-Ledger Entry"."Item No." <> '' THEN
+            lvItemType := lvItemType::Item
+          ELSE IF "Service-Ledger Entry"."Tariff No." <> '' THEN
+            lvItemType := lvItemType::TariffCode;
+        END ELSE BEGIN
+          IF "Service-Ledger Entry"."Item No." <> '' THEN
+            lvItemType := lvItemType::Item
+          ELSE IF "Service-Ledger Entry"."Trade Item" <> '' THEN
+            lvItemType := lvItemType::TradeItem
+          ELSE IF "Service-Ledger Entry"."Tariff No." <> '' THEN
+            lvItemType := lvItemType::TariffCode;
+        END;
+        CASE lvItemType OF
+          lvItemType::TradeItem:
+            BEGIN
+              "Vendor (Trade Item)" := "Service-Ledger Entry"."Vendor (Trade Item)";
+              VALIDATE("Trade Item", "Service-Ledger Entry"."Trade Item");    //vult eventueel ook tariff no.
+              IF "Net Weight" = 0 THEN
+                //If no weight specified at the basic item, the user can specify the weight on the
+                //purchase or sales line, that weight is taken here
+                VALIDATE("Net Weight", "Service-Ledger Entry"."Net Weight");
+              lvItemRec.INIT;                                                               //M28178 sn
+              IF ("Tariff No." = '') AND ("Service-Ledger Entry"."Item No." <> '')  THEN BEGIN
+                IF lvItemRec.GET("Service-Ledger Entry"."Item No.") THEN
+                  "Tariff No." := lvItemRec."Tariff No.";
+                lvItemRec.INIT;
+              END;
+              IF "Tariff No." = '' THEN
+                "Tariff No." := "Service-Ledger Entry"."Tariff No.";
+              IF "Tariff No." = '' THEN
+                lvItemRec.FIELDERROR("Tariff No.")                                          //M28178 en
+            END;
+          lvItemType::Item:
+            BEGIN
+              VALIDATE("Item No.");
+            END;
+          lvItemType::TariffCode:
+            BEGIN
+              VALIDATE("Tariff No.", "Service-Ledger Entry"."Tariff No.");
+              VALIDATE("Net Weight", "Service-Ledger Entry"."Net Weight");
+            END;
+          ELSE
+            CurrReport.SKIP;
+        END;
+
+        VALIDATE("Cost Regulation %",IndirectCostPctReq);
+
+        "Country of Origin/Destination" := "Service-Ledger Entry"."Country/Region of Origin/Dest.";
+
+        INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE GetGLSetup@14();
+    BEGIN
+      IF NOT GLSetupRead THEN BEGIN
+        GLSetup.GET;
+        IF GLSetup."Additional Reporting Currency" <> '' THEN
+          Currency.GET(GLSetup."Additional Reporting Currency");
+      END;
+      GLSetupRead := TRUE;
+    END;
+
+    LOCAL PROCEDURE CalculateAverageCost@5801(VAR AverageCost@1001 : Decimal;VAR AverageCostACY@1002 : Decimal) : Boolean;
+    VAR
+      ValueEntry@1003 : Record 5802;
+      ItemLedgEntry@1000 : Record 32;
+      AverageQty@1004 : Decimal;
+    BEGIN
+      WITH ItemLedgEntry DO BEGIN
+        SETCURRENTKEY("Item No.","Entry Type");
+        SETRANGE("Item No.","Item Ledger Entry"."Item No.");
+        SETRANGE("Entry Type","Item Ledger Entry"."Entry Type");
+        CALCSUMS(Quantity);
+      END;
+
+      WITH ValueEntry DO BEGIN
+        SETCURRENTKEY("Item No.","Posting Date","Item Ledger Entry Type");
+        SETRANGE("Item No.","Item Ledger Entry"."Item No.");
+        SETRANGE("Item Ledger Entry Type","Item Ledger Entry"."Entry Type");
+        CALCSUMS(
+          "Cost Amount (Actual)",
+          "Cost Amount (Expected)");
+        "Cost Amount (Actual) (ACY)" :=
+          CurrExchRate.ExchangeAmtLCYToFCY(
+            //EndDate,GLSetup."Additional Reporting Currency","Cost Amount (Actual)",AddCurrencyFactor); //**4PS.o
+            //**4PS.sn
+            0, '', EndDate,GLSetup."Additional Reporting Currency",
+            "Cost Amount (Actual)",AddCurrencyFactor,TRUE);
+            //**4PS.en
+        "Cost Amount (Expected) (ACY)" :=
+          CurrExchRate.ExchangeAmtLCYToFCY(
+            //EndDate,GLSetup."Additional Reporting Currency","Cost Amount (Expected)",AddCurrencyFactor); //**4PS.o
+            //**4PS.sn
+            0, '', EndDate,GLSetup."Additional Reporting Currency",
+            "Cost Amount (Expected)",AddCurrencyFactor,TRUE);
+            //**4PS.en
+        AverageQty := ItemLedgEntry.Quantity;
+        AverageCost := "Cost Amount (Actual)" + "Cost Amount (Expected)";
+        AverageCostACY := "Cost Amount (Actual) (ACY)" + "Cost Amount (Expected) (ACY)";
+      END;
+      IF AverageQty <> 0 THEN BEGIN
+        AverageCost := AverageCost / AverageQty;
+        AverageCostACY := AverageCostACY / AverageQty;
+        IF (AverageCost < 0) OR (AverageCostACY < 0) THEN BEGIN
+          AverageCost := 0;
+          AverageCostACY := 0;
+        END;
+      END ELSE BEGIN
+        AverageCost := 0;
+        AverageCostACY := 0;
+      END;
+
+      EXIT(AverageQty >= 0);
+    END;
+
+    LOCAL PROCEDURE CountryOfOrigin@6(CountryRegionCode@1000 : Code[20]) : Boolean;
+    VAR
+      CountryRegion@1002 : Record 9;
+    BEGIN
+      IF ("Item Ledger Entry"."Country/Region Code" IN [CompanyInfo."Country/Region Code",'']) =
+         (CountryRegionCode IN [CompanyInfo."Country/Region Code",''])
+      THEN
+        EXIT(FALSE);
+
+      IF CountryRegionCode <> '' THEN BEGIN
+        CountryRegion.GET(CountryRegionCode);
+        IF CountryRegion."Intrastat Code" = '' THEN
+          EXIT(FALSE);
+      END;
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE HasCrossedBorder@5(ItemLedgEntry@1003 : Record 32) : Boolean;
+    VAR
+      ItemLedgEntry2@1002 : Record 32;
+      Location@1001 : Record 14;
+      Include@1000 : Boolean;
+    BEGIN
+      WITH ItemLedgEntry DO
+      BEGIN //**4PS.n
+
+        CASE TRUE OF
+          "Drop Shipment":
+            BEGIN
+              IF ("Country/Region Code" = CompanyInfo."Country/Region Code") OR
+                 ("Country/Region Code" = '')
+              THEN
+                EXIT(FALSE);
+              IF "Applies-to Entry" = 0 THEN BEGIN
+                ItemLedgEntry2.SETCURRENTKEY("Item No.","Posting Date");
+                ItemLedgEntry2.SETRANGE("Item No.","Item No.");
+                ItemLedgEntry2.SETRANGE("Posting Date","Posting Date");
+                ItemLedgEntry2.SETRANGE("Applies-to Entry","Entry No.");
+                ItemLedgEntry2.FINDFIRST;
+              END ELSE
+                ItemLedgEntry2.GET("Applies-to Entry");
+              IF (ItemLedgEntry2."Country/Region Code" <> CompanyInfo."Country/Region Code") AND
+                 (ItemLedgEntry2."Country/Region Code" <> '')
+              THEN
+                EXIT(FALSE);
+            END;
+          "Entry Type" = "Entry Type"::Transfer:
+            BEGIN
+              IF ("Country/Region Code" = CompanyInfo."Country/Region Code") OR
+                 ("Country/Region Code" = '')
+              THEN
+                EXIT(FALSE);
+              IF ("Order Type" <> "Order Type"::Transfer) OR ("Order No." = '') THEN BEGIN
+                Location.GET("Location Code");
+                IF (Location."Country/Region Code" <> '') AND
+                   (Location."Country/Region Code" <> CompanyInfo."Country/Region Code")
+                THEN
+                  EXIT(FALSE);
+              END ELSE BEGIN
+                ItemLedgEntry2.SETCURRENTKEY("Order Type","Order No.");
+                ItemLedgEntry2.SETRANGE("Order Type","Order Type"::Transfer);
+                ItemLedgEntry2.SETRANGE("Order No.","Order No.");
+                ItemLedgEntry2.SETFILTER("Country/Region Code",'%1 | %2','',CompanyInfo."Country/Region Code");
+                IF ItemLedgEntry2.FINDSET THEN
+                  REPEAT
+                    Location.GET(ItemLedgEntry2."Location Code");
+                    IF Location."Use As In-Transit" THEN
+                      Include := TRUE;
+                  UNTIL Include OR (ItemLedgEntry2.NEXT = 0);
+                IF NOT Include THEN
+                  EXIT(FALSE);
+              END;
+            END;
+          "Location Code" <> '':
+            BEGIN
+              Location.GET("Location Code");
+              IF NOT CountryOfOrigin(Location."Country/Region Code") THEN
+                EXIT(FALSE);
+            END;
+          ELSE BEGIN
+            IF "Entry Type" = "Entry Type"::Purchase THEN
+              IF NOT CountryOfOrigin(CompanyInfo."Ship-to Country/Region Code") THEN
+                EXIT(FALSE);
+            IF "Entry Type" = "Entry Type"::Sale THEN
+              IF NOT CountryOfOrigin(CompanyInfo."Country/Region Code") THEN
+                EXIT(FALSE);
+          END;
+        END;
+
+      //**4PS.sn
+        IF ("Country/Region Code" = '') OR
+           ("Country of Origin/Destination" = "Country/Region Code")    //trade within same country, no intrastat entry needed
+        THEN
+           EXIT(FALSE);
+
+        IF NOT Country2.GET("Country/Region Code") OR (Country2."Intrastat Code" = '') THEN
+          //if intrastat code empty then it is not an EU country, no intrastat entry needed.
+           EXIT(FALSE);
+      END;
+      //**4PS.en
+
+      EXIT(TRUE)
+    END;
+
+    LOCAL PROCEDURE InsertValueEntryLine@8();
+    VAR
+      Location@1000 : Record 14;
+    BEGIN
+      GetGLSetup;
+      WITH IntrastatJnlLine DO BEGIN
+        INIT;
+        "Line No." := "Line No." + 10000;
+        Date := "Value Entry"."Posting Date";
+        "Country/Region Code" := "Item Ledger Entry"."Country/Region Code";
+        "Transaction Type" := "Item Ledger Entry"."Transaction Type";
+        "Transport Method" := "Item Ledger Entry"."Transport Method";
+        "Source Entry No." := "Item Ledger Entry"."Entry No.";
+        Quantity := "Item Ledger Entry".Quantity;
+        "Document No." := "Value Entry"."Document No.";
+        "Item No." := "Item Ledger Entry"."Item No.";
+        "Entry/Exit Point" := "Item Ledger Entry"."Entry/Exit Point";
+        Area := "Item Ledger Entry".Area;
+        "Transaction Specification" := "Item Ledger Entry"."Transaction Specification";
+        Amount := ROUND(ABS("Value Entry"."Sales Amount (Actual)"),1);
+
+        IF Quantity < 0 THEN
+          Type := Type::Shipment
+        ELSE
+          Type := Type::Receipt;
+
+        IF ("Country/Region Code" = '') OR
+           ("Country/Region Code" = CompanyInfo."Country/Region Code")
+        THEN
+          IF "Item Ledger Entry"."Location Code" = '' THEN
+            "Country/Region Code" := CompanyInfo."Ship-to Country/Region Code"
+          ELSE BEGIN
+            Location.GET("Item Ledger Entry"."Location Code");
+            "Country/Region Code" := Location."Country/Region Code"
+          END;
+
+        VALIDATE("Item No.");
+        "Source Type" := "Source Type"::"Item Entry";
+        VALIDATE(Quantity,ROUND(ABS(Quantity),0.00001));
+        VALIDATE("Cost Regulation %",IndirectCostPctReq);
+
+        INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE IsService@4(ItemLedgEntry@1000 : Record 32) : Boolean;
+    VAR
+      SalesShipmentLine@1006 : Record 111;
+      ReturnReceiptLine@1005 : Record 6661;
+      SalesCrMemoLine@1009 : Record 115;
+      SalesInvLine@1010 : Record 113;
+      PurchRcptLine@1004 : Record 121;
+      ReturnShipmentLine@1003 : Record 6651;
+      PurchInvLine@1012 : Record 123;
+      PurchCrMemoLine@1011 : Record 125;
+      ServiceShipmentLine@1002 : Record 5991;
+      ServiceCrMemoLine@1001 : Record 5995;
+      ServiceInvLine@1008 : Record 5993;
+      VATPostingSetup@1007 : Record 325;
+    BEGIN
+      WITH ItemLedgEntry DO BEGIN
+        CASE TRUE OF
+          "Document Type" = "Document Type"::"Sales Shipment":
+            IF SalesShipmentLine.GET("Document No.","Document Line No.") THEN
+              IF VATPostingSetup.GET(SalesShipmentLine."VAT Bus. Posting Group",SalesShipmentLine."VAT Prod. Posting Group") THEN;
+          "Document Type" = "Document Type"::"Sales Return Receipt":
+            IF ReturnReceiptLine.GET("Document No.","Document Line No.") THEN
+              IF VATPostingSetup.GET(ReturnReceiptLine."VAT Bus. Posting Group",ReturnReceiptLine."VAT Prod. Posting Group") THEN;
+          "Document Type" = "Document Type"::"Sales Invoice":
+            IF SalesInvLine.GET("Document No.","Document Line No.") THEN
+              IF VATPostingSetup.GET(SalesInvLine."VAT Bus. Posting Group",SalesInvLine."VAT Prod. Posting Group") THEN;
+          "Document Type" = "Document Type"::"Sales Credit Memo":
+            IF SalesCrMemoLine.GET("Document No.","Document Line No.") THEN
+              IF VATPostingSetup.GET(SalesCrMemoLine."VAT Bus. Posting Group",SalesCrMemoLine."VAT Prod. Posting Group") THEN;
+          "Document Type" = "Document Type"::"Purchase Receipt":
+            IF PurchRcptLine.GET("Document No.","Document Line No.") THEN
+              IF VATPostingSetup.GET(PurchRcptLine."VAT Bus. Posting Group",PurchRcptLine."VAT Prod. Posting Group") THEN;
+          "Document Type" = "Document Type"::"Purchase Return Shipment":
+            IF ReturnShipmentLine.GET("Document No.","Document Line No.") THEN
+              IF VATPostingSetup.GET(ReturnShipmentLine."VAT Bus. Posting Group",ReturnShipmentLine."VAT Prod. Posting Group") THEN;
+          "Document Type" = "Document Type"::"Purchase Invoice":
+            IF PurchInvLine.GET("Document No.","Document Line No.") THEN
+              IF VATPostingSetup.GET(PurchInvLine."VAT Bus. Posting Group",PurchInvLine."VAT Prod. Posting Group") THEN;
+          "Document Type" = "Document Type"::"Purchase Credit Memo":
+            IF PurchCrMemoLine.GET("Document No.","Document Line No.") THEN
+              IF VATPostingSetup.GET(PurchCrMemoLine."VAT Bus. Posting Group",PurchCrMemoLine."VAT Prod. Posting Group") THEN;
+          "Document Type" = "Document Type"::"Service Shipment":
+            IF ServiceShipmentLine.GET("Document No.","Document Line No.") THEN
+              IF VATPostingSetup.GET(ServiceShipmentLine."VAT Bus. Posting Group",ServiceShipmentLine."VAT Prod. Posting Group") THEN;
+          "Document Type" = "Document Type"::"Service Credit Memo":
+            IF ServiceCrMemoLine.GET("Document No.","Document Line No.") THEN
+              IF VATPostingSetup.GET(ServiceCrMemoLine."VAT Bus. Posting Group",ServiceCrMemoLine."VAT Prod. Posting Group") THEN;
+          "Document Type" = "Document Type"::"Service Invoice":
+            IF ServiceInvLine.GET("Document No.","Document Line No.") THEN
+              IF VATPostingSetup.GET(ServiceInvLine."VAT Bus. Posting Group",ServiceInvLine."VAT Prod. Posting Group") THEN;
+        END;
+        EXIT(VATPostingSetup."EU Service");
+      END;
+    END;
+
+    LOCAL PROCEDURE CalculateTotals@7(ItemLedgerEntry@1000 : Record 32);
+    VAR
+      VATPostingSetup@1001 : Record 325;
+      TotalInvoicedQty@1005 : Decimal;
+      TotalCostAmt@1004 : Decimal;
+      TotalAmtExpected@1003 : Decimal;
+      TotalCostAmtExpected@1002 : Decimal;
+    BEGIN
+      WITH ItemLedgerEntry DO BEGIN
+        TotalInvoicedQty := 0;
+        TotalAmt := 0;
+        TotalAmtExpected := 0;
+        TotalCostAmt := 0;
+        TotalCostAmtExpected := 0;
+
+        ValueEntry.SETRANGE("Item Ledger Entry No.","Entry No.");
+        IF ValueEntry.FIND('-') THEN
+          REPEAT
+            IF NOT ((ValueEntry."Item Charge No." <> '') AND
+                    ((ValueEntry."Posting Date" > EndDate) OR (ValueEntry."Posting Date" < StartDate)))
+            THEN BEGIN
+              TotalInvoicedQty := TotalInvoicedQty + ValueEntry."Invoiced Quantity";
+              IF NOT IntrastatJnlBatch."Amounts in Add. Currency" THEN BEGIN
+                TotalAmt := TotalAmt + ValueEntry."Sales Amount (Actual)";
+                TotalCostAmt := TotalCostAmt + ValueEntry."Cost Amount (Actual)";
+                TotalAmtExpected := TotalAmtExpected + ValueEntry."Sales Amount (Expected)";
+                TotalCostAmtExpected := TotalCostAmtExpected + ValueEntry."Cost Amount (Expected)";
+              END ELSE BEGIN
+                TotalCostAmt := TotalCostAmt + ValueEntry."Cost Amount (Actual) (ACY)";
+                TotalCostAmtExpected := TotalCostAmtExpected + ValueEntry."Cost Amount (Expected) (ACY)";
+                IF ValueEntry."Cost per Unit" <> 0 THEN BEGIN
+                  TotalAmt :=
+                    TotalAmt +
+                    ValueEntry."Sales Amount (Actual)" * ValueEntry."Cost per Unit (ACY)" / ValueEntry."Cost per Unit";
+                  TotalAmtExpected :=
+                    TotalAmtExpected +
+                    ValueEntry."Sales Amount (Expected)" * ValueEntry."Cost per Unit (ACY)" / ValueEntry."Cost per Unit";
+                END ELSE BEGIN
+                  TotalAmt :=
+                    TotalAmt +
+                    CurrExchRate.ExchangeAmtLCYToFCY(
+                      //**4PS.so
+                      //ValueEntry."Posting Date",GLSetup."Additional Reporting Currency",
+                      //ValueEntry."Sales Amount (Actual)",AddCurrencyFactor);
+                      //**4PS.eo
+                      //**4PS.sn
+                      0, '', ValueEntry."Posting Date",GLSetup."Additional Reporting Currency",
+                      ValueEntry."Sales Amount (Actual)",AddCurrencyFactor,TRUE);
+                      //**4PS.en
+                  TotalAmtExpected :=
+                    TotalAmtExpected +
+                    CurrExchRate.ExchangeAmtLCYToFCY(
+                      //**4PS.so
+                      //ValueEntry."Posting Date",GLSetup."Additional Reporting Currency",
+                      //ValueEntry."Sales Amount (Expected)",AddCurrencyFactor);
+                      //**4PS.eo
+                      //**4PS.sn
+                      0, '', ValueEntry."Posting Date",GLSetup."Additional Reporting Currency",
+                      ValueEntry."Sales Amount (Expected)",AddCurrencyFactor,TRUE);
+                      //**4PS.en
+                END;
+              END;
+            END;
+          UNTIL ValueEntry.NEXT = 0;
+
+        IF Quantity <> TotalInvoicedQty THEN BEGIN
+          TotalAmt := TotalAmt + TotalAmtExpected;
+          TotalCostAmt := TotalCostAmt + TotalCostAmtExpected;
+        END;
+
+        IF "Entry Type" IN ["Entry Type"::Purchase,"Entry Type"::Transfer] THEN BEGIN
+          IF TotalCostAmt = 0 THEN BEGIN
+            CalculateAverageCost(AverageCost,AverageCostACY);
+            IF IntrastatJnlBatch."Amounts in Add. Currency" THEN
+              TotalCostAmt :=
+                TotalCostAmt + Quantity * AverageCostACY
+            ELSE
+              TotalCostAmt :=
+                TotalCostAmt + Quantity * AverageCost;
+          END;
+          TotalAmt := TotalCostAmt;
+        END;
+
+        IF (TotalAmt = 0) AND ("Entry Type" = "Entry Type"::Sale) AND (NOT SkipRecalcZeroAmounts) THEN BEGIN
+          IF Item."No." <> "Item No." THEN
+            Item.GET("Item No.");
+          IF IntrastatJnlBatch."Amounts in Add. Currency" THEN
+            Item."Unit Price" :=
+              CurrExchRate.ExchangeAmtLCYToFCY(
+                //**4PS.so
+                //EndDate,GLSetup."Additional Reporting Currency",
+                //Item."Unit Price",AddCurrencyFactor);
+                //**4PS.eo
+                //**4PS.sn
+                0, '', EndDate,GLSetup."Additional Reporting Currency",
+                Item."Unit Price",AddCurrencyFactor,TRUE);
+                //**4PS.en
+          IF Item."Price Includes VAT" THEN BEGIN
+            VATPostingSetup.GET(Item."VAT Bus. Posting Gr. (Price)",Item."VAT Prod. Posting Group");
+            CASE VATPostingSetup."VAT Calculation Type" OF
+              VATPostingSetup."VAT Calculation Type"::"Reverse Charge VAT":
+                VATPostingSetup."VAT %" := 0;
+              VATPostingSetup."VAT Calculation Type"::"Sales Tax":
+                ERROR(
+                  Text000,
+                  VATPostingSetup.FIELDCAPTION("VAT Calculation Type"),
+                  VATPostingSetup."VAT Calculation Type");
+            END;
+            TotalAmt :=
+              TotalAmt + Quantity *
+              (Item."Unit Price" / (1 + (VATPostingSetup."VAT %" / 100)));
+          END ELSE
+            TotalAmt := TotalAmt + Quantity * Item."Unit Price";
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE IsJobService@9(JobLedgEntry@1003 : Record 11072005) : Boolean;
+    VAR
+      Job@1000 : Record 11072003;
+      Customer@1001 : Record 18;
+      VATPostingSetup@1002 : Record 325;
+    BEGIN
+      IF Job.GET(JobLedgEntry."Job No.") THEN
+        IF Customer.GET(Job."Bill-to Customer No.") THEN;
+      IF Item.GET(JobLedgEntry."No.") THEN
+        IF VATPostingSetup.GET(Customer."VAT Bus. Posting Group",Item."VAT Prod. Posting Group") THEN
+          IF VATPostingSetup."EU Service" THEN
+            EXIT(TRUE);
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE InitializeRequest@10(NewStartDate@1000 : Date;NewEndDate@1001 : Date;NewIndirectCostPctReq@1002 : Decimal);
+    BEGIN
+      StartDate := NewStartDate;
+      EndDate := NewEndDate;
+      IndirectCostPctReq := NewIndirectCostPctReq;
+    END;
+
+    LOCAL PROCEDURE IsItemLedgerEntryCorrected@20(ItemLedgerEntryCorrection@1003 : Record 32;ItemLedgerEntryNo@1000 : Integer) : Boolean;
+    VAR
+      ItemApplicationEntry@1001 : Record 339;
+    BEGIN
+      ItemApplicationEntry.SETRANGE("Item Ledger Entry No.",ItemLedgerEntryCorrection."Entry No.");
+      CASE ItemLedgerEntryCorrection."Document Type" OF
+        ItemLedgerEntryCorrection."Document Type"::"Sales Shipment",
+        ItemLedgerEntryCorrection."Document Type"::"Purchase Return Shipment":
+          ItemApplicationEntry.SETRANGE("Outbound Item Entry No.",ItemLedgerEntryNo);
+        ItemLedgerEntryCorrection."Document Type"::"Purchase Receipt",
+        ItemLedgerEntryCorrection."Document Type"::"Sales Return Receipt":
+          ItemApplicationEntry.SETRANGE("Inbound Item Entry No.",ItemLedgerEntryNo);
+      END;
+      EXIT(NOT ItemApplicationEntry.ISEMPTY);
+    END;
+
+    BEGIN
+    {
+      4PS01 JD 29-10-2008, Improvements for intrastat
+      4PS02 HB 03-06-2010, KB979748 added
+    }
+    END.
+  }
+  RDLDATA
+  {
+  }
+}
+

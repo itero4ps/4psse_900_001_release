@@ -1,0 +1,289 @@
+OBJECT Codeunit 5304 Outlook Synch. Outlook Mgt.
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      OSynchUserSetup@1002 : Record 5305;
+      ErrorConflictBuffer@1013 : TEMPORARY Record 5302;
+      OSynchNAVMgt@1003 : Codeunit 5301;
+      OSynchTypeConversion@1006 : Codeunit 5302;
+      OSynchProcessLine@1025 : Codeunit 5305;
+      ErrorLogXMLWriter@1014 : DotNet "'Microsoft.Dynamics.Nav.OLSync.Common, Version=9.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35'.Microsoft.Dynamics.NAV.OLSync.Common.XmlTextWriter";
+      Text001@1010 : TextConst 'ENU=The synchronization has failed because the synchronization data from Microsoft Outlook cannot be processed. Try again later and if the problem persists contact your system administrator.';
+      Encoding@1009 : DotNet "'mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Text.Encoding";
+      EntityRecID@1007 : RecordID;
+      OSynchActionType@1005 : 'Insert,Modify,Delete,Undefined';
+      Text002@1000 : TextConst 'ENU=The %1 entity cannot be synchronized because it is now based on another table. Try again later and if the problem persists contact your system administrator.';
+      Text003@1001 : TextConst 'ENU=The Outlook item for the %1 entity cannot be synchronized because it was not found in Outlook synchronization folders.';
+      Text004@1015 : TextConst 'ENU=The %1 entity does not exist. Try again later and if the problem persists contact your system administrator.';
+      StartDateTime@1016 : DateTime;
+      RootIterator@1011 : Text[38];
+
+    PROCEDURE ProcessOutlookChanges@1(UserID@1002 : Code[50];XMLMessage@1014 : Text;VAR XMLTextWriterIn@1015 : DotNet "'Microsoft.Dynamics.Nav.OLSync.Common, Version=9.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35'.Microsoft.Dynamics.NAV.OLSync.Common.XmlTextWriter";SkipCheckForConflicts@1006 : Boolean) StartSynchTime : DateTime;
+    VAR
+      OSynchEntity@1000 : Record 5300;
+      OSynchLink@1010 : Record 5302;
+      AllObjWithCaption@1003 : Record 2000000058;
+      XMLTextReader@1008 : DotNet "'Microsoft.Dynamics.Nav.OLSync.Common, Version=9.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35'.Microsoft.Dynamics.NAV.OLSync.Common.XmlTextReader";
+      Container@1005 : Text;
+      SynchEntityCode@1001 : Code[10];
+      TagName@1004 : Text[80];
+      EntryIDHash@1012 : Text[32];
+      StartSynchTimeText@1007 : Text[30];
+      ProcessingFailed@1009 : Boolean;
+    BEGIN
+      XMLTextReader := XMLTextReader.XmlTextReader;
+      IF NOT XMLTextReader.LoadXml(XMLMessage) THEN
+        ERROR(Text001);
+
+      ErrorLogXMLWriter := XMLTextWriterIn;
+
+      OSynchUserSetup.RESET;
+      OSynchUserSetup.SETRANGE("User ID",UserID);
+      IF NOT OSynchUserSetup.FINDFIRST THEN
+        EXIT;
+
+      IF ISNULL(XMLTextReader) THEN
+        ERROR(Text001);
+
+      TagName := XMLTextReader.RootLocalName;
+      IF TagName <> 'SynchronizationMessage' THEN
+        ERROR(Text001);
+
+      XMLTextReader.SelectElements(RootIterator,'SynchronizationMessage');
+      StartSynchTimeText := XMLTextReader.GetCurrentNodeAttribute(RootIterator,'StartSynchTime');
+      IF NOT OSynchTypeConversion.TextToDateTime(StartSynchTimeText,StartSynchTime) THEN
+        ERROR(Text001);
+
+      StartDateTime := StartSynchTime;
+
+      IF XMLTextReader.SelectElements(RootIterator,'*') < 1 THEN
+        EXIT;
+
+      TagName := XMLTextReader.GetName(RootIterator);
+      IF NOT ((TagName <> 'OutlookItem') OR (TagName <> 'DeletedOutlookItem')) THEN
+        ERROR(Text001);
+
+      IF XMLTextReader.SelectElements(RootIterator,'child::OutlookItem | child::DeletedOutlookItem') > 0
+      THEN BEGIN
+        CLEAR(Container);
+        REPEAT
+          CLEAR(EntityRecID);
+          CLEAR(OSynchProcessLine);
+          OSynchActionType := OSynchActionType::Undefined;
+          EntryIDHash := '';
+
+          TagName := XMLTextReader.GetName(RootIterator);
+          SynchEntityCode :=
+            COPYSTR(XMLTextReader.GetCurrentNodeAttribute(RootIterator,'SynchEntityCode'),1,MAXSTRLEN(SynchEntityCode));
+          IF OSynchUserSetup.GET(UserID,SynchEntityCode) THEN
+            IF (OSynchUserSetup."Synch. Direction" <> OSynchUserSetup."Synch. Direction"::"Microsoft Dynamics NAV to Outlook") AND
+               OSynchEntity.GET(SynchEntityCode)
+            THEN BEGIN
+              EntryIDHash := GetEntryIDHash(Container,XMLTextReader,RootIterator);
+              IF EntryIDHash <> '' THEN BEGIN
+                OSynchLink.RESET;
+                OSynchLink.SETRANGE("User ID",UserID);
+                OSynchLink.SETRANGE("Outlook Entry ID Hash",EntryIDHash);
+                IF OSynchLink.FINDFIRST THEN BEGIN
+                  EVALUATE(EntityRecID,FORMAT(OSynchLink."Record ID"));
+                  IF TagName = 'OutlookItem' THEN BEGIN
+                    IF EntityRecID.TABLENO <> OSynchEntity."Table No." THEN BEGIN
+                      AllObjWithCaption.GET(AllObjWithCaption."Object Type"::Table,EntityRecID.TABLENO);
+                      WriteErrorLog(
+                        OSynchUserSetup."User ID",
+                        EntityRecID,
+                        'Error',
+                        SynchEntityCode,
+                        STRSUBSTNO(Text002,SynchEntityCode),
+                        ErrorLogXMLWriter,
+                        Container);
+                    END ELSE
+                      OSynchActionType := OSynchActionType::Modify;
+                  END;
+                  IF TagName = 'DeletedOutlookItem' THEN
+                    OSynchActionType := OSynchActionType::Delete;
+                END ELSE
+                  IF TagName = 'OutlookItem' THEN
+                    OSynchActionType := OSynchActionType::Insert;
+
+                IF OSynchActionType <> OSynchActionType::Undefined THEN BEGIN
+                  CLEAR(OSynchProcessLine);
+                  OSynchProcessLine.SetGlobalParameters(
+                    OSynchEntity,
+                    OSynchUserSetup,
+                    ErrorConflictBuffer,
+                    XMLTextReader,
+                    ErrorLogXMLWriter,
+                    RootIterator,
+                    OSynchActionType,
+                    FORMAT(EntityRecID),
+                    Container,
+                    EntryIDHash,
+                    StartDateTime,
+                    SkipCheckForConflicts);
+
+                  COMMIT;
+                  IF NOT OSynchProcessLine.RUN THEN BEGIN
+                    IF GETLASTERRORTEXT <> '' THEN
+                      WriteErrorLog(
+                        OSynchUserSetup."User ID",
+                        EntityRecID,
+                        'Error',
+                        SynchEntityCode,
+                        GETLASTERRORTEXT,
+                        ErrorLogXMLWriter,
+                        Container);
+                    CLEARLASTERROR;
+                    ErrorConflictBuffer.RESET;
+                    ErrorConflictBuffer.INIT;
+                    ErrorConflictBuffer."User ID" := UserID;
+                    ErrorConflictBuffer."Record ID" := EntityRecID;
+                    ErrorConflictBuffer."Search Record ID" := FORMAT(EntityRecID);
+                    IF ErrorConflictBuffer.INSERT THEN;
+                  END;
+                END;
+              END ELSE
+                WriteErrorLog(
+                  OSynchUserSetup."User ID",
+                  EntityRecID,
+                  'Error',
+                  SynchEntityCode,
+                  STRSUBSTNO(Text003,SynchEntityCode),
+                  ErrorLogXMLWriter,
+                  Container);
+            END ELSE BEGIN
+              WriteErrorLog(
+                OSynchUserSetup."User ID",
+                EntityRecID,
+                'Error',
+                SynchEntityCode,
+                STRSUBSTNO(Text004,SynchEntityCode),
+                ErrorLogXMLWriter,
+                Container);
+              ProcessingFailed := TRUE;
+            END;
+        UNTIL NOT XMLTextReader.MoveNext(RootIterator) OR ProcessingFailed;
+      END;
+
+      XMLTextReader.RemoveIterator(RootIterator);
+      CLEAR(XMLTextReader);
+    END;
+
+    PROCEDURE GetEntryIDHash@15(VAR Container@1004 : Text;VAR XMLTextReaderIn@1002 : DotNet "'Microsoft.Dynamics.Nav.OLSync.Common, Version=9.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35'.Microsoft.Dynamics.NAV.OLSync.Common.XmlTextReader";RootIteratorIn@1003 : Text[38]) EntryIDHash : Text[32];
+    VAR
+      TmpIterator@1001 : Text[38];
+    BEGIN
+      IF XMLTextReaderIn.GetAllCurrentChildNodes(RootIteratorIn,TmpIterator) > 0 THEN
+        IF XMLTextReaderIn.GetName(TmpIterator) = 'EntryID' THEN BEGIN
+          Container := ConvertValueFromBase64(XMLTextReaderIn.GetValue(TmpIterator));
+          EntryIDHash := ComputeHash(Container);
+          XMLTextReaderIn.RemoveIterator(TmpIterator);
+        END;
+    END;
+
+    PROCEDURE WriteErrorLog@3(UserID@1005 : Code[50];ErrorRecordID@1000 : RecordID;KindOfProblem@1001 : Text[80];SynchEntityCode@1002 : Code[10];Description@1003 : Text[1024];VAR ErrorLogXMLWriter1@1004 : DotNet "'Microsoft.Dynamics.Nav.OLSync.Common, Version=9.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35'.Microsoft.Dynamics.NAV.OLSync.Common.XmlTextWriter";Container@1006 : Text);
+    BEGIN
+      ErrorLogXMLWriter1.WriteStartElement(KindOfProblem);
+      ErrorLogXMLWriter1.WriteAttribute('SynchEntityCode',SynchEntityCode);
+      ErrorLogXMLWriter1.WriteAttribute('RecordID',FORMAT(ErrorRecordID));
+
+      ErrorLogXMLWriter1.WriteAttribute(
+        'OccurrenceTime',
+        OSynchTypeConversion.SetDateTimeFormat(
+          OSynchTypeConversion.LocalDT2UTC(CURRENTDATETIME)));
+
+      IF (KindOfProblem = 'Conflict') AND (FORMAT(ErrorRecordID) <> '') THEN
+        ErrorLogXMLWriter1.WriteAttribute(
+          'LastModificationTime',
+          OSynchTypeConversion.SetDateTimeFormat(
+            OSynchTypeConversion.LocalDT2UTC(GetLastModificationTime(ErrorRecordID))));
+      ErrorLogXMLWriter1.WriteAttribute('Description',Description);
+
+      IF FORMAT(ErrorRecordID) = '' THEN BEGIN
+        ErrorLogXMLWriter1.WriteStartElement('EntryID');
+        ErrorLogXMLWriter1.WriteElementTextContent(ConvertValueToBase64(Container));
+        ErrorLogXMLWriter1.WriteEndElement;
+      END ELSE
+        OSynchNAVMgt.WriteLinkedOutlookEntryID(UserID,ErrorRecordID,ErrorLogXMLWriter1);
+
+      ErrorLogXMLWriter1.WriteEndElement;
+    END;
+
+    PROCEDURE GetLastModificationTime@7(SynchRecordID@1003 : RecordID) LastModificationTime : DateTime;
+    VAR
+      ChangeLogEntry@1000 : Record 405;
+      SynchRecRef@1001 : RecordRef;
+      RecID@1004 : RecordID;
+      IsDeleted@1005 : Boolean;
+    BEGIN
+      LastModificationTime := 0DT;
+
+      IsDeleted := NOT SynchRecRef.GET(SynchRecordID);
+      IF IsDeleted THEN
+        SynchRecRef := SynchRecordID.GETRECORD;
+      EVALUATE(RecID,FORMAT(SynchRecRef.RECORDID));
+
+      ChangeLogEntry.SETCURRENTKEY("Table No.","Primary Key Field 1 Value");
+      OSynchProcessLine.FilterChangeLog(RecID,ChangeLogEntry);
+      IF IsDeleted THEN
+        ChangeLogEntry.SETRANGE("Type of Change",ChangeLogEntry."Type of Change"::Deletion)
+      ELSE
+        ChangeLogEntry.SETFILTER("Type of Change",'<>%1',ChangeLogEntry."Type of Change"::Deletion);
+      IF ChangeLogEntry.FINDLAST THEN
+        LastModificationTime := ChangeLogEntry."Date and Time";
+    END;
+
+    PROCEDURE ComputeHash@2(stringToHash@1000 : Text) hashValue : Text[32];
+    VAR
+      HashAlgorithm@1001 : DotNet "'mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Security.Cryptography.HashAlgorithm";
+      Convert@1002 : DotNet "'mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Convert";
+    BEGIN
+      IF stringToHash = '' THEN
+        EXIT('');
+
+      HashAlgorithm := HashAlgorithm.Create;
+      hashValue := Convert.ToBase64String(HashAlgorithm.ComputeHash(Encoding.UTF8.GetBytes(LOWERCASE(stringToHash))));
+      CLEAR(HashAlgorithm);
+      EXIT(hashValue);
+    END;
+
+    PROCEDURE ConvertValueFromBase64@9(base64Value@1001 : Text) stringValue : Text;
+    VAR
+      Convert@1002 : DotNet "'mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Convert";
+    BEGIN
+      IF base64Value = '' THEN
+        EXIT('');
+
+      stringValue := Encoding.UTF8.GetString(Convert.FromBase64String(base64Value));
+      EXIT(stringValue);
+    END;
+
+    PROCEDURE ConvertValueToBase64@4(stringValue@1001 : Text) base64Value : Text;
+    VAR
+      Convert@1002 : DotNet "'mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Convert";
+    BEGIN
+      IF stringValue = '' THEN
+        EXIT('');
+
+      base64Value := Convert.ToBase64String(Encoding.UTF8.GetBytes(stringValue));
+      EXIT(base64Value);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

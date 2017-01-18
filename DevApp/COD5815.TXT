@@ -1,0 +1,445 @@
+OBJECT Codeunit 5815 Undo Sales Shipment Line
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=111;
+    Permissions=TableData 37=imd,
+                TableData 111=imd,
+                TableData 339=rmd,
+                TableData 359=imd,
+                TableData 6507=ri;
+    OnRun=VAR
+            UpdateItemAnalysisView@1000 : Codeunit 7150;
+          BEGIN
+            SETRANGE(Type,Type::Item);
+            IF NOT FIND('-') THEN
+              ERROR(Text006);
+
+            IF NOT HideDialog THEN
+              IF NOT CONFIRM(Text000) THEN
+                EXIT;
+
+            SalesShptLine.COPY(Rec);
+            Code;
+            UpdateItemAnalysisView.UpdateAll(0,TRUE);
+            Rec := SalesShptLine;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      SalesShptLine@1001 : Record 111;
+      TempWhseJnlLine@1017 : TEMPORARY Record 7311;
+      TempGlobalItemLedgEntry@1026 : TEMPORARY Record 32;
+      TempGlobalItemEntryRelation@1025 : TEMPORARY Record 6507;
+      InvtSetup@1007 : Record 313;
+      UndoPostingMgt@1024 : Codeunit 5817;
+      ItemJnlPostLine@1000 : Codeunit 22;
+      Text000@1003 : TextConst 'ENU=Do you really want to undo the selected Shipment lines?';
+      Text001@1009 : TextConst 'ENU=Undo quantity posting...';
+      Text002@1002 : TextConst 'ENU=There is not enough space to insert correction lines.';
+      WhseUndoQty@1015 : Codeunit 7320;
+      InvtAdjmt@1008 : Codeunit 5895;
+      ResJnlPostLine@1004 : Codeunit 212;
+      WhseJnlRegisterLine@1013 : Codeunit 7301;
+      AsmPost@1022 : Codeunit 900;
+      ATOWindow@1023 : Dialog;
+      HideDialog@1005 : Boolean;
+      Text003@1006 : TextConst 'ENU=Checking lines...';
+      Text004@1016 : TextConst 'ENU=Some shipment lines may have unused service items. Do you want to delete them?';
+      NextLineNo@1014 : Integer;
+      Text005@1010 : TextConst 'ENU=This shipment has already been invoiced. Undo Shipment can be applied only to posted, but not invoiced shipments.';
+      Text006@1011 : TextConst 'ENU=Undo Shipment can be performed only for lines of type Item. Please select a line of the Item type and repeat the procedure.';
+      Text055@1019 : TextConst 'ENU=#1#################################\\Checking Undo Assembly #2###########.';
+      Text056@1018 : TextConst 'ENU=#1#################################\\Posting Undo Assembly #2###########.';
+      Text057@1012 : TextConst 'ENU=#1#################################\\Finalizing Undo Assembly #2###########.';
+      Text059@1021 : TextConst '@@@="%1 = SalesShipmentLine.""Document No."". %2 = SalesShipmentLine.FIELDCAPTION(""Line No.""). %3 = SalesShipmentLine.""Line No."". This is used in a progress window.";ENU=%1 %2 %3';
+
+    PROCEDURE SetHideDialog@8(NewHideDialog@1000 : Boolean);
+    BEGIN
+      HideDialog := NewHideDialog;
+    END;
+
+    LOCAL PROCEDURE Code@2();
+    VAR
+      PostedWhseShptLine@1006 : Record 7323;
+      SalesLine@1007 : Record 37;
+      ServItem@1003 : Record 5940;
+      Window@1001 : Dialog;
+      ItemShptEntryNo@1002 : Integer;
+      DocLineNo@1004 : Integer;
+      DeleteServItems@1000 : Boolean;
+      PostedWhseShptLineFound@1005 : Boolean;
+    BEGIN
+      WITH SalesShptLine DO BEGIN
+        CLEAR(ItemJnlPostLine);
+        SETCURRENTKEY("Item Shpt. Entry No.");
+        SETRANGE(Correction,FALSE);
+
+        REPEAT
+          IF NOT HideDialog THEN
+            Window.OPEN(Text003);
+          CheckSalesShptLine(SalesShptLine);
+        UNTIL NEXT = 0;
+
+        ServItem.SETCURRENTKEY("Sales/Serv. Shpt. Document No.");
+        ServItem.SETRANGE("Sales/Serv. Shpt. Document No.","Document No.");
+        IF ServItem.FINDFIRST THEN
+          IF NOT HideDialog THEN
+            DeleteServItems := CONFIRM(Text004,TRUE)
+          ELSE
+            DeleteServItems := TRUE;
+
+        FIND('-');
+        REPEAT
+          TempGlobalItemLedgEntry.RESET;
+          IF NOT TempGlobalItemLedgEntry.ISEMPTY THEN
+            TempGlobalItemLedgEntry.DELETEALL;
+          TempGlobalItemEntryRelation.RESET;
+          IF NOT TempGlobalItemEntryRelation.ISEMPTY THEN
+            TempGlobalItemEntryRelation.DELETEALL;
+
+          IF NOT HideDialog THEN
+            Window.OPEN(Text001);
+
+          PostedWhseShptLineFound :=
+            WhseUndoQty.FindPostedWhseShptLine(
+              PostedWhseShptLine,
+              DATABASE::"Sales Shipment Line",
+              "Document No.",
+              DATABASE::"Sales Line",
+              SalesLine."Document Type"::Order,
+              "Order No.",
+              "Order Line No.");
+
+          CLEAR(ItemJnlPostLine);
+          ItemShptEntryNo := PostItemJnlLine(SalesShptLine,DocLineNo);
+
+          InsertNewShipmentLine(SalesShptLine,ItemShptEntryNo,DocLineNo);
+
+          IF PostedWhseShptLineFound THEN
+            WhseUndoQty.UndoPostedWhseShptLine(PostedWhseShptLine);
+
+          TempWhseJnlLine.SETRANGE("Source Line No.","Line No.");
+          WhseUndoQty.PostTempWhseJnlLine(TempWhseJnlLine);
+
+          UndoPostATO(SalesShptLine);
+
+          UpdateOrderLine(SalesShptLine);
+          IF PostedWhseShptLineFound THEN
+            WhseUndoQty.UpdateShptSourceDocLines(PostedWhseShptLine);
+
+          IF ("Blanket Order No." <> '') AND ("Blanket Order Line No." <> 0) THEN
+            UpdateBlanketOrder(SalesShptLine);
+
+          IF DeleteServItems THEN
+            DeleteSalesShptLineServItems(SalesShptLine);
+
+          "Quantity Invoiced" := Quantity;
+          "Qty. Invoiced (Base)" := "Quantity (Base)";
+          "Qty. Shipped Not Invoiced" := 0;
+          Correction := TRUE;
+          MODIFY;
+
+          UndoFinalizePostATO(SalesShptLine);
+        UNTIL NEXT = 0;
+
+        InvtSetup.GET;
+        IF InvtSetup."Automatic Cost Adjustment" <>
+           InvtSetup."Automatic Cost Adjustment"::Never
+        THEN BEGIN
+          InvtAdjmt.SetProperties(TRUE,InvtSetup."Automatic Cost Posting");
+          InvtAdjmt.SetJobUpdateProperties(TRUE);
+          InvtAdjmt.MakeMultiLevelAdjmt;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckSalesShptLine@3(SalesShptLine@1001 : Record 111);
+    VAR
+      TempItemLedgEntry@1015 : TEMPORARY Record 32;
+    BEGIN
+      WITH SalesShptLine DO BEGIN
+        TESTFIELD(Type,Type::Item);
+        IF "Qty. Shipped Not Invoiced" <> Quantity THEN
+          ERROR(Text005);
+        TESTFIELD("Drop Shipment",FALSE);
+
+        UndoPostingMgt.TestSalesShptLine(SalesShptLine);
+        UndoPostingMgt.CollectItemLedgEntries(TempItemLedgEntry,DATABASE::"Sales Shipment Line",
+          "Document No.","Line No.","Quantity (Base)","Item Shpt. Entry No.");
+        UndoPostingMgt.CheckItemLedgEntries(TempItemLedgEntry,"Line No.");
+
+        UndoInitPostATO(SalesShptLine);
+      END;
+    END;
+
+    LOCAL PROCEDURE PostItemJnlLine@5(SalesShptLine@1000 : Record 111;VAR DocLineNo@1003 : Integer) : Integer;
+    VAR
+      ItemJnlLine@1001 : Record 83;
+      SalesLine@1006 : Record 37;
+      SalesShptHeader@1004 : Record 110;
+      SalesShptLine2@1007 : Record 111;
+      SourceCodeSetup@1002 : Record 242;
+      TempApplyToEntryList@1005 : TEMPORARY Record 32;
+      ItemLedgEntryNotInvoiced@1011 : Record 32;
+      LineSpacing@1008 : Integer;
+      RemQtyBase@1010 : Decimal;
+    BEGIN
+      WITH SalesShptLine DO BEGIN
+        SalesShptLine2.SETRANGE("Document No.","Document No.");
+        SalesShptLine2."Document No." := "Document No.";
+        SalesShptLine2."Line No." := "Line No.";
+        SalesShptLine2.FIND('=');
+
+        DocLineNo := 0;  //**4PS.n        //db, 25-02-14: T003881
+        IF SalesShptLine2.FIND('>') THEN BEGIN
+          LineSpacing := (SalesShptLine2."Line No." - "Line No.") DIV 2;
+          //**4PS.so
+          //IF LineSpacing = 0 THEN
+          //  ERROR(Text002);
+          //**4PS.eo
+          //**4PS.sn
+          IF LineSpacing = 0 THEN BEGIN  //db, 25-02-14: T003881
+            SalesShptLine2.FINDLAST;
+            LineSpacing := 10000;
+            DocLineNo := SalesShptLine2."Line No." + LineSpacing;
+          END;
+          //**4PS.sn
+        END ELSE
+          LineSpacing := 10000;
+        IF DocLineNo = 0 THEN  //**4PS.n  //db, 25-02-14: T003881
+          DocLineNo := "Line No." + LineSpacing;
+
+        SourceCodeSetup.GET;
+        SalesShptHeader.GET("Document No.");
+
+        ItemJnlLine.INIT;
+        ItemJnlLine."Entry Type" := ItemJnlLine."Entry Type"::Sale;
+        ItemJnlLine."Item No." := "No.";
+        ItemJnlLine."Posting Date" := SalesShptHeader."Posting Date";
+        ItemJnlLine."Document No." := "Document No.";
+        ItemJnlLine."Document Line No." := DocLineNo;
+        ItemJnlLine."Gen. Bus. Posting Group" := "Gen. Bus. Posting Group";
+        ItemJnlLine."Gen. Prod. Posting Group" := "Gen. Prod. Posting Group";
+        ItemJnlLine."Location Code" := "Location Code";
+        ItemJnlLine."Source Code" := SourceCodeSetup.Sales;
+        ItemJnlLine.Correction := TRUE;
+        ItemJnlLine."Variant Code" := "Variant Code";
+        ItemJnlLine."Bin Code" := "Bin Code";
+        ItemJnlLine."Document Date" := SalesShptHeader."Document Date";
+
+        WhseUndoQty.InsertTempWhseJnlLine(ItemJnlLine,
+          DATABASE::"Sales Line",
+          SalesLine."Document Type"::Order,
+          "Order No.",
+          "Order Line No.",
+          TempWhseJnlLine."Reference Document"::"Posted Shipment",
+          TempWhseJnlLine,
+          NextLineNo);
+
+        RemQtyBase := -"Quantity (Base)";
+        IF GetUnvoicedShptEntries(SalesShptLine,ItemLedgEntryNotInvoiced) THEN BEGIN
+          REPEAT
+            ItemJnlLine."Applies-to Entry" := ItemLedgEntryNotInvoiced."Entry No.";
+            ItemJnlLine.Quantity := ItemLedgEntryNotInvoiced.Quantity;
+            ItemJnlLine."Quantity (Base)" := ItemLedgEntryNotInvoiced.Quantity;
+            ItemJnlPostLine.RUN(ItemJnlLine);
+            RemQtyBase -= ItemJnlLine.Quantity;
+            IF ItemLedgEntryNotInvoiced.NEXT = 0 THEN;
+          UNTIL (RemQtyBase = 0);
+          EXIT(ItemJnlLine."Item Shpt. Entry No.");
+        END;
+        UndoPostingMgt.CollectItemLedgEntries(TempApplyToEntryList,DATABASE::"Sales Shipment Line",
+          "Document No.","Line No.","Quantity (Base)","Item Shpt. Entry No.");
+
+        UndoPostingMgt.PostItemJnlLineAppliedToList(ItemJnlLine,TempApplyToEntryList,
+          Quantity,"Quantity (Base)",TempGlobalItemLedgEntry,TempGlobalItemEntryRelation);
+
+        EXIT(0); // "Item Shpt. Entry No."
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertNewShipmentLine@1(OldSalesShptLine@1000 : Record 111;ItemShptEntryNo@1001 : Integer;DocLineNo@1004 : Integer);
+    VAR
+      NewSalesShptLine@1002 : Record 111;
+    BEGIN
+      WITH OldSalesShptLine DO BEGIN
+        NewSalesShptLine.INIT;
+        NewSalesShptLine.COPY(OldSalesShptLine);
+        NewSalesShptLine."Line No." := DocLineNo;
+        NewSalesShptLine."Appl.-from Item Entry" := "Item Shpt. Entry No.";
+        NewSalesShptLine."Item Shpt. Entry No." := ItemShptEntryNo;
+        NewSalesShptLine.Quantity := -Quantity;
+        NewSalesShptLine."Qty. Shipped Not Invoiced" := 0;
+        NewSalesShptLine."Quantity (Base)" := -"Quantity (Base)";
+        NewSalesShptLine."Quantity Invoiced" := NewSalesShptLine.Quantity;
+        NewSalesShptLine."Qty. Invoiced (Base)" := NewSalesShptLine."Quantity (Base)";
+        NewSalesShptLine.Correction := TRUE;
+        NewSalesShptLine."Dimension Set ID" := "Dimension Set ID";
+        NewSalesShptLine.INSERT;
+
+        InsertItemEntryRelation(TempGlobalItemEntryRelation,NewSalesShptLine);
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdateOrderLine@4(SalesShptLine@1000 : Record 111);
+    VAR
+      SalesLine@1001 : Record 37;
+    BEGIN
+      WITH SalesShptLine DO BEGIN
+        SalesLine.GET(SalesLine."Document Type"::Order,"Order No.","Order Line No.");
+        UndoPostingMgt.UpdateSalesLine(SalesLine,Quantity,"Quantity (Base)",TempGlobalItemLedgEntry);
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdateBlanketOrder@7(SalesShptLine@1000 : Record 111);
+    VAR
+      BlanketOrderSalesLine@1001 : Record 37;
+      xBlanketOrderSalesLine@1002 : Record 37;
+    BEGIN
+      WITH SalesShptLine DO
+        IF BlanketOrderSalesLine.GET(
+             BlanketOrderSalesLine."Document Type"::"Blanket Order","Blanket Order No.","Blanket Order Line No.")
+        THEN BEGIN
+          BlanketOrderSalesLine.TESTFIELD(Type,Type);
+          BlanketOrderSalesLine.TESTFIELD("No.","No.");
+          BlanketOrderSalesLine.TESTFIELD("Sell-to Customer No.","Sell-to Customer No.");
+          xBlanketOrderSalesLine := BlanketOrderSalesLine;
+
+          IF BlanketOrderSalesLine."Qty. per Unit of Measure" = "Qty. per Unit of Measure" THEN
+            BlanketOrderSalesLine."Quantity Shipped" := BlanketOrderSalesLine."Quantity Shipped" - Quantity
+          ELSE
+            BlanketOrderSalesLine."Quantity Shipped" :=
+              BlanketOrderSalesLine."Quantity Shipped" -
+              ROUND("Qty. per Unit of Measure" / BlanketOrderSalesLine."Qty. per Unit of Measure" * Quantity,0.00001);
+
+          BlanketOrderSalesLine."Qty. Shipped (Base)" := BlanketOrderSalesLine."Qty. Shipped (Base)" - "Quantity (Base)";
+          BlanketOrderSalesLine.InitOutstanding;
+          BlanketOrderSalesLine.MODIFY;
+
+          AsmPost.UpdateBlanketATO(xBlanketOrderSalesLine,BlanketOrderSalesLine);
+        END;
+    END;
+
+    LOCAL PROCEDURE InsertItemEntryRelation@12(VAR TempItemEntryRelation@1003 : TEMPORARY Record 6507;NewSalesShptLine@1000 : Record 111);
+    VAR
+      ItemEntryRelation@1002 : Record 6507;
+    BEGIN
+      IF TempItemEntryRelation.FIND('-') THEN
+        REPEAT
+          ItemEntryRelation := TempItemEntryRelation;
+          ItemEntryRelation.TransferFieldsSalesShptLine(NewSalesShptLine);
+          ItemEntryRelation.INSERT;
+        UNTIL TempItemEntryRelation.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE DeleteSalesShptLineServItems@10(SalesShptLine@1000 : Record 111);
+    VAR
+      ServItem@1003 : Record 5940;
+    BEGIN
+      ServItem.SETCURRENTKEY("Sales/Serv. Shpt. Document No.","Sales/Serv. Shpt. Line No.");
+      ServItem.SETRANGE("Sales/Serv. Shpt. Document No.",SalesShptLine."Document No.");
+      ServItem.SETRANGE("Sales/Serv. Shpt. Line No.",SalesShptLine."Line No.");
+      ServItem.SETRANGE("Shipment Type",ServItem."Shipment Type"::Sales);
+      IF ServItem.FIND('-') THEN
+        REPEAT
+          IF ServItem.CheckIfCanBeDeleted = '' THEN
+            IF ServItem.DELETE(TRUE) THEN;
+        UNTIL ServItem.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE UndoInitPostATO@53(VAR SalesShptLine@1000 : Record 111);
+    VAR
+      PostedAsmHeader@1001 : Record 910;
+    BEGIN
+      IF SalesShptLine.AsmToShipmentExists(PostedAsmHeader) THEN BEGIN
+        OpenATOProgressWindow(Text055,SalesShptLine,PostedAsmHeader);
+
+        AsmPost.UndoInitPostATO(PostedAsmHeader);
+
+        ATOWindow.CLOSE;
+      END;
+    END;
+
+    LOCAL PROCEDURE UndoPostATO@59(VAR SalesShptLine@1004 : Record 111);
+    VAR
+      PostedAsmHeader@1000 : Record 910;
+    BEGIN
+      IF SalesShptLine.AsmToShipmentExists(PostedAsmHeader) THEN BEGIN
+        OpenATOProgressWindow(Text056,SalesShptLine,PostedAsmHeader);
+
+        AsmPost.UndoPostATO(PostedAsmHeader,ItemJnlPostLine,ResJnlPostLine,WhseJnlRegisterLine);
+
+        ATOWindow.CLOSE;
+      END;
+    END;
+
+    LOCAL PROCEDURE UndoFinalizePostATO@61(VAR SalesShptLine@1004 : Record 111);
+    VAR
+      PostedAsmHeader@1000 : Record 910;
+    BEGIN
+      IF SalesShptLine.AsmToShipmentExists(PostedAsmHeader) THEN BEGIN
+        OpenATOProgressWindow(Text057,SalesShptLine,PostedAsmHeader);
+
+        AsmPost.UndoFinalizePostATO(PostedAsmHeader);
+        SynchronizeATO(SalesShptLine);
+
+        ATOWindow.CLOSE;
+      END;
+    END;
+
+    LOCAL PROCEDURE SynchronizeATO@9(VAR SalesShptLine@1000 : Record 111);
+    VAR
+      SalesLine@1001 : Record 37;
+      AsmHeader@1003 : Record 900;
+    BEGIN
+      WITH SalesLine DO BEGIN
+        GET("Document Type"::Order,SalesShptLine."Order No.",SalesShptLine."Order Line No.");
+
+        IF AsmToOrderExists(AsmHeader) AND (AsmHeader.Status = AsmHeader.Status::Released) THEN BEGIN
+          AsmHeader.Status := AsmHeader.Status::Open;
+          AsmHeader.MODIFY;
+          AutoAsmToOrder;
+          AsmHeader.Status := AsmHeader.Status::Released;
+          AsmHeader.MODIFY;
+        END ELSE
+          AutoAsmToOrder;
+
+        MODIFY(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE OpenATOProgressWindow@11(State@1000 : Text[250];SalesShptLine@1001 : Record 111;PostedAsmHeader@1002 : Record 910);
+    BEGIN
+      ATOWindow.OPEN(State);
+      ATOWindow.UPDATE(1,
+        STRSUBSTNO(Text059,
+          SalesShptLine."Document No.",SalesShptLine.FIELDCAPTION("Line No."),SalesShptLine."Line No."));
+      ATOWindow.UPDATE(2,PostedAsmHeader."No.");
+    END;
+
+    LOCAL PROCEDURE GetUnvoicedShptEntries@6(SalesShptLine@1000 : Record 111;VAR ItemLedgEntry@1001 : Record 32) : Boolean;
+    BEGIN
+      ItemLedgEntry.SETCURRENTKEY("Document No.","Document Type","Document Line No.");
+      ItemLedgEntry.SETRANGE("Document Type",ItemLedgEntry."Document Type"::"Sales Shipment");
+      ItemLedgEntry.SETRANGE("Document No.",SalesShptLine."Document No.");
+      ItemLedgEntry.SETRANGE("Document Line No.",SalesShptLine."Line No.");
+      ItemLedgEntry.SETRANGE("Serial No.",'');
+      ItemLedgEntry.SETRANGE("Lot No.",'');
+      ItemLedgEntry.SETRANGE("Completely Invoiced",FALSE);
+      EXIT(ItemLedgEntry.FINDSET)
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

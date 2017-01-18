@@ -1,0 +1,541 @@
+OBJECT Codeunit 70 Purch.-Calc.Discount
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=39;
+    OnRun=VAR
+            TempPurchHeader@1000 : Record 38;
+            TempPurchLine@1001 : Record 39;
+          BEGIN
+            PurchLine.COPY(Rec);
+
+            TempPurchHeader.GET("Document Type","Document No.");
+            UpdateHeader := FALSE;
+            CalculateInvoiceDiscount(TempPurchHeader,TempPurchLine);
+
+            Rec := PurchLine;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1000 : TextConst 'ENU=Service Charge';
+      PurchLine@1001 : Record 39;
+      VendInvDisc@1002 : Record 24;
+      VendPostingGr@1003 : Record 93;
+      Currency@1004 : Record 4;
+      InvDiscBase@1006 : Decimal;
+      ChargeBase@1007 : Decimal;
+      ItemDisc@1100485003 : Decimal;
+      CurrencyDate@1009 : Date;
+      UpdateHeader@1010 : Boolean;
+      Text11012000@1100485004 : TextConst 'ENU=Deleted discount';
+      Confirmed@1100525000 : Boolean;
+
+    PROCEDURE CalculateInvoiceDiscount@1(VAR PurchHeader@1000 : Record 38;VAR PurchLine2@1001 : Record 39);
+    VAR
+      TempVATAmountLine@1002 : TEMPORARY Record 290;
+      PurchSetup@1003 : Record 312;
+      TempServiceChargeLine@1005 : TEMPORARY Record 39;
+      lvDimValRec@1100525003 : Record 349;
+      lvDimMgt@1100525002 : Codeunit 408;
+      lvIsReturnOrder@1100485000 : Boolean;
+      VendorChargeType@1100525001 : Option;
+      counter@1100485001 : Integer;
+      lvAmnt@1100485002 : Decimal;
+      lvAccount@1100485003 : Code[20];
+      lvCostObject@1100485007 : Code[20];
+      lvServOrder@1100485006 : Code[20];
+      lvProject@1100485005 : Code[20];
+      lvElement@1100525000 : Code[20];
+      lvDesc@1100485004 : Text[50];
+      lvCompName@1100485008 : Text[50];
+    BEGIN
+      //**4PS.sn
+      PurchHeader.DetermineRemovalContribution;  //db, 15-11-06
+      IF (PurchHeader."Document Type" IN [PurchHeader."Document Type"::Invoice, PurchHeader."Document Type"::"Credit Memo"]) AND
+         NOT PurchHeader."Invoice Lines Input" THEN //call 28260
+        EXIT;
+      //**4PS.en
+
+      //**4PS.sn (14538)
+      IF NOT Confirmed THEN BEGIN
+        IF ((PurchHeader."Document Type" = PurchHeader."Document Type"::Order) AND
+            (PurchHeader."Purchase Order Type" = PurchHeader."Purchase Order Type"::"Return Order")) OR
+           (PurchHeader."Document Type" = PurchHeader."Document Type"::"Return Order") OR
+           (PurchHeader."Document Type" = PurchHeader."Document Type"::"Credit Memo")
+        THEN
+          EXIT;
+      END;
+      //**4PS.en
+
+      PurchSetup.GET;
+
+      OnBeforeCalcPurchaseDiscount(PurchHeader);
+
+      WITH PurchLine DO BEGIN
+        LOCKTABLE;
+        PurchHeader.TESTFIELD("Vendor Posting Group");
+        VendPostingGr.GET(PurchHeader."Vendor Posting Group");
+
+        PurchLine2.RESET;
+        PurchLine2.SETRANGE("Document Type","Document Type");
+        PurchLine2.SETRANGE("Document No.","Document No.");
+        PurchLine2.SETFILTER(Type,'<>0');
+        PurchLine2.SETRANGE("System-Created Entry",TRUE);
+        PurchLine2.SETRANGE(Type,PurchLine2.Type::"G/L Account");
+        //PurchLine2.SETRANGE("No.",VendPostingGr."Service Charge Acc."); //**4PS.o (24793)
+        //**4PS (24793) In 4PS-Construct not only 'Service Charge' there are more surcharge (for years now) and also the account
+        //**4PS         can be the WIP account (in case of project/service order).
+        PurchLine2.SETRANGE("Vendor Charge",TRUE);  //**4PS.n (24793)
+        IF PurchLine2.FINDSET(TRUE,FALSE) THEN
+          REPEAT
+            IF (PurchLine2."Receipt No." = '') AND (PurchLine2."Qty. Rcd. Not Invoiced (Base)" = 0) THEN BEGIN //**4PS call 26488
+              PurchLine2.SuspendStatusCheck(TRUE); // **4PS.n (25977)
+              PurchLine2.VALIDATE("Direct Unit Cost",0);
+              PurchLine2.SuspendStatusCheck(FALSE); // **4PS.n (25977)
+              //**4PS.sn
+              PurchLine2."Modified by" := USERID; //DP00469
+              PurchLine2."Last Date Modified" := TODAY;//DP00469
+              //**4PS.en
+              PurchLine2.MODIFY;
+              PurchLine2.CreatePurchOrderControl(FALSE); //**4PS.n
+            END; //**4PS call 26488
+            TempServiceChargeLine := PurchLine2;
+            //**4PS.sn
+            TempServiceChargeLine."Input by" := USERID; //DP00469
+            TempServiceChargeLine."Input Date" := TODAY; //DP00469
+            //**4PS.en
+
+            TempServiceChargeLine.INSERT;
+          UNTIL PurchLine2.NEXT = 0;
+
+        PurchLine2.RESET;
+        PurchLine2.SETRANGE("Document Type","Document Type");
+        PurchLine2.SETRANGE("Document No.","Document No.");
+        PurchLine2.SETFILTER(Type,'<>0');
+        IF PurchLine2.FIND('-') THEN;
+        PurchLine2.CalcVATAmountLines(0,PurchHeader,PurchLine2,TempVATAmountLine);
+        InvDiscBase :=
+          TempVATAmountLine.GetTotalInvDiscBaseAmount(
+            PurchHeader."Prices Including VAT",PurchHeader."Currency Code");
+        ChargeBase :=
+          TempVATAmountLine.GetTotalLineAmount(
+            PurchHeader."Prices Including VAT",PurchHeader."Currency Code");
+
+        //**4PS.sn
+        ItemDisc :=
+          TempVATAmountLine.GetTotalItemDiscount(
+            PurchHeader."Prices Including VAT",PurchHeader."Currency Code");
+
+        lvIsReturnOrder := FALSE;
+        IF (PurchHeader."Document Type" = PurchHeader."Document Type"::Order) AND
+           (PurchHeader."Purchase Order Type" = PurchHeader."Purchase Order Type"::"Return Order") THEN BEGIN
+          lvIsReturnOrder := TRUE;
+          InvDiscBase := -InvDiscBase;
+          ChargeBase := -ChargeBase;
+          ItemDisc := 0;
+        END;
+        //**4PS.en
+
+        IF NOT UpdateHeader THEN
+          PurchHeader.MODIFY;
+
+        IF PurchHeader."Posting Date" = 0D THEN
+          CurrencyDate := WORKDATE
+        ELSE
+          CurrencyDate := PurchHeader."Posting Date";
+
+        VendInvDisc.GetRec(
+          PurchHeader."Invoice Disc. Code",PurchHeader."Currency Code",CurrencyDate,ChargeBase);
+
+        //**4PS.sn
+        FOR counter := 1 TO 5 DO BEGIN
+          lvAccount := '';
+          lvCostObject := '';
+          lvServOrder := '';
+          lvProject := '';
+          lvElement := '';
+          lvDesc := '';
+        //CheckAccount(counter, lvAccount, lvCostObject, lvServOrder, lvProject, lvElement, lvCompName);  //C025712.o
+          IF counter = 1 THEN BEGIN
+            lvAmnt := VendInvDisc."Service Charge";
+            IF VendInvDisc."Cost Object Service Charge" <> '' THEN BEGIN
+              lvDimMgt.GetDimValueRec(2, VendInvDisc."Cost Object Service Charge", lvDimValRec, FALSE, '');
+              lvDesc := lvDimValRec.Name;
+            END;
+            IF lvDesc = '' THEN
+              lvDesc := VendInvDisc.FIELDCAPTION("Service Charge");  //db, 04-05-09: M14991
+            VendorChargeType := PurchLine."Vendor Charge Type"::"Service Charge";  //*24793
+          END;
+          IF counter = 2 THEN BEGIN
+            lvAmnt := VendInvDisc."Small Order Charge";
+            IF VendInvDisc."Cost Object Small Order Charge" <> '' THEN BEGIN
+              lvDimMgt.GetDimValueRec(2, VendInvDisc."Cost Object Small Order Charge", lvDimValRec, FALSE, '');
+              lvDesc := lvDimValRec.Name;
+            END;
+            IF lvDesc = '' THEN
+              lvDesc := VendInvDisc.FIELDCAPTION("Small Order Charge");  //db, 04-05-09: M14991
+            VendorChargeType := PurchLine."Vendor Charge Type"::"Small Order Charge";  //*24793
+          END;
+          IF counter = 3 THEN BEGIN
+            lvAmnt := VendInvDisc."Transport Charge";
+            IF VendInvDisc."Cost Object Transport Charge" <> '' THEN BEGIN
+              lvDimMgt.GetDimValueRec(2, VendInvDisc."Cost Object Transport Charge", lvDimValRec, FALSE, '');
+              lvDesc := lvDimValRec.Name;
+            END;
+            IF lvDesc = '' THEN
+              lvDesc := VendInvDisc.FIELDCAPTION("Transport Charge");  //db, 04-05-09: M14991
+            VendorChargeType := PurchLine."Vendor Charge Type"::"Transport Charge";  //*24793
+          END;
+          IF counter = 4 THEN BEGIN
+            lvAmnt := VendInvDisc."Packing Charge";
+            IF VendInvDisc."Cost Object Packing Charge" <> '' THEN BEGIN
+              lvDimMgt.GetDimValueRec(2, VendInvDisc."Cost Object Packing Charge", lvDimValRec, FALSE, '');
+              lvDesc := lvDimValRec.Name;
+            END;
+            IF lvDesc = '' THEN
+              lvDesc := VendInvDisc.FIELDCAPTION("Packing Charge");  //db, 04-05-09: M14991
+            VendorChargeType := PurchLine."Vendor Charge Type"::"Packing Charge";  //*24793
+          END;
+          IF counter = 5 THEN BEGIN
+            lvAmnt := 0;  //db, 15-12-08
+            IF VendInvDisc."Delete Discount" THEN BEGIN
+              lvAmnt := ItemDisc;
+              IF VendInvDisc."Cost Object Deleted Discount" <> '' THEN BEGIN
+                lvDimMgt.GetDimValueRec(2, VendInvDisc."Cost Object Deleted Discount", lvDimValRec, FALSE, '');
+                lvDesc := lvDimValRec.Name;
+              END;
+              IF lvDesc = '' THEN
+                lvDesc := Text11012000;  //db, 04-05-09: M14991
+            END;
+            VendorChargeType := PurchLine."Vendor Charge Type"::"Deleted Discount";  //*24793
+          END;
+          TempServiceChargeLine.SETRANGE("Vendor Charge Type", VendorChargeType);  //*24793
+        //**4PS.en
+
+        IF lvAmnt <> 0 THEN BEGIN  //**4PS.n
+      //IF VendInvDisc."Service Charge" <> 0 THEN BEGIN  //**4PS.o
+      //  VendPostingGr.TESTFIELD("Service Charge Acc.");  //**4PS.o
+          CheckAccount(counter, lvAccount, lvCostObject, lvServOrder, lvProject, lvElement, lvCompName);  //**4PS.n C025712
+
+          IF PurchHeader."Currency Code" = '' THEN
+            Currency.InitRoundingPrecision
+          ELSE
+            Currency.GET(PurchHeader."Currency Code");
+          IF UpdateHeader THEN
+            PurchLine2.SetPurchHeader(PurchHeader);
+          PurchLine2.SuspendStatusCheck(TRUE); // **4PS.n
+          IF NOT TempServiceChargeLine.ISEMPTY THEN BEGIN
+            TempServiceChargeLine.FINDLAST;
+            PurchLine2.GET("Document Type","Document No.",TempServiceChargeLine."Line No.");
+            IF PurchHeader."Prices Including VAT" THEN
+              PurchLine2.VALIDATE(
+                "Direct Unit Cost",
+                ROUND(
+      //          (1 + PurchLine2."VAT %" / 100) * VendInvDisc."Service Charge", //**4PS.o
+                  (1 + PurchLine2."VAT %" / 100) * lvAmnt,   //**4PS.n
+                  Currency."Unit-Amount Rounding Precision"))
+            ELSE
+      //      PurchLine2.VALIDATE("Direct Unit Cost",VendInvDisc."Service Charge"); //**4PS.o
+              PurchLine2.VALIDATE("Direct Unit Cost",lvAmnt);  //**4PS.n
+            PurchLine2.SuspendStatusCheck(FALSE); // **4PS.n
+            //**4PS.sn
+            PurchLine2."Modified by" := USERID; //DP00469
+            PurchLine2."Last Date Modified" := TODAY;//DP00469
+            //**4PS.en
+            PurchLine2.MODIFY;
+            PurchLine2.CreatePurchOrderControl(FALSE); //**4PS.n
+          END ELSE BEGIN
+            PurchLine2.RESET;
+            PurchLine2.SETRANGE("Document Type","Document Type");
+            PurchLine2.SETRANGE("Document No.","Document No.");
+            PurchLine2.FIND('+');
+            PurchLine2.INIT;
+            PurchLine2.SuspendStatusCheck(TRUE); // **4PS.n
+
+            IF UpdateHeader THEN
+              PurchLine2.SetPurchHeader(PurchHeader);
+            PurchLine2."Line No." := PurchLine2."Line No." + 10000;
+            PurchLine2.Type := PurchLine2.Type::"G/L Account";
+            //**4PS.sn
+            IF lvCompName <> COMPANYNAME THEN    //jth, 23-04-2010
+              PurchLine2."Receiving Company" := lvCompName;  //db, 09-10-006
+            IF lvServOrder <> '' THEN
+              PurchLine2.VALIDATE("Service Order No.", lvServOrder);
+            IF lvProject <> '' THEN BEGIN
+              PurchLine2.VALIDATE("Job No.", lvProject);
+              IF lvElement <> '' THEN
+                PurchLine2.VALIDATE(Element, lvElement);
+            END;
+            IF lvCostObject <> '' THEN
+              PurchLine2.VALIDATE("Shortcut Dimension 2 Code", lvCostObject);
+            //**4PS.en
+      //    PurchLine2.VALIDATE("No.",VendPostingGr."Service Charge Acc.");  //**4PS.o
+            PurchLine2.VALIDATE("No.",lvAccount);  //**4PS.n
+      //    PurchLine2.Description := Text000;  //**4PS.o
+            PurchLine2.Description := lvDesc;  //**4PS.n
+      //      PurchLine2.VALIDATE(Quantity,1);  //**4PS.o
+            //**4PS.sn
+            PurchLine2."Vendor Charge" := TRUE;
+            PurchLine2."Exclude From Electronic Order" := TRUE;
+            PurchLine2."Vendor Charge Type" := VendorChargeType;  //*24793
+            IF NOT lvIsReturnOrder THEN
+              PurchLine2.VALIDATE(Quantity,1)
+            ELSE
+              PurchLine2.VALIDATE(Quantity,-1);
+            //**4PS.en
+            IF PurchLine2."Document Type" IN
+               [PurchLine2."Document Type"::"Return Order",PurchLine2."Document Type"::"Credit Memo"]
+            THEN
+              PurchLine2.VALIDATE("Return Qty. to Ship",PurchLine2.Quantity)
+            ELSE
+              PurchLine2.VALIDATE("Qty. to Receive",PurchLine2.Quantity);
+            IF PurchHeader."Prices Including VAT" THEN
+              PurchLine2.VALIDATE(
+                "Direct Unit Cost",
+                ROUND(
+      //          (1 + PurchLine2."VAT %" / 100) * VendInvDisc."Service Charge",  //**4PS.o
+                  (1 + PurchLine2."VAT %" / 100) * lvAmnt,  //**4PS.n
+                  Currency."Unit-Amount Rounding Precision"))
+            ELSE
+      //      PurchLine2.VALIDATE("Direct Unit Cost",VendInvDisc."Service Charge");  //**4PS.o
+              PurchLine2.VALIDATE("Direct Unit Cost",lvAmnt);  //**4PS.n
+            PurchLine2."System-Created Entry" := TRUE;
+            //**4PS.sn
+            IF (lvCostObject <> '') AND (PurchLine2."Shortcut Dimension 2 Code" <> lvCostObject) THEN BEGIN
+              PurchLine2."Shortcut Dimension 2 Code" := lvCostObject;
+              PurchLine2.ValidateShortcutDimCode(2,PurchLine2."Shortcut Dimension 2 Code");
+            END;
+            PurchLine2.SuspendStatusCheck(FALSE);
+            //**4PS.en
+            //**4PS.sn
+            PurchLine2."Input by" := USERID; //DP00469
+            PurchLine2."Input Date" := TODAY; //DP00469
+            //**4PS.en
+            PurchLine2.INSERT;
+            PurchLine2.CreatePurchOrderControl(FALSE); //**4PS.n
+          END;
+          PurchLine2.CalcVATAmountLines(0,PurchHeader,PurchLine2,TempVATAmountLine);
+        END ELSE
+          IF TempServiceChargeLine.FINDSET(FALSE,FALSE) THEN
+            REPEAT
+              IF (TempServiceChargeLine."Receipt No." = '') AND (TempServiceChargeLine."Qty. Rcd. Not Invoiced (Base)" = 0) THEN BEGIN
+                PurchLine2 := TempServiceChargeLine;
+                PurchLine2.SuspendStatusCheck(TRUE); // **4PS.n
+                PurchLine2.DELETE(TRUE);
+                PurchLine2.SuspendStatusCheck(FALSE); // **4PS.n
+              END;
+            UNTIL TempServiceChargeLine.NEXT = 0;
+        END; //**4PS.n (end-for)
+
+        IF VendInvDiscRecExists(PurchHeader."Invoice Disc. Code") THEN BEGIN
+          IF InvDiscBase <> ChargeBase THEN
+            VendInvDisc.GetRec(
+              PurchHeader."Invoice Disc. Code",PurchHeader."Currency Code",CurrencyDate,InvDiscBase);
+
+          PurchHeader."Invoice Discount Calculation" := PurchHeader."Invoice Discount Calculation"::"%";
+          PurchHeader."Invoice Discount Value" := VendInvDisc."Discount %";
+          IF NOT UpdateHeader THEN
+            PurchHeader.MODIFY;
+
+          TempVATAmountLine.SetInvoiceDiscountPercent(
+            VendInvDisc."Discount %",PurchHeader."Currency Code",
+            PurchHeader."Prices Including VAT",PurchSetup."Calc. Inv. Disc. per VAT ID",
+            PurchHeader."VAT Base Discount %");
+
+          PurchLine2.UpdateVATOnLines(0,PurchHeader,PurchLine2,TempVATAmountLine);
+        END;
+      END;
+
+      OnAfterCalcPurchaseDiscount(PurchHeader);
+    END;
+
+    LOCAL PROCEDURE VendInvDiscRecExists@3(InvDiscCode@1000 : Code[20]) : Boolean;
+    VAR
+      VendInvDisc@1001 : Record 24;
+    BEGIN
+      VendInvDisc.SETRANGE(Code,InvDiscCode);
+      EXIT(VendInvDisc.FINDFIRST);
+    END;
+
+    PROCEDURE CalculateIncDiscForHeader@2(VAR PurchHeader@1002 : Record 38);
+    VAR
+      PurchSetup@1000 : Record 312;
+    BEGIN
+      PurchSetup.GET;
+      IF NOT PurchSetup."Calc. Inv. Discount" THEN
+        EXIT;
+      WITH PurchHeader DO BEGIN
+        PurchLine."Document Type" := "Document Type";
+        PurchLine."Document No." := "No.";
+        CalculateInvoiceDiscount(PurchHeader,PurchLine);
+      END;
+    END;
+
+    PROCEDURE CalculateInvoiceDiscountOnLine@24(VAR PurchLineToUpdate@1001 : Record 39);
+    VAR
+      PurchHeaderTemp@1003 : Record 38;
+    BEGIN
+      PurchLine.COPY(PurchLineToUpdate);
+
+      PurchHeaderTemp.GET(PurchLineToUpdate."Document Type",PurchLineToUpdate."Document No.");
+      UpdateHeader := TRUE;
+      CalculateInvoiceDiscount(PurchHeaderTemp,PurchLineToUpdate);
+
+      PurchLineToUpdate.COPY(PurchLine);
+    END;
+
+    [Integration]
+    LOCAL PROCEDURE OnBeforeCalcPurchaseDiscount@4(VAR PurchaseHeader@1000 : Record 38);
+    BEGIN
+    END;
+
+    [Integration]
+    LOCAL PROCEDURE OnAfterCalcPurchaseDiscount@5(VAR PurchaseHeader@1000 : Record 38);
+    BEGIN
+    END;
+
+    PROCEDURE CheckAccount@1100485000(counter@1100485011 : Integer;VAR lvAccount@1100485013 : Code[20];VAR lvCostObject@1100485014 : Code[20];VAR lvServOrder@1100485015 : Code[20];VAR lvProject@1100485016 : Code[20];VAR lvElement@1100525001 : Code[20];VAR lvCompName@1100485002 : Text[50]);
+    VAR
+      PurchSetup@1100485001 : Record 312;
+      ProjSetup@1100485010 : Record 315;
+      PurchLineRec@1100485000 : Record 39;
+      ServOrderRec@1100485004 : Record 11012823;
+      ServTypeRec@1100485007 : Record 11012814;
+      ProjRec@1100485008 : Record 11072003;
+      ProjTypeRec@1100485009 : Record 11012009;
+      DimValRec@1100485006 : Record 349;
+      DimMgt@1100485005 : Codeunit 408;
+    BEGIN
+      //**4PS
+      PurchSetup.GET;
+
+      IF PurchSetup."Vendor Charge Project/Service" THEN BEGIN
+        PurchLineRec.SETRANGE("Document Type", PurchLine."Document Type");
+        PurchLineRec.SETRANGE("Document No.", PurchLine."Document No.");
+        PurchLineRec.SETRANGE(Type, PurchLine.Type::"G/L Account");
+        PurchLineRec.SETFILTER("Service Order No.", '<>%1', '');
+        IF PurchLineRec.FINDFIRST THEN BEGIN
+          lvServOrder := PurchLineRec."Service Order No.";
+          lvCompName := PurchLineRec."Receiving Company";
+        END ELSE BEGIN
+          PurchLineRec.SETRANGE("Service Order No.");
+          PurchLineRec.SETFILTER("Job No.", '<>%1', '');
+          IF PurchLineRec.FINDFIRST THEN BEGIN
+            lvProject := PurchLineRec."Job No.";
+            lvElement := PurchLineRec.Element;
+            lvCompName := PurchLineRec."Receiving Company";
+          END;
+        END;
+      END;
+
+      //IF (lvServOrder <> '') OR (lvProject <> '') THEN BEGIN //#C012296.o kzwerver, 140312
+        IF lvCompName = '' THEN
+          lvCompName := COMPANYNAME;
+        ServOrderRec.CHANGECOMPANY(lvCompName);
+        ProjSetup.CHANGECOMPANY(lvCompName);
+        ProjRec.CHANGECOMPANY(lvCompName);
+
+        IF counter = 1 THEN BEGIN
+          IF VendInvDisc."Service Charge" <> 0 THEN
+            IF (lvServOrder <> '') OR (lvProject <> '') THEN //#C012296.n kzwerver, 140312
+              VendInvDisc.TESTFIELD("Cost Object Service Charge");
+          lvCostObject := VendInvDisc."Cost Object Service Charge";
+        END;
+        IF counter = 2 THEN BEGIN
+          IF VendInvDisc."Small Order Charge" <> 0 THEN
+            IF (lvServOrder <> '') OR (lvProject <> '') THEN //#C012296.n kzwerver, 140312
+              VendInvDisc.TESTFIELD("Cost Object Small Order Charge");
+          lvCostObject := VendInvDisc."Cost Object Small Order Charge";
+        END;
+        IF counter = 3 THEN BEGIN
+          IF VendInvDisc."Transport Charge" <> 0 THEN
+            IF (lvServOrder <> '') OR (lvProject <> '') THEN //#C012296.n kzwerver, 140312
+              VendInvDisc.TESTFIELD("Cost Object Transport Charge");
+          lvCostObject := VendInvDisc."Cost Object Transport Charge";
+        END;
+        IF counter = 4 THEN BEGIN
+          IF VendInvDisc."Packing Charge" <> 0 THEN
+            IF (lvServOrder <> '') OR (lvProject <> '') THEN //#C012296.n kzwerver, 140312
+              VendInvDisc.TESTFIELD("Cost Object Packing Charge");
+          lvCostObject := VendInvDisc."Cost Object Packing Charge";
+        END;
+        IF counter = 5 THEN BEGIN
+          IF VendInvDisc."Delete Discount" THEN
+            IF (lvServOrder <> '') OR (lvProject <> '') THEN //#C012296.n kzwerver, 140312
+              VendInvDisc.TESTFIELD("Cost Object Deleted Discount");
+          lvCostObject := VendInvDisc."Cost Object Deleted Discount";
+        END;
+
+        IF lvCostObject <> '' THEN
+          DimMgt.GetDimValueRec(2, lvCostObject, DimValRec, TRUE, lvProject);
+
+        IF lvServOrder <> '' THEN BEGIN
+          ServOrderRec.GET(lvServOrder);
+          lvAccount := ServTypeRec.GetWipAcc(
+            ServOrderRec."Service Type",
+            DimValRec."Cost Type",
+            lvCompName,
+            DimValRec."Cost Type",
+            '');
+        END;
+
+        IF lvProject <> '' THEN BEGIN
+          ProjSetup.GET;
+          ProjRec.GET(lvProject);
+          lvAccount := ProjTypeRec.GetWipAcc(ProjRec."Project Type",
+                                             DimValRec."Cost Type",
+                                             ProjRec."Project Status",
+                                             ProjSetup."Provisions at Closure",
+                                             lvCompName,
+                                             DimValRec."Cost Type",'');
+        END;
+      //END; //#C012296.o kzwerver, 140312
+
+      IF lvAccount = '' THEN BEGIN
+        //lvCostObject := ''; //#C012296.o kzwerver, 140312
+        lvServOrder := '';
+        lvProject := '';
+        lvElement := '';
+        IF counter = 1 THEN BEGIN
+          VendPostingGr.TESTFIELD("Service Charge Acc.");
+          lvAccount := VendPostingGr."Service Charge Acc.";
+        END;
+        IF counter = 2 THEN BEGIN
+          VendPostingGr.TESTFIELD("Small Order Charge Acc.");
+          lvAccount := VendPostingGr."Small Order Charge Acc.";
+        END;
+        IF counter = 3 THEN BEGIN
+          VendPostingGr.TESTFIELD("Transport Charge Acc.");
+          lvAccount := VendPostingGr."Transport Charge Acc.";
+        END;
+        IF counter = 4 THEN BEGIN
+          VendPostingGr.TESTFIELD("Packing Charge Acc.");
+          lvAccount := VendPostingGr."Packing Charge Acc.";
+        END;
+        IF counter = 5 THEN BEGIN
+          VendPostingGr.TESTFIELD("Deleted Discount Acc.");
+          lvAccount := VendPostingGr."Deleted Discount Acc.";
+        END;
+      END;
+    END;
+
+    PROCEDURE SetConfirmed@1100525000();
+    BEGIN
+      //**4PS (14538)
+      Confirmed := TRUE;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

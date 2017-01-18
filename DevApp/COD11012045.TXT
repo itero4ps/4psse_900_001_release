@@ -1,0 +1,1063 @@
+OBJECT Codeunit 11012045 Purch. Route Ref. Management
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      PurchRouteRefRec@1210190000 : Record 11012079;
+      EstRec@1100525001 : Record 11012151;
+      OLDEstPartRec@1210190011 : Record 11012153;
+      NEWEstPartRec@1100528900 : Record 11072073;
+      OLDEstLineRec@1210190002 : Record 11012154;
+      NEWEstLineRec@1100528901 : Record 11072072;
+      OLDRcpLineRec@1210190001 : Record 11012156;
+      NEWRcpLineRec@1100528902 : Record 11072075;
+      RawEstLineRec@1100525000 : Record 11125680;
+      RawEstElemRec@1100525002 : Record 11125679;
+      PurchHeadRec@1210190007 : Record 38;
+      PurchLineRec@1210190003 : Record 39;
+      BudgetRec@1210190005 : Record 11012001;
+      AdviceOrderRec@1210190006 : Record 11012055;
+      ProjRec@1210190008 : Record 11072003;
+      BudgetAdjRec@1210190009 : Record 11012003;
+      ApprovalLineRec@1210190020 : Record 11012032;
+      PostedPurchRcptHeadRec@1210190015 : Record 120;
+      PostedPurchRcptLineRec@1210190014 : Record 121;
+      PostedPurchInvHeadRec@1210190019 : Record 122;
+      PostedPurchInvLineRec@1210190016 : Record 123;
+      PostedPurchCrMemoHeadRec@1210190018 : Record 124;
+      PostedPurchCrMemoLineRec@1210190017 : Record 125;
+      AssemblyYardNumberObject@1100528400 : Record 11020596;
+      NextEntryNo@1210190004 : Integer;
+      SelectedQuoteEntry@1210190010 : Integer;
+      Text001@1210190013 : TextConst 'ENU=Of %1 ''%2'' still quote(s) present.';
+      Text002@1210190012 : TextConst 'ENU=Delete line?';
+
+    PROCEDURE GetLastRefNo@1210190001() : Code[20];
+    BEGIN
+      PurchRouteRefRec.LOCKTABLE;
+      PurchRouteRefRec.RESET;
+      IF NOT PurchRouteRefRec.GET(PurchRouteRefRec.Type::"Last No. Used", '', 0) THEN
+        EXIT( PADSTR('', MAXSTRLEN(PurchRouteRefRec."No."), '0'));
+
+      EXIT(PurchRouteRefRec."No.");
+    END;
+
+    PROCEDURE WriteLastRefNo@1210190003(IRefNo@1210190000 : Code[20]);
+    BEGIN
+      IF (IRefNo = '') THEN
+        EXIT;
+
+      PurchRouteRefRec.RESET;
+      IF PurchRouteRefRec.GET(PurchRouteRefRec.Type::"Last No. Used", '', 0) THEN BEGIN
+        IF (IRefNo > PurchRouteRefRec."No.") THEN BEGIN
+          PurchRouteRefRec."No." := IRefNo;
+          PurchRouteRefRec.MODIFY;
+        END;
+      END ELSE BEGIN
+        PurchRouteRefRec.INIT;
+        PurchRouteRefRec.Type := PurchRouteRefRec.Type::"Last No. Used";
+        PurchRouteRefRec."Reference No." := '';
+        PurchRouteRefRec."Entry No." := 0;
+        PurchRouteRefRec."No." := IRefNo;
+        PurchRouteRefRec.INSERT;
+      END;
+    END;
+
+    PROCEDURE ShowReferenceList@1210190002(IRefNoFilter@1210190000 : Code[1024]);
+    BEGIN
+      WITH PurchRouteRefRec DO BEGIN
+        UpdateReferenceLines(IRefNoFilter);
+        COMMIT;
+
+        RESET;
+        SETRANGE(Type, Type::Reference);
+        SETFILTER("Reference No.", IRefNoFilter);
+        PAGE.RUNMODAL(PAGE::"Purchase Route Reference List", PurchRouteRefRec);
+
+        RESET;
+        SETRANGE(Type, Type::Reference);
+        SETFILTER("Reference No.", IRefNoFilter);
+        DELETEALL;
+        COMMIT;
+      END;
+    END;
+
+    PROCEDURE ShowReferenceQuoteList@1210190010(IRefNoFilter@1210190000 : Code[1024]);
+    BEGIN
+      WITH PurchRouteRefRec DO BEGIN
+        UpdateReferenceLines(IRefNoFilter);  // Fill for all
+        COMMIT;
+
+        RESET;
+        SETRANGE(Type, Type::Reference);
+        SETFILTER("Reference No.", IRefNoFilter);
+        SETRANGE("Line Type", "Line Type"::"Quote Line");  // Show (default) only quotes
+        IF (SelectedQuoteEntry <> 0) THEN
+          "Entry No." := SelectedQuoteEntry;
+        PAGE.RUNMODAL(PAGE::"Purchase Route Reference List", PurchRouteRefRec);
+
+        RESET;
+        SETRANGE(Type, Type::Reference);
+        SETFILTER("Reference No.", IRefNoFilter);
+        DELETEALL;
+        COMMIT;
+      END;
+    END;
+
+    PROCEDURE ShowReferencePurchOrderList@1210190011(IRefNo@1210190000 : Code[20]);
+    BEGIN
+      WITH PurchRouteRefRec DO BEGIN
+        UpdateReferenceLines(IRefNo);  // Fill for all
+        COMMIT;
+
+        RESET;
+        SETRANGE(Type, Type::Reference);
+        SETRANGE("Reference No.", IRefNo);
+        SETRANGE("Line Type", "Line Type"::"Purchase Order Line");  // Show (default) only purch. orders
+        PAGE.RUNMODAL(PAGE::"Purchase Route Reference List", PurchRouteRefRec);
+
+        RESET;
+        SETRANGE(Type, Type::Reference);
+        SETRANGE("Reference No.", IRefNo);
+        DELETEALL;
+        COMMIT;
+      END;
+    END;
+
+    PROCEDURE UpdateReferenceLines@1210190000(IRefNoFilter@1210190000 : Code[1024]);
+    BEGIN
+      WITH PurchRouteRefRec DO BEGIN
+        SelectedQuoteEntry := 0;
+
+        RESET;
+        SETRANGE(Type, Type::Reference);
+        SETFILTER("Reference No.", IRefNoFilter);
+        DELETEALL;
+
+        IF (IRefNoFilter = '') THEN
+          EXIT;
+
+        NextEntryNo := 1;
+
+        IF RawEstLineRec.READPERMISSION THEN BEGIN  //db, 15-01-10
+          RawEstLineRec.RESET;
+          RawEstLineRec.SETCURRENTKEY("Purchase Route Reference");
+          RawEstLineRec.SETFILTER("Purchase Route Reference", IRefNoFilter);
+          IF RawEstLineRec.FINDSET(FALSE, FALSE) THEN BEGIN
+            REPEAT
+              INIT;
+              Type := Type::Reference;
+              "Reference No." := RawEstLineRec."Purchase Route Reference";
+              "Entry No." := NextEntryNo;
+              "Line Type" := "Line Type"::"Estimate Line";
+              "No." := RawEstLineRec."Estimate No.";
+              "Line No." := RawEstLineRec."Line No.";
+              "Tender Paragraph" := RawEstLineRec."Element No.";
+              "Estimate Line" := RawEstLineRec."Line No.";
+              Vendor := RawEstLineRec.Vendor;
+              INSERT;
+              NextEntryNo := NextEntryNo + 1;
+            UNTIL RawEstLineRec.NEXT = 0;
+          END;
+        END;
+
+        OLDEstLineRec.RESET;
+        OLDEstLineRec.SETCURRENTKEY("Purchase Route Reference");
+        OLDEstLineRec.SETFILTER("Purchase Route Reference", IRefNoFilter);
+        IF OLDEstLineRec.FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            INIT;
+            Type := Type::Reference;
+            "Reference No." := OLDEstLineRec."Purchase Route Reference";
+            "Entry No." := NextEntryNo;
+            "Line Type" := "Line Type"::"Estimate Line";
+            "No." := OLDEstLineRec."Estimate No.";
+            "Line No." := OLDEstLineRec."Line No.";
+            "Sub-Estimate No." := OLDEstLineRec."Sub-Estimate No.";
+            "Part Group" := OLDEstLineRec."Part Group";
+            Part := OLDEstLineRec.Part;
+            "Estimate Line" := OLDEstLineRec."Line No.";
+            Vendor := OLDEstLineRec.Vendor;
+            INSERT;
+            NextEntryNo := NextEntryNo + 1;
+          UNTIL OLDEstLineRec.NEXT = 0;
+        END;
+
+        NEWEstLineRec.RESET;  //DP00381
+        NEWEstLineRec.SETCURRENTKEY("Purchase Route Reference");
+        NEWEstLineRec.SETFILTER("Purchase Route Reference", IRefNoFilter);
+        IF NEWEstLineRec.FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            INIT;
+            Type := Type::Reference;
+            "Reference No." := NEWEstLineRec."Purchase Route Reference";
+            "Entry No." := NextEntryNo;
+            "Line Type" := "Line Type"::"Estimate Line";
+            "No." := NEWEstLineRec."Estimate No.";
+            "Line No." := NEWEstLineRec."Line No.";
+            "Sub-Estimate No." := NEWEstLineRec."Sub-Estimate No.";
+            "Part Group" := NEWEstLineRec."Part Group";
+            Part := NEWEstLineRec.Part;
+            "Estimate Line" := NEWEstLineRec."Line No.";
+            Vendor := NEWEstLineRec.Vendor;
+            INSERT;
+            NextEntryNo := NextEntryNo + 1;
+          UNTIL NEWEstLineRec.NEXT = 0;
+        END;
+
+        OLDRcpLineRec.RESET;
+        OLDRcpLineRec.SETCURRENTKEY("Purchase Route Reference");
+        OLDRcpLineRec.SETFILTER("Purchase Route Reference", IRefNoFilter);
+        IF OLDRcpLineRec.FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            INIT;
+            Type := Type::Reference;
+            "Reference No." := OLDRcpLineRec."Purchase Route Reference";
+            "Entry No." := NextEntryNo;
+            "Line Type" := "Line Type"::"Recipe Line";
+            "No." := OLDRcpLineRec."Estimate No.";
+            "Line No." := OLDRcpLineRec."Line No.";
+            "Sub-Estimate No." := OLDRcpLineRec."Sub-Estimate No.";
+            "Part Group" := OLDRcpLineRec."Part Group";
+            Part := OLDRcpLineRec.Part;
+            "Estimate Line" := OLDRcpLineRec."Estimate Line";
+            "Recipe Group" := OLDRcpLineRec."Recipe Group";
+            Recipe := OLDRcpLineRec.Recipe;
+            Vendor := OLDRcpLineRec.Vendor;
+            INSERT;
+            NextEntryNo := NextEntryNo + 1;
+          UNTIL OLDRcpLineRec.NEXT = 0;
+        END;
+
+        NEWRcpLineRec.RESET;  //DP00381
+        NEWRcpLineRec.SETCURRENTKEY("Purchase Route Reference");
+        NEWRcpLineRec.SETFILTER("Purchase Route Reference", IRefNoFilter);
+        IF NEWRcpLineRec.FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            INIT;
+            Type := Type::Reference;
+            "Reference No." := NEWRcpLineRec."Purchase Route Reference";
+            "Entry No." := NextEntryNo;
+            "Line Type" := "Line Type"::"Recipe Line";
+            "No." := NEWRcpLineRec."Estimate No.";
+            "Line No." := NEWRcpLineRec."Line No.";
+            "Sub-Estimate No." := NEWRcpLineRec."Sub-Estimate No.";
+            "Part Group" := NEWRcpLineRec."Part Group";
+            Part := NEWRcpLineRec.Part;
+            "Estimate Line" := NEWRcpLineRec."Estimate Line";
+            "Recipe Group" := NEWRcpLineRec."Recipe Group";
+            Recipe := NEWRcpLineRec.Recipe;
+            Vendor := NEWRcpLineRec.Vendor;
+            INSERT;
+            NextEntryNo := NextEntryNo + 1;
+          UNTIL NEWRcpLineRec.NEXT = 0;
+        END;
+
+        PurchLineRec.RESET;
+        PurchLineRec.SETCURRENTKEY("Document Type","Purchase Route Reference");
+        PurchLineRec.SETRANGE("Document Type", PurchLineRec."Document Type"::Quote);
+        PurchLineRec.SETFILTER("Purchase Route Reference", IRefNoFilter);
+        IF PurchLineRec.FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            INIT;
+            Type := Type::Reference;
+            "Reference No." := PurchLineRec."Purchase Route Reference";
+            "Entry No." := NextEntryNo;
+            "Line Type" := "Line Type"::"Quote Line";
+            "No." := PurchLineRec."Document No.";
+            "Line No." := PurchLineRec."Line No.";
+            "Quote Selected" := PurchLineRec."Quote Selected";
+            IF (SelectedQuoteEntry = 0) AND ("Quote Selected") THEN
+              SelectedQuoteEntry := "Entry No.";
+            Vendor := PurchLineRec."Buy-from Vendor No.";
+            IF Vendor = '' THEN BEGIN
+              PurchLineRec.CALCFIELDS("Buy-from Contact No.");
+              IF PurchLineRec."Buy-from Contact No." <> '' THEN BEGIN
+                Vendor := PurchLineRec."Buy-from Contact No.";
+                "Vendor/Contact" := "Vendor/Contact"::Contact;
+              END;
+            END;
+            INSERT;
+            NextEntryNo := NextEntryNo + 1;
+          UNTIL PurchLineRec.NEXT = 0;
+        END;
+
+        BudgetRec.RESET;
+        BudgetRec.SETCURRENTKEY("Purchase Route Reference");
+        BudgetRec.SETFILTER("Purchase Route Reference", IRefNoFilter);
+        IF BudgetRec.FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            INIT;
+            Type := Type::Reference;
+            "Reference No." := BudgetRec."Purchase Route Reference";
+            "Entry No." := NextEntryNo;
+            "Line Type" := "Line Type"::"Budget Line";
+            "No." := BudgetRec."Project No.";
+            "Line No." := BudgetRec."Line No.";
+            Adjustment := BudgetRec.Adjustment;
+            "Extension Contract" := BudgetRec."Extension Contract";
+            Option := BudgetRec.Option;
+            Vendor := BudgetRec.Vendor;
+            INSERT;
+            NextEntryNo := NextEntryNo + 1;
+          UNTIL BudgetRec.NEXT = 0;
+        END;
+
+        AdviceOrderRec.RESET;
+        AdviceOrderRec.SETCURRENTKEY("Purchase Route Reference");
+        AdviceOrderRec.SETFILTER("Purchase Route Reference", IRefNoFilter);
+        IF AdviceOrderRec.FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            INIT;
+            Type := Type::Reference;
+            "Reference No." := AdviceOrderRec."Purchase Route Reference";
+            "Entry No." := NextEntryNo;
+            "Line Type" := "Line Type"::"Advice Order";
+            "No." := AdviceOrderRec."Project No.";
+            "Line No." := AdviceOrderRec."Line No.";
+            Vendor := AdviceOrderRec.Vendor;
+            INSERT;
+            NextEntryNo := NextEntryNo + 1;
+          UNTIL AdviceOrderRec.NEXT = 0;
+        END;
+
+        PurchLineRec.RESET;
+        PurchLineRec.SETCURRENTKEY("Document Type","Purchase Route Reference");
+        PurchLineRec.SETRANGE("Document Type", PurchLineRec."Document Type"::Order);
+        PurchLineRec.SETFILTER("Purchase Route Reference", IRefNoFilter);
+        IF PurchLineRec.FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            INIT;
+            Type := Type::Reference;
+            "Reference No." := PurchLineRec."Purchase Route Reference";
+            "Entry No." := NextEntryNo;
+            "Line Type" := "Line Type"::"Purchase Order Line";
+            "No." := PurchLineRec."Document No.";
+            "Line No." := PurchLineRec."Line No.";
+            Vendor := PurchLineRec."Buy-from Vendor No.";
+            INSERT;
+            NextEntryNo := NextEntryNo + 1;
+          UNTIL PurchLineRec.NEXT = 0;
+        END;
+
+        PostedPurchRcptLineRec.RESET;
+        PostedPurchRcptLineRec.SETCURRENTKEY("Purchase Route Reference");
+        PostedPurchRcptLineRec.SETFILTER("Purchase Route Reference", IRefNoFilter);
+        IF PostedPurchRcptLineRec.FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            INIT;
+            Type := Type::Reference;
+            "Reference No." := PostedPurchRcptLineRec."Purchase Route Reference";
+            "Entry No." := NextEntryNo;
+            "Line Type" := "Line Type"::"Posted Receipt Line";
+            "No." := PostedPurchRcptLineRec."Document No.";
+            "Line No." := PostedPurchRcptLineRec."Line No.";
+            Vendor := PostedPurchRcptLineRec."Buy-from Vendor No.";
+            INSERT;
+            NextEntryNo := NextEntryNo + 1;
+          UNTIL PostedPurchRcptLineRec.NEXT = 0;
+        END;
+
+        PurchLineRec.RESET;
+        PurchLineRec.SETCURRENTKEY("Document Type","Purchase Route Reference");
+        PurchLineRec.SETRANGE("Document Type", PurchLineRec."Document Type"::Invoice);
+        PurchLineRec.SETFILTER("Purchase Route Reference", IRefNoFilter);
+        IF PurchLineRec.FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            INIT;
+            Type := Type::Reference;
+            "Reference No." := PurchLineRec."Purchase Route Reference";
+            "Entry No." := NextEntryNo;
+            "Line Type" := "Line Type"::"Invoice Line";
+            "No." := PurchLineRec."Document No.";
+            "Line No." := PurchLineRec."Line No.";
+            Vendor := PurchLineRec."Buy-from Vendor No.";
+            INSERT;
+            NextEntryNo := NextEntryNo + 1;
+          UNTIL PurchLineRec.NEXT = 0;
+        END;
+
+        PurchLineRec.RESET;
+        PurchLineRec.SETCURRENTKEY("Document Type","Purchase Route Reference");
+        PurchLineRec.SETRANGE("Document Type", PurchLineRec."Document Type"::"Credit Memo");
+        PurchLineRec.SETFILTER("Purchase Route Reference", IRefNoFilter);
+        IF PurchLineRec.FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            INIT;
+            Type := Type::Reference;
+            "Reference No." := PurchLineRec."Purchase Route Reference";
+            "Entry No." := NextEntryNo;
+            "Line Type" := "Line Type"::"Credit Memo Line";
+            "No." := PurchLineRec."Document No.";
+            "Line No." := PurchLineRec."Line No.";
+            Vendor := PurchLineRec."Buy-from Vendor No.";
+            INSERT;
+            NextEntryNo := NextEntryNo + 1;
+          UNTIL PurchLineRec.NEXT = 0;
+        END;
+
+        ApprovalLineRec.RESET;
+        ApprovalLineRec.SETCURRENTKEY("Purchase Route Reference");
+        ApprovalLineRec.SETFILTER("Purchase Route Reference", IRefNoFilter);
+        IF ApprovalLineRec.FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            INIT;
+            Type := Type::Reference;
+            "Reference No." := ApprovalLineRec."Purchase Route Reference";
+            "Entry No." := NextEntryNo;
+            IF ApprovalLineRec."Document Type" <> ApprovalLineRec."Document Type"::"Credit Memo" THEN
+              "Line Type" := "Line Type"::"Inv. Approval Line"
+            ELSE
+              "Line Type" := "Line Type"::"Cr. Memo Approval Line";
+            "No." := ApprovalLineRec."Document No.";
+            "Line No." := ApprovalLineRec."Line No.";
+            Vendor := ApprovalLineRec.Vendor;
+            INSERT;
+            NextEntryNo := NextEntryNo + 1;
+          UNTIL ApprovalLineRec.NEXT = 0;
+        END;
+
+        PostedPurchInvLineRec.RESET;
+        PostedPurchInvLineRec.SETCURRENTKEY("Purchase Route Reference");
+        PostedPurchInvLineRec.SETFILTER("Purchase Route Reference", IRefNoFilter);
+        IF PostedPurchInvLineRec.FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            INIT;
+            Type := Type::Reference;
+            "Reference No." := PostedPurchInvLineRec."Purchase Route Reference";
+            "Entry No." := NextEntryNo;
+            "Line Type" := "Line Type"::"Posted Invoice Line";
+            "No." := PostedPurchInvLineRec."Document No.";
+            "Line No." := PostedPurchInvLineRec."Line No.";
+            Vendor := PostedPurchInvLineRec."Buy-from Vendor No.";
+            INSERT;
+            NextEntryNo := NextEntryNo + 1;
+          UNTIL PostedPurchInvLineRec.NEXT = 0;
+        END;
+
+        PostedPurchCrMemoLineRec.RESET;
+        PostedPurchCrMemoLineRec.SETCURRENTKEY("Purchase Route Reference");
+        PostedPurchCrMemoLineRec.SETFILTER("Purchase Route Reference", IRefNoFilter);
+        IF PostedPurchCrMemoLineRec.FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            INIT;
+            Type := Type::Reference;
+            "Reference No." := PostedPurchCrMemoLineRec."Purchase Route Reference";
+            "Entry No." := NextEntryNo;
+            "Line Type" := "Line Type"::"Posted Cr. Memo Line";
+            "No." := PostedPurchCrMemoLineRec."Document No.";
+            "Line No." := PostedPurchCrMemoLineRec."Line No.";
+            Vendor := PostedPurchCrMemoLineRec."Buy-from Vendor No.";
+            INSERT;
+            NextEntryNo := NextEntryNo + 1;
+          UNTIL PostedPurchCrMemoLineRec.NEXT = 0;
+        END;
+
+        PurchLineRec.RESET;
+        PurchLineRec.SETCURRENTKEY("Document Type","Purchase Route Reference");
+        PurchLineRec.SETRANGE("Document Type", PurchLineRec."Document Type"::"Blanket Order");
+        PurchLineRec.SETFILTER("Purchase Route Reference", IRefNoFilter);
+        IF PurchLineRec.FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            INIT;
+            Type := Type::Reference;
+            "Reference No." := PurchLineRec."Purchase Route Reference";
+            "Entry No." := NextEntryNo;
+            "Line Type" := "Line Type"::"Blanket Order Line";
+            "No." := PurchLineRec."Document No.";
+            "Line No." := PurchLineRec."Line No.";
+            Vendor := PurchLineRec."Buy-from Vendor No.";
+            INSERT;
+            NextEntryNo := NextEntryNo + 1;
+          UNTIL PurchLineRec.NEXT = 0;
+        END;
+
+        AssemblyYardNumberObject.RESET;
+        AssemblyYardNumberObject.SETCURRENTKEY("Purchase Route Reference");
+        AssemblyYardNumberObject.SETFILTER("Purchase Route Reference", IRefNoFilter);
+        IF AssemblyYardNumberObject.FINDSET THEN
+          REPEAT
+            INIT;
+            Type := Type::Reference;
+            "Reference No." := AssemblyYardNumberObject."Purchase Route Reference";
+            "Entry No." := NextEntryNo;
+            "Line Type" := "Line Type"::"Assembly Yard Number Object";
+            "No." := AssemblyYardNumberObject."Project No.";
+            "Yard No." := AssemblyYardNumberObject."Yard No.";
+            "Entity Type" := AssemblyYardNumberObject."Entity Type";
+            "System No." := AssemblyYardNumberObject."System No.";
+            "Entity No." := AssemblyYardNumberObject."Entity No.";
+            INSERT;
+            NextEntryNo := NextEntryNo + 1;
+          UNTIL AssemblyYardNumberObject.NEXT = 0;
+
+      END;
+    END;
+
+    PROCEDURE ShowDataOfReferenceLine@1210190007(IPurchRouteRefRec@1210190000 : Record 11012079);
+    VAR
+      lvAdviceOrderFrm@1210190001 : Page 11012122;
+      EstimateLinesPageOLD@1210190002 : Page 11012155;
+      EstimateLineCostPageNEW@1100528900 : Page 11125316;
+      lvRcpLinesFrmOLD@1210190003 : Page 11012157;
+      lvRcpLinesFrmNEW@1100528901 : Page 11125323;
+      lvPurQuoteFrm@1210190004 : Page 49;
+      lvPurOrderFrm@1210190005 : Page 50;
+      lvPrjBudgetFrm@1210190006 : Page 11012003;
+      lvAdjBudgetFrm@1210190007 : Page 11012011;
+      lvPostedPurRcptFrm@1210190008 : Page 136;
+      lvPurInvoiceFrm@1210190009 : Page 51;
+      lvPurCreditMemoFrm@1210190010 : Page 52;
+      lvApprInvoiceFrm@1210190013 : Page 11012066;
+      lvApprCreditMemoFrm@1210190014 : Page 11012068;
+      lvPostedPurInvoiceFrm@1210190011 : Page 138;
+      lvPostedPurCreditMemoFrm@1210190012 : Page 140;
+      lvBlnktOrderFrm@1210190015 : Page 509;
+      AssemblyProjectPage@1100528400 : Page 11124890;
+      lvRawEstLinesFrm@1100528600 : Page 11125680;
+    BEGIN
+      WITH IPurchRouteRefRec DO BEGIN
+        CASE "Line Type" OF
+          "Line Type"::"Estimate Line":
+            BEGIN
+              EstRec.GET("No.");
+              IF EstRec."RAW Estimate" THEN BEGIN  //db, 15-01-10
+                RawEstElemRec.SETRANGE("Estimate No.", "No.");
+                RawEstElemRec.SETRANGE("Element No.", "Tender Paragraph");
+                IF RawEstElemRec.FINDFIRST THEN;
+                RawEstElemRec.SETRANGE("Element No.");
+                lvRawEstLinesFrm.SETTABLEVIEW(RawEstElemRec);
+                lvRawEstLinesFrm.RUNMODAL;
+              END ELSE BEGIN
+                IF EstRec.Converted THEN BEGIN  //DP00381
+                  NEWEstLineRec.RESET;
+                  NEWEstLineRec.SETRANGE("Estimate No.", "No.");
+                  NEWEstLineRec.SETRANGE("Sub-Estimate No.", "Sub-Estimate No.");
+                  NEWEstLineRec.SETRANGE("Part Group", "Part Group");
+                  NEWEstLineRec.SETRANGE(Part, Part);
+                  EstimateLineCostPageNEW.SETTABLEVIEW(NEWEstLineRec);
+                  EstimateLineCostPageNEW.InitSelectionFromReference("Estimate Line");
+                  EstimateLineCostPageNEW.RUNMODAL;
+                END ELSE BEGIN
+                  OLDEstLineRec.RESET;
+                  OLDEstLineRec.SETRANGE("Estimate No.", "No.");
+                  OLDEstLineRec.SETRANGE("Sub-Estimate No.", "Sub-Estimate No.");
+                  OLDEstLineRec.SETRANGE("Part Group", "Part Group");
+                  OLDEstLineRec.SETRANGE(Part, Part);
+                  EstimateLinesPageOLD.SETTABLEVIEW(OLDEstLineRec);
+                  EstimateLinesPageOLD.InitSelectionFromReference("Estimate Line");
+                  EstimateLinesPageOLD.RUNMODAL;
+                END;
+              END;
+            END;
+          "Line Type"::"Recipe Line":
+            BEGIN
+              EstRec.GET("No.");
+              IF EstRec.Converted THEN BEGIN  //DP00381
+                NEWEstLineRec.RESET;
+                NEWEstLineRec.SETRANGE("Estimate No.", "No.");
+                NEWEstLineRec.SETRANGE("Sub-Estimate No.", "Sub-Estimate No.");
+                NEWEstLineRec.SETRANGE("Part Group", "Part Group");
+                NEWEstLineRec.SETRANGE(Part, Part);
+                NEWEstLineRec.SETRANGE("Line No.", "Estimate Line");
+                lvRcpLinesFrmNEW.SETTABLEVIEW(OLDEstLineRec);
+                lvRcpLinesFrmNEW.InitSelectionFromReference("Line No.");
+                lvRcpLinesFrmNEW.RUNMODAL;
+              END ELSE BEGIN
+                OLDEstLineRec.RESET;
+                OLDEstLineRec.SETRANGE("Estimate No.", "No.");
+                OLDEstLineRec.SETRANGE("Sub-Estimate No.", "Sub-Estimate No.");
+                OLDEstLineRec.SETRANGE("Part Group", "Part Group");
+                OLDEstLineRec.SETRANGE(Part, Part);
+                OLDEstLineRec.SETRANGE("Line No.", "Estimate Line");
+                lvRcpLinesFrmOLD.SETTABLEVIEW(OLDEstLineRec);
+                lvRcpLinesFrmOLD.InitSelectionFromReference("Line No.");
+                lvRcpLinesFrmOLD.RUNMODAL;
+              END;
+            END;
+          "Line Type"::"Quote Line":
+            BEGIN
+              PurchHeadRec.RESET;
+              PurchHeadRec.SETRANGE("Document Type", PurchLineRec."Document Type"::Quote);
+              PurchHeadRec.SETRANGE("No.", "No.");
+              lvPurQuoteFrm.SETTABLEVIEW(PurchHeadRec);
+              lvPurQuoteFrm.InitSelectionFromReference("Line No.");
+              lvPurQuoteFrm.RUNMODAL;
+            END;
+          "Line Type"::"Budget Line":
+            BEGIN
+              IF Adjustment = '' THEN BEGIN
+                ProjRec.RESET;
+                ProjRec.SETRANGE("No.", "No.");
+                lvPrjBudgetFrm.SETTABLEVIEW(ProjRec);
+                lvPrjBudgetFrm.InitSelectionFromReference("Line No.");
+                lvPrjBudgetFrm.RUNMODAL;
+              END ELSE BEGIN
+                BudgetAdjRec.RESET;
+                BudgetAdjRec.SETRANGE("Project No.", "No.");
+                BudgetAdjRec.SETRANGE("No.", Adjustment);
+                lvAdjBudgetFrm.SETTABLEVIEW(BudgetAdjRec);
+                lvAdjBudgetFrm.InitSelectionFromReference("Line No.");
+                lvAdjBudgetFrm.RUNMODAL;
+              END;
+            END;
+          "Line Type"::"Advice Order":
+            BEGIN
+              //ProjRec.RESET;
+              //ProjRec.SETRANGE("No.", "No.");
+              //PAGE.RUNMODAL(PAGE::"Advice Orders by Project", ProjRec);
+              //db, 29-01-04: ivm tonen van alle ipv niet verwerkte adviesorder is gekozen voor ander
+              //form (adviesorder per artikel): zie aanpassing aldaar bij openen form.
+              lvAdviceOrderFrm.SetSelection(0, "Reference No.");
+              lvAdviceOrderFrm.RUNMODAL;
+            END;
+          "Line Type"::"Purchase Order Line":
+            BEGIN
+              PurchHeadRec.RESET;
+              PurchHeadRec.SETRANGE("Document Type", PurchLineRec."Document Type"::Order);
+              PurchHeadRec.SETRANGE("No.", "No.");
+              lvPurOrderFrm.SETTABLEVIEW(PurchHeadRec);
+              lvPurOrderFrm.InitSelectionFromReference("Line No.");
+              lvPurOrderFrm.RUNMODAL;
+            END;
+          "Line Type"::"Posted Receipt Line":
+            BEGIN
+              PostedPurchRcptHeadRec.RESET;
+              PostedPurchRcptHeadRec.SETRANGE("No.", "No.");
+              lvPostedPurRcptFrm.SETTABLEVIEW(PostedPurchRcptHeadRec);
+              lvPostedPurRcptFrm.InitSelectionFromReference("Line No.");
+              lvPostedPurRcptFrm.RUNMODAL;
+            END;
+          "Line Type"::"Invoice Line":
+            BEGIN
+              PurchHeadRec.RESET;
+              PurchHeadRec.SETRANGE("Document Type", PurchLineRec."Document Type"::Invoice);
+              PurchHeadRec.SETRANGE("No.", "No.");
+              lvPurInvoiceFrm.SETTABLEVIEW(PurchHeadRec);
+              lvPurInvoiceFrm.InitSelectionFromReference("Line No.");
+              lvPurInvoiceFrm.RUNMODAL;
+            END;
+          "Line Type"::"Credit Memo Line":
+            BEGIN
+              PurchHeadRec.RESET;
+              PurchHeadRec.SETRANGE("Document Type", PurchLineRec."Document Type"::"Credit Memo");
+              PurchHeadRec.SETRANGE("No.", "No.");
+              lvPurCreditMemoFrm.SETTABLEVIEW(PurchHeadRec);
+              lvPurCreditMemoFrm.InitSelectionFromReference("Line No.");
+              lvPurCreditMemoFrm.RUNMODAL;
+            END;
+          "Line Type"::"Inv. Approval Line":
+            BEGIN
+              PostedPurchInvHeadRec.RESET;
+              PostedPurchInvHeadRec.SETRANGE("No.", "No.");
+              lvApprInvoiceFrm.SETTABLEVIEW(PostedPurchInvHeadRec);
+              lvApprInvoiceFrm.InitSelectionFromReference("Line No.");
+              lvApprInvoiceFrm.RUNMODAL;
+            END;
+          "Line Type"::"Cr. Memo Approval Line":
+            BEGIN
+              PostedPurchCrMemoHeadRec.RESET;
+              PostedPurchCrMemoHeadRec.SETRANGE("No.", "No.");
+              lvApprCreditMemoFrm.SETTABLEVIEW(PostedPurchCrMemoHeadRec);
+              lvApprCreditMemoFrm.InitSelectionFromReference("Line No.");
+              lvApprCreditMemoFrm.RUNMODAL;
+            END;
+          "Line Type"::"Posted Invoice Line":
+            BEGIN
+              PostedPurchInvHeadRec.RESET;
+              PostedPurchInvHeadRec.SETRANGE("No.", "No.");
+              lvPostedPurInvoiceFrm.SETTABLEVIEW(PostedPurchInvHeadRec);
+              lvPostedPurInvoiceFrm.InitSelectionFromReference("Line No.");
+              lvPostedPurInvoiceFrm.RUNMODAL;
+            END;
+          "Line Type"::"Posted Cr. Memo Line":
+            BEGIN
+              PostedPurchCrMemoHeadRec.RESET;
+              PostedPurchCrMemoHeadRec.SETRANGE("No.", "No.");
+              lvPostedPurCreditMemoFrm.SETTABLEVIEW(PostedPurchCrMemoHeadRec);
+              lvPostedPurCreditMemoFrm.InitSelectionFromReference("Line No.");
+              lvPostedPurCreditMemoFrm.RUNMODAL;
+            END;
+          "Line Type"::"Blanket Order Line":
+            BEGIN
+              PurchHeadRec.RESET;
+              PurchHeadRec.SETRANGE("Document Type", PurchLineRec."Document Type"::"Blanket Order");
+              PurchHeadRec.SETRANGE("No.", "No.");
+              lvBlnktOrderFrm.SETTABLEVIEW(PurchHeadRec);
+              lvBlnktOrderFrm.InitSelectionFromReference("Line No.");
+              lvBlnktOrderFrm.RUNMODAL;
+            END;
+          "Line Type"::"Assembly Yard Number Object":
+            BEGIN
+              ProjRec.RESET;
+              ProjRec.SETRANGE("No.", "No.");
+              AssemblyProjectPage.SETTABLEVIEW(ProjRec);
+              AssemblyProjectPage.InitSelectionFromReference(
+                "Yard No.", "Entity Type", "System No.", "Entity No.");
+              AssemblyProjectPage.RUNMODAL;
+            END;
+        END;
+      END;
+    END;
+
+    PROCEDURE GetQuoteOfReference@1210190009(IRefNo@1210190000 : Code[20]) : Code[20];
+    VAR
+      lvCounter@1210190001 : Integer;
+      lvQuote@1210190002 : Code[20];
+    BEGIN
+      WITH PurchLineRec DO BEGIN
+        IF (IRefNo = '') THEN
+          EXIT('');
+        lvCounter := 0;
+        lvQuote := '';
+        RESET;
+        SETCURRENTKEY("Document Type","Purchase Route Reference");
+        SETRANGE("Document Type", "Document Type"::Quote);
+        SETRANGE("Purchase Route Reference", IRefNo);
+        IF FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            lvCounter := lvCounter + 1;
+            lvQuote := "Document No.";
+          UNTIL NEXT = 0;
+        END;
+
+        IF lvCounter > 1 THEN
+          lvQuote := STRSUBSTNO('<%1>', lvCounter);
+
+        EXIT(lvQuote);
+      END;
+    END;
+
+    PROCEDURE GetQuoteOfReferenceCompressed@1210190012(IRefNoFilter@1210190000 : Code[1024]) : Code[20];
+    VAR
+      lvTmpPurchHeadRec@1210190003 : TEMPORARY Record 38;
+      lvCounter@1210190001 : Integer;
+      lvQuote@1210190002 : Code[20];
+    BEGIN
+      WITH PurchLineRec DO BEGIN
+        IF (IRefNoFilter = '') THEN
+          EXIT('');
+        lvCounter := 0;
+        lvQuote := '';
+        RESET;
+        SETCURRENTKEY("Document Type","Purchase Route Reference");
+        SETRANGE("Document Type", "Document Type"::Quote);
+        SETFILTER("Purchase Route Reference", IRefNoFilter);
+        IF FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            lvTmpPurchHeadRec.SETRANGE("Document Type", "Document Type"::Quote);
+            lvTmpPurchHeadRec.SETRANGE("No.", "Document No.");
+            IF NOT lvTmpPurchHeadRec.FIND('-') THEN BEGIN
+              lvTmpPurchHeadRec."Document Type" := "Document Type"::Quote;
+              lvTmpPurchHeadRec."No." := "Document No.";
+              lvTmpPurchHeadRec.INSERT;
+            END;
+          UNTIL NEXT = 0;
+        END;
+
+        lvTmpPurchHeadRec.RESET;
+        lvTmpPurchHeadRec.SETRANGE("Document Type", "Document Type"::Quote);
+        IF lvTmpPurchHeadRec.FIND('-') THEN BEGIN
+          REPEAT
+            lvCounter := lvCounter + 1;
+            lvQuote := "Document No.";
+          UNTIL lvTmpPurchHeadRec.NEXT = 0;
+        END;
+
+        IF lvCounter > 1 THEN
+          lvQuote := STRSUBSTNO('<%1>', lvCounter);
+
+        EXIT(lvQuote);
+      END;
+    END;
+
+    PROCEDURE GetPurchOrderOfReference@1210190013(IRefNo@1210190000 : Code[20]) : Code[20];
+    VAR
+      lvCounter@1210190001 : Integer;
+      lvDocNo@1210190002 : Code[20];
+    BEGIN
+      WITH PurchLineRec DO BEGIN
+        IF (IRefNo = '') THEN
+          EXIT('');
+        lvCounter := 0;
+        lvDocNo := '';
+        RESET;
+        SETCURRENTKEY("Document Type","Purchase Route Reference");
+        SETRANGE("Document Type", PurchLineRec."Document Type"::Order);
+        SETRANGE("Purchase Route Reference", IRefNo);
+        IF FINDSET(FALSE, FALSE) THEN BEGIN
+          REPEAT
+            lvCounter := lvCounter + 1;
+            lvDocNo := "Document No.";
+          UNTIL NEXT = 0;
+        END;
+
+        IF lvCounter > 1 THEN
+          lvDocNo := STRSUBSTNO('<%1>', lvCounter);
+
+        EXIT(lvDocNo);
+      END;
+    END;
+
+    PROCEDURE SetQuoteToOrderAllowed@1210190004(IRefNo@1210190000 : Code[20];IQuote@1210190001 : Code[20];VAR ODocument@1210190002 : Code[20];VAR OLineNo@1210190003 : Integer) : Boolean;
+    BEGIN
+      ODocument := '';
+      OLineNo := 0;
+
+      IF (IRefNo = '') THEN
+        EXIT(TRUE);
+
+      PurchLineRec.RESET;
+      PurchLineRec.SETCURRENTKEY("Document Type","Purchase Route Reference");
+      PurchLineRec.SETRANGE("Document Type", PurchLineRec."Document Type"::Quote);
+      PurchLineRec.SETRANGE("Purchase Route Reference", IRefNo);
+      PurchLineRec.SETFILTER("Document No.", '<>%1', IQuote);
+      PurchLineRec.SETRANGE("Quote Selected", TRUE);
+      IF NOT PurchLineRec.FINDFIRST THEN
+        EXIT(TRUE);
+
+      ODocument := PurchLineRec."Document No.";
+      OLineNo := PurchLineRec."Line No.";
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE CheckReferenceHasSelectedQuote@1210190008(IRefNo@1210190000 : Code[20];VAR OPurchLineRec@1210190001 : Record 39) : Boolean;
+    BEGIN
+      CLEAR(OPurchLineRec);
+      IF (IRefNo = '') THEN
+        EXIT(FALSE);
+
+      PurchLineRec.RESET;
+      PurchLineRec.SETCURRENTKEY("Document Type","Purchase Route Reference");
+      PurchLineRec.SETRANGE("Document Type", PurchLineRec."Document Type"::Quote);
+      PurchLineRec.SETRANGE("Purchase Route Reference", IRefNo);
+      PurchLineRec.SETRANGE("Quote Selected", TRUE);
+      IF NOT PurchLineRec.FINDFIRST THEN
+        EXIT(FALSE);
+
+      OPurchLineRec := PurchLineRec;
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE CheckDeleteEstLineHasQuoteOLD@1210190014(IEstLineRec@1210190004 : Record 11012154;IConfirm@1210190001 : Boolean);
+    VAR
+      lvRcpLineRec@1210190005 : Record 11012156;
+      lvRefNo@1210190000 : Code[20];
+      lvQuoteStr@1210190003 : Text[200];
+    BEGIN
+      WITH IEstLineRec DO BEGIN
+        lvRefNo := '';
+        IF ("Purchase Route Reference" <> '') THEN
+          lvRefNo := "Purchase Route Reference"
+        ELSE BEGIN
+          lvRcpLineRec.SETRANGE("Estimate No.", "Estimate No.");
+          lvRcpLineRec.SETRANGE("Sub-Estimate No.", "Sub-Estimate No.");
+          lvRcpLineRec.SETRANGE("Part Group", "Part Group");
+          lvRcpLineRec.SETRANGE(Part, Part);
+          lvRcpLineRec.SETRANGE("Estimate Line", "Line No.");
+          lvRcpLineRec.SETFILTER("Purchase Route Reference", '<>%1', '');
+          IF lvRcpLineRec.FINDFIRST THEN
+            lvRefNo := lvRcpLineRec."Purchase Route Reference"
+        END;
+        IF (lvRefNo = '') THEN
+          EXIT;
+
+        lvQuoteStr := lvFillQuoteString(lvRefNo);
+        IF lvQuoteStr = '' THEN
+          EXIT;
+
+        IF IConfirm THEN BEGIN
+          IF CONFIRM(Text001 + '\\' + Text002, FALSE, TABLECAPTION, "Estimate No." + ' - ' +
+                     "Sub-Estimate No." + ' - ' + Part + ' - ' + FORMAT("Line No."), lvQuoteStr)
+          THEN
+            EXIT
+          ELSE
+            ERROR('');
+        END;
+        ERROR(Text001);
+      END;
+    END;
+
+    PROCEDURE CheckDeleteEstLineHasQuoteNEW@1100528902(IEstLineRec@1210190004 : Record 11072072;IConfirm@1210190001 : Boolean);
+    VAR
+      lvRcpLineRec@1210190005 : Record 11072075;
+      lvRefNo@1210190000 : Code[20];
+      lvQuoteStr@1210190003 : Text[200];
+    BEGIN
+      WITH IEstLineRec DO BEGIN
+        lvRefNo := '';
+        IF ("Purchase Route Reference" <> '') THEN
+          lvRefNo := "Purchase Route Reference"
+        ELSE BEGIN
+          lvRcpLineRec.SETRANGE("Estimate No.", "Estimate No.");
+          lvRcpLineRec.SETRANGE("Sub-Estimate No.", "Sub-Estimate No.");
+          lvRcpLineRec.SETRANGE("Part Group", "Part Group");
+          lvRcpLineRec.SETRANGE(Part, Part);
+          lvRcpLineRec.SETRANGE("Estimate Line", "Line No.");
+          lvRcpLineRec.SETFILTER("Purchase Route Reference", '<>%1', '');
+          IF lvRcpLineRec.FINDFIRST THEN
+            lvRefNo := lvRcpLineRec."Purchase Route Reference"
+        END;
+        IF (lvRefNo = '') THEN
+          EXIT;
+
+        lvQuoteStr := lvFillQuoteString(lvRefNo);
+        IF lvQuoteStr = '' THEN
+          EXIT;
+
+        IF IConfirm THEN BEGIN
+          IF CONFIRM(Text001 + '\\' + Text002, FALSE, TABLECAPTION, "Estimate No." + ' - ' +
+                     "Sub-Estimate No." + ' - ' + Part + ' - ' + FORMAT("Line No."), lvQuoteStr)
+          THEN
+            EXIT
+          ELSE
+            ERROR('');
+        END;
+        ERROR(Text001);
+      END;
+    END;
+
+    PROCEDURE CheckDeleteRcpLineHasQuoteOLD@1210190017(IRcpLineRec@1210190004 : Record 11012156;IConfirm@1210190001 : Boolean);
+    VAR
+      lvQuoteStr@1210190003 : Text[200];
+    BEGIN
+      WITH IRcpLineRec DO BEGIN
+        IF ("Purchase Route Reference" = '') THEN
+          EXIT;
+
+        lvQuoteStr := lvFillQuoteString("Purchase Route Reference");
+        IF lvQuoteStr = '' THEN
+          EXIT;
+
+        IF IConfirm THEN BEGIN
+          IF CONFIRM(Text001 + '\\' + Text002, FALSE, TABLECAPTION, "Estimate No." + ' - ' + "Sub-Estimate No." + ' - ' +
+                     Part + ' - ' + FORMAT("Estimate Line") + ' - ' + Recipe + ' - ' + FORMAT("Line No."), lvQuoteStr)
+          THEN
+            EXIT
+          ELSE
+            ERROR('');
+        END;
+        ERROR(Text001);
+      END;
+    END;
+
+    PROCEDURE CheckDeleteRcpLineHasQuoteNEW@1100528901(IRcpLineRec@1210190004 : Record 11072075;IConfirm@1210190001 : Boolean);
+    VAR
+      lvQuoteStr@1210190003 : Text[200];
+    BEGIN
+      WITH IRcpLineRec DO BEGIN
+        IF ("Purchase Route Reference" = '') THEN
+          EXIT;
+
+        lvQuoteStr := lvFillQuoteString("Purchase Route Reference");
+        IF lvQuoteStr = '' THEN
+          EXIT;
+
+        IF IConfirm THEN BEGIN
+          IF CONFIRM(Text001 + '\\' + Text002, FALSE, TABLECAPTION, "Estimate No." + ' - ' + "Sub-Estimate No." + ' - ' +
+                     Part + ' - ' + FORMAT("Estimate Line") + ' - ' + Recipe + ' - ' + FORMAT("Line No."), lvQuoteStr)
+          THEN
+            EXIT
+          ELSE
+            ERROR('');
+        END;
+        ERROR(Text001);
+      END;
+    END;
+
+    LOCAL PROCEDURE lvFillQuoteString@1210190020(IRefNo@1210190000 : Code[20]) : Text[200];
+    VAR
+      lvPurchLineRec@1210190002 : Record 39;
+      lvQuoteStr@1210190001 : Text[200];
+    BEGIN
+      WITH lvPurchLineRec DO BEGIN
+        lvQuoteStr := '';
+
+        RESET;
+        SETCURRENTKEY("Document Type","Purchase Route Reference");
+        SETRANGE("Document Type", "Document Type"::Quote);
+        SETRANGE("Purchase Route Reference", IRefNo);
+        IF NOT FINDSET(FALSE, FALSE) THEN
+          EXIT('');
+
+        REPEAT
+          IF PurchHeadRec.GET("Document Type", "Document No.") THEN BEGIN
+            IF PurchHeadRec."Quote Status" <> PurchHeadRec."Quote Status"::Thanks THEN BEGIN
+              IF (STRLEN(lvQuoteStr) + STRLEN("Document No.") + 2) <= MAXSTRLEN(lvQuoteStr) THEN BEGIN
+                IF lvQuoteStr = '' THEN
+                  lvQuoteStr := "Document No."
+                ELSE
+                  lvQuoteStr := lvQuoteStr + ', ' + "Document No.";
+              END;
+            END;
+          END;
+        UNTIL NEXT = 0;
+
+        EXIT(lvQuoteStr);
+      END;
+    END;
+
+    PROCEDURE UpdateQuoteLinesFromBudget@1210190005(IBudgetRec@1210190000 : Record 11012001);
+    BEGIN
+      WITH IBudgetRec DO BEGIN
+        IF ("Purchase Route Reference" = '') THEN
+          EXIT;
+
+        PurchLineRec.RESET;
+        PurchLineRec.SETCURRENTKEY("Document Type","Purchase Route Reference");
+        PurchLineRec.SETRANGE("Document Type", PurchLineRec."Document Type"::Quote);
+        PurchLineRec.SETRANGE("Purchase Route Reference", "Purchase Route Reference");
+        IF PurchLineRec.FINDSET(TRUE, FALSE) THEN BEGIN
+          REPEAT
+            PurchLineRec.VALIDATE("Job No.", "Project No.");
+            PurchLineRec.Element := Element;
+            PurchLineRec."Extension Contract" := "Extension Contract";
+            PurchLineRec."Modified by" := USERID; //DP00469
+            PurchLineRec."Last Date Modified" := TODAY;//DP00469
+            PurchLineRec.MODIFY;
+          UNTIL PurchLineRec.NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE CloseAdvOrderFromPurchOrderLin@1210190006(IPurchOrderLineRec@1210190000 : Record 39);
+    BEGIN
+      WITH IPurchOrderLineRec DO BEGIN
+        IF ("Purchase Route Reference" = '') THEN
+          EXIT;
+
+        AdviceOrderRec.RESET;
+        AdviceOrderRec.SETCURRENTKEY("Purchase Route Reference");
+        AdviceOrderRec.SETRANGE("Purchase Route Reference", "Purchase Route Reference");
+        IF AdviceOrderRec.FINDSET(TRUE, FALSE) THEN BEGIN
+          REPEAT
+            IF (NOT AdviceOrderRec.Processed) OR
+               (AdviceOrderRec."Process Status" <> AdviceOrderRec."Process Status"::Processed)
+            THEN BEGIN
+              AdviceOrderRec.VALIDATE(Processed, TRUE); //mg.c, 03-10-11: M28950
+              AdviceOrderRec."Process Status" := AdviceOrderRec."Process Status"::Processed;
+              AdviceOrderRec.MODIFY(TRUE);
+            END;
+          UNTIL AdviceOrderRec.NEXT = 0;
+        END;
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

@@ -1,0 +1,221 @@
+OBJECT Codeunit 11012792 Process ICF Invoice
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=11012327;
+    OnRun=VAR
+            PurchHeader@1100525000 : Record 38;
+            PurchOrder@1100525001 : Record 38;
+          BEGIN
+            PurchSetup.GET;
+
+            //Write Purchase Header
+            IF ("Invoice No." <> '') THEN BEGIN
+              IF "Invoice Amount" < 0 THEN
+                PurchHeader.GET(PurchHeader."Document Type"::"Credit Memo","Invoice No.")
+              ELSE
+                PurchHeader.GET(PurchHeader."Document Type"::Invoice,"Invoice No.");
+            END ELSE BEGIN
+              IF (ProcessType = ProcessType::CreateInvoice) AND (Status = Status::Open) THEN BEGIN
+                WriteInvoiceHeader(PurchHeader,Rec);
+                IF PurchHeader."No." <> '' THEN BEGIN
+                  "Invoice No." := PurchHeader."No.";
+                  IF PurchSetup."Approve ICF Purchase Invoices" THEN
+                    Status := Status::"ICF Finished"
+                  ELSE
+                    Status := Status::"Invoice/Credit Memo Created";
+                  "Process halted at" := 0;
+                  "Reason for halting" := '';
+                  UpdateICFLinesInvoiceNo(Rec);
+                END;
+              END;
+            END;
+
+            IF "Invoice No." <> '' THEN BEGIN
+              //GetReceiptLines
+              IF (ProcessType = ProcessType::GetReceipts) AND (Status = Status::"Invoice/Credit Memo Created") THEN BEGIN
+                PurchOrder.GET(PurchOrder."Document Type"::Order, PurchHeader."Related Purch. Order No.");
+                GetReceiptLines(PurchHeader);
+                Status := Status::"Got Receipt";
+                "Process halted at" := 0;
+                "Reason for halting" := '';
+              END;
+
+              //Match ICF Invoices
+              IF (ProcessType = ProcessType::MatchICF) AND (Status = Status::"Got Receipt") THEN BEGIN
+                MatchICFLines(PurchHeader);
+                Status := Status::"ICF Finished";
+                "Process halted at" := 0;
+                "Reason for halting" := '';
+              END;
+            END;
+
+            UpdateICFLinesStatus(Rec);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      PurchSetup@1100525012 : Record 312;
+      ProcessType@1100525002 : 'CreateInvoice,GetReceipts,MatchICF';
+      Text001@1100525000 : TextConst 'ENU=All Purchase Receipt Lines are alread invoiced.';
+
+    PROCEDURE SetProcessType@1100525001(IProcessType@1100525000 : 'CreateInvoice,GetReceipts,MatchICF');
+    BEGIN
+      ProcessType := IProcessType;
+    END;
+
+    PROCEDURE WriteInvoiceHeader@1210190002(VAR PurchHeader@1100525000 : Record 38;ICFLine@1100525003 : Record 11012327);
+    VAR
+      NoSeriesMgt@1100525002 : Codeunit 396;
+      PurchOrderExists@1100525001 : Boolean;
+    BEGIN
+      IF ICFLine."Invoice Amount" = 0 THEN
+        EXIT;
+
+      WITH PurchHeader DO BEGIN
+        INIT;
+
+        IF ICFLine."Invoice Amount" >= 0 THEN BEGIN
+          "Document Type" := "Document Type"::Invoice;
+          IF PurchSetup."ICF Invoice Nos." <> '' THEN BEGIN
+            PurchSetup.TESTFIELD("ICF Posted Invoice Nos.");
+            "No." := NoSeriesMgt.GetNextNo(PurchSetup."ICF Invoice Nos.",WORKDATE,TRUE);
+            "No. Series" := PurchSetup."ICF Invoice Nos.";
+            "Posting No. Series" := PurchSetup."ICF Posted Invoice Nos.";
+          END;
+        END ELSE BEGIN
+          "Document Type" := "Document Type"::"Credit Memo";
+          IF PurchSetup."ICF Credit Memo Nos." <> '' THEN BEGIN
+            PurchSetup.TESTFIELD("ICF Posted Credit Memo Nos.");
+            "No." := NoSeriesMgt.GetNextNo(PurchSetup."ICF Credit Memo Nos.",WORKDATE,TRUE);
+            "No. Series" := PurchSetup."ICF Credit Memo Nos.";
+            "Posting No. Series" := PurchSetup."ICF Posted Credit Memo Nos.";
+          END;
+        END;
+        INSERT(TRUE);
+
+        SetHideValidationDialog(TRUE);
+
+        GetRelatedPurchOrder(PurchHeader,ICFLine,PurchOrderExists);
+        SetHideValidationDialog(TRUE); //call C000375
+        IF NOT PurchOrderExists THEN
+          VALIDATE("Buy-from Vendor No.", ICFLine.Vendor);
+        //VALIDATE("Pay-to Vendor No.", ICFLine.Vendor); //call C000383
+
+        "Invoice Lines Input" := NOT PurchSetup."Approve ICF Purchase Invoices";
+        IF ("Document Type" = "Document Type"::Invoice) THEN BEGIN
+          VALIDATE("Vendor Invoice No.", ICFLine."Invoice No. (Vendor)");
+          VALIDATE("Amount incl. VAT",ICFLine."Invoice Amount");
+        END ELSE BEGIN
+          VALIDATE("Vendor Cr. Memo No.", ICFLine."Invoice No. (Vendor)");
+          VALIDATE("Amount incl. VAT",ABS(ICFLine."Invoice Amount"));
+        END;
+
+        VALIDATE("Document Date", ICFLine."Invoice Date");  //db, 25-11-08: M13444
+
+        IF PurchSetup."Invoice Date ICF" = PurchSetup."Invoice Date ICF"::Workdate THEN
+          "Posting Date" := WORKDATE
+        ELSE
+          "Posting Date" := ICFLine."Invoice Date";
+
+        "Reference (Vendor)" := ICFLine."Reference (Vendor)";
+
+        "ICF Status" := "ICF Status"::Received;
+        "Invoice Lines Input" := NOT PurchSetup."Approve ICF Purchase Invoices"; //Set twice because validation may change field value
+        MODIFY(TRUE);
+      END;
+    END;
+
+    PROCEDURE GetReceiptLines@1100525015(VAR PurchHeader@1100525000 : Record 38);
+    VAR
+      lvPurchRcptLine@1100525001 : Record 121;
+      PurchLine@1100525003 : Record 39;
+      lvPurchReceiptCU@1100525002 : Codeunit 74;
+    BEGIN
+      lvPurchRcptLine.RESET;
+      lvPurchRcptLine.SETCURRENTKEY("Order No.", "Order Line No.");
+      lvPurchRcptLine.SETRANGE("Order No.", PurchHeader."Related Purch. Order No.");
+      lvPurchRcptLine.FINDSET; //No IF used here, call 24487
+      REPEAT
+        lvPurchRcptLine.MARK := TRUE;
+      UNTIL lvPurchRcptLine.NEXT = 0;
+      lvPurchRcptLine.MARKEDONLY(TRUE);
+
+      lvPurchRcptLine.SETCURRENTKEY("Buy-from Vendor No.","Document No.");
+      lvPurchRcptLine.SETRANGE("Buy-from Vendor No.", PurchHeader."Buy-from Vendor No.");
+
+      lvPurchReceiptCU.SetPurchHeader(PurchHeader);
+      lvPurchReceiptCU.CreateInvLines(lvPurchRcptLine);
+
+      //Check if Purch Lines are created
+      PurchLine.SETRANGE("Document Type", PurchHeader."Document Type");
+      PurchLine.SETRANGE("Document No.", PurchHeader."No.");
+      PurchLine.SETFILTER(Type, '<>%1', PurchLine.Type::" ");
+      IF NOT PurchLine.FINDFIRST THEN
+        ERROR(Text001);
+    END;
+
+    PROCEDURE MatchICFLines@1100525016(VAR PurchHeadRec@1100525000 : Record 38);
+    VAR
+      lvPurchReceiptCU@1100525001 : Codeunit 74;
+    BEGIN
+      lvPurchReceiptCU.MatchReceiptICFInvoice(
+        PurchHeadRec."No.", (PurchHeadRec."Document Type" = PurchHeadRec."Document Type"::"Credit Memo"));
+    END;
+
+    PROCEDURE GetRelatedPurchOrder@1100525002(VAR PurchHeader@1100525004 : Record 38;ICFLine@1100525001 : Record 11012327;VAR PurchOrderExists@1100525002 : Boolean);
+    VAR
+      lvPos@1100525000 : Integer;
+      lvPurchOrderRec@1100525003 : Record 38;
+    BEGIN
+      lvPos := STRPOS(ICFLine."Order No. (Customer)", '/');
+      IF lvPos <> 0 THEN
+        PurchHeader."Related Purch. Order No." := COPYSTR(ICFLine."Order No. (Customer)", 1, lvPos -1)
+      ELSE
+        PurchHeader."Related Purch. Order No." := ICFLine."Order No. (Customer)";
+
+      IF lvPurchOrderRec.GET(lvPurchOrderRec."Document Type"::Order, PurchHeader."Related Purch. Order No.") THEN BEGIN
+        PurchOrderExists := TRUE;
+        PurchHeader.VALIDATE("Related Purch. Order No.");
+      END ELSE BEGIN
+        PurchOrderExists := FALSE;
+        PurchHeader."Related Purch. Order No." := '<' + COPYSTR(ICFLine."Order No. (Customer)"
+          , 1, MAXSTRLEN(PurchHeader."Related Purch. Order No.")-2) + '>';
+      END;
+    END;
+
+    PROCEDURE UpdateICFLinesStatus@1210190007(ICFLine@1100525000 : Record 11012327);
+    VAR
+      ICFLine2@1210190003 : Record 11012327;
+    BEGIN
+      ICFLine2.SETRANGE(Vendor, ICFLine.Vendor);
+      ICFLine2.SETRANGE("Reference (Vendor)", ICFLine."Reference (Vendor)");
+      ICFLine2.SETRANGE("Invoice No. (Vendor)", ICFLine."Invoice No. (Vendor)");
+      ICFLine2.MODIFYALL(Status, ICFLine.Status);
+      ICFLine2.MODIFYALL("Process halted at", ICFLine."Process halted at");
+      ICFLine2.MODIFYALL("Reason for halting", ICFLine."Reason for halting");
+    END;
+
+    PROCEDURE UpdateICFLinesInvoiceNo@1100525000(ICFLine@1100525001 : Record 11012327);
+    VAR
+      ICFLine2@1100525000 : Record 11012327;
+    BEGIN
+      ICFLine2.SETRANGE(Vendor, ICFLine.Vendor);
+      ICFLine2.SETRANGE("Reference (Vendor)", ICFLine."Reference (Vendor)");
+      ICFLine2.SETRANGE("Invoice No. (Vendor)", ICFLine."Invoice No. (Vendor)");
+      ICFLine2.MODIFYALL("Invoice No.", ICFLine."Invoice No.");
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

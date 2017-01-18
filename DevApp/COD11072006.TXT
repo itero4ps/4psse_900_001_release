@@ -1,0 +1,376 @@
+OBJECT Codeunit 11072006 Job Post-Line
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00 (1001);
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 11072005=rm,
+                TableData 11020401=rimd;
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      JobJnlPostLine@1003 : Codeunit 11072003;
+      JobTransferLine@1001 : Codeunit 11072016;
+      Text000@1011 : TextConst 'ENU="has been changed (initial a %1: %2= %3, %4= %5)"';
+      Text003@1000 : TextConst 'ENU=You cannot change the sales line because it is linked to\';
+      Text004@1014 : TextConst 'ENU=" %1: %2= %3, %4= %5."';
+      Text005@1015 : TextConst 'ENU="You must post more usage or credit the sale of %1 %2 in %3 %4 before you can post purchase credit memo %5 %6 = %7."';
+
+    LOCAL PROCEDURE InsertPlanningLine@8(JobJnlLine@1003 : Record 11072008);
+    VAR
+      JobPlanningLine@1002 : Record 11020401;
+    BEGIN
+      IF JobJnlLine."Line Type" = JobJnlLine."Line Type"::" " THEN
+        EXIT;
+      CLEAR(JobPlanningLine);
+      JobPlanningLine."Job No." := JobJnlLine."Job No.";
+      JobPlanningLine."Job Task No." := JobJnlLine."Job Task No.";
+      JobPlanningLine.SETRANGE("Job No.",JobPlanningLine."Job No.");
+      JobPlanningLine.SETRANGE("Job Task No.",JobPlanningLine."Job Task No.");
+      IF JobPlanningLine.FINDLAST THEN;
+      JobPlanningLine."Line No." := JobPlanningLine."Line No." + 10000;
+      JobPlanningLine.INIT;
+      JobPlanningLine.RESET;
+      CLEAR(JobTransferLine);
+      JobTransferLine.FromJnlToPlanningLine(JobJnlLine,JobPlanningLine);
+      PostPlanningLine(JobPlanningLine);
+    END;
+
+    PROCEDURE InsertPlLineFromLedgEntry@2(JobLedgEntry@1003 : Record 11072005);
+    VAR
+      JobPlanningLine@1002 : Record 11020401;
+    BEGIN
+      IF JobLedgEntry."Line Type" = JobLedgEntry."Line Type"::" " THEN
+        EXIT;
+      CLEARALL;
+      JobPlanningLine."Job No." := JobLedgEntry."Job No.";
+      JobPlanningLine."Job Task No." := JobLedgEntry."Job Task No.";
+      JobPlanningLine.SETRANGE("Job No.",JobPlanningLine."Job No.");
+      JobPlanningLine.SETRANGE("Job Task No.",JobPlanningLine."Job Task No.");
+      IF JobPlanningLine.FINDLAST THEN;
+      JobPlanningLine."Line No." := JobPlanningLine."Line No." + 10000;
+      JobPlanningLine.INIT;
+      JobPlanningLine.RESET;
+      CLEAR(JobTransferLine);
+      JobTransferLine.FromJobLedgEntryToPlanningLine(JobLedgEntry,JobPlanningLine);
+      PostPlanningLine(JobPlanningLine);
+    END;
+
+    LOCAL PROCEDURE PostPlanningLine@9(JobPlanningLine@1000 : Record 11020401);
+    VAR
+      Job@1001 : Record 11072003;
+    BEGIN
+      IF JobPlanningLine."Line Type" = JobPlanningLine."Line Type"::"Both Schedule and Contract" THEN BEGIN
+        Job.GET(JobPlanningLine."Job No.");
+        IF NOT Job."Allow Schedule/Contract Lines" OR
+           (JobPlanningLine.Type = JobPlanningLine.Type::"G/L Account")
+        THEN BEGIN
+          JobPlanningLine.VALIDATE("Line Type",JobPlanningLine."Line Type"::Schedule);
+          JobPlanningLine.INSERT(TRUE);
+          JobPlanningLine."Job Contract Entry No." := 0;
+          JobPlanningLine.VALIDATE("Line Type",JobPlanningLine."Line Type"::Contract);
+          JobPlanningLine."Line No." := JobPlanningLine."Line No." + 10000;
+        END;
+      END;
+      IF (JobPlanningLine.Type = JobPlanningLine.Type::"G/L Account") AND
+         (JobPlanningLine."Line Type" = JobPlanningLine."Line Type"::Contract)
+      THEN
+        ChangeGLNo(JobPlanningLine);
+      JobPlanningLine.INSERT(TRUE);
+    END;
+
+    PROCEDURE PostInvoiceContractLine@14(SalesHeader@1006 : Record 36;SalesLine@1000 : Record 37) : Integer;
+    VAR
+      Job@1003 : Record 11072003;
+      JobLedgEntry@1007 : Record 11072005;
+      JobPlanningLine@1001 : Record 11020401;
+      JobPlanningLineInvoice@1009 : Record 1022;
+      EntryType@1010 : 'Usage,Sale';
+    BEGIN
+      JobPlanningLine.SETCURRENTKEY("Job Contract Entry No.");
+      JobPlanningLine.SETRANGE("Job Contract Entry No.",SalesLine."Job Contract Entry No.");
+      JobPlanningLine.FINDFIRST;
+      Job.GET(JobPlanningLine."Job No.");
+
+      IF Job."Invoice Currency Code" = '' THEN BEGIN
+        Job.TESTFIELD("Currency Code",SalesHeader."Currency Code");
+        Job.TESTFIELD("Currency Code",JobPlanningLine."Currency Code");
+        SalesHeader.TESTFIELD("Currency Code",JobPlanningLine."Currency Code");
+        SalesHeader.TESTFIELD("Currency Factor",JobPlanningLine."Currency Factor");
+      END ELSE BEGIN
+        Job.TESTFIELD("Currency Code",'');
+        JobPlanningLine.TESTFIELD("Currency Code",'');
+      END;
+
+      SalesHeader.TESTFIELD("Bill-to Customer No.",Job."Bill-to Customer No.");
+      JobPlanningLine.CALCFIELDS("Qty. Transferred to Invoice");
+      IF JobPlanningLine.Type <> JobPlanningLine.Type::Text THEN
+        JobPlanningLine.TESTFIELD("Qty. Transferred to Invoice");
+
+      ValidateRelationship(SalesHeader,SalesLine,JobPlanningLine);
+
+      CASE SalesHeader."Document Type" OF
+        SalesHeader."Document Type"::Invoice:
+          IF JobPlanningLineInvoice.GET(JobPlanningLine."Job No.",JobPlanningLine."Job Task No.",JobPlanningLine."Line No.",
+               JobPlanningLineInvoice."Document Type"::Invoice,SalesHeader."No.",SalesLine."Line No.")
+          THEN BEGIN
+            JobPlanningLineInvoice.DELETE(TRUE);
+            JobPlanningLineInvoice."Document Type" := JobPlanningLineInvoice."Document Type"::"Posted Invoice";
+            JobPlanningLineInvoice."Document No." := SalesLine."Document No.";
+            JobPlanningLineInvoice.INSERT(TRUE);
+
+            JobPlanningLineInvoice."Invoiced Date" := SalesHeader."Posting Date";
+            JobPlanningLineInvoice."Invoiced Amount (LCY)" :=
+              CalcLineAmountLCY(JobPlanningLine,JobPlanningLineInvoice."Quantity Transferred");
+            JobPlanningLineInvoice."Invoiced Cost Amount (LCY)" :=
+              JobPlanningLineInvoice."Quantity Transferred" * JobPlanningLine."Unit Cost (LCY)";
+            IF JobLedgEntry.FINDLAST THEN
+              JobPlanningLineInvoice."Job Ledger Entry No." := JobLedgEntry."Entry No." + 1
+            ELSE
+              JobPlanningLineInvoice."Job Ledger Entry No." := 1;
+            JobPlanningLineInvoice.MODIFY;
+          END;
+        SalesHeader."Document Type"::"Credit Memo":
+          IF JobPlanningLineInvoice.GET(JobPlanningLine."Job No.",JobPlanningLine."Job Task No.",JobPlanningLine."Line No.",
+               JobPlanningLineInvoice."Document Type"::"Credit Memo",SalesHeader."No.",SalesLine."Line No.")
+          THEN BEGIN
+            JobPlanningLineInvoice.DELETE(TRUE);
+            JobPlanningLineInvoice."Document Type" := JobPlanningLineInvoice."Document Type"::"Posted Credit Memo";
+            JobPlanningLineInvoice."Document No." := SalesLine."Document No.";
+            JobPlanningLineInvoice.INSERT(TRUE);
+
+            JobPlanningLineInvoice."Invoiced Date" := SalesHeader."Posting Date";
+            JobPlanningLineInvoice."Invoiced Amount (LCY)" :=
+              CalcLineAmountLCY(JobPlanningLine,JobPlanningLineInvoice."Quantity Transferred");
+            JobPlanningLineInvoice."Invoiced Cost Amount (LCY)" :=
+              JobPlanningLineInvoice."Quantity Transferred" * JobPlanningLine."Unit Cost (LCY)";
+            IF JobLedgEntry.FINDLAST THEN
+              JobPlanningLineInvoice."Job Ledger Entry No." := JobLedgEntry."Entry No." + 1
+            ELSE
+              JobPlanningLineInvoice."Job Ledger Entry No." := 1;
+            JobPlanningLineInvoice.MODIFY;
+          END;
+      END;
+
+      JobPlanningLine.UpdateQtyToInvoice;
+      JobPlanningLine.MODIFY;
+
+      IF JobPlanningLine.Type <> JobPlanningLine.Type::Text THEN
+        EXIT(InsertJobLedgEntry(JobPlanningLine,SalesHeader,SalesLine,EntryType::Sale));
+    END;
+
+    LOCAL PROCEDURE ValidateRelationship@7(SalesHeader@1006 : Record 36;SalesLine@1000 : Record 37;JobPlanningLine@1005 : Record 11020401);
+    VAR
+      JobTask@1002 : Record 11072600;
+      Txt@1001 : Text[500];
+    BEGIN
+      JobTask.GET(JobPlanningLine."Job No.",JobPlanningLine."Job Task No.");
+      Txt := STRSUBSTNO(Text000,
+          JobTask.TABLECAPTION,JobTask.FIELDCAPTION("Job No."),JobTask."Job No.",
+          JobTask.FIELDCAPTION("Job Task No."),JobTask."Job Task No.");
+
+      IF JobPlanningLine.Type = JobPlanningLine.Type::Text THEN
+        IF SalesLine.Type <> SalesLine.Type::" " THEN
+          SalesLine.FIELDERROR(Type,Txt);
+      IF JobPlanningLine.Type = JobPlanningLine.Type::Resource THEN
+        IF SalesLine.Type <> SalesLine.Type::Resource THEN
+          SalesLine.FIELDERROR(Type,Txt);
+      IF JobPlanningLine.Type = JobPlanningLine.Type::Item THEN
+        IF SalesLine.Type <> SalesLine.Type::Item THEN
+          SalesLine.FIELDERROR(Type,Txt);
+      IF JobPlanningLine.Type = JobPlanningLine.Type::"G/L Account" THEN
+        IF SalesLine.Type <> SalesLine.Type::"G/L Account" THEN
+          SalesLine.FIELDERROR(Type,Txt);
+
+      IF SalesLine."No." <> JobPlanningLine."No." THEN
+        SalesLine.FIELDERROR("No.",Txt);
+      IF SalesLine."Location Code" <> JobPlanningLine."Location Code" THEN
+        SalesLine.FIELDERROR("Location Code",Txt);
+      IF SalesLine."Work Type Code" <> JobPlanningLine."Work Type Code" THEN
+        SalesLine.FIELDERROR("Work Type Code",Txt);
+      IF SalesLine."Unit of Measure Code" <> JobPlanningLine."Unit of Measure Code" THEN
+        SalesLine.FIELDERROR("Unit of Measure Code",Txt);
+      IF SalesLine."Variant Code" <> JobPlanningLine."Variant Code" THEN
+        SalesLine.FIELDERROR("Variant Code",Txt);
+      IF SalesLine."Gen. Prod. Posting Group" <> JobPlanningLine."Gen. Prod. Posting Group" THEN
+        SalesLine.FIELDERROR("Gen. Prod. Posting Group",Txt);
+      IF SalesLine."Line Discount %" <> JobPlanningLine."Line Discount %" THEN
+        SalesLine.FIELDERROR("Line Discount %",Txt);
+      IF JobPlanningLine."Unit Cost (LCY)" <> SalesLine."Unit Cost (LCY)" THEN
+        SalesLine.FIELDERROR("Unit Cost (LCY)",Txt);
+      IF SalesLine.Type = SalesLine.Type::" " THEN BEGIN
+        IF SalesLine."Line Amount" <> 0 THEN
+          SalesLine.FIELDERROR("Line Amount",Txt);
+      END;
+      IF SalesHeader."Prices Including VAT" THEN BEGIN
+        IF JobPlanningLine."VAT %" <> SalesLine."VAT %" THEN
+          SalesLine.FIELDERROR("VAT %",Txt);
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertJobLedgEntry@3(JobPlanningLine@1000 : Record 11020401;SalesHeader@1003 : Record 36;SalesLine@1002 : Record 37;EntryType@1004 : 'Usage,Sale') : Integer;
+    VAR
+      JobJnlLine@1001 : Record 11072008;
+    BEGIN
+      JobTransferLine.FromPlanningSalesLinetoJnlLine(JobPlanningLine,SalesHeader,SalesLine,JobJnlLine,EntryType);
+      EXIT(JobJnlPostLine.RunWithCheck(JobJnlLine));
+    END;
+
+    LOCAL PROCEDURE CalcLineAmountLCY@19(JobPlanningLine@1002 : Record 11020401;Qty@1000 : Decimal) : Decimal;
+    VAR
+      TotalPrice@1001 : Decimal;
+    BEGIN
+      TotalPrice := ROUND(Qty * JobPlanningLine."Unit Price (LCY)",0.01);
+      EXIT(TotalPrice - ROUND(TotalPrice * JobPlanningLine."Line Discount %" / 100,0.01));
+    END;
+
+    PROCEDURE PostGenJnlLine@1(GenJnlLine@1000 : Record 81;GLEntry@1002 : Record 17);
+    VAR
+      JobJnlLine@1001 : Record 11072008;
+      Job@1004 : Record 11072003;
+      JT@1003 : Record 11072600;
+      JobTransferLine@1005 : Codeunit 11072016;
+      SourceCodeSetup@1007 : Record 242;
+    BEGIN
+      IF GenJnlLine."System-Created Entry" THEN
+        EXIT;
+      IF GenJnlLine."Job No." = '' THEN
+        EXIT;
+      SourceCodeSetup.GET;
+      IF GenJnlLine."Source Code" = SourceCodeSetup."Job G/L WIP" THEN
+        EXIT;
+      //GenJnlLine.TESTFIELD("Job Task No.");  //**4PS.o  Job Task not used by 4PS
+      //GenJnlLine.TESTFIELD("Job Quantity");  //**4PS.o C012827 13-02-2014
+      Job.LOCKTABLE;
+      //JT.LOCKTABLE;  //**4PS.o  Job Task not used by 4PS
+      Job.GET(GenJnlLine."Job No.");
+      GenJnlLine.TESTFIELD("Job Currency Code",Job."Currency Code");
+      //**4PS.so  Job Task not used by 4PS
+      {
+      JT.GET(GenJnlLine."Job No.",GenJnlLine."Job Task No.");
+      JT.TESTFIELD("Job Task Type",JT."Job Task Type"::Posting);
+      } //**4PS.eo
+      JobTransferLine.FromGenJnlLineToJnlLine(GenJnlLine,JobJnlLine);
+
+      JobJnlPostLine.SetGLEntryNo(GLEntry."Entry No.");
+      JobJnlPostLine.RunWithCheck(JobJnlLine);
+      JobJnlPostLine.SetGLEntryNo(0);
+    END;
+
+    PROCEDURE InsertPurchLine@6(VAR PurchHeader@1006 : Record 38;VAR PurchInvHeader@1004 : Record 122;VAR PurchCrMemoHeader@1005 : Record 124;PurchLine@1000 : Record 39;Sourcecode@1007 : Code[10]) : Integer;
+    VAR
+      JobJnlLine@1003 : Record 11072008;
+      Job@1001 : Record 11072003;
+      JT@1002 : Record 11072600;
+    BEGIN
+      IF (PurchLine.Type <> PurchLine.Type::Item) AND (PurchLine.Type <> PurchLine.Type::"G/L Account") THEN
+        EXIT;
+      CLEAR(JobJnlLine);
+      PurchLine.TESTFIELD("Job No.");
+      //PurchLine.TESTFIELD("Job Task No."); //**4PS.o  Job Task not used by 4PS
+      Job.LOCKTABLE;
+      JT.LOCKTABLE;
+      Job.GET(PurchLine."Job No.");
+      PurchLine.TESTFIELD("Job Currency Code",Job."Currency Code");
+      //JT.GET(PurchLine."Job No.",PurchLine."Job Task No."); //**4PS.o  Job Task not used by 4PS
+      JobTransferLine.FromPurchaseLineToJnlLine(
+        PurchHeader,PurchInvHeader,PurchCrMemoHeader,PurchLine,Sourcecode,JobJnlLine);
+      JobJnlLine."Job Posting Only" := TRUE;
+      EXIT(JobJnlPostLine.RunWithCheck(JobJnlLine));
+    END;
+
+    PROCEDURE TestSalesLine@11(VAR SalesLine@1000 : Record 37);
+    VAR
+      JT@1003 : Record 11072600;
+      JobPlanningLine@1001 : Record 11020401;
+      Txt@1002 : Text[250];
+    BEGIN
+      IF SalesLine."Job Contract Entry No." = 0 THEN
+        EXIT;
+      JobPlanningLine.SETCURRENTKEY("Job Contract Entry No.");
+      JobPlanningLine.SETRANGE("Job Contract Entry No.",SalesLine."Job Contract Entry No.");
+      IF JobPlanningLine.FINDFIRST THEN BEGIN
+        JT.GET(JobPlanningLine."Job No.",JobPlanningLine."Job Task No.");
+        Txt := Text003 + STRSUBSTNO(Text004,
+            JT.TABLECAPTION,JT.FIELDCAPTION("Job No."),JT."Job No.",
+            JT.FIELDCAPTION("Job Task No."),JT."Job Task No.");
+        ERROR(Txt);
+      END;
+    END;
+
+    LOCAL PROCEDURE ChangeGLNo@13(VAR JobPlanningLine@1000 : Record 11020401);
+    VAR
+      GLAcc@1003 : Record 15;
+      Job@1001 : Record 11072003;
+      JT@1002 : Record 11072600;
+      JobPostingGr@1004 : Record 11072006;
+      Cust@1005 : Record 18;
+    BEGIN
+      JT.GET(JobPlanningLine."Job No.",JobPlanningLine."Job Task No.");
+      Job.GET(JobPlanningLine."Job No.");
+      Cust.GET(Job."Bill-to Customer No.");
+      IF JT."Job Posting Group" <> '' THEN
+        JobPostingGr.GET(JT."Job Posting Group")
+      ELSE BEGIN
+        Job.TESTFIELD("Job Posting Group");
+        JobPostingGr.GET(Job."Job Posting Group");
+      END;
+      IF JobPostingGr."G/L Expense Acc. (Contract)" = '' THEN
+        EXIT;
+      GLAcc.GET(JobPostingGr."G/L Expense Acc. (Contract)");
+      GLAcc.CheckGLAcc;
+      JobPlanningLine."No." := GLAcc."No.";
+      JobPlanningLine."Gen. Bus. Posting Group" := Cust."Gen. Bus. Posting Group";
+      JobPlanningLine."Gen. Prod. Posting Group" := GLAcc."Gen. Prod. Posting Group";
+    END;
+
+    PROCEDURE CheckItemQuantityPurchCredit@15(VAR PurchaseHeader@1006 : Record 38;VAR PurchaseLine@1001 : Record 39);
+    VAR
+      Item@1003 : Record 27;
+      Job@1007 : Record 11072003;
+    BEGIN
+      Job.GET(PurchaseLine."Job No.");
+      IF Job.GetQuantityAvailable(PurchaseLine."No.",PurchaseLine."Location Code",PurchaseLine."Variant Code",0,2) <
+         ABS(PurchaseLine."Return Qty. to Ship (Base)")
+      THEN
+        ERROR(
+          Text005,Item.TABLECAPTION,PurchaseLine."No.",Job.TABLECAPTION,
+          PurchaseLine."Job No.",PurchaseHeader."No.",
+          PurchaseLine.FIELDCAPTION("Line No."),PurchaseLine."Line No.");
+    END;
+
+    PROCEDURE SetGLEntryNoOnJobLedgerEntry@62(InvoicePostBuffer@1000 : Record 49;PostingDate@1003 : Date;DocumentNo@1004 : Code[20];GLEntryNo@1001 : Integer);
+    VAR
+      JobLedgerEntry@1002 : Record 11072005;
+    BEGIN
+      JobLedgerEntry.SETRANGE("Job No.",InvoicePostBuffer."Job No.");
+      JobLedgerEntry.SETRANGE("Posting Date",PostingDate);
+      JobLedgerEntry.SETRANGE("Document No.",DocumentNo);
+      JobLedgerEntry.SETRANGE(Type,JobLedgerEntry.Type::"G/L Account");
+      JobLedgerEntry.SETRANGE("No.",InvoicePostBuffer."G/L Account");
+      JobLedgerEntry.SETRANGE("Gen. Bus. Posting Group",InvoicePostBuffer."Gen. Bus. Posting Group");
+      JobLedgerEntry.SETRANGE("Gen. Prod. Posting Group",InvoicePostBuffer."Gen. Prod. Posting Group");
+      JobLedgerEntry.SETRANGE("Dimension Set ID",InvoicePostBuffer."Dimension Set ID");
+      JobLedgerEntry.SETRANGE("Ledger Entry No.",0);
+
+      IF JobLedgerEntry.FINDSET THEN
+        REPEAT
+          JobLedgerEntry."Ledger Entry Type" := JobLedgerEntry."Ledger Entry Type"::"G/L Account";
+          JobLedgerEntry."Ledger Entry No." := GLEntryNo;
+          JobLedgerEntry.MODIFY(TRUE);
+        UNTIL JobLedgerEntry.NEXT = 0;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

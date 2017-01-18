@@ -1,0 +1,277 @@
+OBJECT Codeunit 5431 Calc. Item Plan - Plan Wksh.
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=27;
+    OnRun=BEGIN
+            Item.COPY(Rec);
+            Code;
+            Rec := Item;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Item@1038 : Record 27;
+      MfgSetup@1019 : Record 99000765;
+      TempPlanningCompList@1018 : TEMPORARY Record 99000829;
+      TempItemList@1017 : TEMPORARY Record 27;
+      InvtProfileOffsetting@1000 : Codeunit 99000854;
+      MPS@1014 : Boolean;
+      MRP@1013 : Boolean;
+      NetChange@1012 : Boolean;
+      PeriodLength@1010 : Integer;
+      CurrTemplateName@1009 : Code[10];
+      CurrWorksheetName@1008 : Code[10];
+      UseForecast@1002 : Code[10];
+      FromDate@1007 : Date;
+      ToDate@1006 : Date;
+      Text000@1045 : TextConst 'ENU=You must decide what to calculate.';
+      Text001@1044 : TextConst 'ENU=Enter a starting date.';
+      Text002@1043 : TextConst 'ENU=Enter an ending date.';
+      Text003@1042 : TextConst 'ENU=The ending date must not be before the order date.';
+      Text004@1041 : TextConst 'ENU=You must not use a variant filter when calculating MPS from a forecast.';
+      ExcludeForecastBefore@1004 : Date;
+      RespectPlanningParm@1003 : Boolean;
+
+    LOCAL PROCEDURE Code@1();
+    VAR
+      ReqLineExtern@1001 : Record 246;
+      PlannedProdOrderLine@1000 : Record 5406;
+      PlanningAssignment@1002 : Record 99000850;
+      ProdOrder@1003 : Record 5405;
+      CurrWorksheetType@1004 : 'Requisition,Planning';
+    BEGIN
+      WITH Item DO BEGIN
+        IF NOT PlanThisItem THEN
+          EXIT;
+
+        ReqLineExtern.SETCURRENTKEY(Type,"No.","Variant Code","Location Code");
+        COPYFILTER("Variant Filter",ReqLineExtern."Variant Code");
+        COPYFILTER("Location Filter",ReqLineExtern."Location Code");
+        ReqLineExtern.SETRANGE(Type,ReqLineExtern.Type::Item);
+        ReqLineExtern.SETRANGE("No.","No.");
+        IF ReqLineExtern.FIND('-') THEN
+          REPEAT
+            ReqLineExtern.DELETE(TRUE);
+          UNTIL ReqLineExtern.NEXT = 0;
+
+        PlannedProdOrderLine.SETCURRENTKEY(Status,"Item No.","Variant Code","Location Code");
+        PlannedProdOrderLine.SETRANGE(Status,PlannedProdOrderLine.Status::Planned);
+        COPYFILTER("Variant Filter",PlannedProdOrderLine."Variant Code");
+        COPYFILTER("Location Filter",PlannedProdOrderLine."Location Code");
+        PlannedProdOrderLine.SETRANGE("Item No.","No.");
+        IF PlannedProdOrderLine.FIND('-') THEN
+          REPEAT
+            IF ProdOrder.GET(PlannedProdOrderLine.Status,PlannedProdOrderLine."Prod. Order No.") THEN BEGIN
+              IF (ProdOrder."Source Type" = ProdOrder."Source Type"::Item) AND
+                 (ProdOrder."Source No." = PlannedProdOrderLine."Item No.")
+              THEN
+                ProdOrder.DELETE(TRUE);
+            END ELSE
+              PlannedProdOrderLine.DELETE(TRUE);
+          UNTIL PlannedProdOrderLine.NEXT = 0;
+
+        COMMIT;
+
+        InvtProfileOffsetting.SetParm(UseForecast,ExcludeForecastBefore,CurrWorksheetType::Planning);
+        InvtProfileOffsetting.CalculatePlanFromWorksheet(
+          Item,MfgSetup,CurrTemplateName,CurrWorksheetName,FromDate,ToDate,MRP,RespectPlanningParm);
+
+        // Retrieve list of Planning Components handled:
+        InvtProfileOffsetting.GetPlanningCompList(TempPlanningCompList);
+
+        COPYFILTER("Variant Filter",PlanningAssignment."Variant Code");
+        COPYFILTER("Location Filter",PlanningAssignment."Location Code");
+        PlanningAssignment.SETRANGE(Inactive,FALSE);
+        PlanningAssignment.SETRANGE("Net Change Planning",TRUE);
+        PlanningAssignment.SETRANGE("Item No.","No.");
+        IF PlanningAssignment.FIND('-') THEN
+          REPEAT
+            IF PlanningAssignment."Latest Date" <= ToDate THEN BEGIN
+              PlanningAssignment.Inactive := TRUE;
+              PlanningAssignment.MODIFY;
+            END;
+          UNTIL PlanningAssignment.NEXT = 0;
+
+        COMMIT;
+
+        TempItemList := Item;
+        TempItemList.INSERT;
+      END;
+    END;
+
+    PROCEDURE Initialize@2(NewFromDate@1001 : Date;NewToDate@1000 : Date;NewMPS@1003 : Boolean;NewMRP@1002 : Boolean;NewRespectPlanningParm@1004 : Boolean);
+    BEGIN
+      FromDate := NewFromDate;
+      ToDate := NewToDate;
+      MPS := NewMPS;
+      MRP := NewMRP;
+      RespectPlanningParm := NewRespectPlanningParm;
+
+      MfgSetup.GET;
+      CheckPreconditions;
+    END;
+
+    PROCEDURE Finalize@3();
+    VAR
+      ReservMgt@1100409000 : Codeunit 99000845;
+    BEGIN
+      // Items already planned for removed from temporary list:
+      IF TempPlanningCompList.FIND('-') THEN
+        REPEAT
+          IF TempItemList.GET(TempPlanningCompList."Item No.") THEN
+            TempPlanningCompList.DELETE;
+        UNTIL TempPlanningCompList.NEXT = 0;
+
+      // Dynamic tracking is run for the remaining Planning Components:
+      IF TempPlanningCompList.FIND('-') THEN
+        REPEAT
+          ReservMgt.SetPlanningComponent(TempPlanningCompList);
+          ReservMgt.AutoTrack(TempPlanningCompList."Net Quantity (Base)");
+        UNTIL TempPlanningCompList.NEXT = 0;
+
+      COMMIT;
+    END;
+
+    LOCAL PROCEDURE CheckPreconditions@12();
+    VAR
+      ForecastEntry@1004 : Record 99000852;
+    BEGIN
+      IF NOT MPS AND NOT MRP THEN
+        ERROR(Text000);
+
+      IF FromDate = 0D THEN
+        ERROR(Text001);
+      IF ToDate = 0D THEN
+        ERROR(Text002);
+      PeriodLength := ToDate - FromDate + 1;
+      IF PeriodLength <= 0 THEN
+        ERROR(Text003);
+
+      IF MPS AND
+         (Item.GETFILTER("Variant Filter") <> '') AND
+         (UseForecast <> '')
+      THEN BEGIN
+        ForecastEntry.SETCURRENTKEY("Production Forecast Name","Item No.","Location Code","Forecast Date","Component Forecast");
+        ForecastEntry.SETRANGE("Production Forecast Name",UseForecast);
+        Item.COPYFILTER("No.",ForecastEntry."Item No.");
+        IF MfgSetup."Use Forecast on Locations" THEN
+          Item.COPYFILTER("Location Filter",ForecastEntry."Location Code");
+        IF ForecastEntry.FINDFIRST THEN
+          ERROR(Text004);
+      END;
+    END;
+
+    PROCEDURE SetTemplAndWorksheet@6(TemplateName@1000 : Code[10];WorksheetName@1001 : Code[10];NetChange2@1002 : Boolean);
+    BEGIN
+      CurrTemplateName := TemplateName;
+      CurrWorksheetName := WorksheetName;
+      NetChange := NetChange2;
+    END;
+
+    LOCAL PROCEDURE PlanThisItem@5() : Boolean;
+    VAR
+      SKU@1005 : Record 5700;
+      ForecastEntry@1004 : Record 99000852;
+      SalesLine@1003 : Record 37;
+      ServLine@1002 : Record 5902;
+      PurchaseLine@1001 : Record 39;
+      ProdOrderLine@1000 : Record 5406;
+      PlanningAssignment@1006 : Record 99000850;
+      JobPlanningLine@1007 : Record 11020401;
+    BEGIN
+      SKU.SETCURRENTKEY("Item No.");
+      Item.COPYFILTER("Variant Filter",SKU."Variant Code");
+      Item.COPYFILTER("Location Filter",SKU."Location Code");
+      SKU.SETRANGE("Item No.",Item."No.");
+      IF NOT SKU.FINDFIRST AND (Item."Reordering Policy" = Item."Reordering Policy"::" ") THEN
+        EXIT(FALSE);
+
+      Item.COPYFILTER("Variant Filter",PlanningAssignment."Variant Code");
+      Item.COPYFILTER("Location Filter",PlanningAssignment."Location Code");
+      PlanningAssignment.SETRANGE(Inactive,FALSE);
+      PlanningAssignment.SETRANGE("Net Change Planning",TRUE);
+      PlanningAssignment.SETRANGE("Item No.",Item."No.");
+      IF NetChange AND NOT PlanningAssignment.FINDFIRST THEN
+        EXIT(FALSE);
+
+      IF MRP = MPS THEN
+        EXIT(TRUE);
+
+      SalesLine.SETCURRENTKEY("Document Type",Type,"No.","Variant Code","Drop Shipment","Location Code","Shipment Date");
+      SalesLine.SETFILTER("Document Type",'%1|%2',SalesLine."Document Type"::Order,SalesLine."Document Type"::"Blanket Order");
+      SalesLine.SETRANGE(Type,SalesLine.Type::Item);
+      Item.COPYFILTER("Variant Filter",SalesLine."Variant Code");
+      Item.COPYFILTER("Location Filter",SalesLine."Location Code");
+      SalesLine.SETRANGE("No.",Item."No.");
+      SalesLine.SETFILTER("Outstanding Qty. (Base)",'<>0');
+      IF SalesLine.FINDFIRST THEN
+        EXIT(MPS);
+
+      ForecastEntry.SETCURRENTKEY("Production Forecast Name","Item No.","Location Code","Forecast Date","Component Forecast");
+      ForecastEntry.SETRANGE("Production Forecast Name",UseForecast);
+      IF MfgSetup."Use Forecast on Locations" THEN
+        Item.COPYFILTER("Location Filter",ForecastEntry."Location Code");
+      ForecastEntry.SETRANGE("Item No.",Item."No.");
+      IF ForecastEntry.FINDFIRST THEN BEGIN
+        ForecastEntry.CALCSUMS("Forecast Quantity (Base)");
+        IF ForecastEntry."Forecast Quantity (Base)" > 0 THEN
+          EXIT(MPS);
+      END;
+
+      IF ServLine.LinesWithItemToPlanExist(Item) THEN
+        EXIT(MPS);
+
+      IF JobPlanningLine.LinesWithItemToPlanExist(Item) THEN
+        EXIT(MPS);
+
+      ProdOrderLine.SETCURRENTKEY("Item No.");
+      ProdOrderLine.SETRANGE("MPS Order",TRUE);
+      ProdOrderLine.SETRANGE("Item No.",Item."No.");
+      IF ProdOrderLine.FINDFIRST THEN
+        EXIT(MPS);
+
+      PurchaseLine.SETCURRENTKEY("Document Type",Type,"No.");
+      PurchaseLine.SETRANGE("Document Type",PurchaseLine."Document Type"::Order);
+      PurchaseLine.SETRANGE(Type,PurchaseLine.Type::Item);
+      PurchaseLine.SETRANGE("MPS Order",TRUE);
+      PurchaseLine.SETRANGE("No.",Item."No.");
+      IF PurchaseLine.FINDFIRST THEN
+        EXIT(MPS);
+
+      EXIT(MRP);
+    END;
+
+    PROCEDURE SetParm@59(Forecast@1000 : Code[10];ExclBefore@1001 : Date;VAR Item2@1002 : Record 27);
+    BEGIN
+      UseForecast := Forecast;
+      ExcludeForecastBefore := ExclBefore;
+      Item.COPY(Item2);
+    END;
+
+    PROCEDURE SetResiliencyOn@64();
+    BEGIN
+      InvtProfileOffsetting.SetResiliencyOn;
+    END;
+
+    PROCEDURE GetResiliencyError@62(VAR PlanningErrorLogEntry@1000 : Record 5430) : Boolean;
+    BEGIN
+      EXIT(InvtProfileOffsetting.GetResiliencyError(PlanningErrorLogEntry));
+    END;
+
+    BEGIN
+    {
+      4PS HBK 09-07-09 SETCURRENTKEY changed in PlanThisItem; need because change of third key in Purchase Line
+    }
+    END.
+  }
+}
+

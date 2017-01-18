@@ -1,0 +1,796 @@
+OBJECT Codeunit 11012039 Export Hours LOSA (CTB)
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=11012379;
+    OnRun=BEGIN
+            TESTFIELD(Blocked,FALSE);
+
+            ProjSetup.GET;
+            ProjSetup.TESTFIELD("Pathname Files to Salary");
+
+            IF EmployerCde <> '' THEN BEGIN
+              EmployerRec.GET(EmployerCde);
+              IF EmployerRec."Period Type" <> "Period Type" THEN
+                ERROR(Text016, EmployerCde, FIELDCAPTION("Period Type"), EmployerRec."Period Type");
+            END;
+
+            LosaPeriodRec.COPY(Rec);
+            NextLosaPeriodRec := Rec;
+            NextLosaPeriodRec.SETRANGE("Period Type", LosaPeriodRec."Period Type");
+            //NextLosaPeriodRec.NEXT;              //**4PS01.o
+            IF NextLosaPeriodRec.NEXT = 0 THEN     //**4PS01.sn
+              ERROR(Text014, Year, "Period No.");  //**4PS01.en
+
+            TESTFIELD("Start Date");
+            NextLosaPeriodRec.TESTFIELD("Start Date");
+
+            StartDate := "Start Date";
+            EndDate := NextLosaPeriodRec."Start Date" - 1;
+
+            WeekStart := DATE2DWY(StartDate,2);
+            WeekEnd := DATE2DWY(EndDate,2);
+            YearStart := DATE2DWY(StartDate,3);
+            YearEnd :=  DATE2DWY(EndDate,3);
+
+            //Determine Employerfilter in case more period types are present in selected year
+            EmployerFilter := '';
+            LosaPeriodRec2 := Rec;
+            LosaPeriodRec2.SETRANGE(Year, Year);
+            LosaPeriodRec2.SETFILTER("Period Type", '<>%1', "Period Type");
+            IF NOT LosaPeriodRec2.ISEMPTY THEN BEGIN
+              EmployerRec.SETRANGE("Period Type", "Period Type");
+              IF EmployerRec.FINDSET THEN
+                REPEAT
+                  IF EmployerFilter = '' THEN
+                    EmployerFilter := EmployerRec.Code
+                  ELSE
+                    EmployerFilter := EmployerFilter + '|' + EmployerRec.Code
+                UNTIL EmployerRec.NEXT = 0;
+            END;
+
+            // Set filters
+            PostedHourLine.RESET;
+            PostedHourLine.SETFILTER(Year,'%1..%2',YearStart,YearEnd);
+            PostedHourLine.SETFILTER(External,'%1',FALSE);
+            PostedHourLine.SETFILTER("Supplying Company", '%1', '');
+            PostedHourLine.SETFILTER("Cost Type", '%1|%2', PostedHourLine."Cost Type"::Labor, PostedHourLine."Cost Type"::Sundry);
+            IF YearStart = YearEnd THEN
+              PostedHourLine.SETFILTER(Week,'%1..%2',WeekStart,WeekEnd)
+            ELSE
+              IF PostedHourLine.FINDSET THEN BEGIN
+                REPEAT
+                  IF ((PostedHourLine.Year = YearStart) AND (PostedHourLine.Week >= WeekStart)) OR
+                     ((PostedHourLine.Year = YearEnd) AND (PostedHourLine.Week <= WeekEnd)) THEN
+                    PostedHourLine.MARK(TRUE);
+                UNTIL PostedHourLine.NEXT = 0;
+                PostedHourLine.MARKEDONLY(TRUE);
+              END;
+            PostedHourLine.SETRANGE(Status,PostedHourLine.Status::Open);
+            IF EmployerCde <> '' THEN
+              PostedHourLine.SETRANGE(Employer, EmployerCde)
+            ELSE
+              PostedHourLine.SETFILTER(Employer, EmployerFilter);
+
+            // Check Lines
+            IF NOT (PostedHourLine.FINDSET) THEN BEGIN
+              PostedHourLine.SETRANGE(Status);
+              IF NOT (PostedHourLine.FINDSET) THEN
+                ERROR(Text013)
+              ELSE
+                IF NOT CONFIRM(Text015, FALSE, "Period No.") THEN
+                  ERROR(Text013);
+            END;
+
+            REPEAT
+              IF (PostedHourLine."Component Type" <> PostedHourLine."Component Type"::Days) AND
+                 (PostedHourLine.Type <> PostedHourLine.Type::Indirect) THEN
+                PostedHourLine.TESTFIELD("Cost Object");
+              CheckEmployee(PostedHourLine."Employee No.");
+              CheckJob(PostedHourLine."Project No.",PostedHourLine."Cost Object");
+              CheckWageComponent(PostedHourLine."Wage Component");
+              GetParticipant(PostedHourLine."Employee No.");
+            UNTIL PostedHourLine.NEXT = 0;
+
+            // Post Lines
+            IF PostedHourLine.FINDSET(TRUE, FALSE) THEN BEGIN
+              ExportDateTime := CURRENTDATETIME;
+              OpenFile;
+              REPEAT
+                PostedHourLine2.COPY(PostedHourLine);
+                LineTxt := '';
+                IF PostedHourLine."Component Type" = PostedHourLine."Component Type"::Hours THEN BEGIN
+                  WeekStartDate := DWY2DATE(1,PostedHourLine.Week,PostedHourLine.Year);
+                  WeekEndDate := DWY2DATE(7,PostedHourLine.Week,PostedHourLine.Year);
+
+                  IF WeekStartDate < StartDate THEN
+                    DaysBegin := StartDate - WeekStartDate
+                  ELSE
+                    DaysBegin := 0;
+                  IF EndDate < WeekEndDate THEN
+                    DaysEnd := WeekEndDate - EndDate
+                  ELSE
+                    DaysEnd := 0;
+                  ProcessHours;
+                END ELSE
+                  WriteExpense;
+
+                IF PostedHourLine.Status = PostedHourLine.Status::Open THEN BEGIN
+                  PostedHourLine.Status := PostedHourLine.Status::Export;
+                  PostedHourLine.Exported := TRUE;
+                  PostedHourLine."Exported on" := ExportDateTime;
+                  PostedHourLine.MODIFY;
+                END;
+              UNTIL PostedHourLine.NEXT = 0;
+              CloseFile;
+            END;
+
+            //Block Losa Period
+            IF EmployerCde <> '' THEN
+              PostedHourLine.SETFILTER(Employer, EmployerFilter);
+            PostedHourLine.SETRANGE(Status,PostedHourLine.Status::Open);
+            Blocked := NOT (PostedHourLine.FINDFIRST);
+
+            "Exported on" := TODAY;
+            MODIFY;
+            COMMIT;
+            MESSAGE(Text012);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      ProjSetup@1210190005 : Record 315;
+      LosaPeriodRec@1210190000 : Record 11012379;
+      LosaPeriodRec2@1100485011 : Record 11012379;
+      NextLosaPeriodRec@1210190006 : Record 11012379;
+      PostedHourLine@1210190015 : Record 11012085;
+      PostedHourLine2@1210190012 : Record 11012085;
+      EmployerRec@1210190016 : Record 11012013;
+      EmployeeRec@1210190026 : Record 5200;
+      WageCompRec@1100485001 : Record 11012014;
+      CompanyData@1100485008 : Record 11020674;
+      TradeAssRec@1100525000 : Record 11012015;
+      OutStreamStrm@1210190031 : OutStream;
+      FileMgt@1100525501 : Codeunit 419;
+      EmployerCde@1210190030 : Code[20];
+      EndDate@1210190002 : Date;
+      StartDate@1210190004 : Date;
+      WeekStartDate@1210190025 : Date;
+      WeekEndDate@1210190024 : Date;
+      WeekStart@1210190017 : Integer;
+      YearStart@1210190020 : Integer;
+      WeekEnd@1210190021 : Integer;
+      YearEnd@1210190022 : Integer;
+      DaysBegin@1210190027 : Integer;
+      DaysEnd@1210190028 : Integer;
+      ServerFileName@1100525500 : Text[1024];
+      FileName@1100485000 : Text[250];
+      LineTxt@1210190003 : Text[250];
+      Text001@1210190007 : TextConst 'ENU=Job Code (Project and Cost Object) %1 should not be longer then %2';
+      Text002@1210190008 : TextConst 'ENU=Employee Code %1 should not be longer then %2';
+      Text003@1210190009 : TextConst 'ENU=Wage component code %1 should not be longer then %2';
+      EmployerFilter@1100485010 : Text[250];
+      gFile@1210190011 : File;
+      Text011@1100485005 : TextConst 'ENU=File %1 already exists';
+      Text012@1100485006 : TextConst 'ENU=Export is ready';
+      Text013@1100485007 : TextConst 'ENU=Nothing to export';
+      maxfld@1100485004 : Integer;
+      Text014@1100485002 : TextConst 'ENU=Cannot determine the end of period %1 in %2 because there is no following period. Create following periods.';
+      Text015@1100485003 : TextConst 'ENU=Period %1 is already exported. Do you want to repeat the export?';
+      Text016@1100485009 : TextConst 'ENU=Period with %2 %3 needs to be selected for employer %1';
+      ExportDateTime@1100525001 : DateTime;
+
+    PROCEDURE CheckEmployee@1210190009(EmployeeCde@1210190000 : Code[20]);
+    BEGIN
+      IF ProjSetup."Salary Application" = ProjSetup."Salary Application"::"LOSA-Cobra" THEN
+        maxfld := 6
+      ELSE
+        maxfld := 5;
+
+      IF STRLEN(EmployeeCde) > maxfld THEN
+        ERROR(Text002, EmployeeCde, maxfld);
+    END;
+
+    PROCEDURE CheckJob@1210190010(ProjectCde@1210190001 : Code[20];CostObjectCde@1210190002 : Code[20]);
+    BEGIN
+      IF ProjSetup."Salary Application" = ProjSetup."Salary Application"::"LOSA-Cobra" THEN
+        maxfld := 42
+      ELSE
+        maxfld := 15;
+
+      IF STRLEN(ProjectCde) + STRLEN(CostObjectCde) > maxfld THEN
+        ERROR(Text001, ProjectCde + ' ' + CostObjectCde, maxfld);
+    END;
+
+    PROCEDURE CheckWageComponent@1210190011(lComp@1210190000 : Code[10]);
+    BEGIN
+      maxfld := 2;
+
+      IF ProjSetup."Salary Application" = ProjSetup."Salary Application"::"LOSA-Cobra" THEN BEGIN
+        WageCompRec.GET(lComp);
+        IF WageCompRec."Component Type" <> WageCompRec."Component Type"::Hours THEN
+          maxfld := 4;
+      END;
+
+      IF STRLEN(lComp) > maxfld THEN
+        ERROR(Text003, lComp, maxfld);
+    END;
+
+    PROCEDURE DetermineFileName@1100485003();
+    VAR
+      EnterFileName@1100525000 : Page 11126491;
+      lFileName@1100485003 : Text[250];
+      LosaYear@1100485005 : Text[30];
+      LosaPeriod@1100485000 : Text[30];
+    BEGIN
+      LosaYear := STRSUBSTNO('%1',LosaPeriodRec.Year);
+      IF LosaPeriodRec."Period No." < 10 THEN
+        LosaPeriod := STRSUBSTNO('0%1',LosaPeriodRec."Period No.")
+      ELSE
+        LosaPeriod := STRSUBSTNO('%1',LosaPeriodRec."Period No.");
+
+      IF ProjSetup."Salary Application" = ProjSetup."Salary Application"::"LOSA-Cobra" THEN BEGIN
+        FileName := '811-831 '  + LosaYear + '-' + LosaPeriod + ' ' +
+          FORMAT(TIME,0,'<Hours24,2><Minutes,2><Seconds,2>') + '.txt';
+      END ELSE BEGIN
+        IF EmployerCde <> '' THEN BEGIN
+          IF UPPERCASE(ProjSetup."Salary Application Version") <> 'INTERACTIEF' THEN BEGIN
+            FileName := 'Losa Uren ' + EmployerRec.Description + ' ' + LosaYear + LosaPeriod + '.txt';
+          END ELSE BEGIN
+            FileName := COPYSTR(EmployerCde,1,3) + COPYSTR(LosaYear,3,2) + LosaPeriod;
+          END;
+        END ELSE BEGIN
+          FileName := 'POU' + COPYSTR(LosaYear,3,2) + LosaPeriod;
+        END;
+        IF UPPERCASE(ProjSetup."Salary Application Version") = 'INTERACTIEF' THEN BEGIN
+          lFileName := FileName;
+          EnterFileName.LOOKUPMODE := TRUE;
+          EnterFileName.SetField(lFileName);
+          IF EnterFileName.RUNMODAL = ACTION::LookupOK THEN
+            EnterFileName.GetField(lFileName)
+          ELSE
+            ERROR('');
+          IF lFileName <> '' THEN
+            FileName := lFileName;
+        END;
+      END;
+
+      FileName := ProjSetup."Pathname Files to Salary" + FileName;
+      IF FileMgt.ClientFileExists(FileName) THEN
+        ERROR(Text011,FileName);
+    END;
+
+    PROCEDURE OpenFile@1210190014();
+    BEGIN
+      DetermineFileName;
+
+      ServerFileName := FileMgt.ServerTempFileName('txt');
+      gFile.CREATE(ServerFileName);
+
+      gFile.TEXTMODE(TRUE);
+      gFile.CREATEOUTSTREAM(OutStreamStrm);
+    END;
+
+    PROCEDURE CloseFile@1210190030();
+    BEGIN
+      gFile.CLOSE();
+
+      IF FileMgt.ClientFileExists(FileName) THEN
+        ERROR(Text011, FileName);
+      FileMgt.DownloadToFile(ServerFileName, FileName);
+      ERASE(ServerFileName);
+    END;
+
+    PROCEDURE ProcessHours@1210190040();
+    BEGIN
+      IF DaysBegin >= 1 THEN
+        PostedHourLine2.Monday := 0;
+      IF DaysBegin >= 2 THEN
+        PostedHourLine2.Tuesday := 0;
+      IF DaysBegin >= 3 THEN
+        PostedHourLine2.Wednesday := 0;
+      IF DaysBegin >= 4 THEN
+        PostedHourLine2.Thursday := 0;
+      IF DaysBegin >= 5 THEN
+        PostedHourLine2.Friday := 0;
+      IF DaysBegin >= 6 THEN
+        PostedHourLine2.Saturday := 0;
+      IF DaysBegin >= 7 THEN
+        PostedHourLine2.Sunday := 0;
+
+      IF DaysEnd >= 1 THEN
+        PostedHourLine2.Sunday := 0;
+      IF DaysEnd >= 2 THEN
+        PostedHourLine2.Saturday := 0;
+      IF DaysEnd >= 3 THEN
+        PostedHourLine2.Friday := 0;
+      IF DaysEnd >= 4 THEN
+        PostedHourLine2.Thursday := 0;
+      IF DaysEnd >= 5 THEN
+        PostedHourLine2.Wednesday := 0;
+      IF DaysEnd >= 6 THEN
+        PostedHourLine2.Tuesday := 0;
+      IF DaysEnd >= 7 THEN
+        PostedHourLine2.Monday := 0;
+
+      WriteHours;
+    END;
+
+    PROCEDURE WriteHours@1210190051();
+    BEGIN
+      IF ProjSetup."Salary Application" = ProjSetup."Salary Application"::"LOSA-Cobra" THEN BEGIN
+        WriteHoursCobra;
+        EXIT;
+      END;
+
+      //Recordtype
+      LineTxt := '0810';
+
+      //Participant
+      FillParticipant(PostedHourLine2."Employee No.");
+
+      //Period
+      FillPeriod;
+
+      //Code wage calculation
+      LineTxt := PADSTR(LineTxt,12);
+
+      //Employee
+      FillEmployee(PostedHourLine2."Employee No.");
+
+      //Way of reward code
+      LineTxt := PADSTR(LineTxt,18);
+
+      //Identification code
+      FillIdentification;
+
+      //N.A.
+      LineTxt := PADSTR(LineTxt,23);
+
+      //Code Work
+      FillJob(39,PostedHourLine2);
+
+      //Code work on wage specification
+      LineTxt := PADSTR(LineTxt,40);
+
+      //Week
+      FillWeek;
+
+      //Hour type code
+      FillWageComponent(44,PostedHourLine2."Wage Component");
+
+      //N.A.
+      LineTxt := PADSTR(LineTxt,72);
+
+      //Total hours per week
+      LineTxt := PADSTR(LineTxt,77);
+
+      //Amount of hours day 1
+      LineTxt := LineTxt + ConvertAmount(PostedHourLine2.Monday,4);
+
+      //Amount of hours day 2
+      LineTxt := LineTxt + ConvertAmount(PostedHourLine2.Tuesday,4);
+
+      //Amount of hours day 3
+      LineTxt := LineTxt + ConvertAmount(PostedHourLine2.Wednesday,4);
+
+      //Amount of hours day 4
+      LineTxt := LineTxt + ConvertAmount(PostedHourLine2.Thursday,4);
+
+      //Amount of hours day 5
+      LineTxt := LineTxt + ConvertAmount(PostedHourLine2.Friday,4);
+
+      //Amount of hours day 6
+      LineTxt := LineTxt + ConvertAmount(PostedHourLine2.Saturday,4);
+
+      //Amount of hours day 7
+      LineTxt := LineTxt + ConvertAmount(PostedHourLine2.Sunday,4);
+
+      //Fill rest of file
+      LineTxt := PADSTR(LineTxt,215);
+
+      //Write line to file
+      OutStreamStrm.WRITETEXT(LineTxt);
+
+      //Carriage return/Linefeed
+      OutStreamStrm.WRITETEXT();
+    END;
+
+    PROCEDURE WriteHoursCobra@1100485000();
+    BEGIN
+      //Recordtype
+      LineTxt := '811';
+
+      //Participant (company/employee group)
+      FillParticipant(PostedHourLine2."Employee No.");
+
+      //Wage year
+      FillYear;
+
+      //Period
+      FillPeriod;
+
+      //Employee
+      FillEmployee(PostedHourLine2."Employee No.");
+
+      //Week
+      FillWeek;
+
+      //Hour type
+      FillWageComponent(29,PostedHourLine2."Wage Component");
+
+      //wage code (n.a.)
+      LineTxt := PADSTR(LineTxt,33);
+
+      //Identification code
+      FillIdentification;
+
+      //Code Work
+      FillJob(75,PostedHourLine2);
+
+      //Total hours per week (n.a.)
+      LineTxt := PADSTR(LineTxt,81);
+
+      //Amount of hours day 1
+      ConvertHours(85,PostedHourLine2.Monday,4);
+
+      //Amount of hours day 2
+      ConvertHours(89,PostedHourLine2.Tuesday,4);
+
+      //Amount of hours day 3
+      ConvertHours(93,PostedHourLine2.Wednesday,4);
+
+      //Amount of hours day 4
+      ConvertHours(97,PostedHourLine2.Thursday,4);
+
+      //Amount of hours day 5
+      ConvertHours(101,PostedHourLine2.Friday,4);
+
+      //Amount of hours day 6
+      ConvertHours(105,PostedHourLine2.Saturday,4);
+
+      //Amount of hours day 7
+      ConvertHours(109,PostedHourLine2.Sunday,4);
+
+      //Type of activities
+      //compensation
+      //inside/outside
+      //amount advance
+
+      //Fill rest of file
+      LineTxt := PADSTR(LineTxt,120);
+
+      //Write line to file
+      OutStreamStrm.WRITETEXT(LineTxt);
+
+      //Carriage return/Linefeed
+      OutStreamStrm.WRITETEXT();
+    END;
+
+    PROCEDURE WriteExpense@1210190008();
+    BEGIN
+      IF ProjSetup."Salary Application" = ProjSetup."Salary Application"::"LOSA-Cobra" THEN BEGIN
+        WriteExpenseCobra;
+        EXIT;
+      END;
+
+      //Recordtype
+      LineTxt := '0830';
+
+      //Participant
+      FillParticipant(PostedHourLine2."Employee No.");
+
+      //Period
+      FillPeriod;
+
+      //Code wage calculation
+      LineTxt := PADSTR(LineTxt,12);
+
+      //Employee
+      FillEmployee(PostedHourLine2."Employee No.");
+
+      //Identification code
+      FillIdentification;
+
+      //N.A.
+      LineTxt := PADSTR(LineTxt,22);
+
+      //Code Work
+      FillJob(38,PostedHourLine2);
+
+      //Week
+      FillWeek;
+
+      //Code U/I (payment/retention)
+      FillWageComponent(42,PostedHourLine2."Wage Component");
+
+      //N.A.
+      LineTxt := PADSTR(LineTxt,72);
+
+      //Code divide
+      LineTxt := PADSTR(LineTxt,73);
+
+      //Amount U/I
+      LineTxt := LineTxt + ConvertAmount(PostedHourLine2.Quantity,7);
+
+      //Percentage U/I
+      LineTxt := PADSTR(LineTxt,84);
+
+      //Code U/I
+      LineTxt := PADSTR(LineTxt,85);
+
+      //Write line to file
+      OutStreamStrm.WRITETEXT(LineTxt);
+
+      //Carriage return/Linefeed
+      OutStreamStrm.WRITETEXT();
+    END;
+
+    PROCEDURE WriteExpenseCobra@1100485001();
+    BEGIN
+      //Recordtype
+      LineTxt := '831';
+
+      //Participant (company/employee group)
+      FillParticipant(PostedHourLine2."Employee No.");
+
+      //Wage year
+      FillYear;
+
+      //Period
+      FillPeriod;
+
+      //Employee
+      FillEmployee(PostedHourLine2."Employee No.");
+
+      //Code U/I (n.a.)
+      LineTxt := PADSTR(LineTxt,27);
+
+      //Wage code
+      FillWageComponent(31,PostedHourLine2."Wage Component");
+      IF NOT WageCompRec.GET(PostedHourLine2."Wage Component") THEN WageCompRec.INIT;
+
+      //Amount
+      IF WageCompRec."Export Quantity i.s.o. Amount" = FALSE THEN
+        LineTxt := LineTxt + ConvertAmount(PostedHourLine2."Amount (LCY)" - PostedHourLine2."Precalc. Surcharge Expenses",8);
+
+      //Hours (n.a.)
+      LineTxt := PADSTR(LineTxt,45);
+
+      //Days (n.a.)
+      LineTxt := PADSTR(LineTxt,51);
+
+      //Quantity
+      IF WageCompRec."Export Quantity i.s.o. Amount" = TRUE THEN
+        LineTxt := LineTxt + ConvertAmount(PostedHourLine2.Quantity,7);
+
+      //inside/outside
+      LineTxt := PADSTR(LineTxt,59);
+
+      //Type of activities
+      LineTxt := PADSTR(LineTxt,62);
+
+      //Identificationcode
+      FillIdentification;
+
+      //Code Work
+      FillJob(105,PostedHourLine2); //21-12-09 call C-018449 endpos from 104 to 105
+
+      //year-period
+      FillYear;
+      LineTxt := LineTxt + '-';
+      FillPeriod;
+
+      //Date (frost out)
+      LineTxt := LineTxt + FORMAT(PostedHourLine2."Posting Date",0,'<Day,2>-<Month,2>-<Year4>');
+
+      //Write line to file
+      OutStreamStrm.WRITETEXT(LineTxt);
+
+      //Carriage return/Linefeed
+      OutStreamStrm.WRITETEXT();
+    END;
+
+    PROCEDURE ConvertAmount@1210190004(lAmount@1210190000 : Decimal;StrLenInt@1210190003 : Integer) HoursTxt@1210190002 : Code[10];
+    VAR
+      HulpCde@1210190001 : Code[10];
+    BEGIN
+      IF lAmount = 0 THEN
+        EXIT(PADSTR('', StrLenInt, '0')) // Concatenate zero based on maximum length of field
+      ELSE BEGIN
+        HulpCde := FORMAT(lAmount,0,'<Sign><Integer Thousand><Decimals,3>');
+        HulpCde := DELCHR(HulpCde,'=',',');
+        HulpCde := DELCHR(HulpCde,'=','.');
+        IF STRLEN(HulpCde) < StrLenInt THEN
+          REPEAT
+            HulpCde := STRSUBSTNO('%1%2','0',HulpCde);
+          UNTIL STRLEN(HulpCde) >= StrLenInt;
+        EXIT(HulpCde);
+      END;
+    END;
+
+    PROCEDURE ConvertHours@1100485004(EndPosition@1100485000 : Integer;lAmount@1210190000 : Decimal;StrLenInt@1210190003 : Integer);
+    VAR
+      HulpCde@1210190001 : Code[10];
+    BEGIN
+      IF lAmount = 0 THEN
+        LineTxt := PADSTR(LineTxt,EndPosition)
+      ELSE BEGIN
+        lAmount := ROUND(lAmount,0.01);   //**4PS.02
+        HulpCde := FORMAT(lAmount,0,'<Sign><Integer Thousand><Decimals,3>');
+        HulpCde := DELCHR(HulpCde,'=',',');
+        HulpCde := DELCHR(HulpCde,'=','.');
+        IF STRLEN(HulpCde) < StrLenInt THEN
+          REPEAT
+            HulpCde := STRSUBSTNO('%1%2','0',HulpCde);
+          UNTIL STRLEN(HulpCde) >= StrLenInt;
+        LineTxt := LineTxt + HulpCde;
+      END;
+    END;
+
+    PROCEDURE GetParticipant@1210190012(EmployeeCde@1210190000 : Code[20]);
+    BEGIN
+      IF ProjSetup."Salary Application" = ProjSetup."Salary Application"::"LOSA-Cobra" THEN
+        maxfld := 10
+      ELSE
+        maxfld := 5;
+
+      EmployeeRec.GET(EmployeeCde);
+      EmployeeRec.TESTFIELD("Participant No. (Losa)");
+      IF STRLEN(EmployeeRec."Participant No. (Losa)") < maxfld THEN
+        REPEAT
+          EmployeeRec."Participant No. (Losa)" := STRSUBSTNO('%1%2','0',EmployeeRec."Participant No. (Losa)");
+        UNTIL STRLEN(EmployeeRec."Participant No. (Losa)") >= maxfld;
+    END;
+
+    PROCEDURE FillParticipant@1210190013(EmployeeCde@1210190000 : Code[20]);
+    BEGIN
+      GetParticipant(EmployeeCde);
+      LineTxt := LineTxt + EmployeeRec."Participant No. (Losa)";
+    END;
+
+    PROCEDURE FillEmployee@1210190021(EmployeeCde@1210190000 : Code[20]);
+    BEGIN
+      IF ProjSetup."Salary Application" = ProjSetup."Salary Application"::"LOSA-Cobra" THEN
+        maxfld := 6
+      ELSE
+        maxfld := 5;
+
+      IF STRLEN(EmployeeCde) < maxfld THEN
+        REPEAT
+          EmployeeCde := STRSUBSTNO('%1%2','0',EmployeeCde);
+        UNTIL STRLEN(EmployeeCde) >= maxfld;
+      LineTxt := LineTxt + EmployeeCde;
+    END;
+
+    PROCEDURE FillIdentification@1210190022();
+    VAR
+      ProjServORLedgerAccount@1100525000 : Code[20];
+    BEGIN
+      WITH PostedHourLine2 DO
+        CASE Type OF
+         Type::Indirect:
+           LineTxt := LineTxt + '1';
+         Type::Project,Type::Service:
+           IF UseCoverageAccount(PostedHourLine2, ProjServORLedgerAccount) THEN
+             LineTxt := LineTxt + '1'
+           ELSE
+             LineTxt := LineTxt + '8';
+        END;
+    END;
+
+    PROCEDURE FillJob@1210190026(EndPosition@1210190000 : Integer;PostedHourLine2@1100485000 : Record 11012085);
+    VAR
+      IndirectCostCodeRec@1210190005 : Record 11012083;
+      DepartmentCode@1100485001 : Code[20];
+      ProjServORLedgerAccount@1100525000 : Code[20];
+      UseLedgerAccount@1100525001 : Boolean;
+    BEGIN
+      WITH PostedHourLine2 DO BEGIN
+        CASE Type OF
+          Type::Indirect:
+            BEGIN
+              IndirectCostCodeRec.CHANGECOMPANY("Receiving Company"); //C-019169
+              IndirectCostCodeRec.GET("Cost Code");
+              IF ProjSetup."Salary Application" = ProjSetup."Salary Application"::"LOSA-Cobra" THEN BEGIN
+                DepartmentCode := EmployeeRec."Global Dimension 1 Code";
+                CASE IndirectCostCodeRec."Use Cost Code as Department" OF
+                  IndirectCostCodeRec."Use Cost Code as Department"::No:
+                    DepartmentCode := EmployeeRec."Global Dimension 1 Code";
+                  IndirectCostCodeRec."Use Cost Code as Department"::Yes:
+                    DepartmentCode := "Cost Code";
+                  IndirectCostCodeRec."Use Cost Code as Department"::Optional:
+                    IF EmployeeRec."Skip Cost Code as Department" = FALSE THEN
+                      DepartmentCode := "Cost Code";
+                END;
+                LineTxt := LineTxt + PADSTR(
+                  IndirectCostCodeRec."Account No.", ProjSetup."Length G/L Account (Losa)") + DepartmentCode;
+              END ELSE
+                LineTxt := LineTxt + IndirectCostCodeRec."Account No.";
+            END;
+          Type::Project,Type::Service:
+            BEGIN
+              UseLedgerAccount := UseCoverageAccount(PostedHourLine2,ProjServORLedgerAccount);  // 4PS 04-05-10 call: C-017927 sn
+              ProjSetup.TESTFIELD("Length Project (Extern)");
+              LineTxt := LineTxt + PADSTR(ProjServORLedgerAccount, ProjSetup."Length Project (Extern)");
+              IF NOT UseLedgerAccount THEN
+                LineTxt := LineTxt + "Cost Object";
+            END;
+        END;
+        IF ProjSetup."Salary Application" = ProjSetup."Salary Application"::"LOSA-Cobra" THEN
+          IF PostedHourLine2."Receiving Company" <> '' THEN
+            IF CompanyData.GET(PostedHourLine2."Receiving Company") THEN
+              IF CompanyData."Company ID" <> '' THEN BEGIN
+                LineTxt := PADSTR(LineTxt,EndPosition-10);
+                LineTxt := LineTxt + CompanyData."Company ID";
+              END;
+        LineTxt := PADSTR(LineTxt,EndPosition);
+      END;
+    END;
+
+    PROCEDURE FillPeriod@1210190017();
+    BEGIN
+      IF LosaPeriodRec."Period No." < 10 THEN
+        LineTxt := LineTxt + STRSUBSTNO('0%1',LosaPeriodRec."Period No.")
+      ELSE
+        LineTxt := LineTxt + STRSUBSTNO('%1',LosaPeriodRec."Period No.");
+    END;
+
+    PROCEDURE FillYear@1100485002();
+    BEGIN
+      LineTxt := LineTxt + STRSUBSTNO('%1',PostedHourLine2.Year);
+    END;
+
+    PROCEDURE FillWeek@1210190029();
+    BEGIN
+      IF PostedHourLine2.Week < 10 THEN
+        LineTxt := LineTxt + STRSUBSTNO('0%1',PostedHourLine2.Week)
+      ELSE
+        LineTxt := LineTxt + STRSUBSTNO('%1',PostedHourLine2.Week);
+    END;
+
+    PROCEDURE FillWageComponent@1210190035(EndPosition@1100485000 : Integer;lComp@1210190000 : Code[10]);
+    BEGIN
+      LineTxt := PADSTR(LineTxt,EndPosition-STRLEN(lComp));
+      LineTxt := LineTxt + lComp;
+    END;
+
+    PROCEDURE SetEmployerSelection@1210190000(lEmployerCde@1210190000 : Code[20]);
+    BEGIN
+      EmployerCde := lEmployerCde;
+    END;
+
+    LOCAL PROCEDURE UseCoverageAccount@1100525000(PostedHourLine2@1100525000 : Record 11012085;VAR ProjServORLedgerAccount@1100525001 : Code[20]) : Boolean;
+    BEGIN
+      // 4PS 04-05-10 call: C-017927 sn
+      CASE PostedHourLine2.Type OF
+        PostedHourLine2.Type::Project:
+          ProjServORLedgerAccount := PostedHourLine2."Project No.";
+        PostedHourLine2.Type::Service:
+          ProjServORLedgerAccount := PostedHourLine2."Service Order No.";
+      END;
+
+      IF (ProjSetup."Salary Application" = ProjSetup."Salary Application"::"LOSA-Cobra") AND
+         (EmployeeRec."Calculate Wage Costs" = EmployeeRec."Calculate Wage Costs"::"Fixed Rate") THEN
+        IF TradeAssRec.GET(EmployeeRec."Trade Association") THEN
+          IF TradeAssRec."Wage Coverage Account" <> '' THEN BEGIN
+            ProjServORLedgerAccount := TradeAssRec."Wage Coverage Account";
+            EXIT(TRUE);
+          END;
+
+      EXIT(FALSE);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

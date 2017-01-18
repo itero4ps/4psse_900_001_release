@@ -1,0 +1,301 @@
+OBJECT Codeunit 11012061 Leave Jnl.-Post Batch
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=11020234;
+    OnRun=BEGIN
+            LeaveJnlLine.COPY(Rec);
+            Code;
+            Rec := LeaveJnlLine;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      GLSetup@1100485020 : Record 98;
+      UserSetup@1100485021 : Record 91;
+      HumanResourcesSetup@1100485023 : Record 5218;
+      GenJnlBatch@1100485005 : Record 232;
+      GenJnlLine@1100485026 : Record 81;
+      LeaveJnlLine@1007 : Record 11020234;
+      LeaveJnlLine2@1100485006 : Record 11020234;
+      LeaveJnlLine3@1100485007 : Record 11020234;
+      LeaveLedgEntry@1100485000 : Record 11020235;
+      NoSeries@1100485009 : TEMPORARY Record 308;
+      NoSeriesMgt@1100485008 : Codeunit 396;
+      NoSeriesMgt2@1100485011 : ARRAY [10] OF Codeunit 396;
+      DimMgt@1100485032 : Codeunit 408;
+      PostGenJnlLine@1100485034 : Codeunit 12;
+      UpdateAnalysisView@1100485033 : Codeunit 410;
+      Window@1100485002 : Dialog;
+      LastDocNo@1100485014 : Code[20];
+      LastDocNo2@1100485013 : Code[20];
+      LastPostedDocNo@1100485012 : Code[20];
+      LineCount@1100485004 : Integer;
+      StartLineNo@1100485003 : Integer;
+      NoOfRecords@1100485001 : Integer;
+      NoOfPostingNoSeries@1100485015 : Integer;
+      PostingNoSeriesNo@1100485010 : Integer;
+      NextEntryNo@1100485022 : Integer;
+      AllowPostingFrom@1100485018 : Date;
+      AllowPostingTo@1100485017 : Date;
+      Text100@1100485030 : TextConst 'ENU=cannot exceed %1 characters';
+      Text101@1100485029 : TextConst 'ENU=Journal Batch Name    #1##########\\';
+      Text102@1100485028 : TextConst 'ENU=Checking lines        #2######\';
+      Text103@1100485025 : TextConst 'ENU=Posting lines         #3###### @4@@@@@@@@@@@@@';
+      Text104@1100485024 : TextConst 'ENU=A maximum of %1 posting number series can be used in each journal.';
+      Text201@1100485019 : TextConst 'ENU=is not within your range of allowed posting dates';
+
+    PROCEDURE Code@1100485002();
+    BEGIN
+      WITH LeaveJnlLine DO BEGIN
+        SETRANGE("Journal Template Name","Journal Template Name");
+        SETRANGE("Journal Batch Name","Journal Batch Name");
+        LOCKTABLE;
+
+        GenJnlBatch.GET("Journal Template Name","Journal Batch Name");
+        IF STRLEN(INCSTR(GenJnlBatch.Name)) > MAXSTRLEN(GenJnlBatch.Name) THEN
+          GenJnlBatch.FIELDERROR(
+            Name,
+            STRSUBSTNO(
+              Text100,
+              MAXSTRLEN(GenJnlBatch.Name)));
+
+        IF NOT FIND('=><') THEN BEGIN
+          "Line No." := 0;
+          COMMIT;
+          EXIT;
+        END;
+
+        Window.OPEN(
+          Text101 +
+          Text102 +
+          Text103);
+        Window.UPDATE(1,"Journal Batch Name");
+
+        // Check lines
+        HumanResourcesSetup.GET;
+        LineCount := 0;
+        StartLineNo := "Line No.";
+        REPEAT
+          LineCount := LineCount + 1;
+          Window.UPDATE(2,LineCount);
+          CheckLine;
+          IF NEXT = 0 THEN
+            FIND('-');
+        UNTIL "Line No." = StartLineNo;
+        NoOfRecords := LineCount;
+
+        LeaveLedgEntry.LOCKTABLE;
+        IF LeaveLedgEntry.FINDLAST THEN;
+
+        // Post lines
+        LineCount := 0;
+        LastDocNo := '';
+        LastDocNo2 := '';
+        LastPostedDocNo := '';
+        FINDSET;
+        REPEAT
+          LineCount := LineCount + 1;
+          Window.UPDATE(3,LineCount);
+          Window.UPDATE(4,ROUND(LineCount / NoOfRecords * 10000,1));
+          IF NOT EmptyLine AND
+             (GenJnlBatch."No. Series" <> '') AND
+             ("Document No." <> LastDocNo2)
+          THEN
+            TESTFIELD("Document No.",NoSeriesMgt.GetNextNo(GenJnlBatch."No. Series","Posting Date",FALSE));
+          LastDocNo2 := "Document No.";
+          IF "Posting No. Series" = '' THEN
+            "Posting No. Series" := GenJnlBatch."No. Series"
+          ELSE
+            IF NOT EmptyLine THEN
+              IF "Document No." = LastDocNo THEN
+                "Document No." := LastPostedDocNo
+              ELSE BEGIN
+                IF NOT NoSeries.GET("Posting No. Series") THEN BEGIN
+                  NoOfPostingNoSeries := NoOfPostingNoSeries + 1;
+                  IF NoOfPostingNoSeries > ARRAYLEN(NoSeriesMgt2) THEN
+                    ERROR(
+                      Text104,
+                      ARRAYLEN(NoSeriesMgt2));
+                  NoSeries.Code := "Posting No. Series";
+                  NoSeries.Description := FORMAT(NoOfPostingNoSeries);
+                  NoSeries.INSERT;
+                END;
+                LastDocNo := "Document No.";
+                EVALUATE(PostingNoSeriesNo,NoSeries.Description);
+                "Document No." := NoSeriesMgt2[PostingNoSeriesNo].GetNextNo("Posting No. Series","Posting Date",FALSE);
+                LastPostedDocNo := "Document No.";
+              END;
+
+          PostLine;
+        UNTIL NEXT = 0;
+
+        // Update/delete lines
+        LeaveJnlLine2.COPYFILTERS(LeaveJnlLine);
+        IF LeaveJnlLine2.FINDLAST THEN; // Remember the last line
+        LeaveJnlLine3.COPY(LeaveJnlLine);
+        LeaveJnlLine3.DELETEALL;
+        LeaveJnlLine3.RESET;
+        LeaveJnlLine3.SETRANGE("Journal Template Name","Journal Template Name");
+        LeaveJnlLine3.SETRANGE("Journal Batch Name","Journal Batch Name");
+        IF NOT LeaveJnlLine3.FINDLAST THEN
+          IF INCSTR("Journal Batch Name") <> '' THEN BEGIN
+            GenJnlBatch.DELETE;
+            GenJnlBatch.Name := INCSTR("Journal Batch Name");
+            IF GenJnlBatch.INSERT THEN;
+            "Journal Batch Name" := GenJnlBatch.Name;
+          END;
+
+        LeaveJnlLine3.SETRANGE("Journal Batch Name","Journal Batch Name");
+        IF (GenJnlBatch."No. Series" = '') AND NOT LeaveJnlLine3.FINDLAST THEN BEGIN
+          LeaveJnlLine3.INIT;
+          LeaveJnlLine3."Journal Template Name" := "Journal Template Name";
+          LeaveJnlLine3."Journal Batch Name" := "Journal Batch Name";
+          LeaveJnlLine3."Line No." := 10000;
+          LeaveJnlLine3.INSERT;
+          LeaveJnlLine3.SetUpNewLine(LeaveJnlLine2);
+          LeaveJnlLine3.MODIFY;
+        END;
+
+        IF GenJnlBatch."No. Series" <> '' THEN
+          NoSeriesMgt.SaveNoSeries;
+        IF NoSeries.FINDSET THEN
+          REPEAT
+            EVALUATE(PostingNoSeriesNo,NoSeries.Description);
+            NoSeriesMgt2[PostingNoSeriesNo].SaveNoSeries;
+          UNTIL NoSeries.NEXT = 0;
+
+        COMMIT;
+      END;
+      UpdateAnalysisView.UpdateAll(0,TRUE);
+      COMMIT;
+    END;
+
+    PROCEDURE CheckLine@1100485007();
+    BEGIN
+      WITH LeaveJnlLine DO BEGIN
+        IF EmptyLine THEN
+          EXIT;
+
+        TESTFIELD("Document No.");
+        TESTFIELD("Employee No.");
+        TESTFIELD("Posting Date");
+        IF "Entry Type" = "Entry Type"::"General Ledger" THEN BEGIN
+          HumanResourcesSetup.TESTFIELD("Leave Hours Account");
+          HumanResourcesSetup.TESTFIELD("Bal. Account Leave Hours");
+        END ELSE
+          TESTFIELD("Leave Type");
+
+        IF (AllowPostingFrom = 0D) AND (AllowPostingTo = 0D) THEN BEGIN
+          IF USERID <> '' THEN BEGIN
+            IF UserSetup.GET(USERID) THEN BEGIN
+              AllowPostingFrom := UserSetup."Allow Posting From";
+              AllowPostingTo := UserSetup."Allow Posting To";
+            END;
+          END;
+          IF (AllowPostingFrom = 0D) AND (AllowPostingTo = 0D) THEN BEGIN
+            GLSetup.GET;
+            AllowPostingFrom := GLSetup."Allow Posting From";
+            AllowPostingTo := GLSetup."Allow Posting To";
+          END;
+          IF AllowPostingTo = 0D THEN
+            AllowPostingTo := 99991231D;
+        END;
+        IF ("Posting Date" < AllowPostingFrom) OR ("Posting Date" > AllowPostingTo) THEN
+          FIELDERROR("Posting Date",Text201);
+      END;
+    END;
+
+    PROCEDURE PostLine@1100485008();
+    BEGIN
+      WITH LeaveJnlLine DO BEGIN
+        IF EmptyLine THEN
+          EXIT;
+
+        CheckLine;
+
+        IF NextEntryNo = 0 THEN BEGIN
+          LeaveLedgEntry.LOCKTABLE;
+          IF LeaveLedgEntry.FINDLAST THEN
+            NextEntryNo := LeaveLedgEntry."Entry No.";
+          NextEntryNo := NextEntryNo + 1;
+        END;
+
+        IF "Document Date" = 0D THEN
+          "Document Date" := "Posting Date";
+
+        LeaveLedgEntry.INIT;
+        LeaveLedgEntry."Entry No." := NextEntryNo;
+        LeaveLedgEntry."Journal Batch Name" := "Journal Batch Name";
+        LeaveLedgEntry."Posting Date" := "Posting Date";
+        LeaveLedgEntry."Document No." := "Document No.";
+        LeaveLedgEntry."No. of Hours" := "No. of Hours";
+        LeaveLedgEntry."Employee No." := "Employee No.";
+        LeaveLedgEntry.Description := Description;
+        LeaveLedgEntry."Leave Type" := "Leave Type";
+        LeaveLedgEntry."User ID" := USERID;
+        LeaveLedgEntry."Document Date" := "Document Date";
+        LeaveLedgEntry."Source Code" := "Source Code";
+        LeaveLedgEntry."Reason Code" := "Reason Code";
+        LeaveLedgEntry."No. Series" := "Posting No. Series";
+        LeaveLedgEntry.Rate := Rate;
+        LeaveLedgEntry.Amount := Amount;
+        LeaveLedgEntry."Entry Type" := "Entry Type";
+        LeaveLedgEntry.INSERT;
+
+        NextEntryNo := NextEntryNo + 1;
+
+        IF "Entry Type" <> "Entry Type"::"General Ledger" THEN
+          EXIT;
+
+        GenJnlLine.INIT;
+        GenJnlLine."Journal Template Name" := "Journal Template Name";
+        GenJnlLine."Journal Batch Name" := "Journal Batch Name";
+        GenJnlLine."Document No." := "Document No.";
+        GenJnlLine."Reason Code" := "Reason Code";
+        GenJnlLine."Source Code" := "Source Code";
+        GenJnlLine."Account Type" := GenJnlLine."Account Type"::"G/L Account";
+        GenJnlLine."System-Created Entry" := TRUE;
+        GenJnlLine."Posting Date" := "Posting Date";
+        GenJnlLine.VALIDATE("Account No.", HumanResourcesSetup."Leave Hours Account");
+        GenJnlLine."Gen. Prod. Posting Group" := '';
+        GenJnlLine."Gen. Bus. Posting Group" := '';
+        GenJnlLine."VAT Prod. Posting Group" :='';
+        GenJnlLine."VAT Bus. Posting Group" := '';
+        GenJnlLine."Gen. Posting Type" := 0;
+        GenJnlLine."Bal. Account Type" := GenJnlLine."Bal. Account Type"::"G/L Account";
+        GenJnlLine.VALIDATE("Bal. Account No.", HumanResourcesSetup."Bal. Account Leave Hours");
+        GenJnlLine."Bal. Gen. Prod. Posting Group" := '';
+        GenJnlLine."Bal. Gen. Bus. Posting Group" := '';
+        GenJnlLine."Bal. VAT Prod. Posting Group" := '';
+        GenJnlLine."Bal. VAT Bus. Posting Group" := '';
+        GenJnlLine."Bal. Gen. Posting Type" := 0;
+        GenJnlLine.Description := Description;
+        GenJnlLine.VALIDATE(Amount, Amount);
+
+        GenJnlLine.CreateDim(
+          DimMgt.TypeToTableID1(GenJnlLine."Account Type"),GenJnlLine."Account No.",
+          DimMgt.TypeToTableID1(GenJnlLine."Bal. Account Type"),GenJnlLine."Bal. Account No.",
+          DATABASE::Employee,"Employee No.",
+          0,'',
+          0,'',  //** 4PS  10-06-2010
+          0,'',0,'',  //**4PS.n
+          0,'');
+
+        PostGenJnlLine.RunWithCheck(GenJnlLine);
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

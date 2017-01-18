@@ -1,0 +1,263 @@
+OBJECT Codeunit 11072078 INSBOU Order Response
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=11072658;
+    OnRun=BEGIN
+            ProcessOrderResponse(Rec);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1100529300 : TextConst 'ENU=Price Difference out of margins (%1).';
+
+    LOCAL PROCEDURE ProcessOrderResponse@1100529302(VAR INSBOUPurchaseOrderResponse@1100525000 : Record 11072658);
+    VAR
+      INSBOUPurchOrderRespLine@1100528300 : Record 11072659;
+      INSBOUPartialDelivery@1100529302 : Record 11012340;
+      PurchaseHeader@1100528301 : Record 38;
+    BEGIN
+      IF (NOT INSBOUPurchaseOrderResponse.FINDSET(TRUE)) THEN
+        EXIT;
+
+      REPEAT
+        IF (INSBOUPurchaseOrderResponse."Process Status" > INSBOUPurchaseOrderResponse."Process Status"::Processing) THEN
+          INSBOUPurchaseOrderResponse.FIELDERROR("Process Status");
+
+        INSBOUPurchaseOrderResponse."Process Status" := INSBOUPurchaseOrderResponse."Process Status"::Processing;
+        INSBOUPurchaseOrderResponse."Error Message" := '';
+        INSBOUPurchaseOrderResponse.MODIFY(TRUE);
+        COMMIT;
+
+        PurchaseHeader.GET(INSBOUPurchaseOrderResponse.DetermineDocumentType, INSBOUPurchaseOrderResponse.BuyersOrderNumber);
+        IF (INSBOUPurchaseOrderResponse.StatusCode <> '29') THEN BEGIN
+          CheckPurchaseHeader(INSBOUPurchaseOrderResponse, PurchaseHeader);
+          PurchaseHeader."Promised Receipt Date" := INSBOUPurchaseOrderResponse.ScheduledDeliveryDate;
+          PurchaseHeader.MODIFY;
+        END;
+
+        ProcessOrderResponseLines(INSBOUPurchaseOrderResponse, PurchaseHeader);
+
+        PostINSBOUConfirmation(PurchaseHeader);
+
+        INSBOUPurchaseOrderResponse."Process Status" := INSBOUPurchaseOrderResponse."Process Status"::Processed;
+        INSBOUPurchaseOrderResponse.MODIFY(TRUE);
+        COMMIT;
+      UNTIL (INSBOUPurchaseOrderResponse.NEXT = 0);
+    END;
+
+    LOCAL PROCEDURE ProcessOrderResponseLines@1100528300(INSBOUPurchaseOrderResponse@1100528300 : Record 11072658;PurchaseHeader@1100528304 : Record 38);
+    VAR
+      INSBOUPurchOrderRespLine@1100528301 : Record 11072659;
+      PurchaseLine@1100528302 : Record 39;
+      PurchaseLineExtension@1100528303 : Record 11020644;
+    BEGIN
+      INSBOUPurchOrderRespLine.SETRANGE(OrderResponsNumber, INSBOUPurchaseOrderResponse.OrderResponsNumber);
+      INSBOUPurchOrderRespLine.SETFILTER("Process Status", '<%1', INSBOUPurchOrderRespLine."Process Status"::Processed);
+      IF (NOT INSBOUPurchOrderRespLine.FINDSET(TRUE)) THEN
+        EXIT;
+
+      REPEAT
+        INSBOUPurchOrderRespLine."Process Status" := INSBOUPurchOrderRespLine."Process Status"::Processing;
+        INSBOUPurchaseOrderResponse."Error Message" := '';
+        INSBOUPurchOrderRespLine.MODIFY(TRUE);
+        COMMIT;
+
+        PurchaseLine.GET(PurchaseHeader."Document Type", PurchaseHeader."No.", INSBOUPurchOrderRespLine.OrderLineIdentification);
+        IF (INSBOUPurchaseOrderResponse.StatusCode <> '29') THEN BEGIN
+          CheckPurchaseOrderLine(INSBOUPurchOrderRespLine, PurchaseLine);
+          PurchaseLine."Promised Receipt Date" := PurchaseHeader."Promised Receipt Date";
+          PurchaseLine.VALIDATE("Direct Unit Cost", INSBOUPurchOrderRespLine.NetLineAmount / INSBOUPurchOrderRespLine.PlannedDeliveryQuantity );
+          PurchaseLine.MODIFY(TRUE);
+
+          ProcessPartialDeliveryLines(INSBOUPurchOrderRespLine, PurchaseLine);
+        END;
+
+        PurchaseLineExtension.INIT;
+        PurchaseLineExtension."GS1 Quantity Confirmed" := PurchaseLine.Quantity;
+        PurchaseLineExtension.UpdatePurchLineExtension(PurchaseLine."Document Type", PurchaseLine."Document No.", PurchaseLine."Line No.");
+
+        INSBOUPurchOrderRespLine."Process Status" := INSBOUPurchOrderRespLine."Process Status"::Processed;
+        INSBOUPurchOrderRespLine.MODIFY(TRUE);
+        COMMIT;
+      UNTIL (INSBOUPurchOrderRespLine.NEXT = 0);
+    END;
+
+    LOCAL PROCEDURE ProcessPartialDeliveryLines@1100528303(INSBOUPurchOrderRespLine@1100528301 : Record 11072659;VAR PurchaseLine@1100528300 : Record 39);
+    VAR
+      INSBOUPartialDelivery@1100528303 : Record 11012340;
+      LineNo@1100528302 : Integer;
+    BEGIN
+      INSBOUPartialDelivery.SETRANGE(INSBOUPartialDelivery.OrderResponsNumber, INSBOUPurchOrderRespLine.OrderResponsNumber);
+      INSBOUPartialDelivery.SETRANGE(INSBOUPartialDelivery.LineNumber, INSBOUPurchOrderRespLine.LineNumber);
+      IF (NOT INSBOUPartialDelivery.FINDFIRST) THEN
+        EXIT;
+
+      LineNo := 10;
+      REPEAT
+        ProcessPartialDeliveryLine(PurchaseLine, LineNo, INSBOUPartialDelivery.PlannedPartialDeliveryQuantity,
+          INSBOUPartialDelivery.ScheduledDeliveryDate);
+        LineNo += 10;
+      UNTIL INSBOUPartialDelivery.NEXT = 0;
+
+      PurchaseLine.VALIDATE(Quantity, 0);
+      PurchaseLine."Modified by" := USERID;
+      PurchaseLine."Last Date Modified" := TODAY;
+      PurchaseLine.MODIFY;
+    END;
+
+    LOCAL PROCEDURE ProcessPartialDeliveryLine@1100528308(PurchaseLineIn@1210190003 : Record 39;SeqNo@1210190005 : Integer;Quantity@1100528300 : Decimal;DeliveryDate@1100528301 : Date) : Boolean;
+    VAR
+      PurchaseLine@1210190006 : Record 39;
+      PurchaseLineExtension@1210190008 : Record 11020644;
+    BEGIN
+      PurchaseLine.COPY(PurchaseLineIn);
+      PurchaseLine."Line No." := PurchaseLineIn."Line No." + (SeqNo * 10);
+      PurchaseLine."Input by" := USERID;
+      PurchaseLine."Input Date" := TODAY;
+      PurchaseLine.INSERT;
+
+      PurchaseLine.VALIDATE(Quantity, Quantity);
+      PurchaseLine."Promised Receipt Date" := DeliveryDate;
+      PurchaseLine."Modified by" := USERID;
+      PurchaseLine."Last Date Modified" := TODAY;
+      PurchaseLine.MODIFY;
+
+      PurchaseLineExtension.INIT;
+      PurchaseLineExtension."GS1 Quantity Confirmed" := Quantity;
+      PurchaseLineExtension.UpdatePurchLineExtension(PurchaseLine."Document Type", PurchaseLine."Document No.", PurchaseLine."Line No.");
+    END;
+
+    LOCAL PROCEDURE CheckPurchaseHeader@1100529306(INSBOUPurchaseOrderResponse@1100529301 : Record 11072658;PurchaseHeader@1100528300 : Record 38);
+    VAR
+      INSBOUPurchOrderRespLine@1100529303 : Record 11072659;
+      PurchasesPayablesSetup@1100529300 : Record 312;
+      TotalAmountDiff@1100529302 : Decimal;
+    BEGIN
+      PurchasesPayablesSetup.GET;
+      PurchaseHeader.CALCFIELDS(Amount);
+
+      IF (PurchasesPayablesSetup."Margin Amount (Header)" <> 0) OR (PurchasesPayablesSetup."Margin % (Header)" <> 0) THEN BEGIN
+        IF (INSBOUPurchaseOrderResponse.TotalAmount <> 0) THEN
+          TotalAmountDiff := ABS(INSBOUPurchaseOrderResponse.TotalAmount - PurchaseHeader.Amount);
+        IF (TotalAmountDiff = 0) THEN
+          EXIT;
+
+        IF ((TotalAmountDiff > PurchasesPayablesSetup."Margin Amount (Header)") AND (PurchasesPayablesSetup."Margin Amount (Header)" <> 0)) OR
+           (((TotalAmountDiff * 100) > (PurchasesPayablesSetup."Margin % (Header)" * PurchaseHeader.Amount)) AND
+            (PurchasesPayablesSetup."Margin % (Header)" <> 0))
+        THEN
+          ERROR(Text000, PurchasesPayablesSetup."Margin Amount (Header)");
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckPurchaseOrderLine@1100529311(INSBOUPurchOrderRespLine@1100528300 : Record 11072659;PurchaseLine@1100528302 : Record 39);
+    VAR
+      PurchasesPayablesSetup@1100529301 : Record 312;
+      AmountDiff@1100529303 : Decimal;
+    BEGIN
+      PurchasesPayablesSetup.GET;
+
+      IF (PurchasesPayablesSetup."Margin Amount (Detail)" <> 0) OR (PurchasesPayablesSetup."Margin % (Detail)" <> 0) THEN BEGIN
+        IF (INSBOUPurchOrderRespLine.NetLineAmount <> 0) THEN
+          AmountDiff := ABS((INSBOUPurchOrderRespLine.NetLineAmount / INSBOUPurchOrderRespLine.PlannedDeliveryQuantity) - PurchaseLine."Direct Unit Cost");
+        IF (AmountDiff = 0) OR (INSBOUPurchOrderRespLine.DifferenceWithOrderedQuantity = 0) THEN
+          EXIT;
+
+        IF ((AmountDiff > PurchasesPayablesSetup."Margin Amount (Detail)") AND (PurchasesPayablesSetup."Margin Amount (Detail)" <> 0)) OR
+           (((AmountDiff * 100) > (PurchasesPayablesSetup."Margin % (Detail)" * PurchaseLine."Direct Unit Cost")) AND
+            (PurchasesPayablesSetup."Margin % (Detail)" <> 0))
+        THEN
+          ERROR(Text000, PurchasesPayablesSetup."Margin Amount (Detail)");
+      END;
+
+      CheckPartialDeliveryLines(INSBOUPurchOrderRespLine, PurchaseLine);
+    END;
+
+    LOCAL PROCEDURE CheckPartialDeliveryLines@1100529323(INSBOUPurchOrderRespLine@1100529300 : Record 11072659;PurchaseLine@1100528300 : Record 39);
+    VAR
+      INSBOUPartialDelivery@1100528301 : Record 11012340;
+    BEGIN
+      INSBOUPartialDelivery.SETRANGE(INSBOUPartialDelivery.OrderResponsNumber,INSBOUPurchOrderRespLine.OrderResponsNumber);
+      INSBOUPartialDelivery.SETRANGE(INSBOUPartialDelivery.LineNumber, INSBOUPurchOrderRespLine.LineNumber);
+      IF (NOT INSBOUPartialDelivery.FINDFIRST) THEN
+        EXIT;
+
+      REPEAT
+        //Check something
+      UNTIL (INSBOUPartialDelivery.NEXT = 0);
+    END;
+
+    LOCAL PROCEDURE PostINSBOUConfirmation@1100528500(VAR PurchHeader@1100528511 : Record 38);
+    VAR
+      PurchLine@1100528504 : Record 39;
+      PurchLineExtension@1100528502 : Record 11020644;
+      DocumentPhase@1100528507 : Record 11020418;
+      PurchPlanPhase@1100528505 : Record 11020417;
+      PurchSetup@1100528510 : Record 312;
+      PurchPostViaJobQueue@1100528509 : Codeunit 98;
+      PurchPlanMgt@1100528506 : Codeunit 11012242;
+      PostOrder@1100528503 : Boolean;
+      PhaseAction@1100528508 : 'Consent,Print,ICMStatus,Word,Confirm,OrderStatus,QuoteStatus,Manual,E-mail,GS1,GS1Posting';
+    BEGIN
+      //Check if fit for posting
+      IF (PurchHeader."Document Type" <> PurchHeader."Document Type"::Order) OR
+         (PurchHeader.Status = PurchHeader.Status::Closed) OR
+         (PurchHeader."Purchase Plan" = '') THEN
+        EXIT;
+
+      DocumentPhase.SETRANGE("Document Type", PurchHeader."Document Type");
+      DocumentPhase.SETRANGE("Document No.", PurchHeader."No.");
+      DocumentPhase.SETRANGE("Purchase Plan", PurchHeader."Purchase Plan");
+      DocumentPhase.SETFILTER(Status, '>%1', DocumentPhase.Status::"Not Active");
+      IF (NOT DocumentPhase.FINDLAST) THEN
+        EXIT;
+
+      PurchPlanPhase.GET(PurchHeader."Purchase Plan", DocumentPhase."Phase No.");
+      IF (NOT PurchPlanPhase."Activates Posting GS1 Confirm.") THEN
+        EXIT;
+
+      //Set To Receive on Purchase Lines
+      PurchLineExtension.SETRANGE("Document Type", PurchHeader."Document Type");
+      PurchLineExtension.SETRANGE("Document No.", PurchHeader."No.");
+      IF (PurchLineExtension.FINDSET) THEN
+        REPEAT
+          IF (PurchLineExtension."GS1 Quantity Confirmed" > 0) THEN BEGIN
+            PurchLine.GET(PurchLineExtension."Document Type", PurchLineExtension."Document No.", PurchLineExtension."Line No.");
+            IF (PurchLineExtension."GS1 Quantity Confirmed" > PurchLine."Quantity Received") THEN BEGIN
+              PurchLine.VALIDATE("Qty. to Receive",PurchLineExtension."GS1 Quantity Confirmed" - PurchLine."Quantity Received");
+              PurchLine.MODIFY(TRUE);
+              PostOrder := TRUE;
+            END;
+          END;
+        UNTIL (PurchLineExtension.NEXT = 0);
+
+      //Post and finish phase (if all is posted)
+      IF (PostOrder) THEN BEGIN
+        PurchHeader.FIND;
+        PurchHeader.Receive := TRUE;
+
+        PurchSetup.GET;
+        IF (PurchSetup."Post with Job Queue") THEN
+          PurchPostViaJobQueue.EnqueuePurchDoc(PurchHeader)
+        ELSE
+          CODEUNIT.RUN(CODEUNIT::"Purch.-Post", PurchHeader);
+
+        IF (DocumentPhase.FIND) THEN
+          PurchPlanMgt.FinishPhase(PurchHeader, PhaseAction::GS1Posting, 0);
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

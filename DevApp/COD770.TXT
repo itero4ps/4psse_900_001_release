@@ -1,0 +1,397 @@
+OBJECT Codeunit 770 Analysis Report Chart Mgt.
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      DefaultTXT@1000 : TextConst '@@@=The default name of the chart setup.;ENU=DEFAULT';
+      DuplicateDescERR@1003 : TextConst 'ENU=Account Schedule %1 has duplicate Description values.';
+      DuplicateColHdrERR@1002 : TextConst 'ENU=Column Layout %1 has duplicate Column Header values.';
+      Text001@1005 : TextConst '@@@=%1 Account Schedule Chart Setup Name, %2 Period, %3 Current time;ENU=%1 | %2 (Updated %3)';
+      Text002@1004 : TextConst '@@@="%1 = Start Date, %2 = End Date";ENU=%1..%2';
+      Text003@1001 : TextConst 'ENU=Analysis line or analysis column has been modified since the chart setup was created. Please reset your chart setup.';
+
+    LOCAL PROCEDURE GetSetup@3(VAR AnalysisReportChartSetup@1000 : Record 770;AnalysisArea@1003 : Option;ChartName@1001 : Text[30]);
+    VAR
+      Found@1002 : Boolean;
+    BEGIN
+      WITH AnalysisReportChartSetup DO BEGIN
+        IF GET(USERID,AnalysisArea,ChartName) THEN BEGIN
+          SetLastViewed;
+          EXIT;
+        END;
+
+        SETRANGE("User ID",USERID);
+        SETRANGE("Analysis Area",AnalysisArea);
+        SETRANGE("Last Viewed",TRUE);
+        Found := FINDFIRST;
+        RESET;
+        IF Found THEN
+          EXIT;
+
+        ChartName := DefaultTXT;
+
+        IF NOT GET(USERID,AnalysisArea,ChartName) THEN BEGIN
+          INIT;
+          "User ID" := USERID;
+          "Analysis Area" := AnalysisArea;
+          Name := ChartName;
+          "Base X-Axis on" := "Base X-Axis on"::Period;
+          "Start Date" := WORKDATE;
+          "Period Length" := "Period Length"::Day;
+          INSERT;
+        END;
+        SetLastViewed;
+      END;
+    END;
+
+    PROCEDURE DrillDown@1(VAR BusChartBuf@1001 : Record 485;AnalysisReportChartSetup@1000 : Record 770);
+    VAR
+      AnalysisLine@1002 : Record 7114;
+      AnalysisColumn@1003 : Record 7118;
+      AnalysisReportMgt@1004 : Codeunit 7110;
+    BEGIN
+      GetAnalysisLineAndColumnForDrillDown(AnalysisLine,AnalysisColumn,BusChartBuf,AnalysisReportChartSetup);
+      AnalysisReportMgt.CalcCell(AnalysisLine,AnalysisColumn,TRUE);
+    END;
+
+    PROCEDURE UpdateData@2(VAR BusChartBuf@1002 : Record 485;AnalysisReportChartSetup@1000 : Record 770;Period@1001 : ' ,Next,Previous');
+    VAR
+      BusChartMapColumn@1011 : Record 486;
+      AnalysisReportChartLine@1010 : Record 771;
+      AnalysisReportChartLine2@1009 : Record 771;
+      AnalysisLine@1008 : Record 7114;
+      AnalysisColumn@1007 : Record 7118;
+      AnalysisReportMgt@1013 : Codeunit 7110;
+      FromDate@1006 : Date;
+      ToDate@1005 : Date;
+      NoOfPeriods@1003 : Integer;
+      PeriodCounter@1012 : Integer;
+      XCounter@1014 : Integer;
+    BEGIN
+      COMMIT;
+      CheckDuplicateAnalysisLineDescription(
+        AnalysisReportChartSetup."Analysis Area",AnalysisReportChartSetup."Analysis Line Template Name");
+      CheckDuplicateAnalysisColumnHeader(
+        AnalysisReportChartSetup."Analysis Area",AnalysisReportChartSetup."Analysis Column Template Name");
+
+      WITH BusChartBuf DO BEGIN
+        "Period Length" := AnalysisReportChartSetup."Period Length";
+
+        CASE AnalysisReportChartSetup."Base X-Axis on" OF
+          AnalysisReportChartSetup."Base X-Axis on"::Period:
+            BEGIN
+              IF Period = Period::" " THEN BEGIN
+                FromDate := 0D;
+                ToDate := 0D;
+              END ELSE
+                IF FindMidColumn(BusChartMapColumn) THEN
+                  GetPeriodFromMapColumn(BusChartMapColumn.Index,FromDate,ToDate);
+            END;
+          AnalysisReportChartSetup."Base X-Axis on"::Line,
+          AnalysisReportChartSetup."Base X-Axis on"::Column:
+            BEGIN
+              IF ("Period Filter Start Date" = 0D) AND (AnalysisReportChartSetup."Start Date" <> 0D) THEN
+                InitializePeriodFilter(AnalysisReportChartSetup."Start Date",AnalysisReportChartSetup."End Date")
+              ELSE
+                RecalculatePeriodFilter("Period Filter Start Date","Period Filter End Date",Period);
+            END;
+        END;
+
+        Initialize;
+        CASE AnalysisReportChartSetup."Base X-Axis on" OF
+          AnalysisReportChartSetup."Base X-Axis on"::Period:
+            BEGIN
+              SetPeriodXAxis;
+              NoOfPeriods := AnalysisReportChartSetup."No. of Periods";
+              CalcAndInsertPeriodAxis(BusChartBuf,AnalysisReportChartSetup,Period,NoOfPeriods,FromDate,ToDate);
+            END;
+          AnalysisReportChartSetup."Base X-Axis on"::Line:
+            SetXAxis(AnalysisLine.FIELDCAPTION(Description),"Data Type"::String);
+          AnalysisReportChartSetup."Base X-Axis on"::Column:
+            SetXAxis(AnalysisColumn.FIELDCAPTION("Column Header"),"Data Type"::String);
+        END;
+
+        AddMeasures(BusChartBuf,AnalysisReportChartSetup);
+
+        CASE AnalysisReportChartSetup."Base X-Axis on" OF
+          AnalysisReportChartSetup."Base X-Axis on"::Period:
+            BEGIN
+              FindFirstColumn(BusChartMapColumn);
+              FOR PeriodCounter := 1 TO NoOfPeriods DO BEGIN
+                AnalysisReportChartSetup.SetLinkToMeasureLines(AnalysisReportChartLine);
+                AnalysisReportChartLine.SETFILTER("Chart Type",'<>%1',AnalysisReportChartLine."Chart Type"::" ");
+                IF AnalysisReportChartLine.FINDSET THEN
+                  REPEAT
+                    GetPeriodFromMapColumn(PeriodCounter - 1,FromDate,ToDate);
+                    AnalysisLine.SETRANGE("Date Filter",FromDate,ToDate);
+                    IF (NOT AnalysisLine.GET(
+                          AnalysisReportChartSetup."Analysis Area",AnalysisReportChartSetup."Analysis Line Template Name",
+                          AnalysisReportChartLine."Analysis Line Line No.")) OR
+                       (NOT AnalysisColumn.GET(
+                          AnalysisReportChartSetup."Analysis Area",AnalysisReportChartSetup."Analysis Column Template Name",
+                          AnalysisReportChartLine."Analysis Column Line No."))
+                    THEN
+                      ERROR(Text003);
+                    SetValue(
+                      AnalysisReportChartLine."Measure Name",PeriodCounter - 1,
+                      AnalysisReportMgt.CalcCell(AnalysisLine,AnalysisColumn,FALSE));
+                  UNTIL AnalysisReportChartLine.NEXT = 0;
+              END;
+            END;
+          AnalysisReportChartSetup."Base X-Axis on"::Line:
+            BEGIN
+              AnalysisReportChartSetup.SetLinkToDimensionLines(AnalysisReportChartLine);
+              AnalysisReportChartLine.SETFILTER("Chart Type",'<>%1',AnalysisReportChartLine."Chart Type"::" ");
+              AnalysisReportChartSetup.SetLinkToMeasureLines(AnalysisReportChartLine2);
+              AnalysisReportChartLine2.SETFILTER("Chart Type",'<>%1',AnalysisReportChartLine2."Chart Type"::" ");
+              XCounter := 0;
+              AnalysisLine.SETRANGE("Date Filter","Period Filter Start Date","Period Filter End Date");
+              IF AnalysisReportChartLine.FINDSET THEN
+                REPEAT
+                  AddColumn(AnalysisReportChartLine."Measure Name");
+                  IF NOT AnalysisLine.GET(
+                       AnalysisReportChartSetup."Analysis Area",AnalysisReportChartSetup."Analysis Line Template Name",
+                       AnalysisReportChartLine."Analysis Line Line No.")
+                  THEN
+                    ERROR(Text003);
+                  IF AnalysisReportChartLine2.FINDSET THEN
+                    REPEAT
+                      IF NOT AnalysisColumn.GET(
+                           AnalysisReportChartSetup."Analysis Area",AnalysisReportChartSetup."Analysis Column Template Name",
+                           AnalysisReportChartLine2."Analysis Column Line No.")
+                      THEN
+                        ERROR(Text003);
+                      SetValue(
+                        AnalysisReportChartLine2."Measure Name",XCounter,AnalysisReportMgt.CalcCell(AnalysisLine,AnalysisColumn,FALSE));
+                    UNTIL AnalysisReportChartLine2.NEXT = 0;
+                  XCounter += 1;
+                UNTIL AnalysisReportChartLine.NEXT = 0;
+            END;
+          AnalysisReportChartSetup."Base X-Axis on"::Column:
+            BEGIN
+              AnalysisReportChartSetup.SetLinkToDimensionLines(AnalysisReportChartLine);
+              AnalysisReportChartLine.SETFILTER("Chart Type",'<>%1',AnalysisReportChartLine."Chart Type"::" ");
+              AnalysisReportChartSetup.SetLinkToMeasureLines(AnalysisReportChartLine2);
+              AnalysisReportChartLine2.SETFILTER("Chart Type",'<>%1',AnalysisReportChartLine2."Chart Type"::" ");
+              AnalysisLine.SETRANGE("Date Filter","Period Filter Start Date","Period Filter End Date");
+              XCounter := 0;
+              IF AnalysisReportChartLine.FINDSET THEN
+                REPEAT
+                  AddColumn(AnalysisReportChartLine."Measure Name");
+                  IF NOT AnalysisColumn.GET(
+                       AnalysisReportChartSetup."Analysis Area",AnalysisReportChartSetup."Analysis Column Template Name",
+                       AnalysisReportChartLine."Analysis Column Line No.")
+                  THEN
+                    ERROR(Text003);
+                  IF AnalysisReportChartLine2.FINDSET THEN
+                    REPEAT
+                      IF NOT AnalysisLine.GET(
+                           AnalysisReportChartSetup."Analysis Area",AnalysisReportChartSetup."Analysis Line Template Name",
+                           AnalysisReportChartLine2."Analysis Line Line No.")
+                      THEN
+                        ERROR(Text003);
+                      SetValue(
+                        AnalysisReportChartLine2."Measure Name",XCounter,AnalysisReportMgt.CalcCell(AnalysisLine,AnalysisColumn,FALSE));
+                    UNTIL AnalysisReportChartLine2.NEXT = 0;
+                  XCounter += 1;
+                UNTIL AnalysisReportChartLine.NEXT = 0;
+            END;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE AddMeasures@13(VAR BusChartBuf@1004 : Record 485;AnalysisReportChartSetup@1001 : Record 770);
+    VAR
+      AnalysisReportChartLine@1000 : Record 771;
+      BusChartType@1003 : Option;
+    BEGIN
+      WITH AnalysisReportChartLine DO BEGIN
+        AnalysisReportChartSetup.SetLinkToMeasureLines(AnalysisReportChartLine);
+        SETFILTER("Chart Type",'<>%1',"Chart Type"::" ");
+        IF FINDSET THEN
+          REPEAT
+            CASE "Chart Type" OF
+              "Chart Type"::Line:
+                BusChartType := BusChartBuf."Chart Type"::Line;
+              "Chart Type"::StepLine:
+                BusChartType := BusChartBuf."Chart Type"::StepLine;
+              "Chart Type"::Column:
+                BusChartType := BusChartBuf."Chart Type"::Column;
+              "Chart Type"::StackedColumn:
+                BusChartType := BusChartBuf."Chart Type"::StackedColumn;
+            END;
+            BusChartBuf.AddMeasure("Measure Name","Measure Value",BusChartBuf."Data Type"::Decimal,BusChartType);
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE CalcAndInsertPeriodAxis@8(VAR BusChartBuf@1000 : Record 485;AnalysisReportChartSetup@1009 : Record 770;Period@1005 : ',Next,Previous';MaxPeriodNo@1008 : Integer;StartDate@1006 : Date;EndDate@1010 : Date);
+    VAR
+      AccSchedChartManagement@1001 : Codeunit 762;
+      PeriodDate@1002 : Date;
+    BEGIN
+      IF (StartDate = 0D) AND (AnalysisReportChartSetup."Start Date" <> 0D) THEN
+        PeriodDate := CALCDATE(STRSUBSTNO('<-1%1>',BusChartBuf.GetPeriodLength),AnalysisReportChartSetup."Start Date")
+      ELSE BEGIN
+        BusChartBuf.RecalculatePeriodFilter(StartDate,EndDate,Period);
+        PeriodDate := CALCDATE(STRSUBSTNO('<-%1%2>',MaxPeriodNo - (MaxPeriodNo DIV 2),BusChartBuf.GetPeriodLength),EndDate);
+      END;
+
+      BusChartBuf.AddPeriods(
+        AccSchedChartManagement.GetCorrectedDate(BusChartBuf,PeriodDate,1),
+        AccSchedChartManagement.GetCorrectedDate(BusChartBuf,PeriodDate,MaxPeriodNo));
+    END;
+
+    LOCAL PROCEDURE GetAnalysisLineAndColumnForDrillDown@6(VAR AnalysisLine@1000 : Record 7114;VAR AnalysisColumn@1001 : Record 7118;VAR BusChartBuf@1003 : Record 485;AnalysisReportChartSetup@1002 : Record 770);
+    VAR
+      XName@1009 : Variant;
+      FromDate@1005 : Date;
+      ToDate@1004 : Date;
+      MeasureValueString@1006 : Text;
+      AnalysisLineLineNo@1008 : Integer;
+      AnalysisColumnLineNo@1007 : Integer;
+    BEGIN
+      CASE AnalysisReportChartSetup."Base X-Axis on" OF
+        AnalysisReportChartSetup."Base X-Axis on"::Period:
+          BEGIN
+            BusChartBuf."Period Length" := AnalysisReportChartSetup."Period Length";
+            ToDate := BusChartBuf.GetXValueAsDate(BusChartBuf."Drill-Down X Index");
+            FromDate := BusChartBuf.CalcFromDate(ToDate);
+            MeasureValueString := BusChartBuf.GetMeasureValueString(BusChartBuf."Drill-Down Measure Index");
+            EVALUATE(AnalysisLineLineNo,COPYSTR(MeasureValueString,1,STRPOS(MeasureValueString,' ') - 1));
+            AnalysisLine.GET(
+              AnalysisReportChartSetup."Analysis Area",AnalysisReportChartSetup."Analysis Line Template Name",AnalysisLineLineNo);
+            EVALUATE(AnalysisColumnLineNo,COPYSTR(MeasureValueString,STRPOS(MeasureValueString,' ') + 1));
+            AnalysisColumn.GET(
+              AnalysisReportChartSetup."Analysis Area",AnalysisReportChartSetup."Analysis Column Template Name",AnalysisColumnLineNo);
+          END;
+        AnalysisReportChartSetup."Base X-Axis on"::Line:
+          BEGIN
+            FromDate := BusChartBuf."Period Filter Start Date";
+            ToDate := BusChartBuf."Period Filter End Date";
+            AnalysisReportChartSetup.FilterAnalysisLine(AnalysisLine);
+            BusChartBuf.GetXValue(BusChartBuf."Drill-Down X Index",XName);
+            AnalysisLine.SETRANGE(Description,FORMAT(XName));
+            AnalysisLine.FINDFIRST;
+            MeasureValueString := BusChartBuf.GetMeasureValueString(BusChartBuf."Drill-Down Measure Index");
+            EVALUATE(AnalysisColumnLineNo,MeasureValueString);
+            AnalysisColumn.GET(
+              AnalysisReportChartSetup."Analysis Area",AnalysisReportChartSetup."Analysis Column Template Name",AnalysisColumnLineNo);
+          END;
+        AnalysisReportChartSetup."Base X-Axis on"::Column:
+          BEGIN
+            FromDate := BusChartBuf."Period Filter Start Date";
+            ToDate := BusChartBuf."Period Filter End Date";
+            AnalysisReportChartSetup.FilterAnalysisColumn(AnalysisColumn);
+            BusChartBuf.GetXValue(BusChartBuf."Drill-Down X Index",XName);
+            AnalysisColumn.SETRANGE("Column Header",FORMAT(XName));
+            AnalysisColumn.FINDFIRST;
+            MeasureValueString := BusChartBuf.GetMeasureValueString(BusChartBuf."Drill-Down Measure Index");
+            EVALUATE(AnalysisLineLineNo,MeasureValueString);
+            AnalysisLine.GET(
+              AnalysisReportChartSetup."Analysis Area",AnalysisReportChartSetup."Analysis Line Template Name",AnalysisLineLineNo);
+          END;
+      END;
+
+      AnalysisLine.SETRANGE("Date Filter",FromDate,ToDate);
+    END;
+
+    PROCEDURE CheckDuplicateAnalysisLineDescription@10(AnalysisArea@1000 : Option;AnalysisLineTemplate@1001 : Code[10]);
+    VAR
+      AnalysisLineDescCountQuery@1002 : Query 770;
+    BEGIN
+      AnalysisLineDescCountQuery.SETRANGE(Analysis_Area,AnalysisArea);
+      AnalysisLineDescCountQuery.SETRANGE(AnalysisLineDescCountQuery.Analysis_Line_Template_Name,AnalysisLineTemplate);
+      AnalysisLineDescCountQuery.OPEN;
+      IF AnalysisLineDescCountQuery.READ THEN
+        ERROR(DuplicateDescERR,AnalysisLineTemplate);
+    END;
+
+    PROCEDURE CheckDuplicateAnalysisColumnHeader@11(AnalysisArea@1000 : Option;AnalysisColumnTemplate@1001 : Code[10]);
+    VAR
+      AnalysisColHeaderCountQuery@1002 : Query 771;
+    BEGIN
+      AnalysisColHeaderCountQuery.SETRANGE(Analysis_Area,AnalysisArea);
+      AnalysisColHeaderCountQuery.SETRANGE(Analysis_Column_Template,AnalysisColumnTemplate);
+      AnalysisColHeaderCountQuery.OPEN;
+      IF AnalysisColHeaderCountQuery.READ THEN
+        ERROR(DuplicateColHdrERR,AnalysisColumnTemplate);
+    END;
+
+    PROCEDURE SelectAll@5(AnalysisReportChartLine@1000 : Record 771;IsMeasure@1002 : Boolean);
+    VAR
+      AnalysisReportChartSetup@1001 : Record 770;
+    BEGIN
+      AnalysisReportChartSetup.GET(
+        AnalysisReportChartLine."User ID",AnalysisReportChartLine."Analysis Area",AnalysisReportChartLine.Name);
+      IF IsMeasure THEN
+        AnalysisReportChartSetup.SetMeasureChartTypesToDefault(AnalysisReportChartLine)
+      ELSE
+        AnalysisReportChartSetup.SetDimensionChartTypesToDefault(AnalysisReportChartLine);
+    END;
+
+    PROCEDURE DeselectAll@4(AnalysisReportChartLine@1000 : Record 771;IsMeasure@1001 : Boolean);
+    VAR
+      AnalysisReportChartSetup@1002 : Record 770;
+    BEGIN
+      AnalysisReportChartSetup.GET(
+        AnalysisReportChartLine."User ID",AnalysisReportChartLine."Analysis Area",AnalysisReportChartLine.Name);
+      IF IsMeasure THEN
+        AnalysisReportChartSetup.SetLinkToMeasureLines(AnalysisReportChartLine)
+      ELSE
+        AnalysisReportChartSetup.SetLinkToDimensionLines(AnalysisReportChartLine);
+      AnalysisReportChartLine.MODIFYALL("Chart Type",AnalysisReportChartLine."Chart Type"::" ");
+    END;
+
+    LOCAL PROCEDURE GetCurrentSelectionText@7(AnalysisReportChartSetup@1000 : Record 770;FromDate@1002 : Date;ToDate@1003 : Date) : Text[100];
+    BEGIN
+      WITH AnalysisReportChartSetup DO
+        CASE "Base X-Axis on" OF
+          "Base X-Axis on"::Period:
+            EXIT(STRSUBSTNO(Text001,Name,"Period Length",TIME));
+          "Base X-Axis on"::Line,
+          "Base X-Axis on"::Column:
+            EXIT(STRSUBSTNO(Text001,Name,STRSUBSTNO(Text002,FromDate,ToDate),TIME));
+        END;
+    END;
+
+    PROCEDURE UpdateChart@9(Period@1000 : ',Next,Previous';VAR AnalysisReportChartSetup@1001 : Record 770;AnalysisArea@1002 : Option;VAR BusChartBuffer@1003 : Record 485;VAR StatusText@1004 : Text[250]);
+    BEGIN
+      GetSetup(AnalysisReportChartSetup,AnalysisArea,AnalysisReportChartSetup.Name);
+      UpdateData(BusChartBuffer,AnalysisReportChartSetup,Period);
+      StatusText :=
+        GetCurrentSelectionText(
+          AnalysisReportChartSetup,BusChartBuffer."Period Filter Start Date",BusChartBuffer."Period Filter End Date");
+    END;
+
+    PROCEDURE SelectChart@12(VAR AnalysisReportChartSetup@1001 : Record 770;VAR BusChartBuffer@1002 : Record 485) Selected : Boolean;
+    VAR
+      AnalysisReportChartSetup2@1000 : Record 770;
+    BEGIN
+      AnalysisReportChartSetup2.SETRANGE("User ID",AnalysisReportChartSetup."User ID");
+      AnalysisReportChartSetup2.SETRANGE("Analysis Area",AnalysisReportChartSetup."Analysis Area");
+      AnalysisReportChartSetup2 := AnalysisReportChartSetup;
+      IF PAGE.RUNMODAL(0,AnalysisReportChartSetup2) = ACTION::LookupOK THEN BEGIN
+        AnalysisReportChartSetup := AnalysisReportChartSetup2;
+        BusChartBuffer.InitializePeriodFilter(0D,0D);
+        Selected := TRUE;
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

@@ -1,0 +1,271 @@
+OBJECT Codeunit 11012603 UAR Hour Acc.-Post Batch
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=11012609;
+    OnRun=BEGIN
+            HourAccRec.COPY(Rec);
+            Code;
+            Rec.COPY(HourAccRec);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      HourAccRec@1210190002 : Record 11012609;
+      HourAccLineRec@1210190005 : Record 11012610;
+      Text000@1210190004 : TextConst 'ENU=Checking lines        #1######\';
+      Text001@1210190003 : TextConst 'ENU=Posting lines         #2###### @3@@@@@@@@@@@@@';
+      HourAccRec3@1210190013 : Record 11012609;
+      HourAccLineRec3@1210190012 : Record 11012610;
+      HourAccPauseRec3@1210190018 : Record 11012611;
+      BlockHoursRec3@1210190024 : Record 11012612;
+      PostedHourAccRec@1210190015 : Record 11012613;
+      PostedHourAccLineRec@1210190014 : Record 11012614;
+      PostedHourAccPauseRec@1210190017 : Record 11012615;
+      PostedBlockHoursRec@1210190023 : Record 11012616;
+      PurchHeadRec@1210190021 : Record 38;
+      TmpPurchHeadRec@1210190020 : TEMPORARY Record 38;
+      HourAccCheckLineCU@1210190010 : Codeunit 11012601;
+      HourAccPostLineCU@1210190009 : Codeunit 11012602;
+      GenJnlPostCU@1210190011 : Codeunit 231;
+      Window@1210190008 : Dialog;
+      StartEmplNo@1210190006 : Code[20];
+      PrevVendorNo@1210190022 : Code[20];
+      PurchOrderNo@1210190025 : Code[20];
+      LineCount@1210190001 : Integer;
+      NoOfRecords@1210190000 : Integer;
+      Text002@1210190007 : TextConst 'ENU=No hour lines present of emplyee ''%1'' in week %2-%3.';
+      NextLineNo@1210190016 : Integer;
+      NextPauseLineNo@1210190019 : Integer;
+      Text003@1210190026 : TextConst 'ENU=Purchase Order %1 could not be posted.';
+
+    PROCEDURE Code@1210190001();
+    VAR
+      lvGenJnlLineRec@1210190004 : Record 81;
+      lvGenJnlTemplateName@1210190003 : Code[10];
+      lvGenJnlBatchName@1210190002 : Code[10];
+      lvGenJnlFirstLineNo@1210190000 : Integer;
+      lvGenJnlLastLineNo@1210190001 : Integer;
+    BEGIN
+      WITH HourAccRec DO BEGIN
+        LOCKTABLE;
+        HourAccLineRec.LOCKTABLE;
+
+        IF NOT FIND('=><') THEN BEGIN
+          "Document No." := '';
+          EXIT;
+        END;
+
+        Window.OPEN(
+          Text000 +
+          Text001);
+
+        // Check lines
+        LineCount := 0;
+        StartEmplNo := "Employee No.";
+        REPEAT
+          HourAccLineRec.SETRANGE(Year, Year);
+          HourAccLineRec.SETRANGE(Week, Week);
+          HourAccLineRec.SETRANGE("Employee No.", "Employee No.");
+          IF HourAccLineRec.FIND('-') THEN BEGIN
+            REPEAT
+              IF NOT HourAccLineRec.EmptyLine THEN BEGIN
+                LineCount := LineCount + 1;
+                Window.UPDATE(1,LineCount);
+                HourAccCheckLineCU.RunCheck(HourAccRec, HourAccLineRec);
+              END;
+            UNTIL HourAccLineRec.NEXT = 0
+          END;
+          IF NEXT = 0 THEN
+            FIND('-');
+        UNTIL "Employee No." = StartEmplNo;
+        IF (LineCount = 0) THEN
+          ERROR(Text002, "Employee No.", Year, Week);
+        NoOfRecords := LineCount;
+
+        // Post lines
+        LineCount := 0;
+        PrevVendorNo := '';
+        PurchOrderNo := '';
+        TmpPurchHeadRec.DELETEALL;
+        HourAccRec.SETCURRENTKEY(Year, Week, External, Employer, "Employee No.");
+        IF FIND('-') THEN BEGIN
+          REPEAT
+            IF (NOT External) OR (Employer <> PrevVendorNo) THEN  //* Note: For external employees the Employer is the Vendor
+              PurchOrderNo := '';
+            HourAccLineRec.SETRANGE(Year, Year);
+            HourAccLineRec.SETRANGE(Week, Week);
+            HourAccLineRec.SETRANGE("Employee No.", "Employee No.");
+            IF HourAccLineRec.FIND('-') THEN BEGIN
+              REPEAT
+                LineCount := LineCount + 1;
+                Window.UPDATE(2,LineCount);
+                Window.UPDATE(3,ROUND(LineCount / NoOfRecords * 10000,1));
+                HourAccPostLineCU.RunWithCheck(HourAccRec, HourAccLineRec, PurchOrderNo, FALSE);
+                IF External THEN
+                  InsertTmpPurchOrder();
+              UNTIL HourAccLineRec.NEXT = 0
+            END;
+            PrevVendorNo := Employer;
+          UNTIL NEXT = 0;
+          HourAccPostLineCU.GetGenJnlPostingInfo(lvGenJnlTemplateName, lvGenJnlBatchName, lvGenJnlFirstLineNo, lvGenJnlLastLineNo);
+
+          DeletedHourAccTransferToPosted();  //* This must be done first because of 'COMMIT' in the next codeunits !
+          //
+          IF (lvGenJnlLastLineNo > 0) THEN BEGIN
+            lvGenJnlLineRec.SETRANGE("Journal Template Name", lvGenJnlTemplateName);
+            lvGenJnlLineRec.SETRANGE("Journal Batch Name", lvGenJnlBatchName);
+            lvGenJnlLineRec.SETRANGE("Line No.", lvGenJnlFirstLineNo, lvGenJnlLastLineNo);
+            lvGenJnlLineRec."Journal Template Name" := lvGenJnlTemplateName;
+            lvGenJnlLineRec."Journal Batch Name" := lvGenJnlBatchName;
+            lvGenJnlLineRec."Line No." := lvGenJnlFirstLineNo;
+
+            GenJnlPostCU.Background(TRUE);
+            GenJnlPostCU.NoCommitAllowed(TRUE);
+            GenJnlPostCU.RUN(lvGenJnlLineRec);
+          END;
+          //
+          PostPurchaseOrderReceives()  //* 'COMMIT' in the codeunit !
+        END;
+      END;
+    END;
+
+    PROCEDURE DeletedHourAccTransferToPosted@1210190002();
+    VAR
+      lvEmplRec@1100485000 : Record 5200;
+    BEGIN
+      // Delete lines and transfer to posted
+
+      WITH HourAccRec DO BEGIN
+        PostedHourAccRec.LOCKTABLE;
+        PostedHourAccLineRec.LOCKTABLE;
+        PostedHourAccPauseRec.LOCKTABLE;
+
+        HourAccRec3.COPY(HourAccRec);
+        IF HourAccRec3.FIND('-') THEN BEGIN
+          REPEAT
+            lvEmplRec.GET(HourAccRec3."Employee No.");  //* Melding 9342
+            IF NOT PostedHourAccRec.GET(HourAccRec3.Year, HourAccRec3.Week, HourAccRec3."Employee No.") THEN BEGIN
+              HourAccRec3.CALCFIELDS("Company No. Paymaster", "Administration No. Paymaster");
+              PostedHourAccRec.INIT;
+              PostedHourAccRec.TRANSFERFIELDS(HourAccRec3);
+              PostedHourAccRec."Company No. Paymaster" := HourAccRec3."Company No. Paymaster";
+              PostedHourAccRec."Administration No. Paymaster" := HourAccRec3."Administration No. Paymaster";
+              PostedHourAccRec.INSERT;
+            END;
+
+            PostedHourAccLineRec.SETRANGE(Year, HourAccRec3.Year);
+            PostedHourAccLineRec.SETRANGE(Week, HourAccRec3.Week);
+            PostedHourAccLineRec.SETRANGE("Employee No.", HourAccRec3."Employee No.");
+            IF NOT PostedHourAccLineRec.FIND('+') THEN
+              PostedHourAccLineRec."Line No." := 0;
+            NextLineNo := PostedHourAccLineRec."Line No." + 1;
+
+            HourAccLineRec3.SETRANGE(Year, HourAccRec3.Year);
+            HourAccLineRec3.SETRANGE(Week, HourAccRec3.Week);
+            HourAccLineRec3.SETRANGE("Employee No.", HourAccRec3."Employee No.");
+            IF HourAccLineRec3.FIND('-') THEN BEGIN
+              REPEAT
+                IF NOT HourAccLineRec3.EmptyLine THEN BEGIN
+                  PostedHourAccLineRec.INIT;
+                  PostedHourAccLineRec.TRANSFERFIELDS(HourAccLineRec3);
+                  PostedHourAccLineRec."Line No." := NextLineNo;
+                  PostedHourAccLineRec."Document No." := HourAccRec3."Document No.";
+                  PostedHourAccLineRec."Posting Date" := HourAccRec3."Posting Date";
+                  PostedHourAccLineRec."Date Created" := TODAY;
+                  //* Melding 9342: Kostenplaats v/d werknemer op moment van boeken, tbv maatwerkrapportage.
+                  PostedHourAccLineRec."Global Dimension 1 Code" := lvEmplRec."Global Dimension 1 Code";
+
+                  PostedHourAccLineRec.INSERT;
+
+                  NextPauseLineNo := 1;
+                  HourAccPauseRec3.SETRANGE(Year, HourAccRec3.Year);
+                  HourAccPauseRec3.SETRANGE(Week, HourAccRec3.Week);
+                  HourAccPauseRec3.SETRANGE("Employee No.", HourAccRec3."Employee No.");
+                  HourAccPauseRec3.SETRANGE("Hour Acc. Line No.", HourAccLineRec3."Line No.");
+                  IF HourAccPauseRec3.FIND('-') THEN BEGIN
+                    REPEAT
+                      IF NOT HourAccPauseRec3.EmptyLine THEN BEGIN
+                        PostedHourAccPauseRec.INIT;
+                        PostedHourAccPauseRec.TRANSFERFIELDS(HourAccPauseRec3);
+                        PostedHourAccPauseRec."Hour Acc. Line No." := NextLineNo;
+                        PostedHourAccPauseRec."Line No." := NextPauseLineNo;
+                        PostedHourAccPauseRec.INSERT;
+                        NextPauseLineNo := NextPauseLineNo + 1;
+                      END;
+                    UNTIL HourAccPauseRec3.NEXT = 0;
+                  END;
+
+                  BlockHoursRec3.SETRANGE(Year, HourAccRec3.Year);
+                  BlockHoursRec3.SETRANGE(Week, HourAccRec3.Week);
+                  BlockHoursRec3.SETRANGE("Employee No.", HourAccRec3."Employee No.");
+                  BlockHoursRec3.SETRANGE("Line No.", HourAccLineRec3."Line No.");
+                  IF BlockHoursRec3.FIND('-') THEN BEGIN
+                    REPEAT
+                        PostedBlockHoursRec.INIT;
+                        PostedBlockHoursRec.TRANSFERFIELDS(BlockHoursRec3);
+                        PostedBlockHoursRec."Line No." := NextLineNo;
+                        PostedBlockHoursRec.INSERT;
+                    UNTIL BlockHoursRec3.NEXT = 0;
+                  END;
+
+                  NextLineNo := NextLineNo + 1;
+                END;
+              UNTIL HourAccLineRec3.NEXT = 0;
+            END;
+            HourAccRec3.DELETE(TRUE);  // Incl. lines and pause
+          UNTIL HourAccRec3.NEXT = 0;
+        END;
+      END;
+    END;
+
+    PROCEDURE InsertTmpPurchOrder@1210190004();
+    BEGIN
+      IF (PurchOrderNo = '') THEN
+        EXIT;
+
+      WITH TmpPurchHeadRec DO BEGIN
+        IF GET("Document Type"::Order, PurchOrderNo) THEN
+          EXIT;
+
+        INIT;
+        "Document Type" := "Document Type"::Order;
+        "No." := PurchOrderNo;
+        INSERT;
+      END;
+    END;
+
+    PROCEDURE PostPurchaseOrderReceives@1210190003();
+    VAR
+      lvPurchPostCU@1210190000 : Codeunit 90;
+    BEGIN
+      WITH TmpPurchHeadRec DO BEGIN
+        IF NOT FIND('-') THEN
+          EXIT;
+
+        COMMIT;
+        REPEAT
+          IF PurchHeadRec.GET("Document Type", "No.") THEN BEGIN
+            PurchHeadRec.Receive := TRUE;
+            PurchHeadRec.Invoice := FALSE;
+            IF NOT lvPurchPostCU.RUN(PurchHeadRec) THEN  //* 28-06-04  'IF' ingebouwd zoals bij boeken uren in 4PS Construct
+              MESSAGE(Text003, "No.");
+            COMMIT;
+          END;
+        UNTIL NEXT = 0;
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

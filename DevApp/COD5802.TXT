@@ -1,0 +1,1530 @@
+OBJECT Codeunit 5802 Inventory Posting To G/L
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=5802;
+    Permissions=TableData 48=rimd,
+                TableData 5802=rimd,
+                TableData 5823=rimd;
+    OnRun=VAR
+            GenJnlLine@1000 : Record 81;
+          BEGIN
+            IF GlobalPostPerPostGroup THEN
+              PostInvtPostBuf(Rec,"Document No.",'','',TRUE)
+            ELSE
+              PostInvtPostBuf(
+                Rec,
+                "Document No.",
+                "External Document No.",
+                COPYSTR(
+                  STRSUBSTNO(Text000,"Entry Type","Source No.","Posting Date"),
+                  1,MAXSTRLEN(GenJnlLine.Description)),
+                FALSE);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      GLSetup@1009 : Record 98;
+      InvtSetup@1008 : Record 313;
+      Currency@1007 : Record 4;
+      SourceCodeSetup@1006 : Record 242;
+      GlobalInvtPostBuf@1005 : TEMPORARY Record 48;
+      TempInvtPostBuf@1029 : ARRAY [4] OF TEMPORARY Record 48;
+      TempInvtPostToGLTestBuf@1014 : TEMPORARY Record 5822;
+      TempGLItemLedgRelation@1026 : TEMPORARY Record 5823;
+      GenJnlPostLine@1002 : Codeunit 12;
+      GenJnlCheckLine@1004 : Codeunit 11;
+      DimBufMgt@1001 : Codeunit 411;
+      DimMgt@1019 : Codeunit 408;
+      COGSAmt@1048 : Decimal;
+      InvtAdjmtAmt@1047 : Decimal;
+      DirCostAmt@1046 : Decimal;
+      OvhdCostAmt@1045 : Decimal;
+      VarPurchCostAmt@1044 : Decimal;
+      VarMfgDirCostAmt@1049 : Decimal;
+      VarMfgOvhdCostAmt@1039 : Decimal;
+      WIPInvtAmt@1038 : Decimal;
+      InvtAmt@1037 : Decimal;
+      TotalCOGSAmt@1036 : Decimal;
+      TotalInvtAdjmtAmt@1035 : Decimal;
+      TotalDirCostAmt@1034 : Decimal;
+      TotalOvhdCostAmt@1033 : Decimal;
+      TotalVarPurchCostAmt@1032 : Decimal;
+      TotalVarMfgDirCostAmt@1040 : Decimal;
+      TotalVarMfgOvhdCostAmt@1017 : Decimal;
+      TotalWIPInvtAmt@1016 : Decimal;
+      TotalInvtAmt@1015 : Decimal;
+      GlobalInvtPostBufEntryNo@1025 : Integer;
+      PostBufDimNo@1030 : Integer;
+      GLSetupRead@1012 : Boolean;
+      SourceCodeSetupRead@1011 : Boolean;
+      InvtSetupRead@1010 : Boolean;
+      Text000@1000 : TextConst 'ENU=%1 %2 on %3';
+      Text001@1031 : TextConst 'ENU=%1 - %2, %3,%4,%5,%6';
+      Text002@1018 : TextConst 'ENU="The following combination %1 = %2, %3 = %4, and %5 = %6 is not allowed."';
+      RunOnlyCheck@1003 : Boolean;
+      RunOnlyCheckSaved@1022 : Boolean;
+      CalledFromItemPosting@1021 : Boolean;
+      CalledFromTestReport@1013 : Boolean;
+      GlobalPostPerPostGroup@1023 : Boolean;
+      Text003@1020 : TextConst 'ENU=%1 %2';
+      GlobalInvtPostBuf2@1100485002 : TEMPORARY Record 48;
+      gvCOGSAccount@1100525000 : Code[20];
+      ReasonCde@1100525001 : Code[20];
+      gvIncStatCOGSAccount@1100409000 : Boolean;
+
+    PROCEDURE Initialize@31(PostPerPostGroup@1002 : Boolean);
+    BEGIN
+      GlobalPostPerPostGroup := PostPerPostGroup;
+      GlobalInvtPostBufEntryNo := 0;
+    END;
+
+    PROCEDURE SetRunOnlyCheck@17(SetCalledFromItemPosting@1002 : Boolean;SetCheckOnly@1000 : Boolean;SetCalledFromTestReport@1001 : Boolean);
+    BEGIN
+      CalledFromItemPosting := SetCalledFromItemPosting;
+      RunOnlyCheck := SetCheckOnly;
+      CalledFromTestReport := SetCalledFromTestReport;
+
+      TempGLItemLedgRelation.RESET;
+      TempGLItemLedgRelation.DELETEALL;
+    END;
+
+    PROCEDURE BufferInvtPosting@1(VAR ValueEntry@1000 : Record 5802) : Boolean;
+    VAR
+      CostToPost@1003 : Decimal;
+      CostToPostACY@1004 : Decimal;
+      ExpCostToPost@1001 : Decimal;
+      ExpCostToPostACY@1002 : Decimal;
+      PostToGL@1005 : Boolean;
+    BEGIN
+      WITH ValueEntry DO BEGIN
+        GetGLSetup;
+        GetInvtSetup;
+        IF (NOT InvtSetup."Expected Cost Posting to G/L") AND
+           ("Expected Cost Posted to G/L" = 0) AND
+           "Expected Cost"
+        THEN
+          EXIT(FALSE);
+
+        IF NOT ("Entry Type" IN ["Entry Type"::"Direct Cost","Entry Type"::Revaluation]) AND
+           NOT CalledFromTestReport
+        THEN BEGIN
+          TESTFIELD("Expected Cost",FALSE);
+          TESTFIELD("Cost Amount (Expected)",0);
+          TESTFIELD("Cost Amount (Expected) (ACY)",0);
+        END;
+
+        IF InvtSetup."Expected Cost Posting to G/L" THEN BEGIN
+          CalcCostToPost(ExpCostToPost,"Cost Amount (Expected)","Expected Cost Posted to G/L",PostToGL);
+          CalcCostToPost(ExpCostToPostACY,"Cost Amount (Expected) (ACY)","Exp. Cost Posted to G/L (ACY)",PostToGL);
+        END;
+        CalcCostToPost(CostToPost,"Cost Amount (Actual)","Cost Posted to G/L",PostToGL);
+        CalcCostToPost(CostToPostACY,"Cost Amount (Actual) (ACY)","Cost Posted to G/L (ACY)",PostToGL);
+        PostBufDimNo := 0;
+
+        RunOnlyCheckSaved := RunOnlyCheck;
+        IF NOT PostToGL THEN BEGIN
+          // Cost amounts are updated by unit value so that that cheking can be simulated.
+          CostToPost := 1;
+          CostToPostACY := 1;
+          RunOnlyCheck := TRUE;
+        END;
+
+        //**4PS.sn
+        GlobalInvtPostBuf."Job No." := "Job No.";
+        GlobalInvtPostBuf.Element := Element;
+        //**4PS.en
+
+        CASE "Item Ledger Entry Type" OF
+          "Item Ledger Entry Type"::Purchase:
+            BufferPurchPosting(ValueEntry,CostToPost,CostToPostACY,ExpCostToPost,ExpCostToPostACY);
+          "Item Ledger Entry Type"::Sale:
+            BufferSalesPosting(ValueEntry,CostToPost,CostToPostACY,ExpCostToPost,ExpCostToPostACY);
+          "Item Ledger Entry Type"::"Positive Adjmt.",
+          "Item Ledger Entry Type"::"Negative Adjmt.",
+          "Item Ledger Entry Type"::Transfer:
+            BufferAdjmtPosting(ValueEntry,CostToPost,CostToPostACY,ExpCostToPost,ExpCostToPostACY);
+          "Item Ledger Entry Type"::Consumption:
+            BufferConsumpPosting(ValueEntry,CostToPost,CostToPostACY);
+          "Item Ledger Entry Type"::Output:
+            BufferOutputPosting(ValueEntry,CostToPost,CostToPostACY,ExpCostToPost,ExpCostToPostACY);
+          "Item Ledger Entry Type"::"Assembly Consumption":
+            BufferAsmConsumpPosting(ValueEntry,CostToPost,CostToPostACY);
+          "Item Ledger Entry Type"::"Assembly Output":
+            BufferAsmOutputPosting(ValueEntry,CostToPost,CostToPostACY);
+          "Item Ledger Entry Type"::" ":
+            BufferCapPosting(ValueEntry,CostToPost,CostToPostACY);
+          ELSE
+            ErrorNonValidCombination(ValueEntry);
+        END;
+      END;
+
+      IF UpdateGlobalInvtPostBuf(ValueEntry."Entry No.") THEN
+        EXIT(TRUE);
+      EXIT(CalledFromTestReport);
+    END;
+
+    LOCAL PROCEDURE BufferPurchPosting@5(ValueEntry@1000 : Record 5802;CostToPost@1004 : Decimal;CostToPostACY@1003 : Decimal;ExpCostToPost@1002 : Decimal;ExpCostToPostACY@1001 : Decimal);
+    BEGIN
+      WITH ValueEntry DO
+        CASE "Entry Type" OF
+          "Entry Type"::"Direct Cost":
+            BEGIN
+              IF (ExpCostToPost <> 0) OR (ExpCostToPostACY <> 0) THEN
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::"Inventory (Interim)",
+                  GlobalInvtPostBuf."Account Type"::"Invt. Accrual (Interim)",
+                  ExpCostToPost,ExpCostToPostACY,TRUE);
+              IF (CostToPost <> 0) OR (CostToPostACY <> 0) THEN
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::Inventory,
+                  GlobalInvtPostBuf."Account Type"::"Direct Cost Applied",
+                  CostToPost,CostToPostACY,FALSE);
+            END;
+          "Entry Type"::"Indirect Cost":
+            InitInvtPostBuf(
+              ValueEntry,
+              GlobalInvtPostBuf."Account Type"::Inventory,
+              GlobalInvtPostBuf."Account Type"::"Overhead Applied",
+              CostToPost,CostToPostACY,FALSE);
+          "Entry Type"::Variance:
+            BEGIN
+              TESTFIELD("Variance Type","Variance Type"::Purchase);
+              InitInvtPostBuf(
+                ValueEntry,
+                GlobalInvtPostBuf."Account Type"::Inventory,
+                GlobalInvtPostBuf."Account Type"::"Purchase Variance",
+                CostToPost,CostToPostACY,FALSE);
+            END;
+          "Entry Type"::Revaluation:
+            BEGIN
+              IF (ExpCostToPost <> 0) OR (ExpCostToPostACY <> 0) THEN
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::"Inventory (Interim)",
+                  GlobalInvtPostBuf."Account Type"::"Invt. Accrual (Interim)",
+                  ExpCostToPost,ExpCostToPostACY,TRUE);
+              IF (CostToPost <> 0) OR (CostToPostACY <> 0) THEN
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::Inventory,
+                  GlobalInvtPostBuf."Account Type"::"Inventory Adjmt.",
+                  CostToPost,CostToPostACY,FALSE);
+            END;
+          "Entry Type"::Rounding:
+            InitInvtPostBuf(
+              ValueEntry,
+              GlobalInvtPostBuf."Account Type"::Inventory,
+              GlobalInvtPostBuf."Account Type"::"Inventory Adjmt.",
+              CostToPost,CostToPostACY,FALSE);
+          ELSE
+            ErrorNonValidCombination(ValueEntry);
+        END;
+    END;
+
+    LOCAL PROCEDURE BufferSalesPosting@6(ValueEntry@1000 : Record 5802;CostToPost@1004 : Decimal;CostToPostACY@1003 : Decimal;ExpCostToPost@1002 : Decimal;ExpCostToPostACY@1001 : Decimal);
+    BEGIN
+      WITH ValueEntry DO
+        CASE "Entry Type" OF
+          "Entry Type"::"Direct Cost":
+            BEGIN
+              IF (ExpCostToPost <> 0) OR (ExpCostToPostACY <> 0) THEN
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::"Inventory (Interim)",
+                  GlobalInvtPostBuf."Account Type"::"COGS (Interim)",
+                  ExpCostToPost,ExpCostToPostACY,TRUE);
+              IF (CostToPost <> 0) OR (CostToPostACY <> 0) THEN
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::Inventory,
+                  GlobalInvtPostBuf."Account Type"::COGS,
+                  CostToPost,CostToPostACY,FALSE);
+            END;
+          "Entry Type"::Revaluation:
+            BEGIN
+              IF (ExpCostToPost <> 0) OR (ExpCostToPostACY <> 0) THEN
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::"Inventory (Interim)",
+                  GlobalInvtPostBuf."Account Type"::"COGS (Interim)",
+                  ExpCostToPost,ExpCostToPostACY,TRUE);
+              IF (CostToPost <> 0) OR (CostToPostACY <> 0) THEN
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::Inventory,
+                  GlobalInvtPostBuf."Account Type"::"Inventory Adjmt.",
+                  CostToPost,CostToPostACY,FALSE);
+            END;
+          "Entry Type"::Rounding:
+            InitInvtPostBuf(
+              ValueEntry,
+              GlobalInvtPostBuf."Account Type"::Inventory,
+              GlobalInvtPostBuf."Account Type"::"Inventory Adjmt.",
+              CostToPost,CostToPostACY,FALSE);
+          ELSE
+            ErrorNonValidCombination(ValueEntry);
+        END;
+    END;
+
+    LOCAL PROCEDURE BufferOutputPosting@9(ValueEntry@1000 : Record 5802;CostToPost@1004 : Decimal;CostToPostACY@1003 : Decimal;ExpCostToPost@1002 : Decimal;ExpCostToPostACY@1001 : Decimal);
+    BEGIN
+      WITH ValueEntry DO
+        CASE "Entry Type" OF
+          "Entry Type"::"Direct Cost":
+            BEGIN
+              IF (ExpCostToPost <> 0) OR (ExpCostToPostACY <> 0) THEN
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::"Inventory (Interim)",
+                  GlobalInvtPostBuf."Account Type"::"WIP Inventory",
+                  ExpCostToPost,ExpCostToPostACY,TRUE);
+              IF (CostToPost <> 0) OR (CostToPostACY <> 0) THEN
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::Inventory,
+                  GlobalInvtPostBuf."Account Type"::"WIP Inventory",
+                  CostToPost,CostToPostACY,FALSE);
+            END;
+          "Entry Type"::"Indirect Cost":
+            InitInvtPostBuf(
+              ValueEntry,
+              GlobalInvtPostBuf."Account Type"::Inventory,
+              GlobalInvtPostBuf."Account Type"::"Overhead Applied",
+              CostToPost,CostToPostACY,FALSE);
+          "Entry Type"::Variance:
+            CASE "Variance Type" OF
+              "Variance Type"::Material:
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::Inventory,
+                  GlobalInvtPostBuf."Account Type"::"Material Variance",
+                  CostToPost,CostToPostACY,FALSE);
+              "Variance Type"::Capacity:
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::Inventory,
+                  GlobalInvtPostBuf."Account Type"::"Capacity Variance",
+                  CostToPost,CostToPostACY,FALSE);
+              "Variance Type"::Subcontracted:
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::Inventory,
+                  GlobalInvtPostBuf."Account Type"::"Subcontracted Variance",
+                  CostToPost,CostToPostACY,FALSE);
+              "Variance Type"::"Capacity Overhead":
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::Inventory,
+                  GlobalInvtPostBuf."Account Type"::"Cap. Overhead Variance",
+                  CostToPost,CostToPostACY,FALSE);
+              "Variance Type"::"Manufacturing Overhead":
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::Inventory,
+                  GlobalInvtPostBuf."Account Type"::"Mfg. Overhead Variance",
+                  CostToPost,CostToPostACY,FALSE);
+              ELSE
+                ErrorNonValidCombination(ValueEntry);
+            END;
+          "Entry Type"::Revaluation:
+            BEGIN
+              IF (ExpCostToPost <> 0) OR (ExpCostToPostACY <> 0) THEN
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::"Inventory (Interim)",
+                  GlobalInvtPostBuf."Account Type"::"WIP Inventory",
+                  ExpCostToPost,ExpCostToPostACY,TRUE);
+              IF (CostToPost <> 0) OR (CostToPostACY <> 0) THEN
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::Inventory,
+                  GlobalInvtPostBuf."Account Type"::"Inventory Adjmt.",
+                  CostToPost,CostToPostACY,FALSE);
+            END;
+          "Entry Type"::Rounding:
+            InitInvtPostBuf(
+              ValueEntry,
+              GlobalInvtPostBuf."Account Type"::Inventory,
+              GlobalInvtPostBuf."Account Type"::"Inventory Adjmt.",
+              CostToPost,CostToPostACY,FALSE);
+          ELSE
+            ErrorNonValidCombination(ValueEntry);
+        END;
+    END;
+
+    LOCAL PROCEDURE BufferConsumpPosting@34(ValueEntry@1000 : Record 5802;CostToPost@1004 : Decimal;CostToPostACY@1003 : Decimal);
+    BEGIN
+      WITH ValueEntry DO
+        CASE "Entry Type" OF
+          "Entry Type"::"Direct Cost":
+            InitInvtPostBuf(
+              ValueEntry,
+              GlobalInvtPostBuf."Account Type"::Inventory,
+              GlobalInvtPostBuf."Account Type"::"WIP Inventory",
+              CostToPost,CostToPostACY,FALSE);
+          "Entry Type"::Revaluation,
+          "Entry Type"::Rounding:
+            InitInvtPostBuf(
+              ValueEntry,
+              GlobalInvtPostBuf."Account Type"::Inventory,
+              GlobalInvtPostBuf."Account Type"::"Inventory Adjmt.",
+              CostToPost,CostToPostACY,FALSE);
+          ELSE
+            ErrorNonValidCombination(ValueEntry);
+        END;
+    END;
+
+    LOCAL PROCEDURE BufferCapPosting@16(ValueEntry@1000 : Record 5802;CostToPost@1004 : Decimal;CostToPostACY@1003 : Decimal);
+    BEGIN
+      WITH ValueEntry DO BEGIN
+        IF "Order Type" = "Order Type"::Assembly THEN
+          CASE "Entry Type" OF
+            "Entry Type"::"Direct Cost":
+              InitInvtPostBuf(
+                ValueEntry,
+                GlobalInvtPostBuf."Account Type"::"Inventory Adjmt.",
+                GlobalInvtPostBuf."Account Type"::"Direct Cost Applied",
+                CostToPost,CostToPostACY,FALSE);
+            "Entry Type"::"Indirect Cost":
+              InitInvtPostBuf(
+                ValueEntry,
+                GlobalInvtPostBuf."Account Type"::"Inventory Adjmt.",
+                GlobalInvtPostBuf."Account Type"::"Overhead Applied",
+                CostToPost,CostToPostACY,FALSE);
+            ELSE
+              ErrorNonValidCombination(ValueEntry);
+          END
+        ELSE
+          CASE "Entry Type" OF
+            "Entry Type"::"Direct Cost":
+              InitInvtPostBuf(
+                ValueEntry,
+                GlobalInvtPostBuf."Account Type"::"WIP Inventory",
+                GlobalInvtPostBuf."Account Type"::"Direct Cost Applied",
+                CostToPost,CostToPostACY,FALSE);
+            "Entry Type"::"Indirect Cost":
+              InitInvtPostBuf(
+                ValueEntry,
+                GlobalInvtPostBuf."Account Type"::"WIP Inventory",
+                GlobalInvtPostBuf."Account Type"::"Overhead Applied",
+                CostToPost,CostToPostACY,FALSE);
+            ELSE
+              ErrorNonValidCombination(ValueEntry);
+          END;
+      END;
+    END;
+
+    LOCAL PROCEDURE BufferAsmOutputPosting@36(ValueEntry@1000 : Record 5802;CostToPost@1004 : Decimal;CostToPostACY@1003 : Decimal);
+    BEGIN
+      WITH ValueEntry DO
+        CASE "Entry Type" OF
+          "Entry Type"::"Direct Cost":
+            InitInvtPostBuf(
+              ValueEntry,
+              GlobalInvtPostBuf."Account Type"::Inventory,
+              GlobalInvtPostBuf."Account Type"::"Inventory Adjmt.",
+              CostToPost,CostToPostACY,FALSE);
+          "Entry Type"::"Indirect Cost":
+            InitInvtPostBuf(
+              ValueEntry,
+              GlobalInvtPostBuf."Account Type"::Inventory,
+              GlobalInvtPostBuf."Account Type"::"Overhead Applied",
+              CostToPost,CostToPostACY,FALSE);
+          "Entry Type"::Variance:
+            CASE "Variance Type" OF
+              "Variance Type"::Material:
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::Inventory,
+                  GlobalInvtPostBuf."Account Type"::"Material Variance",
+                  CostToPost,CostToPostACY,FALSE);
+              "Variance Type"::Capacity:
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::Inventory,
+                  GlobalInvtPostBuf."Account Type"::"Capacity Variance",
+                  CostToPost,CostToPostACY,FALSE);
+              "Variance Type"::Subcontracted:
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::Inventory,
+                  GlobalInvtPostBuf."Account Type"::"Subcontracted Variance",
+                  CostToPost,CostToPostACY,FALSE);
+              "Variance Type"::"Capacity Overhead":
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::Inventory,
+                  GlobalInvtPostBuf."Account Type"::"Cap. Overhead Variance",
+                  CostToPost,CostToPostACY,FALSE);
+              "Variance Type"::"Manufacturing Overhead":
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::Inventory,
+                  GlobalInvtPostBuf."Account Type"::"Mfg. Overhead Variance",
+                  CostToPost,CostToPostACY,FALSE);
+              ELSE
+                ErrorNonValidCombination(ValueEntry);
+            END;
+          "Entry Type"::Revaluation:
+            InitInvtPostBuf(
+              ValueEntry,
+              GlobalInvtPostBuf."Account Type"::Inventory,
+              GlobalInvtPostBuf."Account Type"::"Inventory Adjmt.",
+              CostToPost,CostToPostACY,FALSE);
+          "Entry Type"::Rounding:
+            InitInvtPostBuf(
+              ValueEntry,
+              GlobalInvtPostBuf."Account Type"::Inventory,
+              GlobalInvtPostBuf."Account Type"::"Inventory Adjmt.",
+              CostToPost,CostToPostACY,FALSE);
+          ELSE
+            ErrorNonValidCombination(ValueEntry);
+        END;
+    END;
+
+    LOCAL PROCEDURE BufferAsmConsumpPosting@38(ValueEntry@1000 : Record 5802;CostToPost@1004 : Decimal;CostToPostACY@1003 : Decimal);
+    BEGIN
+      WITH ValueEntry DO
+        CASE "Entry Type" OF
+          "Entry Type"::"Direct Cost":
+            InitInvtPostBuf(
+              ValueEntry,
+              GlobalInvtPostBuf."Account Type"::Inventory,
+              GlobalInvtPostBuf."Account Type"::"Inventory Adjmt.",
+              CostToPost,CostToPostACY,FALSE);
+          "Entry Type"::Revaluation,
+          "Entry Type"::Rounding:
+            InitInvtPostBuf(
+              ValueEntry,
+              GlobalInvtPostBuf."Account Type"::Inventory,
+              GlobalInvtPostBuf."Account Type"::"Inventory Adjmt.",
+              CostToPost,CostToPostACY,FALSE);
+          ELSE
+            ErrorNonValidCombination(ValueEntry);
+        END;
+    END;
+
+    LOCAL PROCEDURE BufferAdjmtPosting@39(ValueEntry@1000 : Record 5802;CostToPost@1004 : Decimal;CostToPostACY@1003 : Decimal;ExpCostToPost@1002 : Decimal;ExpCostToPostACY@1001 : Decimal);
+    BEGIN
+      WITH ValueEntry DO
+        CASE "Entry Type" OF
+          "Entry Type"::"Direct Cost":
+            BEGIN
+              // Posting adjustments to Interim accounts (Service)
+              IF (ExpCostToPost <> 0) OR (ExpCostToPostACY <> 0) THEN
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::"Inventory (Interim)",
+                  GlobalInvtPostBuf."Account Type"::"COGS (Interim)",
+                  ExpCostToPost,ExpCostToPostACY,TRUE);
+              IF (CostToPost <> 0) OR (CostToPostACY <> 0) THEN
+                InitInvtPostBuf(
+                  ValueEntry,
+                  GlobalInvtPostBuf."Account Type"::Inventory,
+                  GlobalInvtPostBuf."Account Type"::"Inventory Adjmt.",
+                  CostToPost,CostToPostACY,FALSE);
+            END;
+          "Entry Type"::Revaluation,
+          "Entry Type"::Rounding:
+            InitInvtPostBuf(
+              ValueEntry,
+              GlobalInvtPostBuf."Account Type"::Inventory,
+              GlobalInvtPostBuf."Account Type"::"Inventory Adjmt.",
+              CostToPost,CostToPostACY,FALSE);
+          ELSE
+            ErrorNonValidCombination(ValueEntry);
+        END;
+    END;
+
+    LOCAL PROCEDURE GetGLSetup@14();
+    BEGIN
+      IF NOT GLSetupRead THEN BEGIN
+        GLSetup.GET;
+        IF GLSetup."Additional Reporting Currency" <> '' THEN
+          Currency.GET(GLSetup."Additional Reporting Currency");
+      END;
+      GLSetupRead := TRUE;
+    END;
+
+    LOCAL PROCEDURE GetInvtSetup@4();
+    BEGIN
+      IF NOT InvtSetupRead THEN
+        InvtSetup.GET;
+      InvtSetupRead := TRUE;
+    END;
+
+    LOCAL PROCEDURE CalcCostToPost@8(VAR CostToPost@1000 : Decimal;AdjdCost@1001 : Decimal;VAR PostedCost@1002 : Decimal;VAR PostToGL@1005 : Boolean);
+    BEGIN
+      CostToPost := AdjdCost - PostedCost;
+
+      IF CostToPost <> 0 THEN BEGIN
+        IF NOT RunOnlyCheck THEN
+          PostedCost := AdjdCost;
+        PostToGL := TRUE;
+      END;
+    END;
+
+    LOCAL PROCEDURE InitInvtPostBuf@10(ValueEntry@1000 : Record 5802;AccType@1001 : Option;BalAccType@1002 : Option;CostToPost@1004 : Decimal;CostToPostACY@1003 : Decimal;InterimAccount@1007 : Boolean);
+    BEGIN
+      PostBufDimNo := PostBufDimNo + 1;
+      SetAccNo(TempInvtPostBuf[PostBufDimNo],ValueEntry,AccType,BalAccType);
+      SetPostBufAmounts(TempInvtPostBuf[PostBufDimNo],CostToPost,CostToPostACY,InterimAccount);
+      TempInvtPostBuf[PostBufDimNo]."Job No." := ValueEntry."Job No.";
+      TempInvtPostBuf[PostBufDimNo]."Dimension Set ID" := ValueEntry."Dimension Set ID";
+      TempInvtPostBuf[PostBufDimNo].Element := ValueEntry.Element;  //M22739
+
+      PostBufDimNo := PostBufDimNo + 1;
+      SetAccNo(TempInvtPostBuf[PostBufDimNo],ValueEntry,BalAccType,AccType);
+      SetPostBufAmounts(TempInvtPostBuf[PostBufDimNo],-CostToPost,-CostToPostACY,InterimAccount);
+      TempInvtPostBuf[PostBufDimNo]."Job No." := ValueEntry."Job No.";
+      TempInvtPostBuf[PostBufDimNo]."Dimension Set ID" := ValueEntry."Dimension Set ID";
+      TempInvtPostBuf[PostBufDimNo].Element := ValueEntry.Element;  //M22739
+    END;
+
+    LOCAL PROCEDURE SetAccNo@18(VAR InvtPostBuf@1001 : Record 48;ValueEntry@1006 : Record 5802;AccType@1005 : Option;BalAccType@1000 : Option);
+    VAR
+      InvtPostSetup@1003 : Record 5813;
+      GenPostingSetup@1004 : Record 252;
+      GLAccount@1002 : Record 15;
+      Item@1101100000 : Record 27;
+      lLocRec@1210190000 : Record 14;
+      lvLocCode@1100525000 : Code[20];
+    BEGIN
+      WITH InvtPostBuf DO BEGIN
+        "Account No." := '';
+        "Account Type" := AccType;
+        "Bal. Account Type" := BalAccType;
+        "Location Code" := ValueEntry."Location Code";
+        "Inventory Posting Group" :=
+          GetInvPostingGroupCode(ValueEntry,AccType = "Account Type"::"WIP Inventory",ValueEntry."Inventory Posting Group");
+        IF AccType = "Account Type"::"WIP Inventory" THEN
+          IF ValueEntry."Source No." <> ValueEntry."Item No." THEN
+            IF Item.GET(ValueEntry."Source No.") THEN
+              "Inventory Posting Group" := Item."Inventory Posting Group";
+        "Gen. Bus. Posting Group" := ValueEntry."Gen. Bus. Posting Group";
+        "Gen. Prod. Posting Group" := ValueEntry."Gen. Prod. Posting Group";
+        "Posting Date" := ValueEntry."Posting Date";
+
+        IF UseInvtPostSetup THEN BEGIN
+          { //**4PS.so
+          IF CalledFromItemPosting THEN
+            InvtPostSetup.GET("Location Code","Inventory Posting Group")
+          ELSE
+            IF NOT InvtPostSetup.GET("Location Code","Inventory Posting Group") THEN
+              EXIT;
+          } //**4PS.so
+          //**4PS.sn
+          lvLocCode := "Location Code";
+          IF NOT lLocRec.GET(lvLocCode) THEN
+            lLocRec.INIT;
+          IF lLocRec.Bundle THEN
+            lvLocCode := '';
+          IF CalledFromItemPosting THEN
+            InvtPostSetup.GET(lvLocCode,"Inventory Posting Group")
+          ELSE
+            IF NOT InvtPostSetup.GET(lvLocCode,"Inventory Posting Group") THEN
+              EXIT;
+          //**4PS.en
+        END ELSE BEGIN
+          IF CalledFromItemPosting THEN
+            GenPostingSetup.GET("Gen. Bus. Posting Group","Gen. Prod. Posting Group")
+          ELSE
+            IF NOT GenPostingSetup.GET("Gen. Bus. Posting Group","Gen. Prod. Posting Group") THEN
+              EXIT;
+        END;
+
+        CASE "Account Type" OF
+          "Account Type"::Inventory:
+            BEGIN
+              //**4PS.sn
+              IF "Bal. Account Type" = "Bal. Account Type"::"Purchase Variance" THEN BEGIN
+                IF InvtPostSetup."Inventory Account (Mat. Var.)" <> '' THEN
+                  "Account No." := InvtPostSetup."Inventory Account (Mat. Var.)"
+                ELSE BEGIN
+                  IF CalledFromItemPosting THEN
+                    InvtPostSetup.TESTFIELD("Inventory Account");
+                  "Account No." := InvtPostSetup."Inventory Account";
+                END;
+              END ELSE BEGIN
+              //**4PS.en
+                IF CalledFromItemPosting THEN
+                  InvtPostSetup.TESTFIELD("Inventory Account");
+                "Account No." := InvtPostSetup."Inventory Account";
+              END; //**4PS.n
+            END;
+          "Account Type"::"Inventory (Interim)":
+            BEGIN
+              IF CalledFromItemPosting THEN
+                InvtPostSetup.TESTFIELD("Inventory Account (Interim)");
+              "Account No." := InvtPostSetup."Inventory Account (Interim)";
+            END;
+          "Account Type"::"WIP Inventory":
+            BEGIN
+              IF CalledFromItemPosting THEN
+                InvtPostSetup.TESTFIELD("WIP Account");
+              "Account No." := InvtPostSetup."WIP Account";
+            END;
+          "Account Type"::"Material Variance":
+            BEGIN
+              IF CalledFromItemPosting THEN
+                InvtPostSetup.TESTFIELD("Material Variance Account");
+              "Account No." := InvtPostSetup."Material Variance Account";
+            END;
+          "Account Type"::"Capacity Variance":
+            BEGIN
+              IF CalledFromItemPosting THEN
+                InvtPostSetup.TESTFIELD("Capacity Variance Account");
+              "Account No." := InvtPostSetup."Capacity Variance Account";
+            END;
+          "Account Type"::"Subcontracted Variance":
+            BEGIN
+              IF CalledFromItemPosting THEN
+                InvtPostSetup.TESTFIELD("Subcontracted Variance Account");
+              "Account No." := InvtPostSetup."Subcontracted Variance Account";
+            END;
+          "Account Type"::"Cap. Overhead Variance":
+            BEGIN
+              IF CalledFromItemPosting THEN
+                InvtPostSetup.TESTFIELD("Cap. Overhead Variance Account");
+              "Account No." := InvtPostSetup."Cap. Overhead Variance Account";
+            END;
+          "Account Type"::"Mfg. Overhead Variance":
+            BEGIN
+              IF CalledFromItemPosting THEN
+                InvtPostSetup.TESTFIELD("Mfg. Overhead Variance Account");
+              "Account No." := InvtPostSetup."Mfg. Overhead Variance Account";
+            END;
+          "Account Type"::"Inventory Adjmt.":
+            BEGIN
+              IF CalledFromItemPosting THEN
+                GenPostingSetup.TESTFIELD("Inventory Adjmt. Account");
+              "Account No." := GenPostingSetup."Inventory Adjmt. Account";
+            END;
+          "Account Type"::"Direct Cost Applied":
+            BEGIN
+              IF NOT ValueEntry."Buy-Back Item (Plant Order)" THEN BEGIN  //**4PS.n
+                IF CalledFromItemPosting THEN
+                  GenPostingSetup.TESTFIELD("Direct Cost Applied Account");
+                "Account No." := GenPostingSetup."Direct Cost Applied Account";
+              //**4PS.sn
+              END ELSE BEGIN
+                IF CalledFromItemPosting THEN
+                  GenPostingSetup.TESTFIELD("Buy-Back Direct Cost Acc. (PO)");
+                "Account No." := GenPostingSetup."Buy-Back Direct Cost Acc. (PO)";
+              END;
+              IF gvCOGSAccount <> '' THEN
+                "Account No." := gvCOGSAccount;
+              //**4PS.en
+            END;
+          "Account Type"::"Overhead Applied":
+            BEGIN
+              IF CalledFromItemPosting THEN
+                GenPostingSetup.TESTFIELD("Overhead Applied Account");
+              "Account No." := GenPostingSetup."Overhead Applied Account";
+            END;
+          "Account Type"::"Purchase Variance":
+            BEGIN
+              IF NOT ValueEntry."Buy-Back Item (Plant Order)" THEN BEGIN  //**4PS.n
+                IF CalledFromItemPosting THEN BEGIN
+                  IF (ValueEntry."Job No." + ValueEntry."Service Order No." = '') THEN BEGIN
+                    GenPostingSetup.TESTFIELD("Purchase Variance Account");
+                    "Account No." := GenPostingSetup."Purchase Variance Account";
+                  END ELSE BEGIN
+                    GenPostingSetup.TESTFIELD(GenPostingSetup."Purch. Variance Acc.(Projects)");
+                    "Account No." := GenPostingSetup."Purch. Variance Acc.(Projects)";
+                  END;
+                END ELSE
+                  "Account No." := GenPostingSetup."Purchase Variance Account";
+              //**4PS.sn
+              END ELSE BEGIN
+                IF CalledFromItemPosting THEN
+                  GenPostingSetup.TESTFIELD("Buy-Back Variance Account (PO)");
+                "Account No." := GenPostingSetup."Buy-Back Variance Account (PO)";
+              END;
+              //**4PS.en
+            END;
+          "Account Type"::COGS:
+            BEGIN
+              IF CalledFromItemPosting THEN
+                GenPostingSetup.TESTFIELD("COGS Account");
+              "Account No." := GenPostingSetup."COGS Account";
+              //**4PS.sn
+              IF gvIncStatCOGSAccount AND (GenPostingSetup."COGS Account (Incomestatement)" <> '') THEN //**4PS M34347
+                "Account No." := GenPostingSetup."COGS Account (Incomestatement)";                      //**4PS M34347
+              IF gvCOGSAccount <> '' THEN
+                "Account No." := gvCOGSAccount;
+              //**4PS.en
+            END;
+          "Account Type"::"COGS (Interim)":
+            BEGIN
+              IF CalledFromItemPosting THEN
+                GenPostingSetup.TESTFIELD("COGS Account (Interim)");
+              "Account No." := GenPostingSetup."COGS Account (Interim)";
+            END;
+          "Account Type"::"Invt. Accrual (Interim)":
+            BEGIN
+              IF CalledFromItemPosting THEN
+                GenPostingSetup.TESTFIELD("Invt. Accrual Acc. (Interim)");
+              "Account No." := GenPostingSetup."Invt. Accrual Acc. (Interim)";
+            END;
+        END;
+        IF "Account No." <> '' THEN BEGIN
+          GLAccount.GET("Account No.");
+          IF GLAccount.Blocked THEN BEGIN
+            IF CalledFromItemPosting THEN
+              GLAccount.TESTFIELD(Blocked,FALSE);
+            IF NOT CalledFromTestReport THEN
+              "Account No." := '';
+          END;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE SetPostBufAmounts@30(VAR InvtPostBuf@1004 : Record 48;CostToPost@1000 : Decimal;CostToPostACY@1001 : Decimal;InterimAccount@1003 : Boolean);
+    BEGIN
+      WITH InvtPostBuf DO BEGIN
+        "Interim Account" := InterimAccount;
+        Amount := CostToPost;
+        "Amount (ACY)" := CostToPostACY;
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdateGlobalInvtPostBuf@28(ValueEntryNo@1002 : Integer) : Boolean;
+    VAR
+      i@1000 : Integer;
+    BEGIN
+      WITH GlobalInvtPostBuf DO BEGIN
+        IF NOT CalledFromTestReport THEN
+          FOR i := 1 TO PostBufDimNo DO BEGIN
+            IF TempInvtPostBuf[i]."Account No." = '' THEN BEGIN
+              CLEAR(TempInvtPostBuf);
+              EXIT(FALSE);
+            END;
+          END;
+        FOR i := 1 TO PostBufDimNo DO BEGIN
+          GlobalInvtPostBuf := TempInvtPostBuf[i];
+          "Dimension Set ID" := TempInvtPostBuf[i]."Dimension Set ID";
+          Negative := (TempInvtPostBuf[i].Amount < 0) OR (TempInvtPostBuf[i]."Amount (ACY)" < 0);
+
+          UpdateReportAmounts;
+          IF FIND THEN BEGIN
+            Amount := Amount + TempInvtPostBuf[i].Amount;
+            "Amount (ACY)" := "Amount (ACY)" + TempInvtPostBuf[i]."Amount (ACY)";
+            MODIFY;
+          END ELSE BEGIN
+            GlobalInvtPostBufEntryNo := GlobalInvtPostBufEntryNo + 1;
+            "Entry No." := GlobalInvtPostBufEntryNo;
+            INSERT;
+          END;
+
+          IF NOT (RunOnlyCheck OR CalledFromTestReport) THEN BEGIN
+            TempGLItemLedgRelation.INIT;
+            TempGLItemLedgRelation."G/L Entry No." := "Entry No.";
+            TempGLItemLedgRelation."Value Entry No." := ValueEntryNo;
+            TempGLItemLedgRelation.INSERT;
+          END;
+        END;
+      END;
+      CLEAR(TempInvtPostBuf);
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE UpdateReportAmounts@24();
+    BEGIN
+      WITH GlobalInvtPostBuf DO
+        CASE "Account Type" OF
+          "Account Type"::Inventory,"Account Type"::"Inventory (Interim)":
+            InvtAmt += Amount;
+          "Account Type"::"WIP Inventory":
+            WIPInvtAmt += Amount;
+          "Account Type"::"Inventory Adjmt.":
+            InvtAdjmtAmt += Amount;
+          "Account Type"::"Invt. Accrual (Interim)":
+            InvtAdjmtAmt += Amount;
+          "Account Type"::"Direct Cost Applied":
+            DirCostAmt += Amount;
+          "Account Type"::"Overhead Applied":
+            OvhdCostAmt += Amount;
+          "Account Type"::"Purchase Variance":
+            VarPurchCostAmt += Amount;
+          "Account Type"::COGS:
+            COGSAmt += Amount;
+          "Account Type"::"COGS (Interim)":
+            COGSAmt += Amount;
+          "Account Type"::"Material Variance","Account Type"::"Capacity Variance",
+          "Account Type"::"Subcontracted Variance","Account Type"::"Cap. Overhead Variance":
+            VarMfgDirCostAmt += Amount;
+          "Account Type"::"Mfg. Overhead Variance":
+            VarMfgOvhdCostAmt += Amount;
+        END;
+    END;
+
+    LOCAL PROCEDURE ErrorNonValidCombination@2(ValueEntry@1000 : Record 5802);
+    BEGIN
+      WITH ValueEntry DO
+        IF CalledFromTestReport THEN
+          InsertTempInvtPostToGLTestBuf2(ValueEntry)
+        ELSE
+          ERROR(
+            Text002,
+            FIELDCAPTION("Item Ledger Entry Type"),"Item Ledger Entry Type",
+            FIELDCAPTION("Entry Type"),"Entry Type",
+            FIELDCAPTION("Expected Cost"),"Expected Cost")
+    END;
+
+    LOCAL PROCEDURE InsertTempInvtPostToGLTestBuf2@23(ValueEntry@1000 : Record 5802);
+    BEGIN
+      WITH ValueEntry DO BEGIN
+        TempInvtPostToGLTestBuf."Line No." := GetNextLineNo;
+        TempInvtPostToGLTestBuf."Posting Date" := "Posting Date";
+        TempInvtPostToGLTestBuf.Description := STRSUBSTNO(Text003,TABLECAPTION,"Entry No.");
+        TempInvtPostToGLTestBuf.Amount := "Cost Amount (Actual)";
+        TempInvtPostToGLTestBuf."Value Entry No." := "Entry No.";
+        TempInvtPostToGLTestBuf."Dimension Set ID" := "Dimension Set ID";
+        TempInvtPostToGLTestBuf.INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE GetNextLineNo@26() : Integer;
+    BEGIN
+      IF TempInvtPostToGLTestBuf.FINDLAST THEN
+        EXIT(TempInvtPostToGLTestBuf."Line No." + 10000);
+
+      EXIT(10000);
+    END;
+
+    PROCEDURE PostInvtPostBufPerEntry@20(VAR ValueEntry@1001 : Record 5802);
+    VAR
+      GenJnlLine@1002 : Record 81;
+    BEGIN
+      ReasonCde := ValueEntry."Reason Code"; //**4PS.n
+      WITH ValueEntry DO
+        PostInvtPostBuf(
+          ValueEntry,
+          "Document No.",
+          "External Document No.",
+          COPYSTR(
+            STRSUBSTNO(Text000,"Entry Type","Source No.","Posting Date"),
+            1,MAXSTRLEN(GenJnlLine.Description)),
+          FALSE);
+    END;
+
+    PROCEDURE PostInvtPostBufPerPostGrp@19(DocNo@1001 : Code[20];Desc@1000 : Text[50]);
+    VAR
+      ValueEntry@1003 : Record 5802;
+    BEGIN
+      PostInvtPostBuf(ValueEntry,DocNo,'',Desc,TRUE);
+    END;
+
+    LOCAL PROCEDURE PostInvtPostBuf@3(VAR ValueEntry@1008 : Record 5802;DocNo@1002 : Code[20];ExternalDocNo@1007 : Code[35];Desc@1003 : Text[50];PostPerPostGrp@1001 : Boolean);
+    VAR
+      GenJnlLine@1004 : Record 81;
+      GenJnlLinePosted@1100525000 : Boolean;
+      PostValueentry@1100525001 : Boolean;
+    BEGIN
+      WITH GlobalInvtPostBuf DO BEGIN
+        RESET;
+        IF NOT FINDSET THEN
+          EXIT;
+
+        GenJnlLine.INIT;
+        GenJnlLine."Document No." := DocNo;
+        GenJnlLine."External Document No." := ExternalDocNo;
+        GenJnlLine.Description := Desc;
+        GetSourceCodeSetup;
+        GenJnlLine."Source Code" := SourceCodeSetup."Inventory Post Cost";
+        //**4PS.sn
+        GenJnlLine."Reason Code" := ReasonCde;
+        CheckSourceReasonInventory(GenJnlLine, ValueEntry);  //db, 08-09-10, M14869
+        GenJnlLine."Journal Batch Name" := ValueEntry."Journal Batch Name";
+        //**4PS.en
+        GenJnlLine."System-Created Entry" := TRUE;
+
+      //M24009 Job No is niet gewenst. Komt uit Servicepack 1, volgens Peter Schoenmaker  so
+      //    GenJnlLine."Job No." := "Job No.";
+      //
+      //    //**4PS.sn M22503, M22738 en M22739
+      //    //Wie weet nog waarom "Job No." hierboven is toegevoegd.
+      //    //Dat geeft een fout bij het doorboeken. Want rekening voor voorraadwaardering is geen OHW rekening
+      //
+      //    //Work around door "Skip Wip Check" aan te zetten.
+      //    IF GenJnlLine."Job No." <> '' THEN
+      //       GenJnlLine."Skip WIP Check" := TRUE;
+      //    //Tevens moet je dan Element ook meegeven want dat kan verplicht zijn.
+      //    GenJnlLine.Element := Element;
+      //    //**4PS.en M22503, M22738 en M22739
+      //M24009 Job No is niet gewenst. Komt uit Servicepack 1, volgens Peter Schoenmaker  eo
+
+        REPEAT
+          //**4PS.sn
+          IF (ValueEntry."Location Code" <> '') AND (NOT ValueEntry.Adjustment) THEN BEGIN
+            CalcInvtPostBufSKUSurcharge(ValueEntry);
+            GlobalInvtPostBuf2.RESET;
+            IF GlobalInvtPostBuf2.FINDSET THEN
+              REPEAT
+
+                IF NOT (RunOnlyCheck OR CalledFromTestReport) THEN BEGIN
+
+                  IF (ValueEntry."Item Ledger Entry Type" = ValueEntry."Item Ledger Entry Type"::Sale) AND
+                     (ValueEntry."Document Type" = ValueEntry."Document Type"::"Sales Invoice") AND
+                     (("Account Type" = "Account Type"::"Inventory (Interim)") OR
+                      ("Account Type" = "Account Type"::"COGS (Interim)")) THEN
+                  BEGIN
+                    // Amount is al goed gevuld?
+                  END ELSE BEGIN
+                    Amount += GlobalInvtPostBuf2.Amount;
+                    "Amount (ACY)" += GlobalInvtPostBuf2."Amount (ACY)";
+                  END;
+
+                  IF ValueEntry."Item Ledger Entry Type" = ValueEntry."Item Ledger Entry Type"::Transfer THEN BEGIN
+                    IF ("Account Type" = "Account Type"::Inventory) THEN BEGIN
+                      //SKU's worden apart geboekt ?
+                    END;
+                  END;
+
+                  IF (ValueEntry."Item Ledger Entry Type" = ValueEntry."Item Ledger Entry Type"::Sale) THEN BEGIN
+
+                    IF ("Account Type" = "Account Type"::Inventory) THEN BEGIN
+                      ValueEntry."Cost Posted to G/L" += GlobalInvtPostBuf2.Amount;
+                      ValueEntry."Cost Amount (Actual)" += GlobalInvtPostBuf2.Amount;
+
+                      ValueEntry."SKU Surcharge Amount" += GlobalInvtPostBuf2.Amount;  //M17839
+                      ValueEntry."SKU Quantity" := ValueEntry."Invoiced Quantity";     //M17839
+                    END;
+
+                    IF ("Account Type" = "Account Type"::"Inventory (Interim)") THEN BEGIN //M22980 sn
+                      IF ValueEntry."Document Type" = ValueEntry."Document Type"::"Sales Shipment" THEN BEGIN  //M25282
+                        ValueEntry."Cost Amount (Expected)" += GlobalInvtPostBuf2.Amount;
+                        ValueEntry."Cost Amount (Expected) (ACY)" += GlobalInvtPostBuf2."Amount (ACY)";
+                      END;
+                    END;
+
+                  END;
+
+                  IF (ValueEntry."Item Ledger Entry Type" = ValueEntry."Item Ledger Entry Type"::Purchase) THEN BEGIN
+                    IF ("Account Type" = "Account Type"::"Inventory (Interim)") THEN BEGIN
+                      IF ValueEntry."Document Type" = ValueEntry."Document Type"::"Purchase Receipt" THEN BEGIN
+                        ValueEntry."Cost Amount (Expected)" += GlobalInvtPostBuf2.Amount;
+                        ValueEntry."Cost Amount (Expected) (ACY)" += GlobalInvtPostBuf2."Amount (ACY)";
+                      END;
+                    END;
+                  END;
+
+                END;
+
+              UNTIL GlobalInvtPostBuf2.NEXT = 0
+          END ELSE BEGIN
+            GlobalInvtPostBuf2.RESET;
+            GlobalInvtPostBuf2.DELETEALL;
+          END;
+          GenJnlLinePosted := FALSE;
+          //**4PS.en
+
+          GenJnlLine.VALIDATE("Posting Date","Posting Date");
+          IF SetAmt(GenJnlLine,Amount,"Amount (ACY)") THEN BEGIN
+            IF PostPerPostGrp THEN
+              SetDesc(GenJnlLine,GlobalInvtPostBuf);
+            GenJnlLine."Account No." := "Account No.";
+            GenJnlLine."Dimension Set ID" := "Dimension Set ID";
+            DimMgt.UpdateGlobalDimFromDimSetID(
+              "Dimension Set ID",GenJnlLine."Shortcut Dimension 1 Code",
+              GenJnlLine."Shortcut Dimension 2 Code");
+            IF NOT CalledFromTestReport THEN
+              IF NOT RunOnlyCheck THEN BEGIN
+                IF NOT CalledFromItemPosting THEN
+                  GenJnlPostLine.SetOverDimErr;
+                GenJnlPostLine.RunWithCheck(GenJnlLine);
+                GenJnlLinePosted := TRUE; //**4PS.n
+              END ELSE
+                GenJnlCheckLine.RunCheck(GenJnlLine)
+            ELSE
+              InsertTempInvtPostToGLTestBuf(GenJnlLine,ValueEntry,
+                                            ValueEntry."Source No.",ValueEntry."Item No.");
+          END;
+          IF NOT CalledFromTestReport AND NOT RunOnlyCheck THEN BEGIN
+            CreateGLItemLedgRelation(ValueEntry);
+          END;
+          //**4PS.sn
+          IF GenJnlLinePosted THEN BEGIN
+            PostValueentry := TRUE;
+
+            IF (ValueEntry."Item Ledger Entry Type" = ValueEntry."Item Ledger Entry Type"::Sale) THEN
+              PostValueentry := FALSE;
+
+            IF (ValueEntry."Item Ledger Entry Type" = ValueEntry."Item Ledger Entry Type"::Purchase) AND
+              (("Account Type" = "Account Type"::"Inventory (Interim)") OR
+              ("Account Type" = "Account Type"::"Invt. Accrual (Interim)")) THEN
+              PostValueentry := FALSE;
+
+            IF PostValueentry THEN BEGIN
+              PostInvtPostBufSKUSurcharge(ValueEntry,"Posting Date",DocNo,ExternalDocNo,Desc,FALSE);
+            END;
+          END;
+          //**4PS.en
+        UNTIL NEXT = 0;
+        RunOnlyCheck := RunOnlyCheckSaved;
+        DELETEALL;
+      END;
+    END;
+
+    LOCAL PROCEDURE CalcInvtPostBufSKUSurcharge@1100485002(VAR ValueEntry@1008 : Record 5802);
+    VAR
+      lSKUSurcharges@1100485000 : Record 11020317;
+      lStockSurcharges@1100485001 : Record 11020316;
+      lTotalSurcharge@1100485002 : Decimal;
+      lTotalSurchargeACY@1100485003 : Decimal;
+      lvQuantity@1100485004 : Decimal;
+    BEGIN
+      //**4PS
+      GlobalInvtPostBuf2.RESET;
+      GlobalInvtPostBuf2.DELETEALL;
+
+      IF (ValueEntry."Entry Type" <> ValueEntry."Entry Type"::"Direct Cost") OR
+         (ValueEntry."Location Code" = '') THEN
+        EXIT;
+
+      WITH GlobalInvtPostBuf DO BEGIN
+
+        CASE "Account Type" OF
+        //"Account Type"::"Inventory (Interim)",   //M22980
+        //"Account Type"::"Inventory (Interim)",
+          "Account Type"::"WIP Inventory",
+          "Account Type"::"Inventory Adjmt.",
+        //  "Account Type"::"Invt. Accrual (Interim)",
+          "Account Type"::"Direct Cost Applied",
+          "Account Type"::"Overhead Applied",
+          "Account Type"::"Purchase Variance",
+        //  "Account Type"::"COGS (Interim)",
+          "Account Type"::"Material Variance",
+          "Account Type"::"Capacity Variance",
+          "Account Type"::"Subcontracted Variance",
+          "Account Type"::"Cap. Overhead Variance",
+          "Account Type"::"Mfg. Overhead Variance":
+            EXIT;
+        END;
+
+        IF ValueEntry."Item Ledger Entry Type" = ValueEntry."Item Ledger Entry Type"::Purchase THEN BEGIN
+          IF ValueEntry."Document Type" = ValueEntry."Document Type"::"Purchase Invoice" THEN BEGIN
+            CASE "Account Type" OF
+              "Account Type"::"Inventory (Interim)",
+              "Account Type"::"Invt. Accrual (Interim)":
+                EXIT;
+            END;
+          END;
+        END;
+
+        IF ValueEntry."Item Ledger Entry Type" = ValueEntry."Item Ledger Entry Type"::Sale THEN BEGIN
+          IF ValueEntry."Document Type" = ValueEntry."Document Type"::"Sales Invoice" THEN BEGIN
+            CASE "Account Type" OF
+              //"Account Type"::"COGS (Interim)",
+              "Account Type"::"Invt. Accrual (Interim)":
+                EXIT;
+            END;
+          END;
+        END;
+
+        //Doorgaan voor Inventory en COGS
+
+        lSKUSurcharges.SETRANGE("Location Code", ValueEntry."Location Code");
+        lSKUSurcharges.SETRANGE("Item No.", ValueEntry."Item No.");
+        lSKUSurcharges.SETRANGE("Variant Code", ValueEntry."Variant Code");
+        lSKUSurcharges.SETFILTER("Time Posted", '<>%1', 0DT);
+        lSKUSurcharges.SETRANGE("Deletion Posted", FALSE);
+
+        lTotalSurcharge := 0;
+        lTotalSurchargeACY := 0;
+
+
+        lvQuantity := ValueEntry."Invoiced Quantity";
+        IF (ValueEntry."Item Ledger Entry Type" = ValueEntry."Item Ledger Entry Type"::Sale) THEN BEGIN
+
+          IF ("Account Type" = "Account Type"::COGS) THEN
+            lvQuantity := ValueEntry."Invoiced Quantity" * -1;
+
+          IF ("Account Type" = "Account Type"::"Invt. Accrual (Interim)") THEN
+            lvQuantity := ValueEntry."Valued Quantity" * -1;
+
+          IF ("Account Type" = "Account Type"::"Inventory (Interim)") THEN
+            lvQuantity := ValueEntry."Valued Quantity";
+
+          IF ("Account Type" = "Account Type"::"Inventory (Interim)") AND
+             (ValueEntry."Document Type" = ValueEntry."Document Type"::"Sales Invoice") THEN
+            lvQuantity := ValueEntry."Valued Quantity" * -1;
+
+          IF ("Account Type" = "Account Type"::"COGS (Interim)") THEN
+            lvQuantity := ValueEntry."Valued Quantity" * -1;
+
+          IF ("Account Type" = "Account Type"::"COGS (Interim)") AND
+             (ValueEntry."Document Type" = ValueEntry."Document Type"::"Sales Invoice") THEN
+            lvQuantity := ValueEntry."Valued Quantity";
+
+        END;
+
+
+        IF (ValueEntry."Item Ledger Entry Type" = ValueEntry."Item Ledger Entry Type"::Purchase) THEN BEGIN
+
+          IF ("Account Type" = "Account Type"::"Invt. Accrual (Interim)") THEN
+            lvQuantity := ValueEntry."Valued Quantity" * -1;
+
+          IF ("Account Type" = "Account Type"::"Inventory (Interim)") THEN
+            lvQuantity := ValueEntry."Valued Quantity";
+
+        END;
+
+        IF lSKUSurcharges.FINDSET(FALSE, FALSE) THEN
+          REPEAT
+            GlobalInvtPostBuf2.INIT;
+            IF lStockSurcharges.GET(lSKUSurcharges."Surcharge Code") THEN BEGIN
+
+              IF lStockSurcharges."Actual Amount" <> 0 THEN BEGIN
+                GlobalInvtPostBuf2.Amount := lStockSurcharges."Actual Amount" * lvQuantity;
+                IF ("Amount (ACY)" <> 0) AND (Amount <> 0) THEN
+                  GlobalInvtPostBuf2."Amount (ACY)" := ROUND(GlobalInvtPostBuf2.Amount * ("Amount (ACY)"/Amount));
+              END;
+              IF lStockSurcharges."Actual Percentage" <> 0 THEN BEGIN
+                GlobalInvtPostBuf2.Amount := ROUND(Amount * (lStockSurcharges."Actual Percentage"/100));
+                IF ("Amount (ACY)" <> 0) AND (Amount <> 0) THEN
+                  GlobalInvtPostBuf2."Amount (ACY)" := ROUND(GlobalInvtPostBuf2.Amount * ("Amount (ACY)"/Amount));
+              END;
+            END;
+
+            IF GlobalInvtPostBuf2.Amount <> 0 THEN BEGIN
+
+              GlobalInvtPostBuf2."Location Code" := lSKUSurcharges."Surcharge Code";
+              lStockSurcharges.TESTFIELD("Coverage Account");
+              GlobalInvtPostBuf2."Inventory Posting Group" := lStockSurcharges."Coverage Account";
+              GlobalInvtPostBuf2.Element := lStockSurcharges."Cost Object Surcharge";
+              GlobalInvtPostBuf2."Dimension Entry No." += 1;
+              GlobalInvtPostBuf2.INSERT;
+
+            END;
+          UNTIL lSKUSurcharges.NEXT = 0;
+
+      END;
+    END;
+
+    LOCAL PROCEDURE PostInvtPostBufSKUSurcharge@1100485001(VAR ValueEntry@1008 : Record 5802;PostDate@1000 : Date;DocNo@1002 : Code[20];ExternalDocNo@1007 : Code[35];Desc@1003 : Text[50];PostPerPostGrp@1001 : Boolean);
+    VAR
+      GenJnlLine@1004 : Record 81;
+      lvValueEntry@1100485000 : Record 5802;
+      GLReg@1100525000 : Record 45;
+      GLItemLedgRelation@1100525001 : Record 5823;
+      NextNr@1100485001 : Integer;
+      GLEntryNo@1100525002 : Integer;
+    BEGIN
+      //**4PS
+      GlobalInvtPostBuf2.RESET;
+      IF NOT GlobalInvtPostBuf2.FIND('-') THEN
+        EXIT;
+
+      GenJnlPostLine.GetGLReg(GLReg);
+      GLEntryNo := GLReg."To Entry No.";
+
+      GenJnlLine.INIT;
+      GenJnlLine.VALIDATE("Posting Date",PostDate);
+      GenJnlLine."Document No." := DocNo;
+      GenJnlLine."External Document No." := ExternalDocNo;
+      GenJnlLine.Description := Desc;
+      GetSourceCodeSetup;
+      GenJnlLine."Source Code" := SourceCodeSetup."Inventory Post Cost";
+      GenJnlLine."Reason Code" := ReasonCde;
+      CheckSourceReasonInventory(GenJnlLine, ValueEntry);  //db, 08-09-10, M14869
+      GenJnlLine."Journal Batch Name" := ValueEntry."Journal Batch Name";
+      GenJnlLine."System-Created Entry" := TRUE;
+      GenJnlLine.VALIDATE("Shortcut Dimension 2 Code", GlobalInvtPostBuf2.Element);
+      REPEAT
+        IF SetAmt(GenJnlLine, -1 * GlobalInvtPostBuf2.Amount, -1 * GlobalInvtPostBuf2."Amount (ACY)") THEN BEGIN
+          GenJnlLine."Account No." := GlobalInvtPostBuf2."Inventory Posting Group";
+          GenJnlPostLine.RunWithCheck(GenJnlLine);
+        END;
+
+        lvValueEntry.SETFILTER("Entry No.", '>%1', ValueEntry."Entry No.");
+        IF lvValueEntry.FINDLAST THEN
+          NextNr := lvValueEntry."Entry No." + 1
+        ELSE
+          NextNr := ValueEntry."Entry No." + 1;
+        lvValueEntry.COPY(ValueEntry);
+        lvValueEntry."Entry No." := NextNr;
+
+        lvValueEntry."SKU Quantity" := lvValueEntry."Invoiced Quantity";
+        lvValueEntry."Cost Posted to G/L" := GenJnlLine.Amount * -1;
+        lvValueEntry."Cost Amount (Actual)" := lvValueEntry."Cost Posted to G/L";   //M22980
+        lvValueEntry."SKU Surcharge Amount" := lvValueEntry."Cost Posted to G/L";
+
+        lvValueEntry."Valued Quantity" := 0;
+        lvValueEntry."Item Ledger Entry Quantity" := 0;
+        lvValueEntry."Invoiced Quantity" := 0;
+        lvValueEntry."Cost per Unit" := 0;
+        lvValueEntry."Sales Amount (Actual)" := 0;
+        lvValueEntry."Discount Amount" := 0;
+        lvValueEntry."Cost Amount (Actual) (ACY)" := 0;
+        lvValueEntry."Cost Posted to G/L (ACY)" := 0;
+        lvValueEntry."Cost per Unit (ACY)" := 0;
+        lvValueEntry."Purchase Amount (Actual)" :=0 ;
+        lvValueEntry."Purchase Amount (Expected)" := 0;
+        lvValueEntry."Sales Amount (Expected)" := 0;
+        lvValueEntry."Cost Amount (Expected)" := 0;
+        lvValueEntry."Cost Amount (Non-Invtbl.)" := 0;
+        lvValueEntry."Cost Amount (Expected) (ACY)" := 0;
+        lvValueEntry."Cost Amount (Non-Invtbl.)(ACY)" := 0;
+        lvValueEntry."Expected Cost Posted to G/L" := 0;
+        lvValueEntry."Exp. Cost Posted to G/L (ACY)" := 0;
+
+        lvValueEntry.INSERT;
+
+        GenJnlPostLine.GetGLReg(GLReg);
+        GLItemLedgRelation.INIT;
+        GLItemLedgRelation."G/L Entry No." := GLReg."To Entry No.";
+        GLItemLedgRelation."Value Entry No." := lvValueEntry."Entry No.";
+        GLItemLedgRelation."G/L Register No." := GLReg."No.";
+        GLItemLedgRelation.INSERT;
+        GLItemLedgRelation."G/L Entry No." := GLEntryNo;
+        GLItemLedgRelation.INSERT;
+
+      UNTIL GlobalInvtPostBuf2.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE GetSourceCodeSetup@15();
+    BEGIN
+      IF NOT SourceCodeSetupRead THEN
+        SourceCodeSetup.GET;
+      SourceCodeSetupRead := TRUE;
+    END;
+
+    LOCAL PROCEDURE SetAmt@22(VAR GenJnlLine@1000 : Record 81;Amt@1001 : Decimal;AmtACY@1002 : Decimal) : Boolean;
+    BEGIN
+      WITH GenJnlLine DO BEGIN
+        "Additional-Currency Posting" := "Additional-Currency Posting"::None;
+        VALIDATE(Amount,Amt);
+
+        GetGLSetup;
+        IF GLSetup."Additional Reporting Currency" <> '' THEN BEGIN
+          "Source Currency Code" := GLSetup."Additional Reporting Currency";
+          "Source Currency Amount" := AmtACY;
+          IF (Amount = 0) AND ("Source Currency Amount" <> 0) THEN BEGIN
+            "Additional-Currency Posting" :=
+              "Additional-Currency Posting"::"Additional-Currency Amount Only";
+            VALIDATE(Amount,"Source Currency Amount");
+            "Source Currency Amount" := 0;
+          END;
+        END;
+      END;
+
+      EXIT((Amt <> 0) OR (AmtACY <> 0));
+    END;
+
+    PROCEDURE SetDesc@27(VAR GenJnlLine@1006 : Record 81;InvtPostBuf@1004 : Record 48);
+    BEGIN
+      WITH InvtPostBuf DO
+        GenJnlLine.Description :=
+          COPYSTR(
+            STRSUBSTNO(
+              Text001,
+              "Account Type","Bal. Account Type",
+              "Location Code","Inventory Posting Group",
+              "Gen. Bus. Posting Group","Gen. Prod. Posting Group"),
+            1,MAXSTRLEN(GenJnlLine.Description));
+    END;
+
+    LOCAL PROCEDURE InsertTempInvtPostToGLTestBuf@25(GenJnlLine@1000 : Record 81;ValueEntry@1001 : Record 5802;SourceNo@1101100001 : Code[20];ItemNo@1101100002 : Code[20]);
+    VAR
+      Item@1101100000 : Record 27;
+    BEGIN
+      WITH GenJnlLine DO BEGIN
+        TempInvtPostToGLTestBuf."Line No." := GetNextLineNo;
+        TempInvtPostToGLTestBuf."Posting Date" := "Posting Date";
+        TempInvtPostToGLTestBuf."Document No." := "Document No.";
+        TempInvtPostToGLTestBuf.Description := Description;
+        TempInvtPostToGLTestBuf."Account No." := "Account No.";
+        TempInvtPostToGLTestBuf.Amount := Amount;
+        TempInvtPostToGLTestBuf."Source Code" := "Source Code";
+        TempInvtPostToGLTestBuf."System-Created Entry" := TRUE;
+        TempInvtPostToGLTestBuf."Value Entry No." := ValueEntry."Entry No.";
+        TempInvtPostToGLTestBuf."Additional-Currency Posting" := "Additional-Currency Posting";
+        TempInvtPostToGLTestBuf."Source Currency Code" := "Source Currency Code";
+        TempInvtPostToGLTestBuf."Source Currency Amount" := "Source Currency Amount";
+        TempInvtPostToGLTestBuf."Inventory Account Type" := GlobalInvtPostBuf."Account Type";
+        TempInvtPostToGLTestBuf."Dimension Set ID" := "Dimension Set ID";
+        IF GlobalInvtPostBuf.UseInvtPostSetup THEN BEGIN
+          TempInvtPostToGLTestBuf."Location Code" := GlobalInvtPostBuf."Location Code";
+          TempInvtPostToGLTestBuf."Invt. Posting Group Code" :=
+            GetInvPostingGroupCode(
+              ValueEntry,
+              TempInvtPostToGLTestBuf."Inventory Account Type" = TempInvtPostToGLTestBuf."Inventory Account Type"::"WIP Inventory",
+              GlobalInvtPostBuf."Inventory Posting Group");
+          IF TempInvtPostToGLTestBuf."Inventory Account Type" = TempInvtPostToGLTestBuf."Inventory Account Type"::"WIP Inventory" THEN
+            IF SourceNo <> ItemNo THEN
+              IF Item.GET(SourceNo) THEN
+                TempInvtPostToGLTestBuf."Invt. Posting Group Code" := Item."Inventory Posting Group";
+        END ELSE BEGIN
+          TempInvtPostToGLTestBuf."Gen. Bus. Posting Group" := GlobalInvtPostBuf."Gen. Bus. Posting Group";
+          TempInvtPostToGLTestBuf."Gen. Prod. Posting Group" := GlobalInvtPostBuf."Gen. Prod. Posting Group";
+        END;
+        TempInvtPostToGLTestBuf.INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE CreateGLItemLedgRelation@33(VAR ValueEntry@1000 : Record 5802);
+    VAR
+      GLReg@1001 : Record 45;
+    BEGIN
+      GenJnlPostLine.GetGLReg(GLReg);
+      IF GlobalPostPerPostGroup THEN BEGIN
+        TempGLItemLedgRelation.RESET;
+        TempGLItemLedgRelation.SETRANGE("G/L Entry No.",GlobalInvtPostBuf."Entry No.");
+        TempGLItemLedgRelation.FINDSET;
+        REPEAT
+          ValueEntry.GET(TempGLItemLedgRelation."Value Entry No.");
+          UpdateValueEntry(ValueEntry);
+          CreateGLItemLedgRelationEntry(GLReg);
+        UNTIL TempGLItemLedgRelation.NEXT = 0;
+      END ELSE BEGIN
+        UpdateValueEntry(ValueEntry);
+        CreateGLItemLedgRelationEntry(GLReg);
+      END;
+    END;
+
+    LOCAL PROCEDURE CreateGLItemLedgRelationEntry@35(GLReg@1003 : Record 45);
+    VAR
+      GLItemLedgRelation@1002 : Record 5823;
+    BEGIN
+      GLItemLedgRelation.INIT;
+      GLItemLedgRelation."G/L Entry No." := GLReg."To Entry No.";
+      GLItemLedgRelation."Value Entry No." := TempGLItemLedgRelation."Value Entry No.";
+      GLItemLedgRelation."G/L Register No." := GLReg."No.";
+      GLItemLedgRelation.INSERT;
+      TempGLItemLedgRelation."G/L Entry No." := GlobalInvtPostBuf."Entry No.";
+      TempGLItemLedgRelation.DELETE;
+    END;
+
+    LOCAL PROCEDURE UpdateValueEntry@13(VAR ValueEntry@1000 : Record 5802);
+    BEGIN
+      WITH ValueEntry DO BEGIN
+        IF GlobalInvtPostBuf."Interim Account" THEN BEGIN
+          "Expected Cost Posted to G/L" := "Cost Amount (Expected)";
+          "Exp. Cost Posted to G/L (ACY)" := "Cost Amount (Expected) (ACY)";
+        END ELSE BEGIN
+          "Cost Posted to G/L" := "Cost Amount (Actual)";
+          "Cost Posted to G/L (ACY)" := "Cost Amount (Actual) (ACY)";
+        END;
+        IF NOT CalledFromItemPosting THEN
+          MODIFY;
+      END;
+    END;
+
+    PROCEDURE GetTempInvtPostToGLTestBuf@29(VAR InvtPostToGLTestBuf@1001 : Record 5822);
+    BEGIN
+      InvtPostToGLTestBuf.DELETEALL;
+      IF NOT TempInvtPostToGLTestBuf.FINDSET THEN
+        EXIT;
+
+      REPEAT
+        InvtPostToGLTestBuf := TempInvtPostToGLTestBuf;
+        InvtPostToGLTestBuf.INSERT;
+      UNTIL TempInvtPostToGLTestBuf.NEXT = 0;
+    END;
+
+    PROCEDURE GetAmtToPost@11(VAR NewCOGSAmt@1000 : Decimal;VAR NewInvtAdjmtAmt@1001 : Decimal;VAR NewDirCostAmt@1002 : Decimal;VAR NewOvhdCostAmt@1003 : Decimal;VAR NewVarPurchCostAmt@1004 : Decimal;VAR NewVarMfgDirCostAmt@1013 : Decimal;VAR NewVarMfgOvhdCostAmt@1008 : Decimal;VAR NewWIPInvtAmt@1009 : Decimal;VAR NewInvtAmt@1010 : Decimal;GetTotal@1007 : Boolean);
+    BEGIN
+      GetAmt(NewInvtAdjmtAmt,InvtAdjmtAmt,TotalInvtAdjmtAmt,GetTotal);
+      GetAmt(NewDirCostAmt,DirCostAmt,TotalDirCostAmt,GetTotal);
+      GetAmt(NewOvhdCostAmt,OvhdCostAmt,TotalOvhdCostAmt,GetTotal);
+      GetAmt(NewVarPurchCostAmt,VarPurchCostAmt,TotalVarPurchCostAmt,GetTotal);
+      GetAmt(NewVarMfgDirCostAmt,VarMfgDirCostAmt,TotalVarMfgDirCostAmt,GetTotal);
+      GetAmt(NewVarMfgOvhdCostAmt,VarMfgOvhdCostAmt,TotalVarMfgOvhdCostAmt,GetTotal);
+      GetAmt(NewWIPInvtAmt,WIPInvtAmt,TotalWIPInvtAmt,GetTotal);
+      GetAmt(NewCOGSAmt,COGSAmt,TotalCOGSAmt,GetTotal);
+      GetAmt(NewInvtAmt,InvtAmt,TotalInvtAmt,GetTotal);
+    END;
+
+    LOCAL PROCEDURE GetAmt@21(VAR NewAmt@1000 : Decimal;VAR Amt@1001 : Decimal;VAR TotalAmt@1002 : Decimal;GetTotal@1003 : Boolean);
+    BEGIN
+      IF GetTotal THEN
+        NewAmt := TotalAmt
+      ELSE BEGIN
+        NewAmt := Amt;
+        TotalAmt := TotalAmt + Amt;
+        Amt := 0;
+      END;
+    END;
+
+    PROCEDURE GetInvtPostBuf@7(VAR InvtPostBuf@1000 : Record 48);
+    BEGIN
+      InvtPostBuf.DELETEALL;
+
+      GlobalInvtPostBuf.RESET;
+      IF GlobalInvtPostBuf.FINDSET THEN
+        REPEAT
+          InvtPostBuf := GlobalInvtPostBuf;
+          InvtPostBuf.INSERT;
+        UNTIL GlobalInvtPostBuf.NEXT = 0;
+    END;
+
+    PROCEDURE GetDimBuf@12(DimEntryNo@1001 : Integer;VAR TempDimBuf@1000 : Record 360);
+    BEGIN
+      TempDimBuf.DELETEALL;
+      DimBufMgt.GetDimensions(DimEntryNo,TempDimBuf);
+    END;
+
+    LOCAL PROCEDURE GetInvPostingGroupCode@32(ValueEntry@1000 : Record 5802;WIPInventory@1001 : Boolean;InvPostingGroupCode@1002 : Code[10]) : Code[10];
+    VAR
+      Item@1003 : Record 27;
+    BEGIN
+      IF WIPInventory THEN
+        IF ValueEntry."Source No." <> ValueEntry."Item No." THEN
+          IF Item.GET(ValueEntry."Source No.") THEN
+            EXIT(Item."Inventory Posting Group");
+
+      EXIT(InvPostingGroupCode);
+    END;
+
+    PROCEDURE PostPlantToGL@1100485000(VAR GenJnlLine@1100485001 : Record 81);
+    BEGIN
+      //**4PS
+      GenJnlPostLine.RunWithCheck(GenJnlLine);
+    END;
+
+    PROCEDURE SetCOGSAccount@1100525000(lvCOGSAccount@1100525000 : Code[20];_IncStatCOGSAccount@1100409000 : Boolean);
+    BEGIN
+      gvCOGSAccount := lvCOGSAccount;
+      gvIncStatCOGSAccount := _IncStatCOGSAccount; //**4PS M34347
+    END;
+
+    PROCEDURE CheckSourceReasonInventory@1100525001(VAR GenJnlLine@1100525000 : Record 81;VAR ValueEntry@1100525001 : Record 5802);
+    VAR
+      ItemRegister@1100525003 : Record 46;
+    BEGIN
+      //**4PS (db, 08-09-10: M14869)
+      ItemRegister.SETRANGE("Creation Date", ValueEntry."Posting Date");
+      IF ItemRegister.FINDSET THEN BEGIN
+        REPEAT
+          IF (ValueEntry."Item Ledger Entry No." >= ItemRegister."From Entry No.") AND
+             (ValueEntry."Item Ledger Entry No." <= ItemRegister."To Entry No.") THEN
+          BEGIN
+            GenJnlLine."Source Code" := ValueEntry."Source Code";
+            GenJnlLine."Reason Code" := ValueEntry."Reason Code";
+            EXIT;
+          END;
+        UNTIL ItemRegister.NEXT = 0;
+      END;
+    END;
+
+    BEGIN
+    {
+      4PS HBK 23-06-2009 Added use of InvtPostSetup."Inventory Account (Mat. Var.)" in SetAccNo
+    }
+    END.
+  }
+}
+

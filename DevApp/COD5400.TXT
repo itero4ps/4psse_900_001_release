@@ -1,0 +1,240 @@
+OBJECT Codeunit 5400 Available Management
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW18.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      gCompany@1100485000 : Text[30];
+
+    PROCEDURE ExpectedQtyOnHand@7(VAR Item@1000 : Record 27;CalcAvailable@1002 : Boolean;ExtraNetNeed@1003 : Decimal;VAR Available@1004 : Decimal;PlannedOrderReceiptDate@1005 : Date) : Decimal;
+    VAR
+      CopyOfItem@1006 : Record 27;
+    BEGIN
+      //**4PS.sn
+      IF (gCompany <> '') THEN
+        CopyOfItem.CHANGECOMPANY(gCompany);
+      //**4PS.en
+
+      CopyOfItem.COPY(Item);
+
+      Available := 0;
+      IF CalcAvailable THEN
+        Available := CalcAvailableQty(Item,TRUE,PlannedOrderReceiptDate) - ExtraNetNeed;
+      Item.COPY(CopyOfItem);
+      EXIT(CalcAvailableQty(Item,FALSE,0D) - ExtraNetNeed);
+    END;
+
+    LOCAL PROCEDURE CalcAvailableQty@3(VAR Item@1000 : Record 27;CalcAvailable@1003 : Boolean;PlannedOrderReceiptDate@1001 : Date) : Decimal;
+    VAR
+      CopyOfItem@1004 : Record 27;
+      ProjSetup@1100525000 : Record 315;
+      RemainingQuantityProjMatReqLine@1100525001 : Decimal;
+    BEGIN
+      CopyOfItem.COPY(Item);
+      WITH CopyOfItem DO BEGIN
+        IF "Include Inventory" THEN
+          CALCFIELDS(Inventory);
+
+        SETRANGE("Date Filter",0D,GETRANGEMAX("Date Filter"));
+        CALCFIELDS(
+          "Qty. on Purch. Order",
+          //**4PS.sn
+          "Qty. on Purch. Order (Inv.)",
+          //**4PS.en
+          "Scheduled Receipt (Qty.)",
+          "Trans. Ord. Receipt (Qty.)",
+          "Planned Order Receipt (Qty.)",
+          "Qty. on Sales Return");
+
+        IF GETFILTER("Location Filter") <> '' THEN
+          CALCFIELDS("Qty. in Transit");
+
+        IF CalcAvailable THEN
+          SETRANGE("Date Filter",0D,PlannedOrderReceiptDate);
+        CALCFIELDS(
+          "Qty. on Sales Order",
+          "Scheduled Need (Qty.)",
+          "Trans. Ord. Shipment (Qty.)",
+          "Qty. on Service Order",
+          "Qty. on Job Order",
+          //**4PS.sn
+          "Qty. on Plant Order",
+          "Qty. on Item Journal Project",
+          "Qty. on Item Journal Service",
+          //**4PS.en
+          "Qty. on Assembly Order",
+          "Qty. on Purch. Return");
+        //**4PS.sn
+        ProjSetup.GET;
+        IF ProjSetup."Apply ProjMat for ReqLine" THEN BEGIN  //db, 23-11-15
+          "Qty. on Item Journal Project" := 0;  //disable ItemJnlLine (see also function CalculateNeed in codeunit 353)
+          RemainingQuantityProjMatReqLine := QtyOnProjMatReqLines;
+        END;
+        //**4PS.en
+        EXIT(
+          Inventory +
+          //"Qty. on Purch. Order" - //**4PS.o
+          //**4PS.sn
+          "Qty. on Purch. Order (Inv.)" -
+          "Qty. on Plant Order" -
+          "Qty. on Item Journal Project" -
+          "Qty. on Item Journal Service" -
+          RemainingQuantityProjMatReqLine -  //db, 23-11-15
+          //**4PS.en
+          "Qty. on Sales Order" -
+          "Scheduled Need (Qty.)" +
+          "Planned Order Receipt (Qty.)" +
+          "Scheduled Receipt (Qty.)" -
+          "Trans. Ord. Shipment (Qty.)" +
+          "Qty. in Transit" +
+          "Trans. Ord. Receipt (Qty.)" -
+          "Qty. on Service Order" -
+          "Qty. on Job Order" -
+          "Qty. on Purch. Return" +
+          "Qty. on Assembly Order" +
+          "Qty. on Sales Return");
+      END;
+    END;
+
+    PROCEDURE GetItemReorderQty@5(Item@1001 : Record 27;QtyAvailable@1003 : Decimal) ReorderQty@1000 : Decimal;
+    BEGIN
+      IF Item."Reordering Policy" = Item."Reordering Policy"::" " THEN
+        IF Item."Maximum Inventory" <= 0 THEN BEGIN
+          IF QtyAvailable > 0 THEN
+            QtyAvailable := 0;
+          IF Item."Reorder Quantity" > 0 THEN
+            ReorderQty :=
+              ROUND((Item."Reorder Point" - QtyAvailable) / Item."Reorder Quantity",1,'>') *
+              Item."Reorder Quantity"
+          ELSE
+            ReorderQty := Item."Reorder Point" - QtyAvailable;
+        END
+        ELSE
+          IF (Item."Reorder Point" > Item."Maximum Inventory") OR
+             ((QtyAvailable + Item."Reorder Quantity") > Item."Maximum Inventory")
+          THEN
+            ReorderQty := 0
+          ELSE
+            IF Item."Reorder Quantity" > 0 THEN
+              ReorderQty :=
+                ROUND((Item."Maximum Inventory" - QtyAvailable) / Item."Reorder Quantity",1,'<') *
+                Item."Reorder Quantity"
+            ELSE
+              ReorderQty := Item."Maximum Inventory" - QtyAvailable
+      ELSE BEGIN
+        IF Item."Reorder Point" > Item."Safety Stock Quantity" THEN BEGIN
+          IF QtyAvailable > 0 THEN
+            QtyAvailable := 0;
+          ReorderQty := Item."Reorder Point" - QtyAvailable
+        END ELSE
+          ReorderQty := -QtyAvailable;
+
+        IF ReorderQty <= 0 THEN
+          EXIT(0);
+
+        ReorderQty := CalcReorderQty(Item,ReorderQty,QtyAvailable);
+        ReorderQty += AdjustReorderQty(ReorderQty,Item);
+      END;
+    END;
+
+    LOCAL PROCEDURE AdjustReorderQty@1(OrderQty@1000 : Decimal;Item@1001 : Record 27) : Decimal;
+    VAR
+      DeltaQty@1002 : Decimal;
+      Rounding@1003 : Decimal;
+    BEGIN
+      // Copy of AdjustReorderQty in COD 99000854 - Inventory Profile Offsetting
+      // excluding logging surplus & MinQty check
+      IF OrderQty <= 0 THEN
+        EXIT(0);
+
+      IF (Item."Maximum Order Quantity" < OrderQty) AND
+         (Item."Maximum Order Quantity" <> 0)
+         // AND  (SKU."Maximum Order Quantity" > MinQty)
+      THEN BEGIN
+        DeltaQty := Item."Maximum Order Quantity" - OrderQty;
+      END ELSE
+        DeltaQty := 0;
+      IF Item."Minimum Order Quantity" > (OrderQty + DeltaQty) THEN
+        DeltaQty := Item."Minimum Order Quantity" - OrderQty;
+
+      IF Item."Order Multiple" <> 0 THEN BEGIN
+        Rounding := ROUND(OrderQty + DeltaQty,Item."Order Multiple",'>') - (OrderQty + DeltaQty);
+        DeltaQty += Rounding;
+      END;
+      EXIT(DeltaQty);
+    END;
+
+    LOCAL PROCEDURE CalcReorderQty@2(Item@1000 : Record 27;NeededQty@1001 : Decimal;ProjectedInventory@1002 : Decimal) QtyToOrder : Decimal;
+    BEGIN
+      // Copy of CalcReorderQty in COD 99000854 - Inventory Profile Offsetting
+      // excluding logging surplus, resiliency errors and comments
+      CASE Item."Reordering Policy" OF
+        Item."Reordering Policy"::"Maximum Qty.":
+          BEGIN
+            IF Item."Maximum Inventory" < Item."Reorder Point" THEN
+              QtyToOrder := Item."Reorder Point" - ProjectedInventory
+            ELSE
+              QtyToOrder := Item."Maximum Inventory" - ProjectedInventory;
+          END;
+        Item."Reordering Policy"::"Fixed Reorder Qty.":
+          BEGIN
+            Item.TESTFIELD("Reorder Quantity"); // Assertion
+            QtyToOrder := Item."Reorder Quantity";
+          END;
+        ELSE
+          QtyToOrder := NeededQty;
+      END;
+    END;
+
+    PROCEDURE GetQtyBlanketOrder@1100525000(VAR Item@1100525001 : Record 27) QtyBlOrder : Decimal;
+    VAR
+      PurchaseHeader@1100525002 : Record 38;
+      PurchaseLine@1100525000 : Record 39;
+    BEGIN
+      //**4PS
+      IF Item."No." = '' THEN
+        EXIT;
+      PurchaseLine.SETRANGE("Document Type",PurchaseLine."Document Type"::"Blanket Order");
+      PurchaseLine.SETRANGE(Type,PurchaseLine.Type::Item);
+      PurchaseLine.SETRANGE("No.",Item."No.");
+      //PurchaseLine.SETFILTER("Qty. to Receive",'<>%1',0); //hbk, 02-06-2010
+      Item.COPYFILTER("Date Filter",PurchaseLine."Expected Receipt Date");
+      IF PurchaseLine.FINDSET THEN
+        REPEAT
+          IF PurchaseHeader."No." <> PurchaseLine."Document No." THEN
+            PurchaseHeader.GET(PurchaseLine."Document Type",PurchaseLine."Document No.");
+          IF PurchaseHeader.Status <> PurchaseHeader.Status::Closed THEN
+            //QtyBlOrder += PurchaseLine."Qty. to Receive"; //hbk, 02-06-2010
+            QtyBlOrder += PurchaseLine.GetQuanToBeDelivered;
+        UNTIL PurchaseLine.NEXT = 0;
+    END;
+
+    PROCEDURE SetCompany@1100485001(ICompany@1100485000 : Text[30]);
+    BEGIN
+      //**4PS
+      IF (ICompany = '') OR (ICompany = COMPANYNAME) THEN
+        gCompany := ''
+      ELSE BEGIN
+        gCompany := ICompany;
+      END;
+    END;
+
+    BEGIN
+    {
+      4PS HBK 06-05-2010 Added function GetQtyBlanketOrder
+    }
+    END.
+  }
+}
+

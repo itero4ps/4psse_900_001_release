@@ -1,0 +1,255 @@
+OBJECT Codeunit 1700 Exp. Launcher Pos. Pay
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00;
+  }
+  PROPERTIES
+  {
+    TableNo=272;
+    Permissions=TableData 272=rimd,
+                TableData 1220=rimd;
+    OnRun=BEGIN
+            PositivePayProcess(Rec,TRUE);
+          END;
+
+  }
+  CODE
+  {
+
+    PROCEDURE PositivePayProcess@2(VAR CheckLedgerEntry@1015 : Record 272;ShowDialog@1016 : Boolean);
+    VAR
+      DataExch@1014 : Record 1220;
+      DataExchDef@1013 : Record 1222;
+      CheckLedgerEntry2@1012 : Record 272;
+      BankAccount@1011 : Record 270;
+      BankExportImportSetup@1010 : Record 1200;
+      FileManagement@1009 : Codeunit 419;
+      ExpWritingPosPay@1008 : Codeunit 1708;
+      ExpExternalDataPosPay@1007 : Codeunit 1709;
+      DataExchEntryCodeDetail@1006 : Integer;
+      DataExchEntryCodeFooter@1005 : Integer;
+      DataExchDefCode@1004 : Code[20];
+      Filename@1003 : Text;
+      HeaderArray@1002 : ARRAY [100] OF Integer;
+      DetailArray@1001 : ARRAY [100] OF Integer;
+      FooterArray@1000 : ARRAY [100] OF Integer;
+    BEGIN
+      CheckLedgerEntry2.COPYFILTERS(CheckLedgerEntry);
+      CheckLedgerEntry2.FINDFIRST;
+
+      BankAccount.GET(CheckLedgerEntry2."Bank Account No.");
+
+      BankExportImportSetup.SETRANGE(Code,BankAccount."Positive Pay Export Code");
+      IF BankExportImportSetup.FINDFIRST THEN BEGIN
+        DataExchDefCode := BankExportImportSetup."Data Exch. Def. Code";
+        Filename := FileManagement.ServerTempFileName('txt');
+
+        ProcessHeaders(BankAccount,DataExchDefCode,HeaderArray,Filename);
+        ProcessDetails(CheckLedgerEntry2,DataExchDefCode,DataExchEntryCodeDetail,DetailArray,Filename);
+        ProcessFooters(BankAccount,DataExchDefCode,FooterArray,Filename,DataExchEntryCodeDetail,DataExchEntryCodeFooter);
+
+        ExpWritingPosPay.ExportPositivePay(DataExchEntryCodeDetail,DataExchEntryCodeFooter,Filename,FooterArray);
+
+        // This should only be called from a test codeunit, calling CreateExportFile MUST pass in a FALSE parameter
+        DataExchDef.GET(DataExchDefCode);
+        IF DataExchDef."Ext. Data Handling Codeunit" > 0 THEN BEGIN
+          DataExch.GET(DataExchEntryCodeDetail);
+          IF DataExchDef."Ext. Data Handling Codeunit" = CODEUNIT::"Exp. External Data Pos. Pay" THEN
+            ExpExternalDataPosPay.CreateExportFile(DataExch,ShowDialog)
+          ELSE
+            CODEUNIT.RUN(DataExchDef."Ext. Data Handling Codeunit",DataExch);
+        END;
+
+        IF DataExchDef."User Feedback Codeunit" > 0 THEN BEGIN
+          DataExch.GET(DataExchEntryCodeDetail);
+          CODEUNIT.RUN(DataExchDef."User Feedback Codeunit",DataExch);
+        END;
+
+        // Clean up the work tables.
+        ExpWritingPosPay.CleanUpPositivePayWorkTables(HeaderArray,DetailArray,FooterArray);
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdateCheckLedger@1(VAR CheckLedgerEntry@1002 : Record 272;DataExchEntryCodeDetail@1001 : Integer);
+    VAR
+      CheckLedgerEntry2@1000 : Record 272;
+    BEGIN
+      CheckLedgerEntry2.COPYFILTERS(CheckLedgerEntry);
+      CheckLedgerEntry2.SETFILTER(
+        "Entry Status",
+        '%1|%2|>%3',
+        CheckLedgerEntry2."Entry Status"::Printed,
+        CheckLedgerEntry2."Entry Status"::Posted,
+        CheckLedgerEntry2."Entry Status"::"Test Print");
+      CheckLedgerEntry2.SETRANGE("Positive Pay Exported",FALSE);
+      CheckLedgerEntry2.MODIFYALL("Data Exch. Entry No.",DataExchEntryCodeDetail,TRUE);
+
+      CheckLedgerEntry2.SETFILTER(
+        "Entry Status",
+        '%1|%2|%3',
+        CheckLedgerEntry2."Entry Status"::Voided,
+        CheckLedgerEntry2."Entry Status"::"Financially Voided",
+        CheckLedgerEntry2."Entry Status"::"Test Print");
+      CheckLedgerEntry2.MODIFYALL("Data Exch. Voided Entry No.",DataExchEntryCodeDetail,TRUE);
+    END;
+
+    LOCAL PROCEDURE ProcessHeaders@3(VAR BankAccount@1006 : Record 270;DataExchDefCode@1001 : Code[20];VAR HeaderArray@1009 : ARRAY [100] OF Integer;Filename@1008 : Text);
+    VAR
+      DataExch@1002 : Record 1220;
+      DataExchDef@1007 : Record 1222;
+      DataExchLineDef@1018 : Record 1227;
+      DataExchMapping@1004 : Record 1224;
+      PositivePayExportMgt@1005 : Codeunit 1711;
+      HdrCount@1000 : Integer;
+    BEGIN
+      HdrCount := 0;
+      DataExchLineDef.INIT;
+      DataExchLineDef.SETRANGE("Data Exch. Def Code",DataExchDefCode);
+      DataExchLineDef.SETRANGE("Line Type",DataExchLineDef."Line Type"::Header);
+      IF DataExchLineDef.FINDSET THEN BEGIN
+        REPEAT
+          // Insert the Data Exchange Header records
+          DataExch."Entry No." := 0;
+          DataExch."Data Exch. Def Code" := DataExchDefCode;
+          DataExch."Data Exch. Line Def Code" := DataExchLineDef.Code;
+          DataExch.INSERT;
+          COMMIT;
+
+          HdrCount := HdrCount + 1;
+          HeaderArray[HdrCount] := DataExch."Entry No.";
+
+          // It is only here where we know the True DataExch."Entry No"..
+          DataExchMapping.SETRANGE("Data Exch. Def Code",DataExchDefCode);
+          DataExchMapping.SETRANGE("Data Exch. Line Def Code",DataExchLineDef.Code);
+          DataExchMapping.FINDFIRST;
+
+          // Populate the Header/Detail/Footer work tables
+          PositivePayExportMgt.PreparePosPayHeader(DataExch,BankAccount."Bank Account No.");
+          IF DataExchMapping."Pre-Mapping Codeunit" > 0 THEN
+            CODEUNIT.RUN(DataExchMapping."Pre-Mapping Codeunit",DataExch);
+
+          // Create the Entries and values in the Data Exch. Field table
+          IF DataExchMapping."Mapping Codeunit" > 0 THEN
+            CODEUNIT.RUN(DataExchMapping."Mapping Codeunit",DataExch);
+
+          DataExchDef.GET(DataExchDefCode);
+          IF DataExchDef."Reading/Writing Codeunit" = CODEUNIT::"Exp. Writing Pos. Pay" THEN
+            PositivePayExportMgt.ExportDataExchToFlatFile(DataExch."Entry No.",Filename,DataExchLineDef."Line Type",HdrCount);
+        UNTIL  DataExchLineDef.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE ProcessDetails@4(VAR CheckLedgerEntry@1012 : Record 272;DataExchDefCode@1008 : Code[20];VAR DataExchEntryCodeDetail@1009 : Integer;VAR DetailArray@1010 : ARRAY [100] OF Integer;Filename@1007 : Text);
+    VAR
+      DataExch@1006 : Record 1220;
+      DataExchDef@1005 : Record 1222;
+      DataExchLineDef@1004 : Record 1227;
+      DataExchMapping@1003 : Record 1224;
+      PositivePayExportMgt@1002 : Codeunit 1711;
+      CurrentDataExchEntryCodeDetail@1001 : Integer;
+      DetailCount@1000 : Integer;
+    BEGIN
+      DetailCount := 0;
+      DataExchLineDef.INIT;
+      DataExchLineDef.SETRANGE("Data Exch. Def Code",DataExchDefCode);
+      DataExchLineDef.SETRANGE("Line Type",DataExchLineDef."Line Type"::Detail);
+      IF DataExchLineDef.FINDSET THEN BEGIN
+        REPEAT
+          // Insert the Data Exchange Detail records
+          DataExch."Entry No." := 0;
+          DataExch."Data Exch. Def Code" := DataExchDefCode;
+          DataExch."Data Exch. Line Def Code" := DataExchLineDef.Code;
+          DataExch.INSERT;
+          COMMIT;
+
+          DetailCount := DetailCount + 1;
+          DetailArray[DetailCount] := DataExch."Entry No.";
+
+          // It is only here where we know the True DataExch."Entry No"..
+          DataExchMapping.SETRANGE("Data Exch. Def Code",DataExchDefCode);
+          DataExchMapping.SETRANGE("Data Exch. Line Def Code",DataExchLineDef.Code);
+          DataExchMapping.FINDFIRST;
+
+          IF DataExchEntryCodeDetail = 0 THEN
+            DataExchEntryCodeDetail := DataExch."Entry No.";
+          CurrentDataExchEntryCodeDetail := DataExch."Entry No.";
+
+          UpdateCheckLedger(CheckLedgerEntry,CurrentDataExchEntryCodeDetail);
+
+          // Populate the Header/Detail/Footer work tables
+          IF DataExchMapping."Pre-Mapping Codeunit" > 0 THEN
+            CODEUNIT.RUN(DataExchMapping."Pre-Mapping Codeunit",DataExch);
+
+          // Create the Entries and values in the Data Exch. Field table
+          IF DataExchMapping."Mapping Codeunit" > 0 THEN
+            CODEUNIT.RUN(DataExchMapping."Mapping Codeunit",DataExch);
+
+          DataExchDef.GET(DataExchDefCode);
+          IF DataExchDef."Reading/Writing Codeunit" > 0 THEN
+            IF DataExchDef."Reading/Writing Codeunit" = CODEUNIT::"Exp. Writing Pos. Pay" THEN
+              PositivePayExportMgt.ExportDataExchToFlatFile(DataExch."Entry No.",Filename,DataExchLineDef."Line Type",0)
+            ELSE
+              CODEUNIT.RUN(DataExchDef."Reading/Writing Codeunit",DataExch);
+
+        UNTIL DataExchLineDef.NEXT = 0;
+        // When we are done, we need to set the Check Ledger record(s) Entry No back to the original.
+        IF DataExchEntryCodeDetail > 0 THEN
+          UpdateCheckLedger(CheckLedgerEntry,DataExchEntryCodeDetail);
+      END;
+    END;
+
+    LOCAL PROCEDURE ProcessFooters@5(VAR BankAccount@1002 : Record 270;DataExchDefCode@1001 : Code[20];VAR FooterArray@1012 : ARRAY [100] OF Integer;Filename@1000 : Text;DataExchEntryCodeDetail@1010 : Integer;VAR DataExchEntryCodeFooter@1011 : Integer);
+    VAR
+      DataExch@1009 : Record 1220;
+      DataExchDef@1008 : Record 1222;
+      DataExchLineDef@1007 : Record 1227;
+      DataExchMapping@1006 : Record 1224;
+      PositivePayExportMgt@1005 : Codeunit 1711;
+      FooterCount@1003 : Integer;
+    BEGIN
+      FooterCount := 0;
+      DataExchLineDef.INIT;
+      DataExchLineDef.SETRANGE("Data Exch. Def Code",DataExchDefCode);
+      DataExchLineDef.SETRANGE("Line Type",DataExchLineDef."Line Type"::Footer);
+      IF DataExchLineDef.FINDSET THEN BEGIN
+        REPEAT
+          // Insert the Data Exchange Footer records
+          DataExch."Entry No." := 0;
+          DataExch."Data Exch. Def Code" := DataExchDefCode;
+          DataExch."Data Exch. Line Def Code" := DataExchLineDef.Code;
+          DataExch.INSERT;
+          COMMIT;
+
+          FooterCount := FooterCount + 1;
+          FooterArray[FooterCount] := DataExch."Entry No.";
+
+          // It is only here where we know the True DataExch."Entry No"..
+          DataExchMapping.SETRANGE("Data Exch. Def Code",DataExchDefCode);
+          DataExchMapping.SETRANGE("Data Exch. Line Def Code",DataExchLineDef.Code);
+          DataExchMapping.FINDFIRST;
+
+          // Populate the Header/Detail/Footer work tables
+          IF DataExchMapping."Pre-Mapping Codeunit" > 0 THEN
+            CODEUNIT.RUN(DataExchMapping."Pre-Mapping Codeunit",DataExch);
+
+          // Create the Entries and values in the Data Exch. Field table
+          PositivePayExportMgt.PreparePosPayFooter(DataExch,DataExchEntryCodeDetail,BankAccount."Bank Account No.");
+          IF DataExchMapping."Mapping Codeunit" > 0 THEN
+            CODEUNIT.RUN(DataExchMapping."Mapping Codeunit",DataExch);
+
+          DataExchDef.GET(DataExchDefCode);
+          IF DataExchDef."Reading/Writing Codeunit" = CODEUNIT::"Exp. Writing Pos. Pay" THEN
+            PositivePayExportMgt.ExportDataExchToFlatFile(DataExch."Entry No.",Filename,DataExchLineDef."Line Type",0);
+          DataExchEntryCodeFooter := DataExch."Entry No.";
+        UNTIL DataExchLineDef.NEXT = 0;
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

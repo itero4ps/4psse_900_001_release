@@ -1,0 +1,649 @@
+OBJECT Codeunit 5051 SegManagement
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1000 : TextConst 'ENU=%1 for Segment No. %2 already exists.';
+      Text001@1001 : TextConst 'ENU=Segment %1 is empty.';
+      Text002@1002 : TextConst 'ENU=Follow-up on segment %1';
+      InteractionTmplSetup@1003 : Record 5122;
+      Text003@1004 : TextConst 'ENU=Interaction Template %1 has assigned Interaction Template Language %2.\It is not allowed to have languages assigned to templates used for system document logging.';
+      Text004@1006 : TextConst 'ENU=Interactions';
+
+    PROCEDURE LogSegment@3(SegHeader@1000 : Record 11072039;Deliver@1001 : Boolean;Followup@1002 : Boolean);
+    VAR
+      SegLine@1003 : Record 11072040;
+      LoggedSeg@1006 : Record 11072038;
+      InteractLogEntry@1007 : Record 11072027;
+      CampaignEntry@1008 : Record 11072035;
+      Attachment@1009 : Record 11072030;
+      InteractTemplate@1017 : Record 11072032;
+      DeliverySorterTemp@1010 : TEMPORARY Record 11072037;
+      AttachmentManagement@1011 : Codeunit 11072021;
+      SegmentNo@1012 : Code[20];
+      CampaignNo@1016 : Code[20];
+      NextRegisterNo@1013 : Integer;
+      NextCampaignEntryNo@1014 : Integer;
+      NextInteractLogEntryNo@1015 : Integer;
+      InteractionTemplateCode@1100485000 : Code[10];
+    BEGIN
+      LoggedSeg.LOCKTABLE;
+      LoggedSeg.SETCURRENTKEY("Segment No.");
+      LoggedSeg.SETRANGE("Segment No.",SegHeader."No.");
+      IF NOT LoggedSeg.ISEMPTY THEN
+        ERROR(Text000,LoggedSeg.TABLECAPTION,SegHeader."No.");
+
+      SegHeader.TESTFIELD(Description);
+
+      LoggedSeg.RESET;
+      IF LoggedSeg.FINDLAST THEN
+        NextRegisterNo := LoggedSeg."Entry No." + 1
+      ELSE
+        NextRegisterNo := 1;
+
+      LoggedSeg.INIT;
+      LoggedSeg."Entry No." := NextRegisterNo;
+      LoggedSeg."Segment No." := SegHeader."No.";
+      LoggedSeg.Description := SegHeader.Description;
+      LoggedSeg."Creation Date" := TODAY;
+      LoggedSeg."User ID" := USERID;
+      //**4PS.sn
+      LoggedSeg."Interaction Template Code" := SegHeader."Interaction Template Code";
+      //**4PS.en
+      LoggedSeg.INSERT;
+
+      SegLine.LOCKTABLE;
+      SegLine.SETCURRENTKEY("Segment No.","Campaign No.",Date);
+      SegLine.SETRANGE("Segment No.",SegHeader."No.");
+      SegLine.SETFILTER("Campaign No.",'<>%1','');
+      SegLine.SETFILTER("Contact No.",'<>%1','');
+      IF SegLine.FINDSET THEN BEGIN
+        CampaignEntry.LOCKTABLE;
+        REPEAT
+          CampaignEntry.SETCURRENTKEY("Campaign No.",Date,"Document Type");
+          CampaignEntry.SETRANGE("Document Type",SegLine."Document Type");
+          CampaignEntry.SETRANGE("Campaign No.",SegLine."Campaign No.");
+          CampaignEntry.SETFILTER("Segment No.",'=%1',SegLine."Segment No.");
+          IF CampaignEntry.FINDFIRST THEN BEGIN
+            SegLine."Campaign Entry No." := CampaignEntry."Entry No.";
+            SegLine.MODIFY;
+          END ELSE BEGIN
+            CampaignEntry.RESET;
+            IF CampaignEntry.FINDLAST THEN
+              NextCampaignEntryNo := CampaignEntry."Entry No." + 1
+            ELSE
+              NextCampaignEntryNo := 1;
+            CampaignEntry.INIT;
+            CampaignEntry."Entry No." := NextCampaignEntryNo;
+            CampaignEntry."Register No." := LoggedSeg."Entry No.";
+            CopyFieldsToCampaignEntry(CampaignEntry,SegLine);
+            CampaignEntry.INSERT;
+            SegLine."Campaign Entry No." := CampaignEntry."Entry No.";
+            SegLine.MODIFY;
+          END;
+        UNTIL SegLine.NEXT = 0;
+      END;
+
+      SegLine.RESET;
+      SegLine.SETRANGE("Segment No.",SegHeader."No.");
+      SegLine.SETFILTER("Contact No.",'<>%1','');
+
+      IF SegLine.FINDSET THEN BEGIN
+        IF InteractTemplate.GET(SegHeader."Interaction Template Code") THEN;
+        InteractLogEntry.LOCKTABLE;
+        IF InteractLogEntry.FINDLAST THEN
+          NextInteractLogEntryNo := InteractLogEntry."Entry No.";
+        REPEAT
+          NextInteractLogEntryNo := NextInteractLogEntryNo + 1;
+          TestFields(SegLine);
+          InteractLogEntry.INIT;
+          InteractLogEntry."Entry No." := NextInteractLogEntryNo;
+          InteractLogEntry."Logged Segment Entry No." := LoggedSeg."Entry No.";
+          CopyFieldsToInteractLogEntry(InteractLogEntry,SegLine);
+          IF Deliver AND ((SegLine."Correspondence Type" <> 0) OR (InteractTemplate."Correspondence Type (Default)" <> 0)) THEN BEGIN
+            InteractLogEntry."Delivery Status" := InteractLogEntry."Delivery Status"::"In Progress";
+            SegLine.TESTFIELD("Attachment No.");
+            DeliverySorterTemp."No." := InteractLogEntry."Entry No.";
+            DeliverySorterTemp."Attachment No." := InteractLogEntry."Attachment No.";
+            DeliverySorterTemp."Correspondence Type" := InteractLogEntry."Correspondence Type";
+            DeliverySorterTemp.Subject := InteractLogEntry.Subject;
+            DeliverySorterTemp."Send Word Docs. as Attmt." := InteractLogEntry."Send Word Docs. as Attmt.";
+            DeliverySorterTemp."Language Code" := SegLine."Language Code";
+            DeliverySorterTemp.INSERT;
+          END;
+          InteractLogEntry.INSERT;
+          CopyFieldsToDocument(InteractLogEntry, InteractTemplate);//**4PS.n
+          Attachment.LOCKTABLE;
+          IF Attachment.GET(SegLine."Attachment No.") AND (NOT Attachment."Read Only") THEN BEGIN
+            Attachment."Read Only" := TRUE;
+            Attachment.MODIFY(TRUE);
+          END;
+        UNTIL SegLine.NEXT = 0;
+      END ELSE
+        ERROR(Text001,SegHeader."No.");
+
+      SegmentNo := SegHeader."No.";
+      CampaignNo := SegHeader."Campaign No.";
+      //**4PS.sn
+      InteractionTemplateCode := SegHeader."Interaction Template Code";
+      //**4PS.en
+      SegHeader.DELETE(TRUE);
+
+      IF Followup THEN BEGIN
+        CLEAR(SegHeader);
+        SegHeader."Campaign No." := CampaignNo;
+        SegHeader.Description := COPYSTR(STRSUBSTNO(Text002,SegmentNo),1,50);
+        //**4PS.sn
+        SegHeader."Interaction Template Code" := InteractionTemplateCode;
+        //**4PS.en
+        SegHeader.INSERT(TRUE);
+        SegHeader.ReuseLogged(LoggedSeg."Entry No.");
+      END;
+
+      IF Deliver THEN
+        AttachmentManagement.Send(DeliverySorterTemp);
+    END;
+
+    PROCEDURE LogInteraction@4(SegLine@1000 : Record 11072040;VAR AttachmentTemp@1001 : Record 11072030;VAR InterLogEntryCommentLineTmp@1010 : Record 11072067;Deliver@1002 : Boolean;Postponed@1012 : Boolean) NextInteractLogEntryNo : Integer;
+    VAR
+      CampaignEntry@1003 : Record 11072035;
+      InteractLogEntry@1004 : Record 11072027;
+      Attachment@1005 : Record 11072030;
+      MarketingSetup@1014 : Record 5079;
+      DeliverySorterTemp@1006 : TEMPORARY Record 11072037;
+      InterLogEntryCommentLine@1011 : Record 11072067;
+      AttachmentManagement@1007 : Codeunit 11072021;
+      NextCampaignEntryNo@1008 : Integer;
+      FileName@1015 : Text;
+    BEGIN
+      IF NOT Postponed THEN
+        TestFields(SegLine);
+      IF (SegLine."Campaign No." <> '') AND (NOT Postponed) THEN BEGIN
+        CampaignEntry.LOCKTABLE;
+        CampaignEntry.SETCURRENTKEY("Campaign No.",Date,"Document Type");
+        CampaignEntry.SETRANGE("Document Type",SegLine."Document Type");
+        CampaignEntry.SETRANGE("Campaign No.",SegLine."Campaign No.");
+        CampaignEntry.SETRANGE("Segment No.",SegLine."Segment No.");
+        IF CampaignEntry.FINDFIRST THEN
+          SegLine."Campaign Entry No." := CampaignEntry."Entry No."
+        ELSE BEGIN
+          CampaignEntry.RESET;
+          IF CampaignEntry.FINDLAST THEN
+            NextCampaignEntryNo := CampaignEntry."Entry No." + 1
+          ELSE
+            NextCampaignEntryNo := 1;
+          CampaignEntry.INIT;
+          CampaignEntry."Entry No." := NextCampaignEntryNo;
+          CopyFieldsToCampaignEntry(CampaignEntry,SegLine);
+          CampaignEntry.INSERT;
+          SegLine."Campaign Entry No." := CampaignEntry."Entry No.";
+        END;
+      END;
+
+      IF AttachmentTemp.Attachment.HASVALUE THEN BEGIN
+        WITH Attachment DO BEGIN
+          LOCKTABLE;
+          IF (SegLine."Line No." <> 0) AND GET(SegLine."Attachment No.") THEN BEGIN
+            RemoveAttachment(FALSE);
+            AttachmentTemp."No." := SegLine."Attachment No.";
+          END;
+
+          COPY(AttachmentTemp);
+          "Read Only" := TRUE;
+          WizSaveAttachment;
+          INSERT(TRUE);
+        END;
+
+        MarketingSetup.GET;
+        IF MarketingSetup."Attachment Storage Type" = MarketingSetup."Attachment Storage Type"::"Disk File" THEN
+          IF Attachment."No." <> 0 THEN BEGIN
+            FileName := Attachment.ConstDiskFileName;
+            IF FileName <> '' THEN
+              AttachmentTemp.ExportAttachmentToServerFile(FileName);
+          END;
+        SegLine."Attachment No." := Attachment."No.";
+      END;
+
+      IF SegLine."Line No." = 0 THEN BEGIN
+        InteractLogEntry.RESET;
+        InteractLogEntry.LOCKTABLE;
+        IF InteractLogEntry.FINDLAST THEN
+          NextInteractLogEntryNo := InteractLogEntry."Entry No." + 1
+        ELSE
+          NextInteractLogEntryNo := 1;
+
+        InteractLogEntry.INIT;
+        InteractLogEntry."Entry No." := NextInteractLogEntryNo;
+        CopyFieldsToInteractLogEntry(InteractLogEntry,SegLine);
+        InteractLogEntry.Postponed := Postponed;
+        InteractLogEntry.INSERT
+      END ELSE BEGIN
+        InteractLogEntry.GET(SegLine."Line No.");
+        CopyFieldsToInteractLogEntry(InteractLogEntry,SegLine);
+        InteractLogEntry.Postponed := Postponed;
+        InteractLogEntry.MODIFY;
+        InterLogEntryCommentLine.SETRANGE("Entry No.",InteractLogEntry."Entry No.");
+        InterLogEntryCommentLine.DELETEALL;
+      END;
+
+      IF InterLogEntryCommentLineTmp.FINDSET THEN
+        REPEAT
+          InterLogEntryCommentLine.INIT;
+          InterLogEntryCommentLine := InterLogEntryCommentLineTmp;
+          InterLogEntryCommentLine."Entry No." := InteractLogEntry."Entry No.";
+          InterLogEntryCommentLine.INSERT;
+        UNTIL InterLogEntryCommentLineTmp.NEXT = 0;
+
+      IF Deliver AND (SegLine."Correspondence Type" <> 0) AND (NOT Postponed) THEN BEGIN
+        InteractLogEntry."Delivery Status" := InteractLogEntry."Delivery Status"::"In Progress";
+        DeliverySorterTemp."No." := InteractLogEntry."Entry No.";
+        DeliverySorterTemp."Attachment No." := Attachment."No.";
+        DeliverySorterTemp."Correspondence Type" := InteractLogEntry."Correspondence Type";
+        DeliverySorterTemp.Subject := InteractLogEntry.Subject;
+        DeliverySorterTemp."Send Word Docs. as Attmt." := FALSE;
+        DeliverySorterTemp."Language Code" := SegLine."Language Code";
+        DeliverySorterTemp.INSERT;
+        AttachmentManagement.Send(DeliverySorterTemp);
+      END;
+    END;
+
+    PROCEDURE LogDocument@2(DocumentType@1000 : Integer;DocumentNo@1001 : Code[20];DocNoOccurrence@1015 : Integer;VersionNo@1016 : Integer;AccountTableNo@1002 : Integer;AccountNo@1003 : Code[20];SalespersonCode@1004 : Code[10];CampaignNo@1018 : Code[20];Description@1005 : Text[50];OpportunityNo@1019 : Code[20]);
+    VAR
+      InteractTmpl@1006 : Record 11072032;
+      SegLine@1007 : TEMPORARY Record 11072040;
+      ContBusRel@1008 : Record 5054;
+      Attachment@1009 : Record 11072030;
+      Cont@1010 : Record 5050;
+      InteractTmplLanguage@1014 : Record 5103;
+      InterLogEntryCommentLine@1017 : TEMPORARY Record 11072067;
+      InteractTmplCode@1012 : Code[10];
+      ContNo@1013 : Code[20];
+    BEGIN
+      InteractTmplCode := FindInteractTmplCode(DocumentType);
+      IF InteractTmplCode = '' THEN
+        EXIT;
+
+      InteractTmpl.GET(InteractTmplCode);
+
+      InteractTmplLanguage.SETRANGE("Interaction Template Code",InteractTmplCode);
+      IF InteractTmplLanguage.FINDFIRST THEN
+        ERROR(Text003,InteractTmplCode,InteractTmplLanguage."Language Code");
+
+      IF Description = '' THEN
+        Description := InteractTmpl.Description;
+
+      CASE AccountTableNo OF
+        DATABASE::Customer:
+          WITH ContBusRel DO BEGIN
+            SETCURRENTKEY("Link to Table","No.");
+            SETRANGE("Link to Table","Link to Table"::Customer);
+            SETRANGE("No.",AccountNo);
+            IF NOT FINDFIRST THEN
+              EXIT;
+            ContNo := "Contact No.";
+          END;
+        DATABASE::Vendor:
+          WITH ContBusRel DO BEGIN
+            SETCURRENTKEY("Link to Table","No.");
+            SETRANGE("Link to Table","Link to Table"::Vendor);
+            SETRANGE("No.",AccountNo);
+            IF NOT FINDFIRST THEN
+              EXIT;
+            ContNo := "Contact No.";
+          END;
+        DATABASE::Contact:
+          BEGIN
+            IF NOT Cont.GET(AccountNo) THEN
+              EXIT;
+            IF SalespersonCode = '' THEN
+              SalespersonCode := Cont."Salesperson Code";
+            ContNo := AccountNo;
+          END;
+      END;
+
+      SegLine.INIT;
+      SegLine."Document Type" := DocumentType;
+      SegLine."Document No." := DocumentNo;
+      SegLine."Doc. No. Occurrence" := DocNoOccurrence;
+      SegLine."Version No." := VersionNo;
+      SegLine.VALIDATE("Contact No.",ContNo);
+      SegLine.Date := TODAY;
+      SegLine."Time of Interaction" := TIME;
+      SegLine.Description := Description;
+      SegLine."Salesperson Code" := SalespersonCode;
+      SegLine."Opportunity No." := OpportunityNo;
+      SegLine.INSERT;
+      SegLine.VALIDATE("Interaction Template Code",InteractTmpl.Code);
+      IF CampaignNo <> '' THEN
+        SegLine."Campaign No." := CampaignNo;
+      SegLine.MODIFY;
+
+      LogInteraction(SegLine,Attachment,InterLogEntryCommentLine,FALSE,FALSE);
+    END;
+
+    PROCEDURE FindInteractTmplCode@7(DocumentType@1000 : Integer) InteractTmplCode@1001 : Code[10];
+    BEGIN
+      IF InteractionTmplSetup.GET THEN
+        CASE DocumentType OF
+          1:
+            InteractTmplCode := InteractionTmplSetup."Sales Quotes";
+          2:
+            InteractTmplCode := InteractionTmplSetup."Sales Blnkt. Ord";
+          3:
+            InteractTmplCode := InteractionTmplSetup."Sales Ord. Cnfrmn.";
+          4:
+            InteractTmplCode := InteractionTmplSetup."Sales Invoices";
+          5:
+            InteractTmplCode := InteractionTmplSetup."Sales Shpt. Note";
+          6:
+            InteractTmplCode := InteractionTmplSetup."Sales Cr. Memo";
+          7:
+            InteractTmplCode := InteractionTmplSetup."Sales Statement";
+          8:
+            InteractTmplCode := InteractionTmplSetup."Sales Rmdr.";
+          9:
+            InteractTmplCode := InteractionTmplSetup."Serv Ord Create";
+          10:
+            InteractTmplCode := InteractionTmplSetup."Serv Ord Post";
+          11:
+            InteractTmplCode := InteractionTmplSetup."Purch. Quotes";
+          12:
+            InteractTmplCode := InteractionTmplSetup."Purch Blnkt Ord";
+          13:
+            InteractTmplCode := InteractionTmplSetup."Purch. Orders";
+          14:
+            InteractTmplCode := InteractionTmplSetup."Purch Invoices";
+          15:
+            InteractTmplCode := InteractionTmplSetup."Purch. Rcpt.";
+          16:
+            InteractTmplCode := InteractionTmplSetup."Purch Cr Memos";
+          17:
+            InteractTmplCode := InteractionTmplSetup."Cover Sheets";
+          18:
+            InteractTmplCode := InteractionTmplSetup."Sales Return Order";
+          19:
+            InteractTmplCode := InteractionTmplSetup."Sales Finance Charge Memo";
+          20:
+            InteractTmplCode := InteractionTmplSetup."Sales Return Receipt";
+          21:
+            InteractTmplCode := InteractionTmplSetup."Purch. Return Shipment";
+          22:
+            InteractTmplCode := InteractionTmplSetup."Purch. Return Ord. Cnfrmn.";
+          23:
+            InteractTmplCode := InteractionTmplSetup."Service Contract";
+          24:
+            InteractTmplCode := InteractionTmplSetup."Service Contract Quote";
+          25:
+            InteractTmplCode := InteractionTmplSetup."Service Quote";
+        END;
+      EXIT(InteractTmplCode);
+    END;
+
+    LOCAL PROCEDURE TestFields@5(VAR SegLine@1000 : Record 11072040);
+    VAR
+      Cont@1001 : Record 5050;
+      Salesperson@1002 : Record 13;
+      Campaign@1003 : Record 11072034;
+      InteractTmpl@1004 : Record 11072032;
+      ContAltAddr@1005 : Record 5051;
+    BEGIN
+      WITH SegLine DO BEGIN
+        TESTFIELD(Date);
+        TESTFIELD("Contact No.");
+        Cont.GET("Contact No.");
+        IF "Document Type" = "Document Type"::" " THEN BEGIN
+          TESTFIELD("Salesperson Code");
+          Salesperson.GET("Salesperson Code");
+        END;
+        TESTFIELD("Interaction Template Code");
+        InteractTmpl.GET("Interaction Template Code");
+        IF "Campaign No." <> '' THEN
+          Campaign.GET("Campaign No.");
+        CASE "Correspondence Type" OF
+          "Correspondence Type"::"E-Mail":
+            IF "Contact Alt. Address Code" <> '' THEN BEGIN
+              ContAltAddr.GET("Contact No.","Contact Alt. Address Code");
+              IF ContAltAddr."E-Mail" = '' THEN
+                Cont.TESTFIELD("E-Mail");
+            END ELSE
+              Cont.TESTFIELD("E-Mail");
+          "Correspondence Type"::Fax:
+            IF "Contact Alt. Address Code" <> '' THEN BEGIN
+              ContAltAddr.GET("Contact No.","Contact Alt. Address Code");
+              IF ContAltAddr."Fax No." = '' THEN
+                Cont.TESTFIELD("Fax No.");
+            END ELSE
+              Cont.TESTFIELD("Fax No.");
+        END;
+      END;
+    END;
+
+    PROCEDURE CopyFieldsToInteractLogEntry@1(VAR InteractLogEntry@1000 : Record 11072027;VAR SegLine@1001 : Record 11072040);
+    BEGIN
+      InteractLogEntry."Contact No." := SegLine."Contact No.";
+      InteractLogEntry."Contact Company No." := SegLine."Contact Company No.";
+      InteractLogEntry.Date := SegLine.Date;
+      InteractLogEntry.Description := SegLine.Description;
+      InteractLogEntry."Information Flow" := SegLine."Information Flow";
+      InteractLogEntry."Initiated By" := SegLine."Initiated By";
+      InteractLogEntry."Attachment No." := SegLine."Attachment No.";
+      InteractLogEntry."Cost (LCY)" := SegLine."Cost (LCY)";
+      InteractLogEntry."Duration (Min.)" := SegLine."Duration (Min.)";
+      InteractLogEntry."User ID" := USERID;
+      InteractLogEntry."Interaction Group Code" := SegLine."Interaction Group Code";
+      InteractLogEntry."Interaction Template Code" := SegLine."Interaction Template Code";
+      InteractLogEntry."Interaction Language Code" := SegLine."Language Code";
+      InteractLogEntry.Subject := SegLine.Subject;
+      InteractLogEntry."Campaign No." := SegLine."Campaign No.";
+      InteractLogEntry."Campaign Entry No." := SegLine."Campaign Entry No.";
+      InteractLogEntry."Campaign Response" := SegLine."Campaign Response";
+      InteractLogEntry."Campaign Target" := SegLine."Campaign Target";
+      InteractLogEntry."Segment No." := SegLine."Segment No.";
+      InteractLogEntry.Evaluation := SegLine.Evaluation;
+      InteractLogEntry."Time of Interaction" := SegLine."Time of Interaction";
+      InteractLogEntry."Attempt Failed" := SegLine."Attempt Failed";
+      InteractLogEntry."To-do No." := SegLine."To-do No.";
+      InteractLogEntry."Salesperson Code" := SegLine."Salesperson Code";
+      InteractLogEntry."Correspondence Type" := SegLine."Correspondence Type";
+      InteractLogEntry."Contact Alt. Address Code" := SegLine."Contact Alt. Address Code";
+      InteractLogEntry."Document Type" := SegLine."Document Type";
+      InteractLogEntry."Document No." := SegLine."Document No.";
+      InteractLogEntry."Doc. No. Occurrence" := SegLine."Doc. No. Occurrence";
+      InteractLogEntry."Version No." := SegLine."Version No.";
+      InteractLogEntry."Send Word Docs. as Attmt." := SegLine."Send Word Doc. As Attmt.";
+      InteractLogEntry."Contact Via" := SegLine."Contact Via";
+      InteractLogEntry."Opportunity No." := SegLine."Opportunity No.";
+      //**4PS.sn
+      InteractLogEntry."Optional Mergefield 1" := SegLine.ShowMergeFieldValue(SegLine."Optional Mergefield 1",1);
+      InteractLogEntry."Optional Mergefield 2" := SegLine.ShowMergeFieldValue(SegLine."Optional Mergefield 2",2);
+      InteractLogEntry."Optional Mergefield 3" := SegLine.ShowMergeFieldValue(SegLine."Optional Mergefield 3",3);
+      InteractLogEntry."Optional Mergefield 4" := SegLine.ShowMergeFieldValue(SegLine."Optional Mergefield 4",4);
+      InteractLogEntry."Optional Mergefield 5" := SegLine.ShowMergeFieldValue(SegLine."Optional Mergefield 5",5);
+      InteractLogEntry."Project No." := SegLine."Project No.";
+      InteractLogEntry."Plot No." := SegLine."Plot No.";
+      //**4PS.en
+      InteractLogEntry."Phone Call Result Code" := SegLine."Phone Call Result Code"; //**4PS.n
+    END;
+
+    LOCAL PROCEDURE CopyFieldsToCampaignEntry@11(VAR CampaignEntry@1000 : Record 11072035;VAR SegLine@1001 : Record 11072040);
+    VAR
+      SegHeader@1002 : Record 11072039;
+    BEGIN
+      CampaignEntry."Campaign No." := SegLine."Campaign No.";
+      CampaignEntry.Date := SegLine.Date;
+      CampaignEntry."Segment No." := SegLine."Segment No.";
+      IF SegLine."Segment No." <> '' THEN BEGIN
+        SegHeader.GET(SegLine."Segment No.");
+        CampaignEntry.Description := SegHeader.Description;
+      END ELSE BEGIN
+        CampaignEntry.Description :=
+          COPYSTR(FindInteractTmplSetupCaption(SegLine."Document Type"),1,MAXSTRLEN(CampaignEntry.Description));
+        IF CampaignEntry.Description = '' THEN
+          CampaignEntry.Description := Text004;
+      END;
+      CampaignEntry."Salesperson Code" := SegLine."Salesperson Code";
+      CampaignEntry."User ID" := USERID;
+      CampaignEntry."Document Type" := SegLine."Document Type";
+    END;
+
+    LOCAL PROCEDURE FindInteractTmplSetupCaption@6(DocumentType@1000 : Integer) InteractTmplSetupCaption@1001 : Text[80];
+    BEGIN
+      InteractionTmplSetup.GET;
+      CASE DocumentType OF
+        1:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Sales Quotes");
+        2:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Sales Blnkt. Ord");
+        3:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Sales Ord. Cnfrmn.");
+        4:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Sales Invoices");
+        5:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Sales Shpt. Note");
+        6:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Sales Cr. Memo");
+        7:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Sales Statement");
+        8:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Sales Rmdr.");
+        9:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Serv Ord Create");
+        10:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Serv Ord Post");
+        11:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Purch. Quotes");
+        12:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Purch Blnkt Ord");
+        13:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Purch. Orders");
+        14:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Purch Invoices");
+        15:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Purch. Rcpt.");
+        16:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Purch Cr Memos");
+        17:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Cover Sheets");
+        18:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Sales Return Order");
+        19:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Sales Finance Charge Memo");
+        20:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Sales Return Receipt");
+        21:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Purch. Return Shipment");
+        22:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Purch. Return Ord. Cnfrmn.");
+        23:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Service Contract");
+        24:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Service Contract Quote");
+        25:
+          InteractTmplSetupCaption := InteractionTmplSetup.FIELDCAPTION("Service Quote");
+      END;
+      EXIT(InteractTmplSetupCaption);
+    END;
+
+    PROCEDURE CopyFieldsFromInteractLogEntry@8(VAR SegLine@1000 : Record 11072040;VAR InteractLogEntry@1001 : Record 11072027);
+    BEGIN
+      SegLine."Line No." := InteractLogEntry."Entry No.";
+      SegLine."Contact No." := InteractLogEntry."Contact No.";
+      SegLine."Contact Company No." := InteractLogEntry."Contact Company No.";
+      SegLine.Date := InteractLogEntry.Date;
+      SegLine.Description := InteractLogEntry.Description;
+      SegLine."Information Flow" := InteractLogEntry."Information Flow";
+      SegLine."Initiated By" := InteractLogEntry."Initiated By";
+      SegLine."Attachment No." := InteractLogEntry."Attachment No.";
+      SegLine."Cost (LCY)" := InteractLogEntry."Cost (LCY)";
+      SegLine."Duration (Min.)" := InteractLogEntry."Duration (Min.)";
+      SegLine."Interaction Group Code" := InteractLogEntry."Interaction Group Code";
+      SegLine."Interaction Template Code" := InteractLogEntry."Interaction Template Code";
+      SegLine."Language Code" := InteractLogEntry."Interaction Language Code";
+      SegLine.Subject := InteractLogEntry.Subject;
+      SegLine."Campaign No." := InteractLogEntry."Campaign No.";
+      SegLine."Campaign Entry No." := InteractLogEntry."Campaign Entry No.";
+      SegLine."Campaign Response" := InteractLogEntry."Campaign Response";
+      SegLine."Campaign Target" := InteractLogEntry."Campaign Target";
+      SegLine."Segment No." := InteractLogEntry."Segment No.";
+      SegLine.Evaluation := InteractLogEntry.Evaluation;
+      SegLine."Time of Interaction" := InteractLogEntry."Time of Interaction";
+      SegLine."Attempt Failed" := InteractLogEntry."Attempt Failed";
+      SegLine."To-do No." := InteractLogEntry."To-do No.";
+      SegLine."Salesperson Code" := InteractLogEntry."Salesperson Code";
+      SegLine."Correspondence Type" := InteractLogEntry."Correspondence Type";
+      SegLine."Contact Alt. Address Code" := InteractLogEntry."Contact Alt. Address Code";
+      SegLine."Document Type" := InteractLogEntry."Document Type";
+      SegLine."Document No." := InteractLogEntry."Document No.";
+      SegLine."Doc. No. Occurrence" := InteractLogEntry."Doc. No. Occurrence";
+      SegLine."Version No." := InteractLogEntry."Version No.";
+      SegLine."Send Word Doc. As Attmt." := InteractLogEntry."Send Word Docs. as Attmt.";
+      SegLine."Contact Via" := InteractLogEntry."Contact Via";
+      SegLine."Opportunity No." := InteractLogEntry."Opportunity No.";
+    END;
+
+    PROCEDURE CopyFieldsToDocument@1210190000(InteractLogEntry@1210190000 : Record 11072027;InteractTemplate@1100525007 : Record 11072032);
+    VAR
+      DocumentProperties@1100525000 : Record 11012746;
+      Job@1100525002 : Record 11072003;
+      Plot@1100525003 : Record 11012500;
+      DocumentLinkMgt@1100525004 : Codeunit 11012401;
+      RecRef@1100525005 : RecordRef;
+      DocLinkRID@1100525006 : ARRAY [5] OF RecordID;
+    BEGIN
+      //**4PS.n
+      //**Function: CopyFieldsToDocument
+
+      DocumentProperties.LOCKTABLE;
+      DocumentProperties.INIT;
+      IF InteractLogEntry."Contact Company No." <> '' THEN BEGIN
+        DocumentProperties.VALIDATE("Contact No.",InteractLogEntry."Contact Company No.");
+        IF InteractLogEntry."Contact No." <> InteractLogEntry."Contact Company No." THEN
+          DocumentProperties.VALIDATE("Contact Person No.",InteractLogEntry."Contact No.");
+      END ELSE BEGIN
+        DocumentProperties.VALIDATE("Contact No.",InteractLogEntry."Contact No.");      //call C-008151
+      END;
+      //DocRec.VALIDATE("Project No.",InteractLogEntry."Project No.");
+      //DocRec.VALIDATE(Plot,InteractLogEntry."Plot No.");
+      DocumentProperties.VALIDATE(Sender,InteractLogEntry."Salesperson Code");
+      DocumentProperties.Subject := InteractLogEntry.Subject;
+      DocumentProperties.Description := InteractLogEntry.Description;
+      DocumentProperties."Document Date" := InteractLogEntry.Date;
+
+      DocumentProperties."Interaction Entry No." := InteractLogEntry."Entry No.";
+      DocumentProperties."Document Type" := InteractTemplate."Document Type";
+      DocumentProperties."Document Category" := InteractTemplate."Document Category";
+      DocumentProperties.INSERT(TRUE);
+
+      // Create Document Links
+      // Get Source Document Link
+      IF Plot.GET(InteractLogEntry."Project No.", InteractLogEntry."Plot No.") THEN BEGIN
+        RecRef.GETTABLE(Plot);
+        DocLinkRID[1] := RecRef.RECORDID();
+      END;
+
+      // Get other Document Links
+      IF Job.GET(InteractLogEntry."Project No.") THEN BEGIN
+        RecRef.GETTABLE(Job);
+        DocLinkRID[2] := RecRef.RECORDID();
+      END;
+
+      DocumentLinkMgt.CreateDocumentLink(DocumentProperties, DocLinkRID);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

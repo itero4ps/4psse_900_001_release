@@ -1,0 +1,684 @@
+OBJECT Codeunit 6502 Late Binding Management
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      TempCurrSupplyReservEntry@1009 : TEMPORARY Record 337;
+      TempCurrDemandReservEntry@1008 : TEMPORARY Record 337;
+      TempSupplyReservEntry@1007 : TEMPORARY Record 337;
+      TempDemandReservEntry@1006 : TEMPORARY Record 337;
+      TempReservEntryDelete@1002 : TEMPORARY Record 337;
+      TempReservEntryModify@1003 : TEMPORARY Record 337;
+      TempReservEntryInsert@1004 : TEMPORARY Record 337;
+      ReservMgt@1000 : Codeunit 99000845;
+      LastEntryNo@1005 : Integer;
+      Text001@1010 : TextConst 'ENU=Not enough free supply available for reallocation.';
+
+    LOCAL PROCEDURE CleanUpVariables@4();
+    BEGIN
+      CLEARALL;
+      TempReservEntryDelete.RESET;
+      TempReservEntryDelete.DELETEALL;
+      TempReservEntryModify.RESET;
+      TempReservEntryModify.DELETEALL;
+      TempReservEntryInsert.RESET;
+      TempReservEntryInsert.DELETEALL;
+      TempCurrSupplyReservEntry.RESET;
+      TempCurrSupplyReservEntry.DELETEALL;
+      TempCurrDemandReservEntry.RESET;
+      TempCurrDemandReservEntry.DELETEALL;
+      TempSupplyReservEntry.RESET;
+      TempSupplyReservEntry.DELETEALL;
+      TempDemandReservEntry.RESET;
+      TempDemandReservEntry.DELETEALL;
+    END;
+
+    PROCEDURE ReallocateTrkgSpecification@3(VAR TempTrackingSpecification@1000 : TEMPORARY Record 336);
+    BEGIN
+      // Go through the tracking specification and calculate what is available/reserved/can be reallocated
+      // The buffer fields on TempTrackingSpecification are used as follows:
+      // "Buffer Value1" : Non-allocated item tracking
+      // "Buffer Value2" : Total inventory
+      // "Buffer Value3" : Total reserved inventory
+      // "Buffer Value4" : Qty for reallocation (negative = need for reallocation)
+      // "Buffer Value5" : Total non-specific reserved inventory (can be un-reserved through reallocation)
+
+      CleanUpVariables;
+
+      TempTrackingSpecification.CALCSUMS("Buffer Value1"); // Non-allocated item tracking
+
+      IF TempTrackingSpecification."Buffer Value1" = 0 THEN
+        EXIT; // Item tracking is fully allocated => no basis for reallocation
+
+      IF NOT CalcInventory(TempTrackingSpecification) THEN
+        EXIT; // No reservations exist => no basis for reallocation
+
+      TempTrackingSpecification.SETFILTER("Buffer Value4",'< %1',0);
+      IF TempTrackingSpecification.ISEMPTY THEN BEGIN
+        TempTrackingSpecification.RESET;
+        EXIT; // Supply is available - no need for reallocation
+      END;
+
+      TempTrackingSpecification.RESET;
+
+      // Try to free sufficient supply by reallocation within the tracking specification
+      CalcAllocations(TempTrackingSpecification);
+
+      TempTrackingSpecification.RESET;
+      TempTrackingSpecification.CALCSUMS("Buffer Value4");
+
+      IF TempTrackingSpecification."Buffer Value4" < 0 THEN
+        IF NOT PrepareTempDataSet(TempTrackingSpecification,ABS(TempTrackingSpecification."Buffer Value4")) THEN
+          EXIT; // There is not sufficient free supply to cover reallocation
+
+      TempTrackingSpecification.RESET;
+      Reallocate(TempTrackingSpecification);
+
+      // Write to database in the end
+      WriteToDatabase;
+    END;
+
+    LOCAL PROCEDURE Reallocate@10(VAR TempTrackingSpecification@1000 : TEMPORARY Record 336) AllocationsChanged : Boolean;
+    VAR
+      TempTrackingSpecification2@1002 : TEMPORARY Record 336;
+      QtyToReallocate@1001 : Decimal;
+    BEGIN
+      TempTrackingSpecification.RESET;
+      TempTrackingSpecification.SETFILTER("Buffer Value4",'< %1',0);
+      IF TempTrackingSpecification.FINDSET THEN
+        REPEAT
+          TempTrackingSpecification2 := TempTrackingSpecification;
+          TempTrackingSpecification2.INSERT;
+        UNTIL TempTrackingSpecification.NEXT = 0;
+      TempTrackingSpecification.RESET;
+
+      TempCurrSupplyReservEntry.RESET;
+      IF TempTrackingSpecification2.FINDSET THEN
+        REPEAT
+          TempCurrSupplyReservEntry.SETRANGE("Lot No.",TempTrackingSpecification2."Lot No.");
+          TempCurrSupplyReservEntry.SETRANGE("Serial No.",TempTrackingSpecification2."Serial No.");
+          QtyToReallocate := ABS(TempTrackingSpecification2."Buffer Value4");
+          IF TempCurrSupplyReservEntry.FINDSET THEN
+            REPEAT
+              QtyToReallocate := ReshuffleReservEntry(TempCurrSupplyReservEntry,QtyToReallocate,TempTrackingSpecification);
+            UNTIL (TempCurrSupplyReservEntry.NEXT = 0) OR (QtyToReallocate = 0);
+          AllocationsChanged := AllocationsChanged OR (QtyToReallocate <> ABS(TempTrackingSpecification2."Buffer Value4"));
+        UNTIL TempTrackingSpecification2.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE PrepareTempDataSet@12(VAR TempTrackingSpecification@1000 : TEMPORARY Record 336;QtyToPrepare@1001 : Decimal) : Boolean;
+    VAR
+      ItemLedgEntry@1007 : Record 32;
+      ReservEntry2@1006 : Record 337;
+    BEGIN
+      IF QtyToPrepare <= 0 THEN
+        EXIT(TRUE);
+
+      TempTrackingSpecification.RESET;
+
+      ItemLedgEntry.SETCURRENTKEY("Item No.",Open,"Variant Code",Positive,"Location Code");
+      ItemLedgEntry.SETRANGE("Item No.",TempTrackingSpecification."Item No.");
+      ItemLedgEntry.SETRANGE("Variant Code",TempTrackingSpecification."Variant Code");
+      ItemLedgEntry.SETRANGE("Location Code",TempTrackingSpecification."Location Code");
+      ItemLedgEntry.SETRANGE(Positive,TRUE);
+      ItemLedgEntry.SETRANGE(Open,TRUE);
+
+      ReservEntry2.SETCURRENTKEY("Source ID","Source Ref. No.","Source Type","Source Subtype");
+      ReservEntry2.SETRANGE("Source Type",DATABASE::"Item Ledger Entry");
+      ReservEntry2.SETRANGE("Source Subtype",0);
+      ReservEntry2.SETRANGE("Source ID",'');
+
+      IF ItemLedgEntry.FINDSET THEN
+        REPEAT
+          TempTrackingSpecification.SETRANGE("Lot No.",ItemLedgEntry."Lot No.");
+          TempTrackingSpecification.SETRANGE("Serial No.",ItemLedgEntry."Serial No.");
+          IF TempTrackingSpecification.ISEMPTY THEN BEGIN
+            InsertTempSupplyReservEntry(ItemLedgEntry);
+            // GET record
+            QtyToPrepare -= ItemLedgEntry."Remaining Quantity";
+            TempSupplyReservEntry.GET(-ItemLedgEntry."Entry No.",TRUE);
+            ReservEntry2.SETRANGE("Source Ref. No.",ItemLedgEntry."Entry No.");
+            IF ReservEntry2.FINDSET THEN
+              REPEAT
+                TempSupplyReservEntry."Quantity (Base)" -= ReservEntry2."Quantity (Base)";
+                IF TempSupplyReservEntry."Quantity (Base)" = 0 THEN
+                  TempSupplyReservEntry.DELETE
+                ELSE
+                  TempSupplyReservEntry.MODIFY;
+
+                IF ReservEntry2."Reservation Status" = ReservEntry2."Reservation Status"::Surplus THEN BEGIN
+                  TempSupplyReservEntry := ReservEntry2;
+                  TempSupplyReservEntry.INSERT;
+                END ELSE
+                  QtyToPrepare += ReservEntry2."Quantity (Base)";
+              UNTIL ReservEntry2.NEXT = 0;
+          END;
+        UNTIL (ItemLedgEntry.NEXT = 0) OR (QtyToPrepare <= 0);
+
+      TempTrackingSpecification.RESET;
+      EXIT(QtyToPrepare <= 0);
+    END;
+
+    LOCAL PROCEDURE ReshuffleReservEntry@9(SupplyReservEntry@1000 : Record 337;QtyToReshuffle@1006 : Decimal;VAR TempTrackingSpecification@1008 : TEMPORARY Record 336) RemainingQty : Decimal;
+    VAR
+      TotalAvailable@1003 : Decimal;
+      QtyToReshuffleThisLine@1004 : Decimal;
+      xQtyToReshuffleThisLine@1005 : Decimal;
+      AdjustmentQty@1013 : Decimal;
+      NewQty@1007 : Decimal;
+      xQty@1014 : Decimal;
+    BEGIN
+      IF SupplyReservEntry."Reservation Status" > SupplyReservEntry."Reservation Status"::Tracking THEN
+        EXIT; // The entry is neither reservation nor tracking and cannot be reshuffled
+
+      IF NOT SupplyReservEntry.Positive THEN
+        EXIT; // The entry is not supply and cannot be reshuffled
+
+      TempCurrDemandReservEntry.GET(SupplyReservEntry."Entry No.",NOT SupplyReservEntry.Positive); // Demand
+
+      IF TempCurrDemandReservEntry.TrackingExists THEN // The reservation is not open
+        EXIT; // The entry is a specific allocation and cannot be reshuffled
+
+      IF QtyToReshuffle <= 0 THEN
+        EXIT;
+
+      TempSupplyReservEntry.CALCSUMS("Quantity (Base)");
+      TotalAvailable := TempSupplyReservEntry."Quantity (Base)";
+
+      IF TotalAvailable < QtyToReshuffle THEN
+        ERROR(Text001);
+
+      IF SupplyReservEntry."Quantity (Base)" > QtyToReshuffle THEN
+        QtyToReshuffleThisLine := QtyToReshuffle
+      ELSE
+        QtyToReshuffleThisLine := SupplyReservEntry."Quantity (Base)";
+
+      xQtyToReshuffleThisLine := QtyToReshuffleThisLine;
+
+      TempSupplyReservEntry.SETRANGE("Reservation Status",TempSupplyReservEntry."Reservation Status"::Surplus);
+      IF TempSupplyReservEntry.FINDSET THEN
+        REPEAT
+          TempTrackingSpecification.SETRANGE("Lot No.",TempSupplyReservEntry."Lot No.");
+          TempTrackingSpecification.SETRANGE("Serial No.",TempSupplyReservEntry."Serial No.");
+          IF TempTrackingSpecification.FINDFIRST THEN BEGIN
+            IF TempTrackingSpecification."Buffer Value4" > 0 THEN BEGIN
+              IF TempTrackingSpecification."Buffer Value4" < QtyToReshuffleThisLine THEN BEGIN
+                AdjustmentQty := QtyToReshuffleThisLine - TempTrackingSpecification."Buffer Value4";
+                QtyToReshuffleThisLine := TempTrackingSpecification."Buffer Value4";
+              END ELSE
+                AdjustmentQty := 0;
+
+              xQty := QtyToReshuffleThisLine;
+              QtyToReshuffleThisLine := MakeConnection(TempSupplyReservEntry,TempCurrDemandReservEntry,QtyToReshuffleThisLine);
+              TempTrackingSpecification."Buffer Value4" -= (xQty - QtyToReshuffleThisLine);
+              TempTrackingSpecification.MODIFY;
+              QtyToReshuffleThisLine += AdjustmentQty;
+            END;
+          END ELSE
+            QtyToReshuffleThisLine := MakeConnection(TempSupplyReservEntry,TempCurrDemandReservEntry,QtyToReshuffleThisLine);
+
+        UNTIL (TempSupplyReservEntry.NEXT = 0) OR (QtyToReshuffleThisLine = 0);
+
+      RemainingQty := QtyToReshuffle - xQtyToReshuffleThisLine + QtyToReshuffleThisLine;
+
+      // Modify the original demand/supply entries
+
+      NewQty := SupplyReservEntry."Quantity (Base)" - xQtyToReshuffleThisLine + QtyToReshuffleThisLine;
+      IF NewQty = 0 THEN BEGIN
+        TempReservEntryDelete := SupplyReservEntry;
+        TempReservEntryDelete.INSERT;
+        TempReservEntryDelete := TempCurrDemandReservEntry;
+        TempReservEntryDelete.INSERT;
+      END ELSE BEGIN
+        TempReservEntryModify := SupplyReservEntry;
+        TempReservEntryModify."Quantity (Base)" := NewQty;
+        TempReservEntryModify.INSERT;
+        TempReservEntryModify := TempCurrDemandReservEntry;
+        TempReservEntryModify."Quantity (Base)" := -NewQty;
+        TempReservEntryModify.INSERT;
+      END;
+
+      TempTrackingSpecification.RESET;
+    END;
+
+    LOCAL PROCEDURE MakeConnection@6(VAR SupplySurplusEntry@1000 : Record 337;VAR DemandReservEntry@1001 : Record 337;QtyToReshuffle@1002 : Decimal) RemainingQty : Decimal;
+    VAR
+      NewEntryNo@1003 : Integer;
+    BEGIN
+      IF SupplySurplusEntry."Quantity (Base)" = 0 THEN
+        EXIT(QtyToReshuffle);
+
+      IF SupplySurplusEntry."Quantity (Base)" <= QtyToReshuffle THEN BEGIN
+        // Convert supply surplus fully
+        IF SupplySurplusEntry."Entry No." < 0 THEN BEGIN // Item Ledger Entry temporary record
+          LastEntryNo := LastEntryNo + 1;
+          NewEntryNo := -LastEntryNo;
+        END ELSE
+          NewEntryNo := SupplySurplusEntry."Entry No.";
+
+        TempReservEntryInsert := DemandReservEntry;
+        TempReservEntryInsert."Entry No." := NewEntryNo;
+        TempReservEntryInsert."Expected Receipt Date" := SupplySurplusEntry."Expected Receipt Date";
+        TempReservEntryInsert."Quantity (Base)" := -SupplySurplusEntry."Quantity (Base)";
+        TempReservEntryInsert.INSERT;
+
+        TempReservEntryModify := SupplySurplusEntry;
+        TempReservEntryModify."Entry No." := NewEntryNo;
+        TempReservEntryModify."Reservation Status" := DemandReservEntry."Reservation Status";
+        TempReservEntryModify."Shipment Date" := DemandReservEntry."Shipment Date";
+
+        IF SupplySurplusEntry."Entry No." < 0 THEN BEGIN // Entry does not really exist
+          TempReservEntryInsert := TempReservEntryModify;
+          TempReservEntryInsert.INSERT;
+        END ELSE
+          TempReservEntryModify.INSERT;
+
+        RemainingQty := QtyToReshuffle - SupplySurplusEntry."Quantity (Base)";
+        SupplySurplusEntry."Quantity (Base)" := 0;
+        SupplySurplusEntry.MODIFY;
+      END ELSE BEGIN
+        IF SupplySurplusEntry."Entry No." > 0 THEN BEGIN
+          TempReservEntryModify := SupplySurplusEntry;
+          TempReservEntryModify."Quantity (Base)" -= QtyToReshuffle;
+          TempReservEntryModify.INSERT;
+        END;
+
+        LastEntryNo := LastEntryNo + 1;
+        NewEntryNo := -LastEntryNo;
+        TempReservEntryInsert := SupplySurplusEntry;
+        TempReservEntryInsert."Entry No." := NewEntryNo;
+        TempReservEntryInsert."Reservation Status" := DemandReservEntry."Reservation Status";
+        TempReservEntryInsert.VALIDATE("Quantity (Base)",QtyToReshuffle);
+        TempReservEntryInsert."Shipment Date" := DemandReservEntry."Shipment Date";
+        TempReservEntryInsert.INSERT;
+
+        TempReservEntryInsert := DemandReservEntry;
+        TempReservEntryInsert."Entry No." := NewEntryNo;
+        TempReservEntryInsert."Expected Receipt Date" := SupplySurplusEntry."Expected Receipt Date";
+        TempReservEntryInsert.VALIDATE("Quantity (Base)",-QtyToReshuffle);
+        TempReservEntryInsert.INSERT;
+
+        SupplySurplusEntry."Quantity (Base)" -= QtyToReshuffle;
+        SupplySurplusEntry.MODIFY;
+        RemainingQty := 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE WriteToDatabase@13();
+    VAR
+      ReservEntry@1000 : Record 337;
+      PrevNegEntryNo@1001 : Integer;
+      LastInsertedEntryNo@1002 : Integer;
+    BEGIN
+      TempReservEntryDelete.RESET;
+      TempReservEntryModify.RESET;
+      TempReservEntryInsert.RESET;
+
+      IF TempReservEntryDelete.FINDSET THEN
+        REPEAT
+          ReservEntry := TempReservEntryDelete;
+          ReservEntry.DELETE;
+        UNTIL TempReservEntryDelete.NEXT = 0;
+
+      IF TempReservEntryModify.FINDSET THEN
+        REPEAT
+          ReservEntry := TempReservEntryModify;
+          ReservEntry.VALIDATE("Quantity (Base)");
+          ReservEntry.MODIFY;
+        UNTIL TempReservEntryModify.NEXT = 0;
+
+      IF TempReservEntryInsert.FINDSET THEN
+        REPEAT
+          ReservEntry := TempReservEntryInsert;
+          IF ReservEntry."Entry No." < 0 THEN
+            IF ReservEntry."Entry No." = PrevNegEntryNo THEN
+              ReservEntry."Entry No." := LastInsertedEntryNo
+            ELSE BEGIN
+              PrevNegEntryNo := ReservEntry."Entry No.";
+              ReservEntry."Entry No." := 0;
+            END;
+          ReservEntry.VALIDATE("Quantity (Base)");
+          ReservEntry.UpdateItemTracking;
+          ReservEntry.INSERT;
+          LastInsertedEntryNo := ReservEntry."Entry No.";
+        UNTIL TempReservEntryInsert.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE CalcInventory@7(VAR TempTrackingSpecification@1000 : TEMPORARY Record 336) : Boolean;
+    VAR
+      ItemLedgEntry@1006 : Record 32;
+      ReservEntry@1002 : Record 337;
+      TotalReservedQty@1001 : Decimal;
+    BEGIN
+      ReservEntry.LOCKTABLE;
+      ReservEntry.SETCURRENTKEY("Item No.","Source Type","Source Subtype","Reservation Status","Location Code","Variant Code");
+      ReservEntry.SETRANGE("Item No.",TempTrackingSpecification."Item No.");
+      ReservEntry.SETRANGE("Variant Code",TempTrackingSpecification."Variant Code");
+      ReservEntry.SETRANGE("Location Code",TempTrackingSpecification."Location Code");
+      ReservEntry.SETRANGE("Source Type",DATABASE::"Item Ledger Entry");
+      ReservEntry.SETRANGE("Source Subtype",0);
+      ReservEntry.SETRANGE("Reservation Status",ReservEntry."Reservation Status"::Reservation);
+      ReservEntry.SETFILTER("Item Tracking",'<> %1',ReservEntry."Item Tracking"::None);
+
+      IF ReservEntry.ISEMPTY THEN  // No reservations with Item Tracking exist against inventory - no basis for reallocation.
+        EXIT(FALSE);
+
+      ItemLedgEntry.SETCURRENTKEY("Item No.",Open,"Variant Code",Positive,"Location Code");
+      ItemLedgEntry.SETRANGE("Item No.",TempTrackingSpecification."Item No.");
+      ItemLedgEntry.SETRANGE("Variant Code",TempTrackingSpecification."Variant Code");
+      ItemLedgEntry.SETRANGE("Location Code",TempTrackingSpecification."Location Code");
+      ItemLedgEntry.SETRANGE(Positive,TRUE);
+      ItemLedgEntry.SETRANGE(Open,TRUE);
+
+      IF TempTrackingSpecification.FINDSET THEN
+        REPEAT
+          ItemLedgEntry.SETRANGE("Serial No.",TempTrackingSpecification."Serial No.");
+          ItemLedgEntry.SETRANGE("Lot No.",TempTrackingSpecification."Lot No.");
+
+          IF ItemLedgEntry.FINDSET THEN
+            REPEAT
+              TempTrackingSpecification."Buffer Value2" += ItemLedgEntry."Remaining Quantity";
+              ItemLedgEntry.CALCFIELDS("Reserved Quantity");
+              TempTrackingSpecification."Buffer Value3" += ItemLedgEntry."Reserved Quantity";
+              InsertTempSupplyReservEntry(ItemLedgEntry);
+            UNTIL ItemLedgEntry.NEXT = 0;
+
+          TempTrackingSpecification."Buffer Value4" :=
+            TempTrackingSpecification."Buffer Value2" - // Total Inventory
+            TempTrackingSpecification."Buffer Value3" + // Reserved Inventory
+            TempTrackingSpecification."Buffer Value1";  // Non-allocated lot/sn demand (signed negatively)
+          TempTrackingSpecification.MODIFY;
+          TotalReservedQty += TempTrackingSpecification."Buffer Value3";
+        UNTIL TempTrackingSpecification.NEXT = 0;
+
+      IF TotalReservedQty = 0 THEN
+        EXIT(FALSE); // No need to consider reallocation if no reservations exist.
+
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE CalcAllocations@11(VAR TempTrackingSpecification@1000 : TEMPORARY Record 336) : Boolean;
+    VAR
+      ReservEntry@1005 : Record 337;
+      ReservEntry2@1001 : Record 337;
+      QtyNeededForReallocation@1002 : Decimal;
+    BEGIN
+      ReservEntry.SETCURRENTKEY("Item No.","Source Type","Source Subtype","Reservation Status","Location Code","Variant Code");
+      ReservEntry.SETRANGE("Item No.",TempTrackingSpecification."Item No.");
+      ReservEntry.SETRANGE("Variant Code",TempTrackingSpecification."Variant Code");
+      ReservEntry.SETRANGE("Location Code",TempTrackingSpecification."Location Code");
+      ReservEntry.SETRANGE("Source Type",DATABASE::"Item Ledger Entry"); // (ILE)
+      ReservEntry.SETRANGE("Source Subtype",0);
+      ReservEntry.SETRANGE(Positive,TRUE);
+      ReservEntry.SETRANGE("Reservation Status",
+        ReservEntry."Reservation Status"::Reservation,ReservEntry."Reservation Status"::Tracking);
+
+      TempTrackingSpecification.SETFILTER("Buffer Value4",'< %1',0);
+
+      IF TempTrackingSpecification.FINDSET THEN
+        REPEAT
+          IF TempTrackingSpecification."Serial No." <> '' THEN
+            ReservEntry.SETRANGE("Serial No.",TempTrackingSpecification."Serial No.")
+          ELSE
+            ReservEntry.SETRANGE("Serial No.");
+          IF TempTrackingSpecification."Lot No." <> '' THEN
+            ReservEntry.SETRANGE("Lot No.",TempTrackingSpecification."Lot No.")
+          ELSE
+            ReservEntry.SETRANGE("Lot No.");
+          IF ReservEntry.FINDSET(TRUE,TRUE) THEN
+            REPEAT
+              ReservEntry2.GET(ReservEntry."Entry No.",NOT ReservEntry.Positive); // Get demand
+              IF NOT ReservEntry2.TrackingExists THEN BEGIN
+                TempCurrSupplyReservEntry := ReservEntry;
+                TempCurrSupplyReservEntry.INSERT;
+                TempTrackingSpecification."Buffer Value5" += ReservEntry."Quantity (Base)";
+                TempCurrDemandReservEntry := ReservEntry2;
+                TempCurrDemandReservEntry.INSERT;
+              END;
+            UNTIL (ReservEntry.NEXT = 0) OR
+                  (TempTrackingSpecification."Buffer Value4" + TempTrackingSpecification."Buffer Value5" >= 0);
+          IF TempTrackingSpecification."Buffer Value4" + TempTrackingSpecification."Buffer Value5" < 0 THEN // Not sufficient qty
+            EXIT(FALSE);
+          TempTrackingSpecification.MODIFY;
+          QtyNeededForReallocation += ABS(TempTrackingSpecification."Buffer Value4");
+        UNTIL TempTrackingSpecification.NEXT = 0;
+
+      TempTrackingSpecification.SETFILTER("Buffer Value4",'>= %1',0);
+      ReservEntry.SETRANGE("Reservation Status");
+
+      // The quantity temporary records representing Item Ledger Entries are adjusted according to the
+      // reservation entries actually existing in the database pointing at those entries. Otherwise these
+      // would be counted twice.
+      IF TempTrackingSpecification.FINDSET THEN
+        REPEAT
+          IF TempTrackingSpecification."Serial No." <> '' THEN
+            ReservEntry.SETRANGE("Serial No.",TempTrackingSpecification."Serial No.")
+          ELSE
+            ReservEntry.SETRANGE("Serial No.");
+          IF TempTrackingSpecification."Lot No." <> '' THEN
+            ReservEntry.SETRANGE("Lot No.",TempTrackingSpecification."Lot No.")
+          ELSE
+            ReservEntry.SETRANGE("Lot No.");
+
+          IF ReservEntry.FINDSET THEN
+            REPEAT
+              TempSupplyReservEntry.GET(-ReservEntry."Source Ref. No.",TRUE);
+              TempSupplyReservEntry."Quantity (Base)" -= ReservEntry."Quantity (Base)";
+              IF TempSupplyReservEntry."Quantity (Base)" = 0 THEN
+                TempSupplyReservEntry.DELETE
+              ELSE
+                TempSupplyReservEntry.MODIFY;
+
+              IF ReservEntry."Reservation Status" = ReservEntry."Reservation Status"::Surplus THEN BEGIN
+                TempSupplyReservEntry := ReservEntry;
+                TempSupplyReservEntry.INSERT;
+              END;
+            UNTIL (ReservEntry.NEXT = 0);
+          QtyNeededForReallocation -= TempTrackingSpecification."Buffer Value4";
+        UNTIL (TempTrackingSpecification.NEXT = 0);
+      EXIT(QtyNeededForReallocation <= 0);
+    END;
+
+    LOCAL PROCEDURE InsertTempSupplyReservEntry@8(ItemLedgEntry@1000 : Record 32);
+    BEGIN
+      TempSupplyReservEntry.INIT;
+      TempSupplyReservEntry."Entry No." := -ItemLedgEntry."Entry No.";
+      TempSupplyReservEntry.Positive := TRUE;
+
+      TempSupplyReservEntry."Source Type" := DATABASE::"Item Ledger Entry";
+      TempSupplyReservEntry."Source Ref. No." := ItemLedgEntry."Entry No.";
+
+      TempSupplyReservEntry."Item No." := ItemLedgEntry."Item No.";
+      TempSupplyReservEntry."Variant Code" := ItemLedgEntry."Variant Code";
+      TempSupplyReservEntry."Location Code" := ItemLedgEntry."Location Code";
+      TempSupplyReservEntry."Serial No." := ItemLedgEntry."Serial No.";
+      TempSupplyReservEntry."Lot No." := ItemLedgEntry."Lot No.";
+      TempSupplyReservEntry."Qty. per Unit of Measure" := ItemLedgEntry."Qty. per Unit of Measure";
+      TempSupplyReservEntry.Description := ItemLedgEntry.Description;
+      TempSupplyReservEntry."Serial No." := ItemLedgEntry."Serial No.";
+      TempSupplyReservEntry."Lot No." := ItemLedgEntry."Lot No.";
+      TempSupplyReservEntry."Quantity (Base)" := ItemLedgEntry."Remaining Quantity";
+      TempSupplyReservEntry."Reservation Status" := TempSupplyReservEntry."Reservation Status"::Surplus;
+      TempSupplyReservEntry."Expected Receipt Date" := 0D;
+      TempSupplyReservEntry."Shipment Date" := 0D;
+      TempSupplyReservEntry.INSERT;
+    END;
+
+    PROCEDURE NonspecificReservedQty@5(VAR ItemLedgEntry@1000 : Record 32) UnspecificQty : Decimal;
+    VAR
+      ReservEntry@1001 : Record 337;
+      ReservEntry2@1002 : Record 337;
+    BEGIN
+      IF NOT ItemLedgEntry.FINDSET THEN
+        EXIT;
+
+      ReservEntry.SETCURRENTKEY("Item No.","Source Type","Source Subtype","Reservation Status","Location Code","Variant Code");
+      ReservEntry.SETRANGE("Item No.",ItemLedgEntry."Item No.");
+      ReservEntry.SETRANGE("Variant Code",ItemLedgEntry."Variant Code");
+      ReservEntry.SETRANGE("Location Code",ItemLedgEntry."Location Code");
+      ReservEntry.SETRANGE("Source Type",DATABASE::"Item Ledger Entry");
+      ReservEntry.SETRANGE("Source Subtype",0);
+      ReservEntry.SETRANGE("Reservation Status",ReservEntry."Reservation Status"::Reservation);
+      ReservEntry.SETRANGE(Positive,TRUE);
+      ItemLedgEntry.COPYFILTER("Serial No.",ReservEntry."Serial No.");
+      ItemLedgEntry.COPYFILTER("Lot No.",ReservEntry."Lot No.");
+
+      IF NOT ReservEntry.FINDSET THEN
+        EXIT;
+
+      REPEAT
+        ReservEntry2.GET(ReservEntry."Entry No.",NOT ReservEntry.Positive);  // Get demand
+        IF NOT ReservEntry2.TrackingExists THEN
+          UnspecificQty -= ReservEntry2."Quantity (Base)"; // Sum up negative entries to a positive value
+      UNTIL ReservEntry.NEXT = 0;
+    END;
+
+    PROCEDURE ReleaseForReservation@14(ItemNo@1006 : Code[20];VariantCode@1005 : Code[20];LocationCode@1001 : Code[10];SerialNo@1004 : Code[40];LotNo@1002 : Code[20];QtyToRelease@1000 : Decimal) AllocationsChanged : Boolean;
+    VAR
+      TempTrackingSpecification@1003 : TEMPORARY Record 336;
+    BEGIN
+      // Local procedure used when doing item tracking specific reservations
+      // "Buffer Value4" : Qty for reallocation (negative = need for reallocation)
+
+      CleanUpVariables;
+      TempTrackingSpecification."Item No." := ItemNo;
+      TempTrackingSpecification."Variant Code" := VariantCode;
+      TempTrackingSpecification."Location Code" := LocationCode;
+      TempTrackingSpecification."Serial No." := SerialNo;
+      TempTrackingSpecification."Lot No." := LotNo;
+      TempTrackingSpecification."Quantity (Base)" := QtyToRelease;
+      TempTrackingSpecification."Buffer Value4" := -QtyToRelease;
+      TempTrackingSpecification.INSERT;
+
+      PrepareTempDataSet(TempTrackingSpecification,QtyToRelease);
+      CalcAllocations(TempTrackingSpecification);
+      AllocationsChanged := Reallocate(TempTrackingSpecification);
+      WriteToDatabase;
+    END;
+
+    LOCAL PROCEDURE ReleaseForReservation2@15(VAR TempTrackingSpecification@1000 : TEMPORARY Record 336);
+    VAR
+      TempTrackingSpecification2@1001 : TEMPORARY Record 336;
+      QtyToRelease@1002 : Decimal;
+    BEGIN
+      // Used from Item Tracking form when adding Item Tracking to existing reservations
+      // "Buffer Value4" : Qty for reallocation (negative = need for reallocation)
+
+      CleanUpVariables;
+
+      QtyToRelease := TempTrackingSpecification."Quantity (Base)";
+
+      IF QtyToRelease = 0 THEN
+        EXIT;
+
+      TempTrackingSpecification2 := TempTrackingSpecification;
+      TempTrackingSpecification2."Buffer Value4" := -QtyToRelease;
+      TempTrackingSpecification2.INSERT;
+
+      PrepareTempDataSet(TempTrackingSpecification2,QtyToRelease);
+      CalcAllocations(TempTrackingSpecification2);
+      Reallocate(TempTrackingSpecification2);
+      WriteToDatabase;
+    END;
+
+    PROCEDURE ReleaseForReservation3@16(VAR CalcItemLedgEntry@1000 : Record 32;CalcReservEntry@1004 : Record 337;RemainingQtyToReserve@1003 : Decimal) AllocationsChanged : Boolean;
+    VAR
+      AvailableToReserve@1005 : Decimal;
+    BEGIN
+      // Used when doing item tracking specific reservations on reservation form.
+      // "Buffer Value4" : Qty for reallocation (negative = need for reallocation)
+
+      IF CalcItemLedgEntry.FINDSET THEN
+        REPEAT
+          CalcItemLedgEntry.CALCFIELDS("Reserved Quantity");
+          AvailableToReserve +=
+            CalcItemLedgEntry."Remaining Quantity" - CalcItemLedgEntry."Reserved Quantity";
+        UNTIL (CalcItemLedgEntry.NEXT = 0) OR (AvailableToReserve >= RemainingQtyToReserve);
+
+      IF AvailableToReserve < RemainingQtyToReserve THEN
+        AllocationsChanged := ReleaseForReservation(
+            CalcReservEntry."Item No.",CalcReservEntry."Variant Code",CalcReservEntry."Location Code",
+            CalcReservEntry."Serial No.",CalcReservEntry."Lot No.",RemainingQtyToReserve - AvailableToReserve);
+    END;
+
+    PROCEDURE ReserveItemTrackingLine@17(TrackingSpecification@1001 : Record 336);
+    VAR
+      ReservEntry@1003 : Record 337;
+      QtyToReserveBase@1000 : Decimal;
+      QtyToReserve@1002 : Decimal;
+      UnreservedQty@1006 : Decimal;
+      AvailabilityDate@1004 : Date;
+    BEGIN
+      // Used when fully reserving an item tracking line
+      QtyToReserveBase := TrackingSpecification."Quantity (Base)" - TrackingSpecification."Quantity Handled (Base)";
+
+      IF QtyToReserveBase <= 0 THEN
+        EXIT;
+
+      ReservMgt.SetCalcReservEntry(TrackingSpecification,ReservEntry);
+
+      IF ReservEntry."Quantity (Base)" < 0 THEN
+        AvailabilityDate := ReservEntry."Shipment Date"
+      ELSE
+        AvailabilityDate := ReservEntry."Expected Receipt Date";
+
+      UnreservedQty :=
+        TrackingSpecification."Quantity (Base)" - TrackingSpecification."Quantity Handled (Base)";
+
+      ReservEntry.SETCURRENTKEY(
+        "Source ID","Source Ref. No.","Source Type","Source Subtype",
+        "Source Batch Name","Source Prod. Order Line","Reservation Status");
+      ReservMgt.SetPointerFilter(ReservEntry);
+      ReservEntry.SETRANGE("Serial No.",ReservEntry."Serial No.");
+      ReservEntry.SETRANGE("Lot No.",ReservEntry."Lot No.");
+      ReservEntry.SETRANGE("Reservation Status",ReservEntry."Reservation Status"::Reservation);
+      IF ReservEntry.FINDSET THEN
+        REPEAT
+          UnreservedQty -= ABS(ReservEntry."Quantity (Base)");
+        UNTIL ReservEntry.NEXT = 0;
+
+      IF QtyToReserveBase > UnreservedQty THEN
+        QtyToReserveBase := UnreservedQty;
+
+      ReservMgt.AutoReserveOneLine(1,QtyToReserve,QtyToReserveBase,'',AvailabilityDate);
+    END;
+
+    PROCEDURE ReserveItemTrackingLine2@1(TrackingSpecification@1001 : Record 336;QtyToReserve@1002 : Decimal;QtyToReserveBase@1000 : Decimal);
+    VAR
+      ReservEntry@1003 : Record 337;
+      AvailabilityDate@1004 : Date;
+    BEGIN
+      // Used when reserving a specific quantity on an item tracking line
+      IF QtyToReserveBase <= 0 THEN
+        EXIT;
+
+      ReservMgt.SetCalcReservEntry(TrackingSpecification,ReservEntry);
+
+      IF ReservEntry."Quantity (Base)" < 0 THEN
+        AvailabilityDate := ReservEntry."Shipment Date"
+      ELSE
+        AvailabilityDate := ReservEntry."Expected Receipt Date";
+
+      ReservMgt.AutoReserveOneLine(1,QtyToReserve,QtyToReserveBase,'',AvailabilityDate);
+    END;
+
+    BEGIN
+    {
+      4PS, Serial No. from 20 to 40
+    }
+    END.
+  }
+}
+

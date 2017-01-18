@@ -1,0 +1,203 @@
+OBJECT Codeunit 1208 Pmt Export Mgt Cust Ledg Entry
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00;
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 21=rm;
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      ExportAgainQst@1002 : TextConst 'ENU=One or more of the selected lines has already been exported. Do you want to export it again?';
+      ProgressMsg@1001 : TextConst 'ENU=Processing line no. #1######.';
+      PaymentExportMgt@1000 : Codeunit 1210;
+
+    PROCEDURE ExportCustPaymentFileYN@7(VAR CustLedgerEntry@1000 : Record 21);
+    BEGIN
+      IF IsCustLedgerEntryExported(CustLedgerEntry) OR IsAppliedToCustPaymentExported(CustLedgerEntry) THEN
+        IF NOT CONFIRM(ExportAgainQst) THEN
+          EXIT;
+      ExportCustPaymentFile(CustLedgerEntry);
+    END;
+
+    LOCAL PROCEDURE IsCustLedgerEntryExported@28(VAR CustLedgerEntry@1000 : Record 21) : Boolean;
+    VAR
+      CustLedgerEntry2@1001 : Record 21;
+    BEGIN
+      // In case of selecting more than one line on the page.
+      IF CustLedgerEntry.MARKEDONLY THEN
+        WITH CustLedgerEntry2 DO BEGIN
+          MARKEDONLY(TRUE);
+          SETRANGE("Exported to Payment File",TRUE);
+          EXIT(NOT ISEMPTY);
+        END;
+
+      // In case of selecting one line on the page or passing a variable directly.
+      IF CustLedgerEntry.HASFILTER THEN
+        WITH CustLedgerEntry2 DO BEGIN
+          COPYFILTERS(CustLedgerEntry);
+          SETRANGE("Exported to Payment File",TRUE);
+          EXIT(NOT ISEMPTY);
+        END;
+
+      // The case of a record not being passed via the user interface is not supported.
+      EXIT(FALSE);
+    END;
+
+    LOCAL PROCEDURE IsAppliedToCustPaymentExported@33(VAR CustLedgerEntry@1000 : Record 21) : Boolean;
+    VAR
+      AppliedToCustLedgerEntry@1002 : Record 21;
+      ExportCustLedgerEntry@1001 : Record 21;
+    BEGIN
+      CASE TRUE OF
+        CustLedgerEntry.MARKEDONLY:
+          ExportCustLedgerEntry.MARKEDONLY(TRUE);
+        CustLedgerEntry.HASFILTER:
+          BEGIN
+            ExportCustLedgerEntry.COPYFILTERS(CustLedgerEntry);
+            ExportCustLedgerEntry.FINDSET;
+          END;
+        ELSE
+          ExportCustLedgerEntry.COPY(CustLedgerEntry);
+      END;
+
+      AppliedToCustLedgerEntry.SETRANGE("Exported to Payment File",TRUE);
+      REPEAT
+        AppliedToCustLedgerEntry.SETRANGE("Closed by Entry No.",ExportCustLedgerEntry."Entry No.");
+        IF NOT AppliedToCustLedgerEntry.ISEMPTY THEN
+          EXIT(TRUE);
+      UNTIL ExportCustLedgerEntry.NEXT = 0;
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE ExportCustPaymentFile@112(VAR CustLedgerEntry@1000 : Record 21);
+    BEGIN
+      CODEUNIT.RUN(CODEUNIT::"Pmt. Export Cust. Ledger Check",CustLedgerEntry);
+      ExportCustLedgerEntry(CustLedgerEntry);
+      SetExportFlagOnCustLedgerEntries(CustLedgerEntry);
+    END;
+
+    PROCEDURE ExportCustLedgerEntry@19(VAR CustLedgerEntry@1000 : Record 21);
+    VAR
+      CustLedgerEntry2@1004 : Record 21;
+      DataExch@1001 : Record 1220;
+      Window@1003 : Dialog;
+      LineNo@1002 : Integer;
+    BEGIN
+      CustLedgerEntry2.COPY(CustLedgerEntry);
+      PaymentExportMgt.CreateDataExch(DataExch,CustLedgerEntry2."Bal. Account No.");
+      Window.OPEN(ProgressMsg);
+      REPEAT
+        LineNo += 1;
+        Window.UPDATE(1,LineNo);
+        CreateCustLedgerDataExchLine(DataExch."Entry No.",CustLedgerEntry2,LineNo);
+      UNTIL CustLedgerEntry2.NEXT = 0;
+      Window.CLOSE;
+      PaymentExportMgt.ExportToFile(DataExch."Entry No.")
+    END;
+
+    LOCAL PROCEDURE CreateCustLedgerDataExchLine@20(DataExchEntryNo@1000 : Integer;CustLedgerEntry@1001 : Record 21;LineNo@1002 : Integer);
+    VAR
+      PaymentExportData@1003 : Record 1226;
+    BEGIN
+      WITH CustLedgerEntry DO BEGIN
+        PreparePaymentExportDataCLE(PaymentExportData,CustLedgerEntry,DataExchEntryNo,LineNo);
+        PaymentExportMgt.CreatePaymentLines(PaymentExportData);
+      END;
+    END;
+
+    PROCEDURE PreparePaymentExportDataCLE@14(VAR TempPaymentExportData@1000 : TEMPORARY Record 1226;CustLedgerEntry@1001 : Record 21;DataExchEntryNo@1003 : Integer;LineNo@1007 : Integer);
+    VAR
+      Customer@1006 : Record 18;
+      CustomerBankAccount@1008 : Record 287;
+      GeneralLedgerSetup@1002 : Record 98;
+      PaymentMethod@1009 : Record 289;
+      BankAccount@1005 : Record 270;
+      BankExportImportSetup@1004 : Record 1200;
+    BEGIN
+      GeneralLedgerSetup.GET;
+      Customer.GET(CustLedgerEntry."Customer No.");
+      CustomerBankAccount.GET(CustLedgerEntry."Customer No.",CustLedgerEntry."Recipient Bank Account");
+
+      WITH TempPaymentExportData DO BEGIN
+        BankAccount.GET(CustLedgerEntry."Bal. Account No.");
+        BankAccount.GetBankExportImportSetup(BankExportImportSetup);
+        SetPreserveNonLatinCharacters(BankExportImportSetup."Preserve Non-Latin Characters");
+
+        INIT;
+        "Data Exch Entry No." := DataExchEntryNo;
+        "Sender Bank Account Code" := CustLedgerEntry."Bal. Account No.";
+
+        IF BankAccount."Country/Region Code" = CustomerBankAccount."Country/Region Code" THEN BEGIN
+          CustLedgerEntry.CALCFIELDS("Amount (LCY)");
+          Amount := CustLedgerEntry."Amount (LCY)";
+          "Currency Code" := GeneralLedgerSetup."LCY Code";
+        END ELSE BEGIN
+          CustLedgerEntry.CALCFIELDS(Amount);
+          Amount := CustLedgerEntry.Amount;
+          "Currency Code" := GeneralLedgerSetup.GetCurrencyCode(CustLedgerEntry."Currency Code");
+        END;
+
+        "Recipient Bank Acc. No." :=
+          COPYSTR(CustomerBankAccount.GetBankAccountNo,1,MAXSTRLEN("Recipient Bank Acc. No."));
+        "Recipient Reg. No." := CustomerBankAccount."Bank Branch No.";
+        "Recipient Acc. No." := CustomerBankAccount."Bank Account No.";
+        "Recipient Bank Country/Region" := CustomerBankAccount."Country/Region Code";
+        "Recipient Bank Name" := COPYSTR(CustomerBankAccount.Name,1,35);
+        "Recipient Bank Address" := COPYSTR(CustomerBankAccount.Address,1,35);
+        "Recipient Bank City" := COPYSTR(CustomerBankAccount."Post Code" + CustomerBankAccount.City,1,35);
+        "Recipient Bank BIC" := CustomerBankAccount."SWIFT Code";
+
+        "Recipient Name" := COPYSTR(Customer.Name,1,35);
+        "Recipient Address" := COPYSTR(Customer.Address,1,35);
+        "Recipient City" := COPYSTR(Customer."Post Code" + ' ' + Customer.City,1,35);
+        "Transfer Date" := CustLedgerEntry."Posting Date";
+        "Message to Recipient 1" := COPYSTR(CustLedgerEntry."Message to Recipient",1,35);
+        "Message to Recipient 2" := COPYSTR(CustLedgerEntry."Message to Recipient",36,70);
+        "Document No." := CustLedgerEntry."Document No.";
+        "Applies-to Ext. Doc. No." := CustLedgerEntry."Applies-to Ext. Doc. No.";
+        "Short Advice" := CustLedgerEntry."Applies-to Ext. Doc. No.";
+        "Line No." := LineNo;
+        IF PaymentMethod.GET(CustLedgerEntry."Payment Method Code") THEN
+          "Data Exch. Line Def Code" := PaymentMethod."Pmt. Export Line Definition";
+        INSERT(TRUE);
+      END;
+    END;
+
+    PROCEDURE EnableExportToServerTempFile@27(SilentServerMode@1000 : Boolean;ServerFileExtension@1001 : Text[3]);
+    BEGIN
+      PaymentExportMgt.EnableExportToServerTempFile(SilentServerMode,ServerFileExtension);
+    END;
+
+    PROCEDURE GetServerTempFileName@29() : Text[1024];
+    BEGIN
+      EXIT(PaymentExportMgt.GetServerTempFileName);
+    END;
+
+    LOCAL PROCEDURE SetExportFlagOnCustLedgerEntries@40(VAR CustLedgerEntry@1000 : Record 21);
+    VAR
+      CustLedgerEntry2@1001 : Record 21;
+    BEGIN
+      WITH CustLedgerEntry2 DO BEGIN
+        COPY(CustLedgerEntry);
+        REPEAT
+          VALIDATE("Exported to Payment File",TRUE);
+          CODEUNIT.RUN(CODEUNIT::"Cust. Entry-Edit",CustLedgerEntry2);
+        UNTIL NEXT = 0;
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

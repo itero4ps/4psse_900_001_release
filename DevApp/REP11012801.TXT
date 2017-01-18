@@ -1,0 +1,311 @@
+OBJECT Report 11012801 Create Serv. Order Cost Plus
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 11012819=m;
+    CaptionML=ENU=Create Service Order Cost Plus Entries;
+    ProcessingOnly=Yes;
+    OnPostReport=BEGIN
+                   IF CounterOK = 0 THEN
+                     MESSAGE(Text007)
+                   ELSE
+                     MESSAGE(Text008,CounterOK);  //db, 04-08-09: M15907
+                   CheckCompressLines;  //db, 20-09-10: M20069
+                 END;
+
+  }
+  DATASET
+  {
+    { 4723;    ;DataItem;                    ;
+               DataItemTable=Table11012819;
+               DataItemTableView=SORTING(Service Order No.)
+                                 WHERE(Transfer to Project=FILTER(' '|Processed));
+               OnPreDataItem=BEGIN
+                               //Boost performance invoicing from Base Order call 25049
+                               IF GETFILTER("Base Service Order No.") <> '' THEN BEGIN
+                                 SETCURRENTKEY("Base Service Order No.","Service Order No.","Cost Type");  //db, 10-02-12: M31700
+                               //ELSE
+                               //  SETCURRENTKEY("Service Order No.");  //db, 10-02-12: M31700
+                               END ELSE BEGIN
+                                 //SETCURRENTKEY("Service Order No.");  //db, 10-02-12: M31700
+                                 IF SortEntry = SortEntry::CostTypeObject THEN   //db, 14-11-12: C003383
+                                   SETCURRENTKEY("Service Order No.", "Source Type", "Cost Type", "Global Dimension 2 Code");
+                               END;
+
+                               IF DefaultReasonCodeFilter <> '' THEN BEGIN
+                                 FILTERGROUP(7);
+                                 SETFILTER("Reason Code", DefaultReasonCodeFilter);
+                                 FILTERGROUP(0);
+                               END;
+
+                               TmpServiceLedgerEntry.DELETEALL; //mg, 04-12-12: C004459
+                               CALCFIELDS("Service-Ledger Entry"."Service Order Status");
+                               ServSetup.GET;
+                               LOCKTABLE;
+                               CostPlusRec.LOCKTABLE;
+                               CounterTotal := COUNT;
+
+                               Window.OPEN(Text000 +
+                                           Text001);
+                             END;
+
+               OnAfterGetRecord=VAR
+                                  NSItemTrackingRelation@1100528503 : Record 11071905;
+                                  NSItemTrackingEntry@1100528502 : Record 11071902;
+                                  SerialServLedgEntry@1100528501 : Record 11012819;
+                                  TotQuanSpecified@1100528500 : Decimal;
+                                BEGIN
+                                  IF NOT Chargeable THEN
+                                    CurrReport.SKIP;  //db, 10-02-12: M31700
+
+                                  IF (("Document Type" = "Document Type"::"Sales Invoice") OR
+                                      ("Document Type" = "Document Type"::"Sales Credit Memo")) THEN
+                                    CurrReport.SKIP;
+
+                                  IF "Service Order No." = '' THEN
+                                    CurrReport.SKIP;
+
+                                  ServOrderRec.GET("Service Order No.");
+                                  ServOrderRec.CheckStatus(1);
+                                  IF ServOrderRec.CheckBlockedByFSA() THEN
+                                    ERROR(Text009, "Service Order No.");
+
+                                  Counter := Counter + 1;
+                                  Window.UPDATE(1,ROUND(Counter / CounterTotal * 10000,1));
+
+                                  //DP00121.sn
+                                  NSItemTrackingRelation.SETCURRENTKEY("Service Ledger Entry No.");
+                                  NSItemTrackingRelation.SETRANGE("Service Ledger Entry No.", "Entry No.");
+                                  IF SpecifySerialAndLot AND NOT NSItemTrackingRelation.ISEMPTY THEN BEGIN
+                                    NSItemTrackingRelation.FINDSET;
+                                    REPEAT
+                                      NSItemTrackingEntry.GET(NSItemTrackingRelation."Item Tracking Entry No.");
+                                      SerialServLedgEntry := "Service-Ledger Entry";
+                                      SerialServLedgEntry.Quantity := NSItemTrackingEntry.Quantity;
+                                      TotQuanSpecified := TotQuanSpecified + NSItemTrackingEntry.Quantity;
+                                      GenerateCostPlusFromServEntry(
+                                        SerialServLedgEntry, NSItemTrackingEntry."Serial No.", NSItemTrackingEntry."Lot No.");
+                                    UNTIL NSItemTrackingRelation.NEXT = 0;
+                                    IF Quantity <> TotQuanSpecified THEN BEGIN
+                                      SerialServLedgEntry := "Service-Ledger Entry";
+                                      SerialServLedgEntry.Quantity := Quantity - TotQuanSpecified;
+                                      GenerateCostPlusFromServEntry(SerialServLedgEntry, '','');
+                                    END;
+                                  END ELSE
+                                  //DP00121.en
+                                    GenerateCostPlusFromServEntry("Service-Ledger Entry",'','');
+
+                                  //db.sn, 20-09-10: M20069
+                                  TmpServOrderRec."No." := "Service Order No.";
+                                  IF TmpServOrderRec.INSERT THEN;
+                                  //db.en, 20-09-10: M20069
+
+                                  //mg.sc, 07-12-12: C004459 - "Cost Plus Entry Created" may be is in PK
+                                  TmpServiceLedgerEntry := "Service-Ledger Entry";
+                                  TmpServiceLedgerEntry.INSERT;
+                                  //"Cost Plus Entry Created" := TRUE;
+                                  //MODIFY;
+                                  //mg.sc, 07-12-12: C004459
+
+                                  CounterOK := CounterOK + 1;
+                                END;
+
+               OnPostDataItem=VAR
+                                ServiceLedgerEntry@1100409000 : Record 11012819;
+                              BEGIN
+                                //mg.sn, 07-12-12: C004459
+                                IF TmpServiceLedgerEntry.FINDSET THEN
+                                  REPEAT
+                                    ServiceLedgerEntry := TmpServiceLedgerEntry;
+                                    IF ServiceLedgerEntry.FIND('=') THEN BEGIN
+                                      ServiceLedgerEntry."Cost Plus Entry Created" := TRUE;
+                                      ServiceLedgerEntry.MODIFY;
+                                    END;
+                                  UNTIL TmpServiceLedgerEntry.NEXT = 0;
+                                //mg.sn, 07-12-12: C004459
+
+                                COMMIT;
+                                Window.CLOSE;
+                              END;
+
+               ReqFilterFields=Service Order No.,Cost Present }
+
+    { 1100525000;;DataItem;                  ;
+               DataItemTable=Table11012823;
+               DataItemTableView=SORTING(No.);
+               OnPreDataItem=BEGIN
+                               IF NOT InclExtraCost THEN
+                                 CurrReport.BREAK;
+                               IF "Service-Ledger Entry".GETFILTER("Base Service Order No.") <> '' THEN BEGIN
+                                 SETCURRENTKEY("Base Service Order No.");
+                                 SETFILTER("Base Service Order No.", "Service-Ledger Entry".GETFILTER("Base Service Order No."));
+                               END ELSE BEGIN
+                                 SETFILTER("No.", "Service-Ledger Entry".GETFILTER("Service Order No."));
+                               END;
+                             END;
+                              }
+
+    { 1100525001;1;DataItem;                 ;
+               DataItemTable=Table11020344;
+               DataItemTableView=SORTING(Entity Type,Entity Code,Line No.)
+                                 WHERE(Entity Type=CONST(Service Order),
+                                       Cost Plus Line No.=CONST(0));
+               OnAfterGetRecord=BEGIN
+                                  ServOrderRec.GET("Entity Code");
+                                  IF (ServOrderRec."Date/Time Export to FSA" = 0DT) OR
+                                     (ServOrderRec."Decentral Created") THEN BEGIN
+                                     // The first work order has no extra costs since this order was created decentral. So for this order, the extra costs may be copied to cost plus lines once.
+                                     // For subsequent work orders there is no difference with work orders that are not created decentral.
+                                    SetSkip4PSMobileCheck(TRUE);
+                                    InsertCostPlusEntry;
+                                    MODIFY(TRUE);
+                                    CounterOK += 1;
+                                  END;
+                                END;
+
+               DataItemLink=Entity Code=FIELD(No.) }
+
+  }
+  REQUESTPAGE
+  {
+    PROPERTIES
+    {
+      SaveValues=Yes;
+      OnOpenPage=BEGIN
+                   IF SortEntry = 0 THEN
+                     SortEntry := SortEntry::CostTypeObject;  //db, 14-11-12: C003383
+                 END;
+
+    }
+    CONTROLS
+    {
+      { 1210190000;;Container;
+                  ContainerType=ContentArea }
+
+      { 1210190001;1;Group  ;
+                  CaptionML=ENU=Options;
+                  GroupType=Group }
+
+      { 1210190002;2;Field  ;
+                  CaptionML=ENU=Compress Cost Plus Entries;
+                  SourceExpr=CompressCPE }
+
+      { 1210190003;2;Field  ;
+                  CaptionML=ENU=Convert Purchase-Inventory Unit;
+                  SourceExpr=ConvertUnit }
+
+      { 1210190004;2;Field  ;
+                  CaptionML=ENU=Automatic Translation;
+                  SourceExpr=AutoTranslate }
+
+      { 1210190005;2;Field  ;
+                  CaptionML=ENU=Default Reason Code Filter;
+                  SourceExpr=DefaultReasonCodeFilter;
+                  OnLookup=VAR
+                             ReasonCode@1100525001 : Record 231;
+                             ReasonCodes@1100525000 : Page 259;
+                           BEGIN
+                             ReasonCodes.LOOKUPMODE(TRUE);
+                             IF ReasonCodes.RUNMODAL = ACTION::LookupOK THEN BEGIN
+                               ReasonCodes.GETRECORD(ReasonCode);
+                               DefaultReasonCodeFilter := ReasonCodes.GetSelectionFilter;
+                             END;
+                           END;
+                            }
+
+      { 1100528500;2;Field  ;
+                  CaptionML=ENU=Specify Serial and Lot No.'s;
+                  SourceExpr=SpecifySerialAndLot }
+
+      { 1100409000;2;Field  ;
+                  CaptionML=ENU=Sort Entries;
+                  OptionCaptionML=ENU=,Entry No.,Cost Type - Cost Object;
+                  SourceExpr=SortEntry }
+
+      { 1100525000;2;Field  ;
+                  CaptionML=ENU=Include Extra Cost;
+                  SourceExpr=InclExtraCost }
+
+    }
+  }
+  LABELS
+  {
+  }
+  CODE
+  {
+    VAR
+      Text000@11012011 : TextConst 'ENU=Creating Cost Plus Entries....\\';
+      Text001@11012012 : TextConst 'ENU=Percentage Finished     @1@@@@@@@@@@@@@\';
+      Text007@11012018 : TextConst 'ENU=There are no Cost Plus Entries created.';
+      Text008@11012019 : TextConst 'ENU=%1 Cost Plus Entries have been created.';
+      ServSetup@1210190000 : Record 11012800;
+      ServOrderRec@1210190003 : Record 11012823;
+      TmpServOrderRec@1100525005 : TEMPORARY Record 11012823;
+      CostPlusRec@11012000 : Record 11012825;
+      TmpServiceLedgerEntry@1100409001 : TEMPORARY Record 11012819;
+      ConvertUnit@1100485006 : Boolean;
+      CompressCPE@1100485000 : Boolean;
+      CounterTotal@11012005 : Integer;
+      Counter@11012006 : Integer;
+      CounterOK@11012007 : Integer;
+      Window@11012008 : Dialog;
+      CompressCu@1100485005 : Codeunit 11012043;
+      AutoTranslate@1100525001 : Boolean;
+      Text009@1100525003 : TextConst 'ENU=Service Order %1 is blocked by its reference point.';
+      DefaultReasonCodeFilter@1210190001 : Text[250];
+      SpecifySerialAndLot@1100528500 : Boolean;
+      SortEntry@1100409000 : ',EntryNo,CostTypeObject';
+      InclExtraCost@1100525000 : Boolean;
+
+    PROCEDURE CheckCompressLines@1100525002();
+    VAR
+      CostPlusRec@1100530000 : Record 11012825;
+    BEGIN
+      //db, 20-09-10: M20069
+      IF CompressCPE THEN BEGIN
+        COMMIT;
+        IF TmpServOrderRec.FINDFIRST THEN BEGIN
+          REPEAT
+           CostPlusRec.SETRANGE("Service Order No.", TmpServOrderRec."No.");
+           IF CostPlusRec.FINDFIRST THEN BEGIN
+             REPEAT
+               CostPlusRec.MARK(TRUE);
+             UNTIL CostPlusRec.NEXT = 0;
+           END;
+          UNTIL TmpServOrderRec.NEXT = 0;
+        END;
+        CostPlusRec.MARKEDONLY(TRUE);
+        CostPlusRec.SETFILTER("Service Order No.", "Service-Ledger Entry".GETFILTER("Service Order No."));
+        IF CostPlusRec.FINDFIRST THEN
+          CompressCu.ProcessServiceCostPlus(CostPlusRec);
+      END;
+    END;
+
+    PROCEDURE GenerateCostPlusFromServEntry@1100528500(VAR ServLedgerEntry@1100528502 : Record 11012819;SerialNo@1100528501 : Code[40];LotNo@1100528500 : Code[20]);
+    BEGIN
+      //DP00121
+      //db.sn, 10-01-11: M22696
+      CostPlusRec.GenerateCostPlusFromServEntry(ServLedgerEntry,
+        ConvertUnit, AutoTranslate,  //db, -07-07-11: M21954
+        SerialNo, LotNo); //DP00121
+      //db.en, 10-01-11: M22696
+    END;
+
+    BEGIN
+    {
+      //db, 10-02-12: M31700, DataItemTableView removed: SORTING(Service Order No.) WHERE(Chargeable=CONST(Yes))
+      //db, 14-11-12: C003383, Sorting restored (default); choosen index stored by SortEntry.
+    }
+    END.
+  }
+  RDLDATA
+  {
+  }
+}
+

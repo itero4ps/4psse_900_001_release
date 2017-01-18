@@ -1,0 +1,824 @@
+OBJECT Codeunit 7313 Create Put-away
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW17.10;
+  }
+  PROPERTIES
+  {
+    TableNo=7319;
+    OnRun=BEGIN
+            PostedWhseRcptLine.COPY(Rec);
+            Code;
+            COPY(PostedWhseRcptLine)
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      PostedWhseRcptLine@1007 : Record 7319;
+      xPostedWhseRcptLine@1036 : TEMPORARY Record 7319;
+      WhseActivHeader@1009 : Record 5766;
+      WhseActivLine@1024 : Record 5767;
+      TempWhseActivHeader@1022 : TEMPORARY Record 5766;
+      TempWhseActivLine@1023 : TEMPORARY Record 5767;
+      TempWhseItemTrkgLine@1018 : TEMPORARY Record 6550;
+      PutAwayTemplHeader@1019 : Record 7307;
+      PutAwayTemplLine@1003 : Record 7308;
+      Location@1013 : Record 14;
+      BinContent@1002 : Record 7302;
+      Bin@1001 : Record 7354;
+      Item@1012 : Record 27;
+      SKU@1014 : Record 5700;
+      PutAwayItemUOM@1015 : Record 5404;
+      ProductGroup@1017 : Record 5723;
+      WMSMgt@1037 : Codeunit 7302;
+      BinTypeFilter@1004 : Text[250];
+      MessageText@1035 : Text[80];
+      WarehouseClassCode@1016 : Code[10];
+      AssignedID@1021 : Code[50];
+      EverythingHandled@1008 : Boolean;
+      DoNotFillQtytoHandle@1026 : Boolean;
+      BreakbulkFilter@1027 : Boolean;
+      QtyToPickBase@1039 : Decimal;
+      QtyToPutAwayBase@1040 : Decimal;
+      RemQtyToPutAwayBase@1041 : Decimal;
+      LineNo@1010 : Integer;
+      OldLineNo@1000 : Integer;
+      BreakbulkNo@1025 : Integer;
+      EntryNo@1028 : Integer;
+      SortActivity@1020 : ' ,Item,Document,Shelf/Bin No.,Due Date,Ship-To,Bin Ranking,Action Type';
+      Text001@1029 : TextConst 'ENU=There are no %1 created.';
+      Text002@1030 : TextConst 'ENU=There is not enough bin capacity for items.';
+      NewCrossDockBinContent@1034 : Boolean;
+      CrossDockBinContent@1033 : Record 7302;
+      CrossDock@1032 : Boolean;
+      CrossDockInfo@1031 : Option;
+      Text003@1038 : TextConst 'ENU=There is no default bin for one or more item.';
+
+    LOCAL PROCEDURE Code@1();
+    VAR
+      BinType@1005 : Record 7303;
+      BinContentQtyBase@1004 : Decimal;
+      TakeLineNo@1000 : Integer;
+      BreakPackage@1001 : Boolean;
+      Breakbulk@1003 : Boolean;
+    BEGIN
+      WITH PostedWhseRcptLine DO BEGIN
+        QtyToPickBase := 0;
+        QtyToPutAwayBase := 0;
+        CrossDockInfo := 0;
+        MessageText := '';
+        EverythingHandled := FALSE;
+        TempWhseActivLine.DELETEALL;
+
+        GetLocation("Location Code");
+        IF NOT Location."Bin Mandatory" THEN BEGIN
+          MakeCrossDockPutAway;
+          CalcQtyToPutAway(TRUE,FALSE);
+          EXIT;
+        END;
+
+        IF Location."Directed Put-away and Pick" THEN BEGIN
+          GetItemAndSKU("Item No.","Location Code","Variant Code");
+          GetPutAwayUOM;
+          GetPutAwayTemplate;
+          IF PutAwayTemplHeader.Code = '' THEN BEGIN
+            MessageText := STRSUBSTNO(Text001,PutAwayTemplHeader.TABLECAPTION);
+            EXIT;
+          END;
+
+          PutAwayTemplLine.RESET;
+          PutAwayTemplLine.SETRANGE("Put-away Template Code",PutAwayTemplHeader.Code);
+          IF NOT PutAwayTemplLine.FIND('-') THEN BEGIN
+            MessageText := STRSUBSTNO(Text001,PutAwayTemplLine.TABLECAPTION);
+            EXIT;
+          END;
+          RemQtyToPutAwayBase := "Qty. (Base)";
+          IF "Qty. per Unit of Measure" > PutAwayItemUOM."Qty. per Unit of Measure" THEN
+            CreateBreakPackageLines(PostedWhseRcptLine);
+
+          IF RemQtyToPutAwayBase = 0 THEN
+            EXIT;
+        END ELSE
+          RemQtyToPutAwayBase := "Qty. (Base)";
+
+        MakeCrossDockPutAway;
+
+        LineNo := LineNo + 10000;
+        IF Location."Directed Put-away and Pick" THEN BEGIN
+          BinType.CreateBinTypeFilter(BinTypeFilter,2);
+          REPEAT
+            QtyToPutAwayBase := RemQtyToPutAwayBase;
+            IF NOT (PutAwayTemplLine."Find Empty Bin" OR PutAwayTemplLine."Find Floating Bin") OR
+               PutAwayTemplLine."Find Fixed Bin" OR
+               PutAwayTemplLine."Find Same Item" OR
+               PutAwayTemplLine."Find Unit of Measure Match" OR
+               PutAwayTemplLine."Find Bin w. Less than Min. Qty"
+            THEN BEGIN
+              // Calc Availability per Bin Content
+              IF FindBinContent("Location Code","Item No.","Variant Code",WarehouseClassCode) THEN
+                REPEAT
+                  IF BinContent."Bin Code" <> "Bin Code" THEN BEGIN
+                    QtyToPutAwayBase := RemQtyToPutAwayBase;
+
+                    BinContent.CALCFIELDS("Quantity (Base)","Put-away Quantity (Base)","Positive Adjmt. Qty. (Base)");
+                    BinContentQtyBase :=
+                      BinContent."Quantity (Base)" + BinContent."Put-away Quantity (Base)" + BinContent."Positive Adjmt. Qty. (Base)";
+                    IF (NOT PutAwayTemplLine."Find Bin w. Less than Min. Qty" OR
+                        (BinContentQtyBase < BinContent."Min. Qty." * BinContent."Qty. per Unit of Measure")) AND
+                       (NOT PutAwayTemplLine."Find Empty Bin" OR (BinContentQtyBase <= 0))
+                    THEN BEGIN
+                      IF (BinContent."Max. Qty." <> 0) AND
+                         (BinContent."Max. Qty." * BinContent."Qty. per Unit of Measure" >= BinContentQtyBase)
+                      THEN BEGIN
+                        QtyToPutAwayBase := BinContent."Max. Qty." * BinContent."Qty. per Unit of Measure" - BinContentQtyBase;
+                        IF QtyToPutAwayBase > RemQtyToPutAwayBase THEN
+                          QtyToPutAwayBase := RemQtyToPutAwayBase;
+                      END;
+                      IF (BinContent."Max. Qty." <> 0) AND
+                         (BinContent."Max. Qty." * BinContent."Qty. per Unit of Measure" >= BinContentQtyBase)
+                      THEN BEGIN
+                        QtyToPutAwayBase :=
+                          BinContent."Max. Qty." * BinContent."Qty. per Unit of Measure" - BinContentQtyBase;
+                        IF QtyToPutAwayBase > RemQtyToPutAwayBase THEN
+                          QtyToPutAwayBase := RemQtyToPutAwayBase;
+                      END;
+
+                      GetBin("Location Code",BinContent."Bin Code");
+                      CalcQtyToPutAway(FALSE,FALSE);
+                    END;
+                  END;
+                UNTIL (BinContent.NEXT(-1) = 0) OR EverythingHandled
+            END ELSE BEGIN
+              // Calc Availability per Bin
+              IF FindBin("Location Code",WarehouseClassCode) THEN
+                REPEAT
+                  IF Bin.Code <> "Bin Code" THEN BEGIN
+                    QtyToPutAwayBase := RemQtyToPutAwayBase;
+                    IF BinContent.GET(
+                         "Location Code",Bin.Code,"Item No.","Variant Code",PutAwayItemUOM.Code)
+                    THEN BEGIN
+                      BinContent.CALCFIELDS("Quantity (Base)","Put-away Quantity (Base)","Positive Adjmt. Qty. (Base)");
+                      BinContentQtyBase :=
+                        BinContent."Quantity (Base)" +
+                        BinContent."Put-away Quantity (Base)" +
+                        BinContent."Positive Adjmt. Qty. (Base)";
+
+                      IF BinContent."Max. Qty." <> 0 THEN BEGIN
+                        QtyToPutAwayBase := BinContent."Max. Qty." * BinContent."Qty. per Unit of Measure" - BinContentQtyBase;
+                        IF QtyToPutAwayBase > RemQtyToPutAwayBase THEN
+                          QtyToPutAwayBase := RemQtyToPutAwayBase;
+                      END;
+                      CalcQtyToPutAway(FALSE,FALSE);
+                      BinContentQtyBase := BinContent.CalcQtyBase;
+                      IF BinContent."Max. Qty." <> 0 THEN BEGIN
+                        QtyToPutAwayBase :=
+                          BinContent."Max. Qty." * BinContent."Qty. per Unit of Measure" - BinContentQtyBase;
+                        IF QtyToPutAwayBase > RemQtyToPutAwayBase THEN
+                          QtyToPutAwayBase := RemQtyToPutAwayBase;
+                      END;
+                    END ELSE
+                      CalcQtyToPutAway(FALSE,TRUE);
+                  END;
+                UNTIL (Bin.NEXT(-1) = 0) OR EverythingHandled
+            END
+          UNTIL (PutAwayTemplLine.NEXT = 0) OR EverythingHandled;
+        END ELSE BEGIN
+          CLEAR(Bin);
+          IF WMSMgt.GetDefaultBin("Item No.","Variant Code","Location Code",Bin.Code) THEN
+            Bin.GET(Location.Code,Bin.Code);
+          QtyToPutAwayBase := RemQtyToPutAwayBase;
+          CalcQtyToPutAway(FALSE,FALSE);
+        END;
+
+        IF NOT EverythingHandled AND Location."Always Create Put-away Line" THEN BEGIN
+          QtyToPutAwayBase := RemQtyToPutAwayBase;
+          CalcQtyToPutAway(TRUE,FALSE);
+        END;
+
+        IF QtyToPickBase > 0 THEN BEGIN
+          IF InsertBreakPackageLines THEN BEGIN
+            TakeLineNo := OldLineNo + 30000;
+            Breakbulk := TRUE;
+          END ELSE BEGIN
+            TakeLineNo := OldLineNo + 10000;
+            IF ("Unit of Measure Code" <> PutAwayItemUOM.Code) AND
+               Location."Directed Put-away and Pick"
+            THEN
+              BreakPackage := TRUE;
+          END;
+          CreateNewWhseActivity(
+            PostedWhseRcptLine,WhseActivLine,1,TakeLineNo,
+            0,QtyToPickBase,FALSE,BreakPackage,FALSE,Breakbulk);
+          OldLineNo := LineNo
+        END ELSE
+          IF MessageText = '' THEN
+            IF Location."Directed Put-away and Pick" THEN
+              MessageText := Text002
+            ELSE
+              MessageText := Text003;
+      END
+    END;
+
+    LOCAL PROCEDURE CreateBreakPackageLines@12(PostedWhseReceiptLine@1000 : Record 7319);
+    BEGIN
+      WITH PostedWhseRcptLine DO BEGIN
+        LineNo := LineNo + 10000;
+        BreakbulkNo := BreakbulkNo + 1;
+        CreateNewWhseActivity(
+          PostedWhseReceiptLine,TempWhseActivLine,1,LineNo,
+          BreakbulkNo,"Qty. (Base)",FALSE,TRUE,FALSE,FALSE);
+        LineNo := LineNo + 10000;
+        CreateNewWhseActivity(
+          PostedWhseReceiptLine,TempWhseActivLine,2,LineNo,
+          BreakbulkNo,RemQtyToPutAwayBase,FALSE,FALSE,FALSE,TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertBreakPackageLines@24() : Boolean;
+    VAR
+      WhseActivLine@1000 : Record 5767;
+    BEGIN
+      IF TempWhseActivLine.FIND('-') THEN BEGIN
+        REPEAT
+          WhseActivLine.INIT;
+          WhseActivLine := TempWhseActivLine;
+          WhseActivLine."Activity Type" := WhseActivHeader.Type;
+          WhseActivLine."No." := WhseActivHeader."No.";
+          WhseActivLine."Bin Code" := PostedWhseRcptLine."Bin Code";
+          WhseActivLine."Zone Code" := PostedWhseRcptLine."Zone Code";
+          WhseActivLine.INSERT;
+        UNTIL TempWhseActivLine.NEXT = 0;
+        EXIT(TRUE);
+      END
+    END;
+
+    LOCAL PROCEDURE CreateNewWhseActivity@5(PostedWhseRcptLine@1001 : Record 7319;VAR WhseActivLine@1000 : Record 5767;ActionType@1002 : ',Take,Place';LineNo@1003 : Integer;BreakbulkNo@1008 : Integer;QtyToHandleBase@1010 : Decimal;InsertHeader@1004 : Boolean;BreakPackage@1006 : Boolean;EmptyZoneBin@1007 : Boolean;Breakbulk@1009 : Boolean);
+    BEGIN
+      WITH PostedWhseRcptLine DO BEGIN
+        IF (WhseActivHeader."No." = '') AND InsertHeader THEN
+          InsertWhseActivHeader("Location Code");
+
+        WhseActivLine.INIT;
+        WhseActivLine."Activity Type" := WhseActivHeader.Type;
+        WhseActivLine."No." := WhseActivHeader."No.";
+        WhseActivLine."Line No." := LineNo;
+        WhseActivLine."Action Type" := ActionType;
+        WhseActivLine."Source Type" := "Source Type";
+        WhseActivLine."Source Subtype" := "Source Subtype";
+        WhseActivLine."Source No." := "Source No.";
+        WhseActivLine."Source Line No." := "Source Line No.";
+        WhseActivLine."Source Document" := "Source Document";
+        IF WhseActivLine."Source Type" = 0 THEN
+          WhseActivLine."Whse. Document Type" := WhseActivLine."Whse. Document Type"::"Internal Put-away"
+        ELSE
+          WhseActivLine."Whse. Document Type" := WhseActivLine."Whse. Document Type"::Receipt;
+        WhseActivLine."Whse. Document No." := "No.";
+        WhseActivLine."Whse. Document Line No." := "Line No.";
+        WhseActivLine."Location Code" := Location.Code;
+        WhseActivLine."Shelf No." := "Shelf No.";
+        WhseActivLine."Due Date" := "Due Date";
+        WhseActivLine."Starting Date" := "Starting Date";
+        WhseActivLine."Breakbulk No." := BreakbulkNo;
+        WhseActivLine."Original Breakbulk" := Breakbulk;
+        IF BreakbulkFilter THEN
+          WhseActivLine.Breakbulk := Breakbulk;
+        CASE ActionType OF
+          ActionType::Take:
+            BEGIN
+              WhseActivLine."Bin Code" := "Bin Code";
+              WhseActivLine."Zone Code" := "Zone Code";
+            END;
+          ActionType::Place:
+            BEGIN
+              IF NOT EmptyZoneBin THEN
+                AssignPlaceBinZone(WhseActivLine);
+            END;
+          ELSE
+            BEGIN
+            WhseActivLine."Bin Code" := '';
+            WhseActivLine."Zone Code" := '';
+          END
+        END;
+        IF WhseActivLine."Bin Code" <> '' THEN BEGIN
+          WhseActivLine."Special Equipment Code" :=
+            GetSpecEquipmentCode(WhseActivLine."Bin Code");
+          GetBin(WhseActivLine."Location Code",WhseActivLine."Bin Code");
+          WhseActivLine.Dedicated := Bin.Dedicated;
+          WhseActivLine."Bin Ranking" := Bin."Bin Ranking";
+          WhseActivLine."Bin Type Code" := Bin."Bin Type Code";
+        END;
+        WhseActivLine."Item No." := "Item No.";
+        WhseActivLine."Variant Code" := "Variant Code";
+        WhseActivLine.Description := Description;
+        WhseActivLine."Description 2" := "Description 2";
+        WhseActivLine."Cross-Dock Information" := CrossDockInfo;
+        IF BreakPackage OR (ActionType = 0) OR
+           NOT Location."Directed Put-away and Pick"
+        THEN BEGIN
+          WhseActivLine."Unit of Measure Code" := "Unit of Measure Code";
+          WhseActivLine."Qty. per Unit of Measure" := "Qty. per Unit of Measure";
+        END ELSE BEGIN
+          WhseActivLine."Unit of Measure Code" := PutAwayItemUOM.Code;
+          WhseActivLine."Qty. per Unit of Measure" := PutAwayItemUOM."Qty. per Unit of Measure";
+        END;
+        WhseActivLine.VALIDATE(Quantity,ROUND(QtyToHandleBase / WhseActivLine."Qty. per Unit of Measure",0.00001));
+        IF QtyToHandleBase <> 0 THEN BEGIN
+          WhseActivLine."Qty. (Base)" := QtyToHandleBase;
+          WhseActivLine."Qty. to Handle (Base)" := QtyToHandleBase;
+          WhseActivLine."Qty. Outstanding (Base)" := QtyToHandleBase;
+        END;
+        IF DoNotFillQtytoHandle THEN BEGIN
+          WhseActivLine."Qty. to Handle" := 0;
+          WhseActivLine."Qty. to Handle (Base)" := 0;
+          WhseActivLine.Cubage := 0;
+          WhseActivLine.Weight := 0;
+        END;
+        IF "Serial No." <> '' THEN
+          WhseActivLine.TESTFIELD("Qty. per Unit of Measure",1);
+        WhseActivLine."Serial No." := "Serial No.";
+        WhseActivLine."Lot No." := "Lot No.";
+        WhseActivLine."Warranty Date" := "Warranty Date";
+        WhseActivLine."Expiration Date" := "Expiration Date";
+        WhseActivLine.INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE AssignPlaceBinZone@22(VAR WhseActivLine@1000 : Record 5767);
+    VAR
+      Bin2@1002 : Record 7354;
+    BEGIN
+      WITH WhseActivLine DO BEGIN
+        "Bin Code" := Bin.Code;
+        "Zone Code" := Bin."Zone Code";
+        IF Location.IsBWReceive AND
+           (CrossDockInfo <> "Cross-Dock Information"::"Cross-Dock Items") AND
+           ((Bin.Code = PostedWhseRcptLine."Bin Code") OR Location.IsBinBWReceiveOrShip(Bin.Code))
+        THEN BEGIN
+          Bin2.SETRANGE("Location Code",Location.Code);
+          Bin2.SETFILTER(Code,'<>%1&<>%2&<>%3',Location."Receipt Bin Code",Location."Shipment Bin Code",
+            PostedWhseRcptLine."Bin Code");
+          IF Bin2.FINDFIRST THEN BEGIN
+            "Bin Code" := Bin2.Code;
+            "Zone Code" := Bin2."Zone Code";
+          END ELSE BEGIN
+            "Bin Code" := '';
+            "Zone Code" := '';
+          END;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertWhseActivHeader@15(LocationCode@1000 : Code[10]);
+    BEGIN
+      WhseActivHeader.LOCKTABLE;
+      WhseActivHeader.INIT;
+      WhseActivHeader.Type := WhseActivHeader.Type::"Put-away";
+      WhseActivHeader."Location Code" := LocationCode;
+      WhseActivHeader.VALIDATE("Assigned User ID",AssignedID);
+      WhseActivHeader."Sorting Method" := SortActivity;
+      WhseActivHeader."Breakbulk Filter" := BreakbulkFilter;
+      WhseActivHeader.INSERT(TRUE);
+      COMMIT;
+      InsertTempWhseActivHeader(WhseActivHeader);
+      WhseActivLine.LOCKTABLE;
+    END;
+
+    LOCAL PROCEDURE FindBinContent@16(LocationCode@1003 : Code[10];ItemNo@1000 : Code[20];VariantCode@1002 : Code[10];WarehouseClassCode@1001 : Code[10]) : Boolean;
+    BEGIN
+      WITH BinContent DO BEGIN
+        RESET;
+        SETCURRENTKEY("Location Code","Warehouse Class Code",Fixed,"Bin Ranking");
+        SETRANGE("Location Code",LocationCode);
+        SETRANGE("Warehouse Class Code",WarehouseClassCode);
+        IF PutAwayTemplLine."Find Fixed Bin" THEN
+          SETRANGE(Fixed,TRUE)
+        ELSE
+          SETRANGE(Fixed,FALSE);
+        SETFILTER("Block Movement",'%1|%2',"Block Movement"::" ","Block Movement"::Outbound);
+        SETFILTER("Bin Type Code",BinTypeFilter);
+        SETRANGE("Cross-Dock Bin",FALSE);
+        IF PutAwayTemplLine."Find Same Item" THEN BEGIN
+          SETCURRENTKEY(
+            "Location Code","Item No.","Variant Code","Warehouse Class Code",Fixed,"Bin Ranking");
+          SETRANGE("Item No.",ItemNo);
+          SETRANGE("Variant Code",VariantCode);
+        END;
+        IF PutAwayTemplLine."Find Unit of Measure Match" THEN
+          SETRANGE("Unit of Measure Code",PutAwayItemUOM.Code);
+        IF FIND('+') THEN
+          EXIT(TRUE);
+
+        EXIT(FALSE)
+      END
+    END;
+
+    LOCAL PROCEDURE FindBin@17(LocationCode@1001 : Code[10];WarehouseClassCode@1000 : Code[10]) : Boolean;
+    VAR
+      WhseActivLine@1002 : Record 5767;
+    BEGIN
+      WITH Bin DO BEGIN
+        RESET;
+        SETCURRENTKEY("Location Code","Warehouse Class Code","Bin Ranking");
+        SETRANGE("Location Code",LocationCode);
+        SETRANGE("Warehouse Class Code",WarehouseClassCode);
+        SETRANGE("Adjustment Bin",FALSE);
+        SETFILTER("Block Movement",'%1|%2',"Block Movement"::" ","Block Movement"::Outbound);
+        SETFILTER("Bin Type Code",BinTypeFilter);
+        SETRANGE("Cross-Dock Bin",FALSE);
+        IF PutAwayTemplLine."Find Empty Bin" THEN
+          SETRANGE(Empty,TRUE);
+        IF FIND('+') THEN BEGIN
+          IF NOT (PutAwayTemplLine."Find Empty Bin" OR PutAwayTemplLine."Find Floating Bin") THEN
+            EXIT(TRUE);
+          REPEAT
+            IF PutAwayTemplLine."Find Empty Bin" THEN BEGIN
+              WhseActivLine.SETCURRENTKEY("Bin Code","Location Code","Action Type");
+              WhseActivLine.SETRANGE("Bin Code",Code);
+              WhseActivLine.SETRANGE("Location Code",LocationCode);
+              WhseActivLine.SETRANGE("Action Type",WhseActivLine."Action Type"::Place);
+              IF WhseActivLine.ISEMPTY THEN
+                IF NOT PutAwayTemplLine."Find Floating Bin" OR IsFloatingBin THEN
+                  EXIT(TRUE);
+            END ELSE
+              IF IsFloatingBin THEN
+                EXIT(TRUE);
+          UNTIL NEXT(-1) = 0;
+        END;
+      END;
+      EXIT(FALSE)
+    END;
+
+    LOCAL PROCEDURE CalcQtyToPutAway@19(EmptyZoneBin@1001 : Boolean;NewBinContent@1002 : Boolean);
+    VAR
+      ActionType@1000 : ',Take,Place';
+    BEGIN
+      IF Location."Bin Mandatory" THEN BEGIN
+        ActionType := ActionType::Place;
+        IF NOT EmptyZoneBin AND Location."Directed Put-away and Pick" THEN
+          CalcAvailCubageAndWeight;
+        IF QtyToPutAwayBase >= RemQtyToPutAwayBase THEN BEGIN
+          QtyToPutAwayBase := RemQtyToPutAwayBase;
+          EverythingHandled := TRUE;
+        END ELSE
+          RemQtyToPutAwayBase := RemQtyToPutAwayBase - QtyToPutAwayBase;
+      END ELSE
+        QtyToPutAwayBase := PostedWhseRcptLine."Qty. (Base)";
+
+      QtyToPickBase := QtyToPickBase + QtyToPutAwayBase;
+      IF QtyToPutAwayBase > 0 THEN BEGIN
+        LineNo := LineNo + 10000;
+        IF NewBinContent AND Location."Directed Put-away and Pick" THEN
+          CreateBinContent(PostedWhseRcptLine);
+        CreateNewWhseActivity(
+          PostedWhseRcptLine,WhseActivLine,ActionType,LineNo,
+          0,QtyToPutAwayBase,TRUE,FALSE,EmptyZoneBin,FALSE)
+      END
+    END;
+
+    LOCAL PROCEDURE CalcAvailCubageAndWeight@10();
+    VAR
+      AvailPerCubageBase@1001 : Decimal;
+      AvailPerWeightBase@1000 : Decimal;
+    BEGIN
+      WITH Bin DO BEGIN
+        IF ("Maximum Cubage" <> 0) OR ("Maximum Weight" <> 0) THEN BEGIN
+          CalcCubageAndWeight(AvailPerCubageBase,AvailPerWeightBase,FALSE);
+          IF ("Maximum Cubage" <> 0) AND (PutAwayItemUOM.Cubage <> 0) THEN BEGIN
+            AvailPerCubageBase := AvailPerCubageBase DIV PutAwayItemUOM.Cubage * PutAwayItemUOM."Qty. per Unit of Measure";
+            IF AvailPerCubageBase < 0 THEN
+              AvailPerCubageBase := 0;
+            IF AvailPerCubageBase < QtyToPutAwayBase THEN
+              QtyToPutAwayBase := AvailPerCubageBase;
+          END;
+          IF ("Maximum Weight" <> 0) AND (PutAwayItemUOM.Weight <> 0) THEN BEGIN
+            AvailPerWeightBase := AvailPerWeightBase DIV PutAwayItemUOM.Weight * PutAwayItemUOM."Qty. per Unit of Measure";
+            IF AvailPerWeightBase < 0 THEN
+              AvailPerWeightBase := 0;
+            IF AvailPerWeightBase < QtyToPutAwayBase THEN
+              QtyToPutAwayBase := AvailPerWeightBase;
+          END
+        END
+      END
+    END;
+
+    LOCAL PROCEDURE CreateBinContent@14(PostedWhseRcptLine@1000 : Record 7319);
+    VAR
+      NewBinContent@1001 : Record 7302;
+    BEGIN
+      WITH PostedWhseRcptLine DO BEGIN
+        NewBinContent.INIT;
+        NewBinContent."Location Code" := Bin."Location Code";
+        NewBinContent."Bin Code" := Bin.Code;
+        NewBinContent."Item No." := "Item No.";
+        NewBinContent."Variant Code" := "Variant Code";
+        NewBinContent."Unit of Measure Code" := PutAwayItemUOM.Code;
+        NewBinContent.Dedicated := Bin.Dedicated;
+        NewBinContent."Zone Code" := Bin."Zone Code";
+        NewBinContent."Bin Type Code" := Bin."Bin Type Code";
+        NewBinContent."Warehouse Class Code" := Bin."Warehouse Class Code";
+        NewBinContent."Block Movement" := Bin."Block Movement";
+        NewBinContent."Qty. per Unit of Measure" := PutAwayItemUOM."Qty. per Unit of Measure";
+        NewBinContent."Bin Ranking" := Bin."Bin Ranking";
+        NewBinContent."Cross-Dock Bin" := Bin."Cross-Dock Bin";
+        NewBinContent.INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE GetSpecEquipmentCode@3(BinCode@1000 : Code[20]) : Code[10];
+    BEGIN
+      CASE Location."Special Equipment" OF
+        Location."Special Equipment"::"According to Bin":
+          BEGIN
+            GetBin(Location.Code,BinCode);
+            IF Bin."Special Equipment Code" <> '' THEN
+              EXIT(Bin."Special Equipment Code");
+
+            IF SKU."Special Equipment Code" <> '' THEN
+              EXIT(SKU."Special Equipment Code");
+
+            EXIT(Item."Special Equipment Code")
+          END;
+        Location."Special Equipment"::"According to SKU/Item":
+          BEGIN
+            IF SKU."Special Equipment Code" <> '' THEN
+              EXIT(SKU."Special Equipment Code");
+
+            IF Item."Special Equipment Code" <> '' THEN
+              EXIT(Item."Special Equipment Code");
+
+            GetBin(Location.Code,BinCode);
+            EXIT(Bin."Special Equipment Code")
+          END
+      END
+    END;
+
+    LOCAL PROCEDURE GetLocation@33(LocationCode@1000 : Code[10]);
+    BEGIN
+      IF LocationCode <> Location.Code THEN
+        Location.GET(LocationCode)
+    END;
+
+    LOCAL PROCEDURE GetBin@21(LocationCode@1000 : Code[10];BinCode@1002 : Code[20]);
+    BEGIN
+      IF (Bin."Location Code" <> LocationCode) OR
+         (Bin.Code <> BinCode)
+      THEN
+        Bin.GET(LocationCode,BinCode)
+    END;
+
+    LOCAL PROCEDURE GetItemAndSKU@48(ItemNo@1000 : Code[20];LocationCode@1001 : Code[10];VariantCode@1002 : Code[10]);
+    BEGIN
+      IF Item."No." <> ItemNo THEN BEGIN
+        Item.GET(ItemNo);
+        GetWarehouseClassCode;
+      END;
+      IF (ItemNo <> SKU."Item No.") OR
+         (LocationCode <> SKU."Location Code") OR
+         (VariantCode <> SKU."Variant Code")
+      THEN BEGIN
+        IF NOT SKU.GET(Location.Code,Item."No.",PostedWhseRcptLine."Variant Code") THEN
+          CLEAR(SKU)
+      END
+    END;
+
+    LOCAL PROCEDURE GetWarehouseClassCode@51();
+    BEGIN
+      IF (Item."Item Category Code" <> ProductGroup."Item Category Code") OR
+         (Item."Product Group Code" <> ProductGroup.Code)
+      THEN BEGIN
+        IF ProductGroup.GET(Item."Item Category Code",Item."Product Group Code") THEN
+          WarehouseClassCode := ProductGroup."Warehouse Class Code"
+        ELSE
+          WarehouseClassCode := ''
+      END
+    END;
+
+    LOCAL PROCEDURE GetPutAwayUOM@57();
+    BEGIN
+      IF NOT Location."Directed Put-away and Pick" THEN BEGIN
+        PutAwayItemUOM.Code := PostedWhseRcptLine."Unit of Measure Code";
+        PutAwayItemUOM."Qty. per Unit of Measure" := PostedWhseRcptLine."Qty. per Unit of Measure";
+        EXIT;
+      END;
+      IF (PutAwayItemUOM."Item No." <> '') AND (PutAwayItemUOM.Code <> '') AND
+         (SKU."Item No." = PutAwayItemUOM."Item No.") AND
+         (SKU."Put-away Unit of Measure Code" = PutAwayItemUOM.Code)
+      THEN
+        EXIT;
+
+      IF (SKU."Put-away Unit of Measure Code" <> '') AND
+         ((Item."No." <> PutAwayItemUOM."Item No.") OR
+          (SKU."Put-away Unit of Measure Code" <> PutAwayItemUOM.Code))
+      THEN BEGIN
+        IF NOT PutAwayItemUOM.GET(Item."No.",SKU."Put-away Unit of Measure Code") THEN
+          IF NOT PutAwayItemUOM.GET(Item."No.",Item."Put-away Unit of Measure Code") THEN
+            PutAwayItemUOM.GET(Item."No.",PostedWhseRcptLine."Unit of Measure Code")
+      END ELSE
+        IF (Item."No." <> PutAwayItemUOM."Item No.") OR
+           (Item."Put-away Unit of Measure Code" <> PutAwayItemUOM.Code)
+        THEN
+          IF NOT PutAwayItemUOM.GET(Item."No.",Item."Put-away Unit of Measure Code") THEN
+            PutAwayItemUOM.GET(Item."No.",PostedWhseRcptLine."Unit of Measure Code")
+    END;
+
+    LOCAL PROCEDURE GetPutAwayTemplate@2();
+    BEGIN
+      IF SKU."Put-away Template Code" <> '' THEN BEGIN
+        IF SKU."Put-away Template Code" <> PutAwayTemplHeader.Code THEN
+          IF NOT PutAwayTemplHeader.GET(SKU."Put-away Template Code") THEN
+            IF (Item."Put-away Template Code" <> '') AND
+               (Item."Put-away Template Code" <> PutAwayTemplHeader.Code)
+            THEN
+              IF NOT PutAwayTemplHeader.GET(Item."Put-away Template Code") THEN
+                IF (PutAwayTemplHeader.Code <> Location."Put-away Template Code")
+                THEN
+                  PutAwayTemplHeader.GET(Location."Put-away Template Code");
+      END ELSE
+        IF (Item."Put-away Template Code" <> '') OR
+           (Item."Put-away Template Code" <> PutAwayTemplHeader.Code)
+        THEN BEGIN
+          IF NOT PutAwayTemplHeader.GET(Item."Put-away Template Code") THEN
+            IF (PutAwayTemplHeader.Code <> Location."Put-away Template Code")
+            THEN
+              PutAwayTemplHeader.GET(Location."Put-away Template Code")
+        END ELSE
+          PutAwayTemplHeader.GET(Location."Put-away Template Code")
+    END;
+
+    PROCEDURE SetValues@4(NewAssignedID@1002 : Code[50];NewSortActivity@1001 : ' ,Item,Document,Shelf/Bin No.,Due Date,Ship-To,Bin Ranking,Action Type';NewDoNotFillQtytoHandle@1003 : Boolean;BreakbulkFilter2@1004 : Boolean);
+    BEGIN
+      AssignedID := NewAssignedID;
+      SortActivity := NewSortActivity;
+      DoNotFillQtytoHandle := NewDoNotFillQtytoHandle;
+      BreakbulkFilter := BreakbulkFilter2;
+    END;
+
+    PROCEDURE GetWhseActivHeaderNo@6(VAR FirstPutAwayNo@1001 : Code[20];VAR LastPutAwayNo@1000 : Code[20]);
+    BEGIN
+      FirstPutAwayNo := WhseActivHeader."No.";
+      LastPutAwayNo := WhseActivHeader."No.";
+    END;
+
+    PROCEDURE EverythingIsHandled@7() : Boolean;
+    BEGIN
+      EXIT(EverythingHandled);
+    END;
+
+    LOCAL PROCEDURE InsertTempWhseActivHeader@13(WhseActivHeader@1000 : Record 5766);
+    BEGIN
+      TempWhseActivHeader.INIT;
+      TempWhseActivHeader := WhseActivHeader;
+      TempWhseActivHeader.INSERT;
+    END;
+
+    PROCEDURE GetFirstPutAwayDocument@11(VAR WhseActivHeader@1000 : Record 5766) : Boolean;
+    VAR
+      WhseActivLine@1002 : Record 5767;
+      Found@1001 : Boolean;
+    BEGIN
+      Found := TempWhseActivHeader.FIND('-');
+      IF Found THEN BEGIN
+        WhseActivHeader := TempWhseActivHeader;
+        WhseActivLine.SETRANGE("Activity Type",WhseActivHeader.Type);
+        WhseActivLine.SETRANGE("No.",WhseActivHeader."No.");
+        Found := WhseActivLine.FINDFIRST;
+      END;
+      EXIT(Found);
+    END;
+
+    PROCEDURE GetNextPutAwayDocument@9(VAR WhseActivHeader@1000 : Record 5766) : Boolean;
+    VAR
+      WhseActivLine@1002 : Record 5767;
+      Found@1001 : Boolean;
+    BEGIN
+      Found := TempWhseActivHeader.NEXT <> 0;
+      IF Found THEN BEGIN
+        WhseActivHeader := TempWhseActivHeader;
+        WhseActivLine.SETRANGE("Activity Type",WhseActivHeader.Type);
+        WhseActivLine.SETRANGE("No.",WhseActivHeader."No.");
+        Found := WhseActivLine.FINDFIRST;
+      END;
+      EXIT(Found);
+    END;
+
+    PROCEDURE GetMessage@18(VAR ErrText000@1000 : Text[80]);
+    BEGIN
+      ErrText000 := MessageText;
+    END;
+
+    PROCEDURE UpdateTempWhseItemTrkgLines@7304(PostedWhseRcptLine@1000 : Record 7319;SourceType@1001 : Integer);
+    BEGIN
+      TempWhseItemTrkgLine.INIT;
+      EntryNo += 1;
+      TempWhseItemTrkgLine."Entry No." := EntryNo;
+      TempWhseItemTrkgLine."Source Type" := SourceType;
+      TempWhseItemTrkgLine."Source ID" := PostedWhseRcptLine."No.";
+      TempWhseItemTrkgLine."Source Ref. No." := PostedWhseRcptLine."Line No.";
+      TempWhseItemTrkgLine."Serial No." := PostedWhseRcptLine."Serial No.";
+      TempWhseItemTrkgLine."Lot No." := PostedWhseRcptLine."Lot No.";
+      TempWhseItemTrkgLine."Quantity (Base)" := QtyToPickBase;
+      TempWhseItemTrkgLine.INSERT;
+    END;
+
+    PROCEDURE GetQtyHandledBase@7305(VAR TempRec@1000 : TEMPORARY Record 6550) QtyHandledBase@1001 : Decimal;
+    BEGIN
+      TempRec.RESET;
+      TempRec.DELETEALL;
+      QtyHandledBase := 0;
+      IF TempWhseItemTrkgLine.FIND('-') THEN
+        REPEAT
+          QtyHandledBase += TempWhseItemTrkgLine."Quantity (Base)";
+          TempRec := TempWhseItemTrkgLine;
+          TempRec.INSERT;
+        UNTIL TempWhseItemTrkgLine.NEXT = 0;
+      TempWhseItemTrkgLine.DELETEALL;
+      EXIT(QtyHandledBase);
+    END;
+
+    LOCAL PROCEDURE MakeCrossDockPutAway@8();
+    VAR
+      CrossDockMgt@1000 : Codeunit 5780;
+      UseCrossDock@1001 : Boolean;
+      UOMCode@1002 : Code[10];
+    BEGIN
+      WITH PostedWhseRcptLine DO BEGIN
+        IF NOT CrossDock THEN
+          EXIT;
+        CrossDockMgt.GetUseCrossDock(UseCrossDock,"Location Code","Item No.");
+        IF NOT UseCrossDock THEN
+          EXIT;
+        IF "Qty. Cross-Docked" <> 0 THEN BEGIN
+          IF NOT Location."Bin Mandatory" THEN
+            PutAwayItemUOM.GET("Item No.","Unit of Measure Code")
+          ELSE
+            Bin.GET("Location Code","Cross-Dock Bin Code");
+          LineNo := LineNo + 10000;
+          xPostedWhseRcptLine := PostedWhseRcptLine;
+          IF Location."Directed Put-away and Pick" THEN
+            Quantity := "Qty. Cross-Docked (Base)" / PutAwayItemUOM."Qty. per Unit of Measure"
+          ELSE
+            Quantity := "Qty. Cross-Docked";
+
+          QtyToPutAwayBase := "Qty. Cross-Docked (Base)";
+          RemQtyToPutAwayBase := "Qty. Cross-Docked (Base)";
+          "Zone Code" := "Cross-Dock Zone Code";
+          "Bin Code" := "Cross-Dock Bin Code";
+          IF Location."Directed Put-away and Pick" THEN
+            UOMCode := PutAwayItemUOM.Code
+          ELSE
+            UOMCode := "Unit of Measure Code";
+          IF CrossDockBinContent.GET("Location Code","Cross-Dock Bin Code","Item No.","Variant Code",UOMCode) THEN
+            NewCrossDockBinContent := FALSE
+          ELSE
+            NewCrossDockBinContent := TRUE;
+          IF NOT Location."Bin Mandatory" THEN
+            NewCrossDockBinContent := FALSE;
+          CrossDockInfo := 1;
+          CalcQtyToPutAway(FALSE,NewCrossDockBinContent);
+          CrossDockInfo := 2;
+          PostedWhseRcptLine := xPostedWhseRcptLine;
+          IF Location."Directed Put-away and Pick" THEN
+            Quantity := ("Qty. (Base)" - "Qty. Cross-Docked (Base)") / PutAwayItemUOM."Qty. per Unit of Measure"
+          ELSE
+            Quantity := Quantity - "Qty. Cross-Docked";
+
+          QtyToPutAwayBase := "Qty. (Base)" - "Qty. Cross-Docked (Base)";
+          RemQtyToPutAwayBase := "Qty. (Base)" - "Qty. Cross-Docked (Base)";
+          EverythingHandled := FALSE;
+        END;
+      END;
+    END;
+
+    PROCEDURE SetCrossDockValues@20(NewCrossDock@1000 : Boolean);
+    BEGIN
+      CrossDock := NewCrossDock;
+    END;
+
+    LOCAL PROCEDURE IsFloatingBin@23() : Boolean;
+    BEGIN
+      IF Bin.Dedicated = TRUE THEN
+        EXIT(FALSE);
+      WITH BinContent DO BEGIN
+        RESET;
+        SETRANGE("Location Code",Bin."Location Code");
+        SETRANGE("Zone Code",Bin."Zone Code");
+        SETRANGE("Bin Code",Bin.Code);
+        IF FINDSET THEN
+          REPEAT
+            IF Fixed OR Default THEN
+              EXIT(FALSE);
+          UNTIL NEXT = 0;
+        EXIT(TRUE);
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

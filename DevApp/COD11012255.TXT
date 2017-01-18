@@ -1,0 +1,266 @@
+OBJECT Codeunit 11012255 Post Shipping Order
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=11020623;
+    OnRun=BEGIN
+            ShippingOrderHeader := Rec;
+            ShippingOrderHeader.TESTFIELD(Status, ShippingOrderHeader.Status::Released);
+
+            RewriteSourceDocument;
+            PostSourceDocument;
+            Code();
+            Rec := ShippingOrderHeader;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      ShippingOrderHeader@1100525000 : Record 11020623;
+      Text001@1100525001 : TextConst 'ENU=Posting lines              #2######\';
+      Text002@1100525002 : TextConst 'ENU=Comment Lines              #3######\';
+      Text003@1100525003 : TextConst 'ENU=There is nothing to post!';
+      TmpShippingOrderLine@1100528805 : TEMPORARY Record 11071885;
+      PostingNoOld@1100528800 : Code[20];
+      PostingNoNew@1100528801 : Code[20];
+
+    PROCEDURE RewriteSourceDocument@1100525003();
+    VAR
+      ShippingOrderLine@1100528800 : Record 11071885;
+      SalesLine@1100528801 : Record 37;
+      PurchaseLine@1100528803 : Record 39;
+      ProjectInventoryDelivery@1100528805 : Record 11012671;
+      LineNo@1100528802 : Integer;
+    BEGIN
+      IF ShippingOrderHeader."Source Type" = ShippingOrderHeader."Source Type"::Project THEN
+        ProjectInventoryDelivery.UpdateDeliveryLines(ShippingOrderHeader."Source No.");
+
+      TmpShippingOrderLine.RESET;
+      TmpShippingOrderLine.DELETEALL;
+      LineNo := 0;
+
+      // Cumulate Lines
+      ShippingOrderLine.SETRANGE("Document No.", ShippingOrderHeader."No.");
+      IF ShippingOrderLine.FINDSET THEN BEGIN
+        REPEAT
+          TmpShippingOrderLine.SETRANGE("Document No.", ShippingOrderLine."Document No.");
+          TmpShippingOrderLine.SETRANGE("Source Line No.", ShippingOrderLine."Source Line No.");
+          IF NOT TmpShippingOrderLine.FINDFIRST THEN BEGIN
+            TmpShippingOrderLine."Document No." := ShippingOrderLine."Document No.";
+            TmpShippingOrderLine."Source Line No." := ShippingOrderLine."Source Line No.";
+            LineNo := LineNo + 10;
+            TmpShippingOrderLine."Line No." := LineNo;
+            TmpShippingOrderLine."Qty. to Ship" := ShippingOrderLine."Qty. to Ship";
+            TmpShippingOrderLine.INSERT;
+          END ELSE BEGIN
+            TmpShippingOrderLine."Qty. to Ship" += ShippingOrderLine."Qty. to Ship";
+            TmpShippingOrderLine.MODIFY;
+          END;
+        UNTIL ShippingOrderLine.NEXT = 0;
+      END;
+
+      // Process Cumulated Lines
+      TmpShippingOrderLine.RESET;
+      IF TmpShippingOrderLine.FINDSET THEN BEGIN
+        REPEAT
+          IF TmpShippingOrderLine."Qty. to Ship" <> 0 THEN BEGIN
+            CASE ShippingOrderHeader."Source Type" OF
+              ShippingOrderHeader."Source Type"::"Sales Order":
+                BEGIN
+                  SalesLine.GET(
+                    SalesLine."Document Type"::Order,ShippingOrderHeader."Source No.",
+                    TmpShippingOrderLine."Source Line No.");
+                  IF SalesLine."Qty. to Ship" <> TmpShippingOrderLine."Qty. to Ship" THEN BEGIN
+                    SalesLine.VALIDATE("Qty. to Ship", TmpShippingOrderLine."Qty. to Ship");
+                    SalesLine.MODIFY(TRUE);
+                  END;
+                END;
+              ShippingOrderHeader."Source Type"::"Purchase Return Order":
+                BEGIN
+                  PurchaseLine.GET(
+                    PurchaseLine."Document Type"::Order,ShippingOrderHeader."Source No.",
+                    TmpShippingOrderLine."Source Line No.");
+                  IF PurchaseLine."Qty. to Receive" <> -TmpShippingOrderLine."Qty. to Ship" THEN BEGIN
+                    PurchaseLine.VALIDATE("Qty. to Receive", -1 * TmpShippingOrderLine."Qty. to Ship");
+                    PurchaseLine.MODIFY(TRUE);
+                  END;
+                END;
+              ShippingOrderHeader."Source Type"::Project:
+                BEGIN
+                  RewriteDeliveryLine;
+                END;
+            END;
+          END;
+        UNTIL TmpShippingOrderLine.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE RewriteDeliveryLine@1100528800();
+    VAR
+      ProjectInventoryDelivery@1210190002 : Record 11012671;
+      ProjectInventoryEntry@1100528802 : Record 11012670;
+    BEGIN
+      WITH ProjectInventoryEntry DO BEGIN
+        GET(TmpShippingOrderLine."Source Line No.");
+
+        IF ProjectInventoryEntry.GetProjInventoryDeliveryLine(ProjectInventoryDelivery) THEN BEGIN
+          ProjectInventoryDelivery.VALIDATE(Quantity, TmpShippingOrderLine."Qty. to Ship");
+          ProjectInventoryDelivery.MODIFY(TRUE);
+        END;
+      END;
+    END;
+
+    PROCEDURE PostSourceDocument@1100528801();
+    VAR
+      SalesHeader@1100528802 : Record 36;
+      PurchaseHeader@1100528801 : Record 38;
+      ProjectInventoryDelivery@1100528804 : Record 11012671;
+      ProjInventDelPostCU@1100528805 : Codeunit 11012671;
+    BEGIN
+      CASE ShippingOrderHeader."Source Type" OF
+        ShippingOrderHeader."Source Type"::"Sales Order":
+          BEGIN
+            SalesHeader.GET(SalesHeader."Document Type"::Order,ShippingOrderHeader."Source No.");
+            SalesHeader.SendToPosting(81);
+          END;
+        ShippingOrderHeader."Source Type"::"Purchase Return Order":
+          BEGIN
+            PurchaseHeader.GET(PurchaseHeader."Document Type"::Order,ShippingOrderHeader."Source No.");
+            PurchaseHeader.SendToPosting(71);
+          END;
+        ShippingOrderHeader."Source Type"::Project:
+          BEGIN
+            ProjectInventoryDelivery.SETRANGE("Project No.", ShippingOrderHeader."Source No.");
+            ProjInventDelPostCU.RunWithCheck(ProjectInventoryDelivery, ShippingOrderHeader."No.");
+          END;
+      END;
+    END;
+
+    PROCEDURE Code@1100525000();
+    VAR
+      PostedShippingOrderHeader@1100525000 : Record 11020625;
+      PostedShippingOrderLine@1100525001 : Record 11071886;
+      ShippingOrderLine@1100525002 : Record 11071885;
+      ShippingOrderCommentLine@1100525005 : Record 11071887;
+      ShippingOrderCommentLine2@1100525006 : Record 11071887;
+      NoSeriesMgt@1100525004 : Codeunit 396;
+      Window@1100525007 : Dialog;
+      LineCount@1100525008 : Integer;
+    BEGIN
+      WITH ShippingOrderHeader DO BEGIN
+        TESTFIELD(Status, Status::Released);
+
+        Window.OPEN('#1#################################\\' + Text001 + Text002);
+        Window.UPDATE(1,STRSUBSTNO('%1 %2', ShippingOrderHeader.TABLECAPTION, "No."));
+
+        IF "Posting Date" = 0D THEN
+          "Posting Date" := WORKDATE;
+        IF "Shipment Date" = 0D THEN
+          "Shipment Date" := WORKDATE;
+
+        IF ("No. Series" <> "Posting No.") AND ("Posting No." <> '') THEN
+          "Posting No." := NoSeriesMgt.GetNextNo("No. Series", "Posting Date", TRUE)
+        ELSE
+          "Posting No." := "No.";
+
+        PostingNoOld := "No.";
+        PostingNoNew := "Posting No.";
+
+        PostedShippingOrderHeader.INIT;
+        PostedShippingOrderHeader.TRANSFERFIELDS(ShippingOrderHeader);
+        PostedShippingOrderHeader."No." := "Posting No.";
+        PostedShippingOrderHeader."Posted by" := USERID;
+        PostedShippingOrderHeader."Posted on" := WORKDATE;
+        PostedShippingOrderHeader.INSERT;
+
+        LineCount := 0;
+
+        ShippingOrderLine.RESET;
+        ShippingOrderLine.SETRANGE("Document No.", ShippingOrderHeader."No.");
+        IF ShippingOrderLine.FINDSET THEN BEGIN
+          REPEAT
+            LineCount += 1;
+            Window.UPDATE(2, LineCount);
+
+            PostedShippingOrderLine.INIT;
+            PostedShippingOrderLine.TRANSFERFIELDS(ShippingOrderLine);
+            PostedShippingOrderLine."Document No." := "Posting No.";
+            PostedShippingOrderLine.INSERT;
+          UNTIL ShippingOrderLine.NEXT = 0;
+        END ELSE
+          ERROR(Text003);
+
+        IF PostingNoOld <> PostingNoNew THEN BEGIN
+          LineCount := 0;
+
+          ShippingOrderCommentLine.RESET;
+          ShippingOrderCommentLine.SETRANGE("Document No.", ShippingOrderHeader."No.");
+          IF ShippingOrderCommentLine.FINDSET THEN BEGIN
+            REPEAT
+              LineCount += 1;
+              Window.UPDATE(3, LineCount);
+
+              ShippingOrderCommentLine2.INIT;
+              ShippingOrderCommentLine2.TRANSFERFIELDS(ShippingOrderCommentLine);
+              ShippingOrderCommentLine2."Document No." := "Posting No.";
+              ShippingOrderCommentLine2.INSERT;
+            UNTIL ShippingOrderCommentLine.NEXT = 0;
+          END;
+        END;
+
+        DeleteShippingOrder();
+
+        Window.CLOSE;
+      END;
+    END;
+
+    PROCEDURE DeleteShippingOrder@1100529800();
+    VAR
+      ShippingOrderLine@1100529802 : Record 11071885;
+      CommentLine@1100529803 : Record 11071887;
+    BEGIN
+      WITH ShippingOrderHeader DO BEGIN
+        ShippingOrderLine.RESET;
+        ShippingOrderLine.SETRANGE("Document No.", "No.");
+        ShippingOrderLine.DELETEALL(FALSE);
+
+        IF PostingNoOld <> PostingNoNew THEN BEGIN
+          CommentLine.RESET;
+          CommentLine.SETRANGE("Document No.", "No.");
+          CommentLine.DELETEALL(FALSE);
+        END;
+
+        DELETE(FALSE);
+      END;
+    END;
+
+    LOCAL PROCEDURE RunSalesPostYesNo@1100528404(SalesHeader@1100528400 : Record 36);
+    VAR
+      SalesPostYesNo@1100528401 : Codeunit 81;
+    BEGIN
+      SalesPostYesNo.RUN(SalesHeader);
+      IF NOT SalesPostYesNo.GetPostingHasBeenDone THEN
+        ERROR('');
+    END;
+
+    LOCAL PROCEDURE RunPurchPostYesNo@1100528405(PurchaseHeader@1100528400 : Record 38);
+    VAR
+      PurchPostYesNo@1100528401 : Codeunit 91;
+    BEGIN
+      PurchPostYesNo.RUN(PurchaseHeader);
+      IF NOT PurchPostYesNo.GetPostingHasBeenDone THEN
+        ERROR('');
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

@@ -1,0 +1,327 @@
+OBJECT Codeunit 5774 Whse.-Production Release
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Location@1000 : Record 14;
+      WhseRqst@1003 : Record 5765;
+      WhsePickRqst@1001 : Record 7325;
+      ProdOrderComp@1002 : Record 5407;
+
+    PROCEDURE Release@1(ProdHeader@1000 : Record 5405);
+    VAR
+      LocationCode2@1001 : Code[10];
+      CurrentSignFactor@1002 : Integer;
+      OldSignFactor@1003 : Integer;
+    BEGIN
+      IF ProdHeader.Status <> ProdHeader.Status::Released THEN
+        EXIT;
+
+      WITH ProdHeader DO BEGIN
+        ProdOrderComp.SETCURRENTKEY(Status,"Prod. Order No.","Location Code");
+        ProdOrderComp.SETRANGE(Status,Status);
+        ProdOrderComp.SETRANGE("Prod. Order No.","No.");
+        ProdOrderComp.SETFILTER(
+          "Flushing Method",
+          '%1|%2|%3',
+          ProdOrderComp."Flushing Method"::Manual,
+          ProdOrderComp."Flushing Method"::"Pick + Forward",
+          ProdOrderComp."Flushing Method"::"Pick + Backward");
+        ProdOrderComp.SETRANGE("Planning Level Code",0);
+        ProdOrderComp.SETFILTER("Remaining Quantity",'<>0');
+        IF ProdOrderComp.FIND('-') THEN
+          CreateWhseRqst(ProdOrderComp,ProdHeader);
+        REPEAT
+          CurrentSignFactor := SignFactor(ProdOrderComp.Quantity);
+          IF (ProdOrderComp."Location Code" <> LocationCode2) OR
+             (CurrentSignFactor <> OldSignFactor)
+          THEN
+            CreateWhseRqst(ProdOrderComp,ProdHeader);
+          LocationCode2 := ProdOrderComp."Location Code";
+          OldSignFactor := CurrentSignFactor;
+        UNTIL ProdOrderComp.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE CreateWhseRqst@3(VAR ProdOrderComp@1000 : Record 5407;VAR ProdHeader@1001 : Record 5405);
+    VAR
+      ProdOrderComp2@1002 : Record 5407;
+    BEGIN
+      GetLocation(ProdOrderComp."Location Code");
+      IF NOT Location."Require Pick" THEN
+        EXIT;
+
+      IF (ProdOrderComp."Flushing Method" = ProdOrderComp."Flushing Method"::"Pick + Forward") AND
+         (ProdOrderComp."Routing Link Code" = '')
+      THEN
+        EXIT;
+
+      ProdOrderComp2.COPY(ProdOrderComp);
+      ProdOrderComp2.SETRANGE("Location Code",ProdOrderComp."Location Code");
+      ProdOrderComp2.SETRANGE("Unit of Measure Code",'');
+      IF ProdOrderComp2.FINDFIRST THEN
+        ProdOrderComp2.TESTFIELD("Unit of Measure Code");
+
+      IF Location."Require Shipment" THEN BEGIN
+        IF ProdOrderComp."Remaining Quantity" > 0 THEN BEGIN
+          WhsePickRqst.INIT;
+          WhsePickRqst."Document Type" := WhsePickRqst."Document Type"::Production;
+          WhsePickRqst."Document Subtype" := ProdOrderComp.Status;
+          WhsePickRqst."Document No." := ProdOrderComp."Prod. Order No.";
+          WhsePickRqst.Status := WhsePickRqst.Status::Released;
+          WhsePickRqst."Location Code" := ProdOrderComp."Location Code";
+          WhsePickRqst."Completely Picked" :=
+            ProdOrderCompletelyPicked(
+              ProdOrderComp."Location Code",ProdHeader."No.",ProdHeader.Status,ProdOrderComp."Line No.");
+          IF WhsePickRqst."Completely Picked" AND (NOT ProdOrderComp."Completely Picked") THEN
+            WhsePickRqst."Completely Picked" := FALSE;
+          IF NOT WhsePickRqst.INSERT THEN
+            WhsePickRqst.MODIFY;
+        END
+      END ELSE BEGIN
+        WhseRqst.INIT;
+        IF ProdOrderComp."Remaining Quantity" > 0 THEN
+          WhseRqst.Type := WhseRqst.Type::Outbound
+        ELSE
+          WhseRqst.Type := WhseRqst.Type::Inbound;
+        WhseRqst."Location Code" := ProdOrderComp."Location Code";
+        WhseRqst."Source Type" := DATABASE::"Prod. Order Component";
+        WhseRqst."Source No." := ProdOrderComp."Prod. Order No.";
+        WhseRqst."Source Subtype" := ProdOrderComp.Status;
+        WhseRqst."Source Document" := WhseRqst."Source Document"::"Prod. Consumption";
+        WhseRqst."Document Status" := WhseRqst."Document Status"::Released;
+        CASE ProdHeader."Source Type" OF
+          ProdHeader."Source Type"::Item:
+            WhseRqst."Destination Type" := WhseRqst."Destination Type"::Item;
+          ProdHeader."Source Type"::Family:
+            WhseRqst."Destination Type" := WhseRqst."Destination Type"::Family;
+          ProdHeader."Source Type"::"Sales Header":
+            WhseRqst."Destination Type" := WhseRqst."Destination Type"::"Sales Order";
+        END;
+        WhseRqst."Destination No." := ProdHeader."Source No.";
+        WhseRqst."Completely Handled" :=
+          ProdOrderCompletelyHandled(ProdHeader,ProdOrderComp."Location Code");
+        IF NOT WhseRqst.INSERT THEN
+          WhseRqst.MODIFY;
+      END;
+    END;
+
+    PROCEDURE ReleaseLine@2(VAR ProdOrderComp@1000 : Record 5407;VAR OldProdOrderComp@1001 : Record 5407);
+    VAR
+      ProdHeader@1002 : Record 5405;
+      WarehouseRequest@1003 : Record 5765;
+      WhsePickRequest@1004 : Record 7325;
+    BEGIN
+      WITH ProdOrderComp DO BEGIN
+        GetLocation("Location Code");
+        IF Location."Require Pick" THEN
+          IF Location."Require Shipment" THEN BEGIN
+            IF "Remaining Quantity" > 0 THEN BEGIN
+              WhsePickRequest.INIT;
+              WhsePickRequest."Document Type" := WhsePickRequest."Document Type"::Production;
+              WhsePickRequest."Document Subtype" := Status;
+              WhsePickRequest."Document No." := "Prod. Order No.";
+              WhsePickRequest.Status := WhsePickRequest.Status::Released;
+              WhsePickRequest."Completely Picked" :=
+                ProdOrderCompletelyPicked("Location Code","Prod. Order No.",Status,"Line No.");
+              IF WhsePickRequest."Completely Picked" AND (NOT "Completely Picked") THEN
+                WhsePickRequest."Completely Picked" := FALSE;
+              WhsePickRequest."Location Code" := "Location Code";
+              IF NOT WhsePickRequest.INSERT THEN
+                WhsePickRequest.MODIFY;
+            END;
+          END ELSE
+            IF "Remaining Quantity" <> 0 THEN BEGIN
+              IF "Remaining Quantity" > 0 THEN
+                WarehouseRequest.Type := WarehouseRequest.Type::Outbound
+              ELSE
+                WarehouseRequest.Type := WarehouseRequest.Type::Inbound;
+              ProdHeader.GET(Status,"Prod. Order No.");
+              WarehouseRequest.INIT;
+              WarehouseRequest."Location Code" := "Location Code";
+              WarehouseRequest."Source Type" := DATABASE::"Prod. Order Component";
+              WarehouseRequest."Source No." := "Prod. Order No.";
+              WarehouseRequest."Source Subtype" := Status;
+              WarehouseRequest."Source Document" := WarehouseRequest."Source Document"::"Prod. Consumption";
+              WarehouseRequest."Document Status" := WarehouseRequest."Document Status"::Released;
+              CASE ProdHeader."Source Type" OF
+                ProdHeader."Source Type"::Item:
+                  WarehouseRequest."Destination Type" := WarehouseRequest."Destination Type"::Item;
+                ProdHeader."Source Type"::Family:
+                  WarehouseRequest."Destination Type" := WarehouseRequest."Destination Type"::Family;
+                ProdHeader."Source Type"::"Sales Header":
+                  WarehouseRequest."Destination Type" := WarehouseRequest."Destination Type"::"Sales Order";
+              END;
+              WarehouseRequest."Destination No." := ProdHeader."Source No.";
+              IF NOT WarehouseRequest.INSERT THEN
+                WarehouseRequest.MODIFY;
+            END;
+
+        IF ("Line No." = OldProdOrderComp."Line No.") AND
+           (("Location Code" <> OldProdOrderComp."Location Code") OR
+            (("Remaining Quantity" * OldProdOrderComp."Remaining Quantity") <= 0))
+        THEN
+          DeleteLine(OldProdOrderComp);
+      END;
+    END;
+
+    PROCEDURE DeleteLine@4(ProdOrderComp@1000 : Record 5407);
+    VAR
+      ProdOrderComp2@1001 : Record 5407;
+      KeepWhseRqst@1002 : Boolean;
+    BEGIN
+      WITH ProdOrderComp DO BEGIN
+        KeepWhseRqst := FALSE;
+        GetLocation("Location Code");
+        ProdOrderComp2.SETCURRENTKEY(Status,"Prod. Order No.","Location Code");
+        ProdOrderComp2.SETRANGE(Status,Status);
+        ProdOrderComp2.SETRANGE("Prod. Order No.","Prod. Order No.");
+        ProdOrderComp2.SETRANGE("Location Code","Location Code");
+        ProdOrderComp2.SETFILTER(
+          "Flushing Method",'%1|%2|%3',
+          ProdOrderComp2."Flushing Method"::Manual,
+          ProdOrderComp2."Flushing Method"::"Pick + Forward",
+          ProdOrderComp2."Flushing Method"::"Pick + Backward");
+        ProdOrderComp2.SETRANGE("Planning Level Code",0);
+        ProdOrderComp2.SETFILTER("Remaining Quantity",'<>0');
+        IF ProdOrderComp2.FIND('-') THEN
+          REPEAT
+            IF ((ProdOrderComp2.Status <> Status) OR
+                (ProdOrderComp2."Prod. Order No." <> "Prod. Order No.") OR
+                (ProdOrderComp2."Prod. Order Line No." <> "Prod. Order Line No.") OR
+                (ProdOrderComp2."Line No." <> "Line No.")) AND
+               ((NOT ProdOrderComp2."Completely Picked") OR
+                (NOT (Location."Require Pick" AND Location."Require Shipment")))
+            THEN
+              KeepWhseRqst := TRUE;
+          UNTIL (ProdOrderComp2.NEXT = 0) OR KeepWhseRqst;
+
+        IF NOT KeepWhseRqst THEN BEGIN
+          IF Location."Require Shipment" THEN
+            DeleteWhsePickRqst(ProdOrderComp,FALSE)
+          ELSE
+            DeleteWhseRqst(ProdOrderComp,FALSE);
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE DeleteWhsePickRqst@5(ProdOrderComp@1000 : Record 5407;DeleteAllWhsePickRqst@1003 : Boolean);
+    VAR
+      WhseRqst@1005 : Record 7325;
+    BEGIN
+      WITH ProdOrderComp DO BEGIN
+        WhsePickRqst.SETRANGE("Document Type",WhseRqst."Document Type"::Production);
+        WhsePickRqst.SETRANGE("Document No.","Prod. Order No.");
+        IF NOT DeleteAllWhsePickRqst THEN BEGIN
+          WhsePickRqst.SETRANGE("Document Subtype",Status);
+          WhsePickRqst.SETRANGE("Location Code","Location Code");
+        END;
+        WhsePickRqst.DELETEALL(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE DeleteWhseRqst@10(ProdOrderComp@1000 : Record 5407;DeleteAllWhseRqst@1003 : Boolean);
+    VAR
+      WhseRqst@1005 : Record 5765;
+    BEGIN
+      WITH ProdOrderComp DO BEGIN
+        IF NOT DeleteAllWhseRqst THEN
+          CASE TRUE OF
+            "Remaining Quantity" > 0:
+              WhseRqst.SETRANGE(Type,WhseRqst.Type::Outbound);
+            "Remaining Quantity" < 0:
+              WhseRqst.SETRANGE(Type,WhseRqst.Type::Inbound);
+            "Remaining Quantity" = 0:
+              EXIT;
+          END;
+        WhseRqst.SETRANGE("Source Type",DATABASE::"Prod. Order Component");
+        WhseRqst.SETRANGE("Source No.","Prod. Order No.");
+        IF NOT DeleteAllWhseRqst THEN BEGIN
+          WhseRqst.SETRANGE("Source Subtype",Status);
+          WhseRqst.SETRANGE("Location Code","Location Code");
+        END;
+        WhseRqst.DELETEALL(TRUE);
+      END;
+    END;
+
+    PROCEDURE FinishedDelete@6(VAR ProdHeader@1000 : Record 5405);
+    BEGIN
+      WITH ProdHeader DO BEGIN
+        ProdOrderComp.SETCURRENTKEY(Status,"Prod. Order No.","Location Code");
+        ProdOrderComp.SETRANGE(Status,Status);
+        ProdOrderComp.SETRANGE("Prod. Order No.","No.");
+        IF ProdOrderComp.FIND('-') THEN BEGIN
+          DeleteWhsePickRqst(ProdOrderComp,TRUE);
+          DeleteWhseRqst(ProdOrderComp,TRUE);
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE ProdOrderCompletelyPicked@7(LocationCode@1001 : Code[10];ProdOrderNo@1003 : Code[20];ProdOrderStatus@1000 : Option;CompLineNo@1004 : Integer) : Boolean;
+    VAR
+      ProdOrderComp@1002 : Record 5407;
+    BEGIN
+      ProdOrderComp.SETCURRENTKEY(Status,"Prod. Order No.","Location Code");
+      ProdOrderComp.SETRANGE(Status,ProdOrderStatus);
+      ProdOrderComp.SETRANGE("Prod. Order No.",ProdOrderNo);
+      ProdOrderComp.SETRANGE("Location Code",LocationCode);
+      ProdOrderComp.SETFILTER("Line No.",'<>%1',CompLineNo);
+      ProdOrderComp.SETRANGE("Flushing Method",ProdOrderComp."Flushing Method"::Manual);
+      ProdOrderComp.SETRANGE("Planning Level Code",0);
+      ProdOrderComp.SETRANGE("Completely Picked",FALSE);
+      EXIT(NOT ProdOrderComp.FINDFIRST);
+    END;
+
+    LOCAL PROCEDURE ProdOrderCompletelyHandled@9(ProdOrder@1000 : Record 5405;LocationCode@1001 : Code[10]) : Boolean;
+    VAR
+      ProdOrderComp@1002 : Record 5407;
+    BEGIN
+      ProdOrderComp.SETCURRENTKEY(Status,"Prod. Order No.","Location Code");
+      ProdOrderComp.SETRANGE(Status,ProdOrder.Status);
+      ProdOrderComp.SETRANGE("Prod. Order No.",ProdOrder."No.");
+      ProdOrderComp.SETRANGE("Location Code",LocationCode);
+      ProdOrderComp.SETFILTER(
+        "Flushing Method",'%1|%2|%3',
+        ProdOrderComp."Flushing Method"::Manual,
+        ProdOrderComp."Flushing Method"::"Pick + Forward",
+        ProdOrderComp."Flushing Method"::"Pick + Backward");
+      ProdOrderComp.SETRANGE("Planning Level Code",0);
+      ProdOrderComp.SETFILTER("Remaining Quantity",'<>0');
+      EXIT(NOT ProdOrderComp.FINDFIRST);
+    END;
+
+    LOCAL PROCEDURE GetLocation@8(LocationCode@1000 : Code[10]);
+    BEGIN
+      IF LocationCode <> Location.Code THEN BEGIN
+        IF LocationCode = '' THEN BEGIN
+          Location.GetLocationSetup(LocationCode,Location);
+          Location.Code := '';
+        END ELSE
+          Location.GET(LocationCode);
+      END;
+    END;
+
+    LOCAL PROCEDURE SignFactor@11(Quantity@1000 : Decimal) : Integer;
+    BEGIN
+      IF Quantity > 0 THEN
+        EXIT(1);
+      EXIT(-1);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

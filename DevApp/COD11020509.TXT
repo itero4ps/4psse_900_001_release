@@ -1,0 +1,312 @@
+OBJECT Codeunit 11020509 IMOS Inbound Document Mgt.
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+            CASE GlobalAction OF
+              GlobalAction::"Receive Documents":
+                BEGIN
+                  GetNewDocuments;
+                  COMMIT;
+                  UpdateInboundDocuments;
+                END;
+              GlobalAction::"Process Inbound Messages":
+                ProcessDocuments;
+            END;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      IMOSSetup@1000000004 : Record 11020549;
+      WerkbonMgt@1000000006 : Codeunit 11020513;
+      GlobalAction@1000000002 : 'Process Inbound Messages,Receive Documents';
+      IMOSSetupRead@1000000005 : Boolean;
+      Text001@1000000000 : TextConst 'ENU=Inbound Document does not match validation schema (%1)';
+      GlobalContinueOnError@1000000001 : Boolean;
+
+    PROCEDURE GetNewDocuments@1000000004();
+    VAR
+      PartnerAgreement@1000000001 : Record 11020547;
+      FileProtocolMgt@1000000000 : Codeunit 11020512;
+    BEGIN
+      PartnerAgreement.SETRANGE(Active,TRUE);
+      PartnerAgreement.SETRANGE(Direction,PartnerAgreement.Direction::Inbound);
+      PartnerAgreement.SETFILTER("File Protocol Code",'<>%1','');
+
+      IF PartnerAgreement.FIND('-') THEN
+        REPEAT
+          FileProtocolMgt.Receive(PartnerAgreement);
+        UNTIL PartnerAgreement.NEXT=0;
+    END;
+
+    PROCEDURE ProcessDocuments@1000000001();
+    VAR
+      PartnerAgreement@1000000000 : Record 11020547;
+    BEGIN
+      PartnerAgreement.SETRANGE(Active,TRUE);
+      PartnerAgreement.SETRANGE(Direction,PartnerAgreement.Direction::Inbound);
+      PartnerAgreement.SETFILTER("Codeunit No.",'<>%1',0);
+
+      IF PartnerAgreement.FIND('-') THEN
+        REPEAT
+          ReceiveDocuments(PartnerAgreement);
+        UNTIL PartnerAgreement.NEXT = 0;
+    END;
+
+    PROCEDURE ReceiveDocuments@1000000008(PartnerAgreement@1000000000 : Record 11020547);
+    VAR
+      InboundDocument@1000000001 : Record 11020538;
+    BEGIN
+      ReadIMOSSetup;
+      WITH InboundDocument DO BEGIN
+        SETRANGE("Agreement Code",PartnerAgreement."Agreement Code");
+        SETFILTER("No. Received",'<%1',IMOSSetup."Maximum Retry Documents");
+        SETFILTER(Status,'<>%1',Status::Processed);
+        IF NOT FIND('-') THEN
+          EXIT;
+
+        REPEAT
+          ReceiveDocument(InboundDocument);
+        UNTIL NEXT=0;
+      END;
+    END;
+
+    PROCEDURE ReceiveDocument@1000000011(InboundDocument@1000000000 : Record 11020538);
+    VAR
+      PartnerAgreement@1000000003 : Record 11020547;
+      ParseError@1000000002 : Text[1024];
+      XMLDOMDocument@1000000004 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+    BEGIN
+      ReadIMOSSetup;
+      WITH InboundDocument DO BEGIN
+        "No. Received" += 1;
+        Status := Status::Failed;
+        MODIFY;
+        COMMIT;
+        PartnerAgreement.GET("Agreement Code");
+        InboundDocument.GetInboundXMLDOM(XMLDOMDocument);
+
+        IF NOT PartnerAgreement.ValidateAgreementXMLDocument(PartnerAgreement,XMLDOMDocument,ParseError) THEN BEGIN
+          IF GlobalContinueOnError THEN
+            EXIT
+          ELSE
+            ERROR(Text001,ParseError);
+        END;
+
+        IF NOT ReceiveDocument2(InboundDocument,PartnerAgreement) THEN
+          EXIT;
+
+        FIND('=');
+        IF IMOSSetup."Delete Received Documents" THEN BEGIN
+          DELETE;
+        END ELSE BEGIN
+          "Date Received" := TODAY;
+          "Time Received" := TIME;
+          Status := Status::Processed;
+          MODIFY;
+          MaintainStatus(InboundDocument);
+        END;
+        COMMIT;
+      END;
+    END;
+
+    PROCEDURE ReceiveDocument2@1000000007(InboundDocument@1000000000 : Record 11020538;PartnerAgreement@1000000003 : Record 11020547) : Boolean;
+    VAR
+      CodeunitInterface@1000000004 : TEMPORARY Record 11020534;
+    BEGIN
+      CodeunitInterface.Action := CodeunitInterface.Action::"Receive Document";
+      CodeunitInterface.SetInboundDocument(InboundDocument);
+
+      IF GlobalContinueOnError THEN
+        EXIT(CODEUNIT.RUN(PartnerAgreement."Codeunit No.",CodeunitInterface));
+
+      CODEUNIT.RUN(PartnerAgreement."Codeunit No.",CodeunitInterface);
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE UpdateInboundDocuments@1000000005();
+    VAR
+      InboundDocument@1000000000 : Record 11020538;
+    BEGIN
+      IF InboundDocument.FIND('-') THEN BEGIN
+        REPEAT
+          IF InboundDocument."Agreement Code" = '' THEN BEGIN
+            UpdateInboundDocument(InboundDocument);
+            InboundDocument.MODIFY;
+            COMMIT;
+          END;
+        UNTIL InboundDocument.NEXT=0;
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdateInboundDocument@14(VAR InboundDocument@1000000001 : Record 11020538);
+    VAR
+      InboundDocumentRule@1000000002 : Record 11020546;
+      XMLDOMManagement4PS@1000000005 : Codeunit 11020220;
+      PartnerNo@1010 : Code[20];
+      xmlin@1000000000 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      XMLNode@1014 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      XMLDocNode@1016 : DotNet "'System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      RecRef@1000000003 : RecordRef;
+      FldRef@1000000004 : FieldRef;
+    BEGIN
+      WITH InboundDocumentRule DO BEGIN
+        SETCURRENTKEY(Priority);
+        IF FIND('-') THEN BEGIN
+          REPEAT
+            CASE Type OF
+              Type::"Protocol Code":
+                IF InboundDocument."Protocol Code" = Value THEN
+                  BEGIN
+                    UpdateInboundDocFields(InboundDocumentRule,InboundDocument);
+                  END;
+              Type::"File Name":
+                IF STRPOS(InboundDocument."File Name",DELCHR(Value,'=','*')) > 0 THEN
+                  BEGIN
+                    UpdateInboundDocFields(InboundDocumentRule,InboundDocument);
+                  END;
+              Type::"XQL Path":
+                BEGIN
+                  InboundDocument.GetInboundXMLDOM(xmlin);
+                  XMLDocNode := xmlin.DocumentElement;
+                  IF XMLDOMManagement4PS.FindNode(XMLDocNode,Value,XMLNode) THEN BEGIN
+                    RecRef.GETTABLE(InboundDocument);
+                    IF RecRef.FIELDEXIST("Destination Field No.") THEN BEGIN
+                      FldRef := RecRef.FIELD("Destination Field No.");
+                      IF NOT HasValue(FldRef.VALUE) THEN BEGIN
+                        FldRef.VALIDATE(XMLNode.InnerText);
+                        RecRef.SETTABLE(InboundDocument)
+                      END;
+                    END;
+                  END;
+                END;
+            END;
+          UNTIL (NEXT = 0) OR (InboundDocument."Agreement Code" <>'');
+        END;
+      END;
+      CLEAR(xmlin);
+      CLEAR(XMLDocNode);
+      CLEAR(XMLNode);
+    END;
+
+    PROCEDURE UpdateInboundDocFields@1000000010(InboundDocumentRule@1000000000 : Record 11020546;VAR InboundDocument@1000000001 : Record 11020538);
+    BEGIN
+      WITH InboundDocumentRule DO
+        BEGIN
+          IF (InboundDocument."Agreement Code" = '') AND ("Agreement Code" <> '') THEN
+            InboundDocument."Agreement Code" := "Agreement Code";
+        END;
+    END;
+
+    PROCEDURE SetReceiveDocuments@1000000000();
+    BEGIN
+      GlobalAction := GlobalAction::"Receive Documents";
+    END;
+
+    PROCEDURE SetProcesInboundDocs@1000000002(ContinueOnErrorIn@1000000000 : Boolean);
+    BEGIN
+      GlobalAction := GlobalAction::"Process Inbound Messages";
+      GlobalContinueOnError := ContinueOnErrorIn;
+    END;
+
+    PROCEDURE InsertDocument@1000000003(AgreementCode@1000000000 : Code[10];SourceType@1000000001 : Integer;SourceNo@1000000002 : Integer) : Integer;
+    VAR
+      InboundDocument@1000000003 : Record 11020538;
+    BEGIN
+      WITH InboundDocument DO
+        BEGIN
+          LOCKTABLE;
+          IF FIND('+') THEN;
+          "Entry No." += 1;
+          INIT;
+          "Source Type" := SourceType;
+          "Source No." := SourceNo;
+          "Agreement Code" := AgreementCode;
+          Status := InboundDocument.Status::Pending;
+          "Date Received" := TODAY;
+          "Time Received" := TIME;
+          INSERT;
+          EXIT("Entry No.");
+        END;
+    END;
+
+    LOCAL PROCEDURE HasValue@10(Value@1000 : Variant) : Boolean;
+    VAR
+      HasValue@1001 : Boolean;
+      Int@1002 : Integer;
+      Dec@1003 : Decimal;
+      D@1007 : Date;
+      T@1008 : Time;
+    BEGIN
+      CASE TRUE OF
+        Value.ISBOOLEAN :
+          HasValue := Value;
+        Value.ISOPTION :
+          HasValue := TRUE;
+        Value.ISINTEGER :
+          BEGIN
+            Int := Value;
+            HasValue := Int <> 0;
+          END;
+        Value.ISDECIMAL :
+          BEGIN
+            Dec := Value;
+            HasValue := Dec <> 0;
+          END;
+        Value.ISDATE :
+          BEGIN
+            D := Value;
+            HasValue := D <> 0D;
+          END;
+        Value.ISTIME :
+          BEGIN
+            T := Value;
+            HasValue := T <> 0T;
+          END;
+        Value.ISBINARY :
+          HasValue := FALSE;
+        ELSE
+          HasValue := FORMAT(Value) <> '';
+      END;
+      EXIT(HasValue);
+    END;
+
+    PROCEDURE ReadIMOSSetup@1000000009();
+    BEGIN
+      IF NOT IMOSSetupRead THEN
+        BEGIN
+          IMOSSetup.GET;
+          IMOSSetupRead := TRUE;
+        END;
+    END;
+
+    LOCAL PROCEDURE MaintainStatus@1000000012(InboundDocument@1000000000 : Record 11020538);
+    BEGIN
+      IMOSSetup.GET;
+      WITH InboundDocument DO BEGIN
+        CASE "Source Type" OF
+          DATABASE::"Inbound Job Notice":
+            WerkbonMgt.InMgtMaintainStatus(InboundDocument);
+        END;
+
+        IF (IMOSSetup."Delete Received Documents") AND
+           (InboundDocument.Status = InboundDocument.Status::Processed) THEN
+          DELETE
+        ELSE
+          MODIFY;
+      END;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

@@ -1,0 +1,525 @@
+OBJECT Codeunit 5813 Undo Purchase Receipt Line
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=121;
+    Permissions=TableData 39=imd,
+                TableData 120=m,
+                TableData 121=imd,
+                TableData 359=imd,
+                TableData 6507=ri,
+                TableData 6509=rimd;
+    OnRun=BEGIN
+            //**4PS.so
+            //SETRANGE(Type,Type::Item);
+            //IF NOT FIND('-') THEN
+            //  ERROR(Text005);
+            //**4PS.eo
+            SETFILTER(Type,'<>%1', Type::" "); //**4PS.n
+
+            IF NOT HideDialog THEN
+              IF NOT CONFIRM(Text000) THEN
+                EXIT;
+
+            PurchRcptLine.COPY(Rec);
+            Code;
+            Rec := PurchRcptLine;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1001 : TextConst 'ENU=Do you really want to undo the selected Receipt lines?';
+      Text001@1012 : TextConst 'ENU=Undo quantity posting...';
+      PurchRcptLine@1004 : Record 121;
+      TempWhseJnlLine@1014 : TEMPORARY Record 7311;
+      TempGlobalItemLedgEntry@1017 : TEMPORARY Record 32;
+      TempGlobalItemEntryRelation@1005 : TEMPORARY Record 6507;
+      InvtSetup@1002 : Record 313;
+      UndoPostingMgt@1022 : Codeunit 5817;
+      Text002@1003 : TextConst 'ENU=There is not enough space to insert correction lines.';
+      WhseUndoQty@1016 : Codeunit 7320;
+      InvtAdjmt@1006 : Codeunit 5895;
+      NSItemTrackingEntriesApply@1100528500 : Codeunit 11012352;
+      HideDialog@1007 : Boolean;
+      JobItem@1018 : Boolean;
+      Text003@1009 : TextConst 'ENU=Checking lines...';
+      OnlyDetermineDocLineNo@1100525000 : Boolean;
+      NextLineNo@1015 : Integer;
+      Text004@1010 : TextConst 'ENU=This receipt has already been invoiced. Undo Receipt can be applied only to posted, but not invoiced receipts.';
+      Text005@1011 : TextConst 'ENU=Undo Receipt can be performed only for lines of type Item. Please select a line of the Item type and repeat the procedure.';
+
+    PROCEDURE SetHideDialog@6(NewHideDialog@1000 : Boolean);
+    BEGIN
+      HideDialog := NewHideDialog;
+    END;
+
+    LOCAL PROCEDURE Code@4();
+    VAR
+      PostedWhseRcptLine@1001 : Record 7319;
+      PurchLine@1005 : Record 39;
+      Window@1003 : Dialog;
+      ItemRcptEntryNo@1002 : Integer;
+      DocLineNo@1000 : Integer;
+      PostedWhseRcptLineFound@1004 : Boolean;
+    BEGIN
+      WITH PurchRcptLine DO BEGIN
+        SETRANGE(Correction,FALSE);
+
+        REPEAT
+          IF NOT HideDialog THEN
+            Window.OPEN(Text003);
+          CheckPurchRcptLine(PurchRcptLine);
+        UNTIL NEXT = 0;
+
+        FIND('-');
+        REPEAT
+          TempGlobalItemLedgEntry.RESET;
+          IF NOT TempGlobalItemLedgEntry.ISEMPTY THEN
+            TempGlobalItemLedgEntry.DELETEALL;
+          TempGlobalItemEntryRelation.RESET;
+          IF NOT TempGlobalItemEntryRelation.ISEMPTY THEN
+            TempGlobalItemEntryRelation.DELETEALL;
+
+          IF NOT HideDialog THEN
+            Window.OPEN(Text001);
+
+          IF ("Job No." = '') AND (Type = Type::Item) THEN BEGIN //**4PS.n
+            PostedWhseRcptLineFound :=
+              WhseUndoQty.FindPostedWhseRcptLine(
+                PostedWhseRcptLine,
+                DATABASE::"Purch. Rcpt. Line",
+                "Document No.",
+                DATABASE::"Purchase Line",
+                PurchLine."Document Type"::Order,
+                "Order No.",
+                "Order Line No.");
+
+            ItemRcptEntryNo := PostItemJnlLine(PurchRcptLine,DocLineNo);
+          //**4PS.sn
+          END ELSE BEGIN
+            PostedWhseRcptLineFound := FALSE;
+            //* In 'PostItemJnlLine' now (since NAV2009) 'DocLineNo' is determined, but is not done always because of 4PS modification
+            OnlyDetermineDocLineNo := TRUE;
+            PostItemJnlLine(PurchRcptLine,DocLineNo);
+            OnlyDetermineDocLineNo := FALSE;
+          END;
+          UndoPlantReceipt(PurchRcptLine);
+          "Requested Receipt Date differs" := 0;
+          "Promised Receipt Date differs" := 0;
+          //**4PS.en
+          InsertNewReceiptLine(PurchRcptLine,ItemRcptEntryNo,DocLineNo);
+          IF PostedWhseRcptLineFound THEN
+            WhseUndoQty.UndoPostedWhseRcptLine(PostedWhseRcptLine);
+
+          UpdateOrderLine(PurchRcptLine);
+          IF PostedWhseRcptLineFound THEN
+            WhseUndoQty.UpdateRcptSourceDocLines(PostedWhseRcptLine);
+
+          UndoNSItemTracking(PurchRcptLine,DocLineNo); //**4PS.n DP00121
+
+          IF ("Blanket Order No." <> '') AND ("Blanket Order Line No." <> 0) THEN
+            UpdateBlanketOrder(PurchRcptLine);
+
+          "Quantity Invoiced" := Quantity;
+          "Qty. Invoiced (Base)" := "Quantity (Base)";
+          "Qty. Rcd. Not Invoiced" := 0;
+          Correction := TRUE;
+
+          MODIFY;
+
+          IF NOT JobItem THEN
+            JobItem := (Type = Type::Item) AND ("Job No." <> '');
+        UNTIL NEXT = 0;
+
+        InvtSetup.GET;
+        IF InvtSetup."Automatic Cost Adjustment" <>
+           InvtSetup."Automatic Cost Adjustment"::Never
+        THEN BEGIN
+          InvtAdjmt.SetProperties(TRUE,InvtSetup."Automatic Cost Posting");
+          InvtAdjmt.SetJobUpdateProperties(NOT JobItem);
+          InvtAdjmt.MakeMultiLevelAdjmt;
+        END;
+
+        WhseUndoQty.PostTempWhseJnlLine(TempWhseJnlLine);
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckPurchRcptLine@2(PurchRcptLine@1000 : Record 121);
+    VAR
+      TempItemLedgEntry@1003 : TEMPORARY Record 32;
+      PurchHeader@1100485000 : Record 38;
+    BEGIN
+      WITH PurchRcptLine DO BEGIN
+        //**4PS.so
+        //TESTFIELD(Type,Type::Item);
+        //IF "Qty. Rcd. Not Invoiced" <> Quantity THEN
+        //  ERROR(Text004);
+        //**4PS.eo
+
+        //**4PS.sn
+        PurchHeader.GET(PurchHeader."Document Type"::Order,"Order No.");
+        IF NOT PurchHeader."Amounts only" THEN BEGIN
+          IF("Qty. Rcd. Not Invoiced" <> Quantity) THEN
+            ERROR(Text004);
+        END ELSE
+          TESTFIELD("Invoiced (line)",0);
+
+        IF (Type <> Type::Item) AND (Type <> Type::"G/L Account") THEN
+          EXIT;
+        //**4PS.en
+
+        TESTFIELD("Prod. Order No.",'');
+        TESTFIELD("Sales Order No.",'');
+        TESTFIELD("Sales Order Line No.",0);
+
+        IF Type = Type::Item THEN BEGIN //**4PS.n
+          UndoPostingMgt.TestPurchRcptLine(PurchRcptLine);
+          UndoPostingMgt.CollectItemLedgEntries(TempItemLedgEntry,DATABASE::"Purch. Rcpt. Line",
+            "Document No.","Line No.","Quantity (Base)","Item Rcpt. Entry No.");
+          UndoPostingMgt.CheckItemLedgEntries(TempItemLedgEntry,"Line No.");
+        END; //**4PS.n
+      END;
+    END;
+
+    LOCAL PROCEDURE PostItemJnlLine@13(PurchRcptLine@1000 : Record 121;VAR DocLineNo@1005 : Integer) : Integer;
+    VAR
+      ItemJnlLine@1002 : Record 83;
+      PurchLine@1004 : Record 39;
+      PurchRcptHeader@1003 : Record 120;
+      PurchRcptLine2@1007 : Record 121;
+      SourceCodeSetup@1001 : Record 242;
+      TempApplyToEntryList@1008 : TEMPORARY Record 32;
+      LineSpacing@1006 : Integer;
+    BEGIN
+      WITH PurchRcptLine DO BEGIN
+        PurchRcptLine2.SETRANGE("Document No.","Document No.");
+        PurchRcptLine2."Document No." := "Document No.";
+        PurchRcptLine2."Line No." := "Line No.";
+        PurchRcptLine2.FIND('=');
+
+        DocLineNo := 0;  //**4PS.n  23007
+        IF PurchRcptLine2.FIND('>') THEN BEGIN
+          LineSpacing := (PurchRcptLine2."Line No." - "Line No.") DIV 2;
+          //**4PS.so  23007
+          //IF LineSpacing = 0 THEN
+          //  ERROR(Text002);
+          //**4PS.eo  23007
+          //**4PS.sn  23007
+          IF LineSpacing = 0 THEN BEGIN
+            PurchRcptLine2.FINDLAST;
+            LineSpacing := 10000;
+            DocLineNo := PurchRcptLine2."Line No." + LineSpacing;
+          END;
+          //**4PS.sn  23007.en
+        END ELSE
+          LineSpacing := 10000;
+        IF DocLineNo = 0 THEN  //**4PS.n  23007
+          DocLineNo := "Line No." + LineSpacing;
+        IF OnlyDetermineDocLineNo THEN EXIT;  //**4PS.n  MERGE2009
+
+        SourceCodeSetup.GET;
+        PurchRcptHeader.GET("Document No.");
+        ItemJnlLine.INIT;
+        ItemJnlLine."Entry Type" := ItemJnlLine."Entry Type"::Purchase;
+        ItemJnlLine."Item No." := "No.";
+        ItemJnlLine."Posting Date" := PurchRcptHeader."Posting Date";
+        ItemJnlLine."Document No." := "Document No.";
+        ItemJnlLine."Document Line No." := DocLineNo;
+        ItemJnlLine."Document Type" := ItemJnlLine."Document Type"::"Purchase Receipt";
+        ItemJnlLine."Gen. Bus. Posting Group" := "Gen. Bus. Posting Group";
+        ItemJnlLine."Gen. Prod. Posting Group" := "Gen. Prod. Posting Group";
+        ItemJnlLine."Location Code" := "Location Code";
+        ItemJnlLine."Source Code" := SourceCodeSetup.Purchases;
+        ItemJnlLine."Variant Code" := "Variant Code";
+        ItemJnlLine."Bin Code" := "Bin Code";
+        ItemJnlLine."Unit of Measure Code" := "Unit of Measure Code";
+        ItemJnlLine."Qty. per Unit of Measure" := "Qty. per Unit of Measure";
+        ItemJnlLine."Document Date" := PurchRcptHeader."Document Date";
+        ItemJnlLine."Shortcut Dimension 1 Code" := "Shortcut Dimension 1 Code";
+        ItemJnlLine."Shortcut Dimension 2 Code" := "Shortcut Dimension 2 Code";
+        ItemJnlLine."Dimension Set ID" := "Dimension Set ID";
+
+        IF "Job No." = '' THEN BEGIN
+          ItemJnlLine.Correction := TRUE;
+          ItemJnlLine."Applies-to Entry" := "Item Rcpt. Entry No.";
+        END ELSE BEGIN
+          ItemJnlLine."Job No." := "Job No.";
+          ItemJnlLine."Job Task No." := "Job Task No.";
+          ItemJnlLine."Job Purchase" := TRUE;
+          ItemJnlLine."Unit Cost" := "Unit Cost (LCY)";
+        END;
+        ItemJnlLine.Quantity := -Quantity;
+        ItemJnlLine."Quantity (Base)" := -"Quantity (Base)";
+
+        WhseUndoQty.InsertTempWhseJnlLine(ItemJnlLine,
+          DATABASE::"Purchase Line",
+          PurchLine."Document Type"::Order,
+          "Order No.",
+          "Line No.",
+          TempWhseJnlLine."Reference Document"::"Posted Rcpt.",
+          TempWhseJnlLine,
+          NextLineNo);
+
+        IF "Item Rcpt. Entry No." <> 0 THEN BEGIN
+          IF "Job No." <> '' THEN
+            UndoPostingMgt.TransferSourceValues(ItemJnlLine,"Item Rcpt. Entry No.");
+          UndoPostingMgt.PostItemJnlLine(ItemJnlLine);
+          IF "Job No." <> '' THEN
+            UndoPostingMgt.ReapplyJobConsumption("Item Rcpt. Entry No.");
+
+          EXIT(ItemJnlLine."Item Shpt. Entry No.");
+        END;
+
+        UndoPostingMgt.CollectItemLedgEntries(
+          TempApplyToEntryList,DATABASE::"Purch. Rcpt. Line","Document No.","Line No.","Quantity (Base)","Item Rcpt. Entry No.");
+
+        IF "Job No." <> '' THEN
+          IF TempApplyToEntryList.FINDSET THEN
+            REPEAT
+              UndoPostingMgt.ReapplyJobConsumption(TempApplyToEntryList."Entry No.");
+            UNTIL TempApplyToEntryList.NEXT = 0;
+
+        UndoPostingMgt.PostItemJnlLineAppliedToList(ItemJnlLine,TempApplyToEntryList,
+          Quantity,"Quantity (Base)",TempGlobalItemLedgEntry,TempGlobalItemEntryRelation);
+
+        EXIT(0); // "Item Shpt. Entry No."
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertNewReceiptLine@1(OldPurchRcptLine@1000 : Record 121;ItemRcptEntryNo@1002 : Integer;DocLineNo@1004 : Integer);
+    VAR
+      NewPurchRcptLine@1001 : Record 121;
+      PurchRcptHeader@1210190000 : Record 120;
+      lvPurchPostCU@1100525000 : Codeunit 90;
+    BEGIN
+      WITH OldPurchRcptLine DO BEGIN
+        NewPurchRcptLine.INIT;
+        NewPurchRcptLine.COPY(OldPurchRcptLine);
+        NewPurchRcptLine."Line No." := DocLineNo;
+        NewPurchRcptLine."Appl.-to Item Entry" := "Item Rcpt. Entry No.";
+        NewPurchRcptLine."Item Rcpt. Entry No." := ItemRcptEntryNo;
+        NewPurchRcptLine.Quantity := -Quantity;
+        //**4PS.sn
+        NewPurchRcptLine."Received (line)" := -OldPurchRcptLine."Received (line)";
+        NewPurchRcptLine."Amount (LCY)" := -OldPurchRcptLine."Amount (LCY)";
+        //**4PS.en
+        NewPurchRcptLine."Quantity (Base)" := -"Quantity (Base)";
+        NewPurchRcptLine."Quantity Invoiced" := NewPurchRcptLine.Quantity;
+        NewPurchRcptLine."Qty. Invoiced (Base)" := NewPurchRcptLine."Quantity (Base)";
+        NewPurchRcptLine."Qty. Rcd. Not Invoiced" := 0;
+        NewPurchRcptLine.Correction := TRUE;
+        NewPurchRcptLine."Dimension Set ID" := "Dimension Set ID";
+        NewPurchRcptLine.INSERT;
+
+        //**4PS.sn
+        PurchRcptHeader.GET(OldPurchRcptLine."Document No.");
+        PurchRcptHeader."Received Not Invoiced" := PurchRcptHeader."Received Not Invoiced" - OldPurchRcptLine."Received (line)";
+        PurchRcptHeader.MODIFY;
+        //**4PS.en
+
+        InsertItemEntryRelation(TempGlobalItemEntryRelation,NewPurchRcptLine);
+
+        lvPurchPostCU.UndoProjectInventory(NewPurchRcptLine);  //**4PS.n
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdateOrderLine@3(PurchRcptLine@1000 : Record 121);
+    VAR
+      PurchLine@1002 : Record 39;
+      PurchHeader@1100485000 : Record 38;
+    BEGIN
+      WITH PurchRcptLine DO BEGIN
+        PurchLine.GET(PurchLine."Document Type"::Order,"Order No.","Order Line No.");
+        //**4PS.sn
+        PurchHeader.GET(PurchLine."Document Type", PurchLine."Document No.");
+        UndoPostingMgt.PassPurchRcptLine(PurchHeader,PurchRcptLine);
+        //**4PS.en
+        UndoPostingMgt.UpdatePurchLine(PurchLine,Quantity,"Quantity (Base)",TempGlobalItemLedgEntry);
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdateBlanketOrder@5(PurchRcptLine@1000 : Record 121);
+    VAR
+      BlanketOrderPurchaseLine@1001 : Record 39;
+    BEGIN
+      WITH PurchRcptLine DO
+        IF BlanketOrderPurchaseLine.GET(
+             BlanketOrderPurchaseLine."Document Type"::"Blanket Order","Blanket Order No.","Blanket Order Line No.")
+        THEN BEGIN
+          BlanketOrderPurchaseLine.TESTFIELD(Type,Type);
+          BlanketOrderPurchaseLine.TESTFIELD("No.","No.");
+          BlanketOrderPurchaseLine.TESTFIELD("Buy-from Vendor No.","Buy-from Vendor No.");
+
+          IF BlanketOrderPurchaseLine."Qty. per Unit of Measure" = "Qty. per Unit of Measure" THEN
+            BlanketOrderPurchaseLine."Quantity Received" := BlanketOrderPurchaseLine."Quantity Received" - Quantity
+          ELSE
+            BlanketOrderPurchaseLine."Quantity Received" :=
+              BlanketOrderPurchaseLine."Quantity Received" -
+              ROUND("Qty. per Unit of Measure" / BlanketOrderPurchaseLine."Qty. per Unit of Measure" * Quantity,0.00001);
+
+          BlanketOrderPurchaseLine."Qty. Received (Base)" := BlanketOrderPurchaseLine."Qty. Received (Base)" - "Quantity (Base)";
+          BlanketOrderPurchaseLine.InitOutstanding;
+          BlanketOrderPurchaseLine.MODIFY;
+        END;
+    END;
+
+    LOCAL PROCEDURE InsertItemEntryRelation@10(VAR TempItemEntryRelation@1006 : TEMPORARY Record 6507;NewPurchRcptLine@1002 : Record 121);
+    VAR
+      ItemEntryRelation@1001 : Record 6507;
+    BEGIN
+      IF TempItemEntryRelation.FIND('-') THEN
+        REPEAT
+          ItemEntryRelation := TempItemEntryRelation;
+          ItemEntryRelation.TransferFieldsPurchRcptLine(NewPurchRcptLine);
+          ItemEntryRelation.INSERT;
+        UNTIL TempItemEntryRelation.NEXT = 0;
+    END;
+
+    PROCEDURE UndoPlantReceipt@1100525002(IPurchRcptLineRec@1100525000 : Record 121);
+    VAR
+      lvPlantNoRec@1100525001 : Record 11012552;
+      lvPurchLineRec@1100525004 : Record 39;
+      lvExtendedPlantOrderFuncCU@1100525006 : Codeunit 11020503;
+      lvUndoPlantOrder@1100525005 : Boolean;
+      lvQuantity@1100525003 : Decimal;
+      lvPlantStockNo@1100525002 : Code[10];
+    BEGIN
+      //**4PS
+      WITH IPurchRcptLineRec DO BEGIN
+        IF lvPurchLineRec.GET(lvPurchLineRec."Document Type"::Order, "Order No.", "Order Line No.") THEN BEGIN
+          IF (lvPurchLineRec."Plant Order No." <> '') AND (lvPurchLineRec."Plant Order Line No." <> 0) THEN
+            lvUndoPlantOrder := TRUE;
+        END;
+        IF CheckPlantNoAcquisitionOrRent(IPurchRcptLineRec) THEN BEGIN
+          IF lvPlantNoRec.GET("Plant Type", "Plant No." ) THEN BEGIN
+            lvPlantStockNo := lvPlantNoRec."Stock No.";
+            lvQuantity := lvPlantNoRec.Quantity;  //* Qty of the plant no, not qty of receipt line (can be in another unit).
+            lvPlantNoRec.SetNoConfirmOnDeleteAllowed(TRUE);
+            lvPlantNoRec.DELETE(TRUE);  //* Also linked Fixed Asset will be deleted
+
+            IF lvUndoPlantOrder THEN
+              lvExtendedPlantOrderFuncCU.RunUndoPOPlantQtyOnReceipt("Order No.", "Order Line No.",
+                lvPurchLineRec."Plant Order No.", lvPurchLineRec."Plant Order Line No.", "Plant Type", lvPlantStockNo, lvQuantity);
+          END;
+        END;
+        IF lvUndoPlantOrder AND ("Item No." <> '') THEN
+          lvExtendedPlantOrderFuncCU.RunUndoPOItemQtyOnReceipt("Order No.", "Order Line No.",
+            lvPurchLineRec."Plant Order No.", lvPurchLineRec."Plant Order Line No.", "Item No.", "Quantity (Base)");
+      END;
+    END;
+
+    PROCEDURE CheckPlantNoAcquisitionOrRent@1100485001(IPurchRcptLineRec@1100485000 : Record 121) : Boolean;
+    VAR
+      lvPlantSetupRec@1100485001 : Record 11012550;
+    BEGIN
+      //**4PS
+      WITH IPurchRcptLineRec DO BEGIN
+        IF ("Plant Type" <> '') AND ("Plant No." <> '') AND ("Cost Component Plant" <> '') THEN BEGIN
+          lvPlantSetupRec.GET;
+          IF ("Cost Component Plant" = lvPlantSetupRec."Cost Component Acquisition") OR
+             ("Cost Component Plant" = lvPlantSetupRec."Cost Component Rent")
+          THEN
+            EXIT(TRUE);
+        END;
+
+        EXIT(FALSE);
+      END;
+    END;
+
+    PROCEDURE UndoNSItemTracking@1100528500(PurchRcptLine@1100528501 : Record 121;NewDocLineNo@1100528506 : Integer);
+    VAR
+      OldNSItemEntryRelation@1100528500 : Record 11071903;
+      NewNSItemEntryRelation@1100528505 : Record 11071903;
+      OldNSItemTrackingEntry@1100528502 : Record 11071902;
+      NewNSItemTrackingEntry@1100528503 : Record 11071902;
+      NSTrackingSpecification@1100528507 : Record 11071901;
+      NSReservationEntry@1100528508 : Record 11071900;
+      PurchLine@1100528510 : Record 39;
+      LastTrackingEntryNo@1100528504 : Integer;
+      LastReservEntryNo@1100528509 : Integer;
+    BEGIN
+      //**4PS DP00121
+      OldNSItemEntryRelation.SETCURRENTKEY("Source ID","Source Type");
+      OldNSItemEntryRelation.SETRANGE("Source ID",PurchRcptLine."Document No.");
+      OldNSItemEntryRelation.SETRANGE("Source Type",DATABASE::"Purch. Rcpt. Line");
+      OldNSItemEntryRelation.SETRANGE("Source Subtype",0);
+      OldNSItemEntryRelation.SETRANGE("Source Batch Name",'');
+      OldNSItemEntryRelation.SETRANGE("Source Prod. Order Line",0);
+      OldNSItemEntryRelation.SETRANGE("Source Ref. No.",PurchRcptLine."Line No.");
+      IF OldNSItemEntryRelation.FINDSET THEN BEGIN
+        NewNSItemTrackingEntry.LOCKTABLE;
+        NewNSItemTrackingEntry.FINDLAST;
+        LastTrackingEntryNo := NewNSItemTrackingEntry."Entry No.";
+        REPEAT
+          //Create New Reversed Item Tracking Entry
+          OldNSItemTrackingEntry.GET(OldNSItemEntryRelation."Item Tracking Entry No.");
+          OldNSItemTrackingEntry.TESTFIELD(Open,TRUE);
+          NewNSItemTrackingEntry := OldNSItemTrackingEntry;
+          NewNSItemTrackingEntry."Entry No." := LastTrackingEntryNo + 1;
+          NewNSItemTrackingEntry.Quantity := -OldNSItemTrackingEntry.Quantity;
+          NewNSItemTrackingEntry."Remaining Quantity" := -OldNSItemTrackingEntry."Remaining Quantity";
+          NewNSItemTrackingEntry.Positive := NOT OldNSItemTrackingEntry.Positive;
+          NewNSItemTrackingEntry.INSERT;
+          LastTrackingEntryNo := LastTrackingEntryNo + 1;
+
+          //Apply Old eand New Item Tracking Entries
+          NSItemTrackingEntriesApply.ApplyUndoneTrackingEntries(OldNSItemTrackingEntry, NewNSItemTrackingEntry);
+
+          //Create Item Entry Relation for New Item Tracking Entry
+          NewNSItemEntryRelation := OldNSItemEntryRelation;
+          NewNSItemEntryRelation."Item Tracking Entry No." := NewNSItemTrackingEntry."Entry No.";
+          NewNSItemEntryRelation."Source Ref. No." := NewDocLineNo;
+          NewNSItemEntryRelation.INSERT;
+
+          //Move Order Line Tracking Specification to Reservation
+          NSTrackingSpecification.SETCURRENTKEY("Source ID","Source Type");
+          NSTrackingSpecification.SETRANGE("Source ID", PurchRcptLine."Order No.");
+          NSTrackingSpecification.SETRANGE("Source Type", DATABASE::"Purchase Line");
+          NSTrackingSpecification.SETRANGE("Source Subtype", 1); //Order
+          NSTrackingSpecification.SETRANGE("Source Ref. No.", PurchRcptLine."Order Line No.");
+          NSTrackingSpecification.SETRANGE("Serial No.", OldNSItemEntryRelation."Serial No.");
+          NSTrackingSpecification.SETRANGE("Lot No.", OldNSItemEntryRelation."Lot No.");
+          IF NSTrackingSpecification.FINDSET(TRUE) THEN BEGIN
+            NSReservationEntry.LOCKTABLE;
+            IF NSReservationEntry.FINDLAST THEN
+              LastReservEntryNo := NSReservationEntry."Entry No."
+            ELSE
+              LastReservEntryNo := 0;
+            REPEAT
+              NSReservationEntry.INIT;
+              NSReservationEntry.TRANSFERFIELDS(NSTrackingSpecification);
+              NSReservationEntry."Entry No." := LastReservEntryNo + 1;
+              NSReservationEntry.VALIDATE("Quantity (Base)");
+              NSReservationEntry."Reservation Status" := NSReservationEntry."Reservation Status"::Surplus;
+              PurchLine.GET(PurchLine."Document Type"::Order,PurchRcptLine."Order No.",PurchRcptLine."Order Line No.");
+              IF NSReservationEntry.Positive THEN
+                NSReservationEntry."Expected Receipt Date" := PurchLine."Expected Receipt Date"
+              ELSE
+                NSReservationEntry."Shipment Date" := PurchLine."Expected Receipt Date";
+              NSReservationEntry.INSERT;
+              LastReservEntryNo := LastReservEntryNo + 1;
+
+              NSTrackingSpecification.DELETE;
+            UNTIL NSReservationEntry.NEXT = 0;
+          END;
+
+        UNTIL OldNSItemEntryRelation.NEXT = 0;
+      END;
+    END;
+
+    BEGIN
+    {
+      4PS02 MMA 15-03-2010 Changes RFC Vendor rating
+    }
+    END.
+  }
+}
+

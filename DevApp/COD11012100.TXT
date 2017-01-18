@@ -1,0 +1,341 @@
+OBJECT Codeunit 11012100 Post Plant Rental Free Order
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    TableNo=11020552;
+    OnRun=BEGIN
+            OrderRec.COPY(Rec);
+            Code;
+            Rec := OrderRec;
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1100525000 : TextConst 'ENU=Do you want to post %1 ''%2''?';
+      PlantSetupRec@1100525004 : Record 11012550;
+      PlantLocRec@1100525005 : Record 11012554;
+      PlantRateCodeRec@1100525010 : Record 11020502;
+      OrderRec@1100525001 : Record 11020552;
+      OrderLineRec@1100525002 : Record 11020553;
+      Text001@1100525003 : TextConst 'ENU=%1 ''''%2'' has no %3.';
+      PlantOrderRec1@1100525007 : Record 11012556;
+      PlantOrderRec2@1100525008 : Record 11012556;
+      PlantOrderLineRec@1100525009 : Record 11012557;
+      NextLineNo@1100525006 : Integer;
+      Text002@1100409002 : TextConst 'ENU=Transfer plant to another location (and/or rate code) before %1 then not possible anymore.\%2\ \Do you want to post the order already, are you sure?';
+      Text003@1100409001 : TextConst 'ENU=It is better to split the order first.';
+      Text004@1100409000 : TextConst 'ENU=Date %1 days in future, already post the order NOT recommended.\ \Are you VERY sure?';
+
+    PROCEDURE ConfirmPost@1100525001(OrderRec@1100525000 : Record 11020552) : Boolean;
+    VAR
+      OrderDate@1100409003 : Date;
+      RefDate1@1100409002 : Date;
+      RefDate2@1100409001 : Date;
+      SplitText@1100409000 : Text[100];
+    BEGIN
+      IF NOT CONFIRM(Text000, FALSE, OrderRec.TABLECAPTION, OrderRec."No.") THEN
+        EXIT(FALSE);
+
+      RefDate1 := TODAY + 7;
+      RefDate2 := TODAY + 30;
+      CASE OrderRec.Type OF
+        OrderRec.Type::RentalFree,
+        OrderRec.Type::Modify:
+          OrderDate := OrderRec."Starting Date Rental Free";
+        OrderRec.Type::EndRentalFree:
+          OrderDate := OrderRec."Ending Date Rental Free";
+        OrderRec.Type::PeriodRentalFree,
+        OrderRec.Type::PeriodModify:
+          BEGIN
+            OrderDate := OrderRec."Ending Date Rental Free";
+            SplitText := Text003;
+          END;
+      END;
+      IF OrderDate > RefDate1 THEN BEGIN
+        IF NOT CONFIRM(Text002, FALSE, OrderDate, SplitText) THEN
+          EXIT(FALSE);
+        IF OrderDate > RefDate2 THEN BEGIN
+          IF NOT CONFIRM(Text004, FALSE, OrderDate-TODAY) THEN
+            EXIT(FALSE);
+        END;
+      END;
+
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE Code@1100525000();
+    BEGIN
+      PlantSetupRec.GET;
+      PlantSetupRec.TESTFIELD("Rate Codes");
+
+      WITH OrderRec DO BEGIN
+        LOCKTABLE;
+        TESTFIELD(Posted,FALSE);
+        TESTFIELD("No.");
+        TESTFIELD("Plant Location");
+        CASE Type OF
+          Type::RentalFree:
+            TESTFIELD("Starting Date Rental Free");
+          Type::EndRentalFree:
+            TESTFIELD("Ending Date Rental Free");
+          Type::PeriodRentalFree:
+            BEGIN
+              TESTFIELD("Starting Date Rental Free");
+              TESTFIELD("Ending Date Rental Free");
+              OrderRec.CheckEndingDate();  //* End > Start
+            END;
+          Type::Modify:  //C008369
+            TESTFIELD("Starting Date Rental Free");
+          Type::PeriodModify:  //C008369
+            BEGIN
+              TESTFIELD("Starting Date Rental Free");
+              TESTFIELD("Ending Date Rental Free");
+              OrderRec.CheckEndingDate();  //* End > Start
+            END;
+        END;
+        PlantLocRec.GET("Plant Location");
+        OrderRec.CheckBlock("Plant Location", TRUE);
+
+        //* Check Orderlines
+        OrderLineRec.RESET;
+        OrderLineRec.SETRANGE("Rental Free Order No.","No.");
+        IF NOT OrderLineRec.FINDSET(FALSE,FALSE) THEN
+          ERROR(Text001, OrderLineRec.FIELDCAPTION("Rental Free Order No."), "No.", OrderLineRec.TABLECAPTION);
+        REPEAT
+          OrderLineRec.TESTFIELD("Plant Type");
+          OrderLineRec.TESTFIELD("Plant No.");
+          //* Plant can be on location with Rate Code empty, do not check "From Rate Code" is filled.
+          //* Only when 'End Rental Free', then "From Rate Code" must be filled (must be 0%, empty is 100%)
+          IF Type = Type::EndRentalFree THEN
+            OrderLineRec.TESTFIELD("From Rate Code");
+          OrderLineRec.TESTFIELD("To Rate Code");
+          IF Type IN [Type::Modify, Type::PeriodModify] THEN BEGIN  //C008369
+            IF OrderLineRec."From Rate Code" = OrderLineRec."To Rate Code" THEN
+              OrderLineRec.FIELDERROR("To Rate Code");
+          END;
+          OrderLineRec.CALCFIELDS(Bulk);
+          IF OrderLineRec.Bulk THEN
+            OrderLineRec.TESTFIELD(Quantity)
+          ELSE BEGIN
+            IF OrderLineRec."Plant No." = '0' THEN
+              OrderLineRec.FIELDERROR("Plant No.");
+            OrderLineRec.TESTFIELD(Quantity, 1)
+          END;
+          OrderLineRec.CheckFromRateCode(OrderRec);
+          OrderLineRec.CheckToRateCode(OrderRec);
+          OrderLineRec.CheckInventoryQuantity();
+          IF NOT PlantSetupRec.CheckElementMandatory("Plant Location", OrderLineRec.Element, '') THEN //*C004558
+            OrderLineRec.TESTFIELD(Element);
+        UNTIL OrderLineRec.NEXT = 0;
+
+        //* Process, create Plantorder(s)
+        PlantOrderRec1."No." := '';
+        PlantOrderRec2."No." := '';
+        OrderLineRec.RESET;
+        OrderLineRec.SETRANGE("Rental Free Order No.","No.");
+        IF OrderLineRec.FINDSET(FALSE,FALSE) THEN BEGIN
+          CreatePlantOrder();
+          NextLineNo := 10000;
+          REPEAT
+            CreatePlantOrderLine();
+          UNTIL OrderLineRec.NEXT = 0;
+        END;
+
+        IF PlantOrderRec1."No." <> '' THEN BEGIN
+          CODEUNIT.RUN(CODEUNIT::"Post Plant Order", PlantOrderRec1);
+          IF PlantOrderRec2."No." <> '' THEN
+            CODEUNIT.RUN(CODEUNIT::"Post Plant Order", PlantOrderRec2);
+
+          Posted := TRUE;
+          "Posting Date" := TODAY;
+          "Plant Order No." := PlantOrderRec1."No.";
+          "Plant Order No. 2" := PlantOrderRec2."No.";
+          MODIFY;
+        END;
+      END;
+    END;
+
+    PROCEDURE CreatePlantOrder@1100525002();
+    BEGIN
+      WITH PlantOrderRec1 DO BEGIN
+        INIT;
+        "No." := OrderRec."No.";  //* Plant Order same ordernumber as Rental Free Order
+        Type := Type::"Other Transfers";
+        VALIDATE("From Location", OrderRec."Plant Location");
+        VALIDATE("To Location", OrderRec."Plant Location");
+        "Created by" := USERID;
+        Posted := FALSE;
+        "Posting Date" := 0D;
+        Status := Status::Released;
+        "Rental Free Order No." := OrderRec."No.";
+        IF OrderRec.Type <> OrderRec.Type::EndRentalFree THEN BEGIN
+          "Rental Free Order Type" := "Rental Free Order Type"::RentalFree;
+          IF OrderRec.Type IN [OrderRec.Type::Modify, OrderRec.Type::PeriodModify] THEN  //C008369
+            "Rental Free Order Type" := "Rental Free Order Type"::RentalModification;
+          "Transfer Date" := OrderRec."Starting Date Rental Free";
+        END ELSE BEGIN
+          "Rental Free Order Type" := "Rental Free Order Type"::EndRentalFree;
+          "Transfer Date" := OrderRec."Ending Date Rental Free" + 1;
+        END;
+        IF (PlantSetupRec."Def. Transfer PO" = PlantSetupRec."Def. Transfer PO"::Yes) THEN  //26715 (see also call 22454)
+          "Def. Transfer" := "Transfer Date";
+        "Rental Shift" := TRUE;
+        "Rental Startdate (To Location)" := "Transfer Date";
+        "Rental Enddate (From Location)" := "Transfer Date" - 1;
+        INSERT(FALSE);
+
+        IF OrderRec.Type IN [OrderRec.Type::PeriodRentalFree, OrderRec.Type::PeriodModify] THEN BEGIN  //C008369.C
+          PlantOrderRec2 := PlantOrderRec1;
+          PlantOrderRec2."No." := OrderRec."No." + '_1';
+          PlantOrderRec2."Rental Free Order Type" := "Rental Free Order Type"::EndRentalFree;
+          IF OrderRec.Type = OrderRec.Type::PeriodModify THEN  //C008369
+            PlantOrderRec2."Rental Free Order Type" := "Rental Free Order Type"::EndRentalModification;
+          PlantOrderRec2."Transfer Date" := OrderRec."Ending Date Rental Free" + 1;
+          IF (PlantSetupRec."Def. Transfer PO" = PlantSetupRec."Def. Transfer PO"::Yes) THEN  //26715 (see also call 22454)
+            PlantOrderRec2."Def. Transfer" := PlantOrderRec2."Transfer Date";
+          PlantOrderRec2."Rental Startdate (To Location)" := PlantOrderRec2."Transfer Date";
+          PlantOrderRec2."Rental Enddate (From Location)" := PlantOrderRec2."Transfer Date" - 1;
+          PlantOrderRec2.INSERT(FALSE);
+        END;
+      END;
+    END;
+
+    PROCEDURE CreatePlantOrderLine@1100525009();
+    VAR
+      ToRateCode@1100525000 : Code[10];
+    BEGIN
+      //* No cost-/item lines may be created and also no check with messages/errors on fields (checks are already done), etc.
+      //* So do not use VALIDATES and INSERT(TRUE).
+      PlantOrderLineRec.INIT;
+      PlantOrderLineRec."Plant Order No." := PlantOrderRec1."No.";
+      PlantOrderLineRec."Transfer Date" := PlantOrderRec1."Transfer Date";
+      PlantOrderLineRec."To Employee Company" := PlantOrderRec1."To Employee Company";
+      PlantOrderLineRec."To Employee No." := PlantOrderRec1."To Employee No.";
+      PlantOrderLineRec."Line No." := NextLineNo;
+      NextLineNo := NextLineNo + 10000;
+      PlantOrderLineRec.Posted := FALSE;
+      PlantOrderLineRec.Type := PlantOrderLineRec.Type::Plant;
+      PlantOrderLineRec."Plant Type" := OrderLineRec."Plant Type";
+      PlantOrderLineRec.VALIDATE("Unit of Measure");  //Fill with Plant Unit
+      PlantOrderLineRec."Rental Type" := PlantOrderLineRec."Rental Type"::Rental;
+      PlantOrderLineRec."No." := OrderLineRec."Plant No.";
+      PlantOrderLineRec.Description := OrderLineRec.Description;
+      PlantOrderLineRec."Description 2" := OrderLineRec."Description 2";
+      PlantOrderLineRec."From Location" := OrderRec."Plant Location";
+      PlantOrderLineRec.Quantity :=  OrderLineRec.Quantity;
+      PlantOrderLineRec."From Rate Code" := OrderLineRec."From Rate Code";
+      PlantOrderLineRec."To Rate Code" := OrderLineRec."To Rate Code";
+      IF PlantLocRec."Project No." <> '' THEN
+        PlantOrderLineRec.Element :=  OrderLineRec.Element;  //C008414.n
+
+      FillFieldsFromPlantInventory();
+      PlantOrderLineRec.INSERT(FALSE);
+
+      IF PlantOrderRec2."No." <> '' THEN BEGIN
+        PlantOrderLineRec."Plant Order No." := PlantOrderRec2."No.";
+        PlantOrderLineRec."Transfer Date" := PlantOrderRec2."Transfer Date";
+        IF PlantOrderLineRec."Expected return on" <= PlantOrderLineRec."Transfer Date" THEN
+          PlantOrderLineRec."Expected return on" := 0D;
+        //DP00485.sn C009208
+        PlantOrderLineRec.Description := '';
+        PlantOrderLineRec."Description 2" := '';
+        PlantOrderLineRec.GetPlantDescription();
+        //DP00485.en
+        PlantOrderLineRec."From Rate Code" := OrderLineRec."To Rate Code";
+        PlantOrderLineRec."To Rate Code" := OrderLineRec."From Rate Code";
+        //DP00485.so
+        //IF (PlantOrderLineRec."To Rate Code" = '') AND (PlantSetupRec."Default Rate Code Rental" <> '') AND
+        //   (PlantSetupRec."Default Rate Code Rental" <> PlantOrderLineRec."From Rate Code")
+        //THEN BEGIN
+        //  IF PlantRateCodeRec.ReadPlantRateCode(OrderRec."Plant Location",PlantSetupRec."Default Rate Code Rental",'') THEN BEGIN
+        //    IF PlantRateCodeRec.Percentage = 100 THEN
+        //      PlantOrderLineRec."To Rate Code" := PlantSetupRec."Default Rate Code Rental";
+        //  END;
+        //END;
+        //DP00485.eo
+        //DP00485.sn C009804
+        IF PlantOrderLineRec."To Rate Code" = '' THEN BEGIN
+          // So was on loc with from rate code empty(=100%), then fill with 'default rate code rentel' but only if 100%
+          ToRateCode := PlantRateCodeRec.GetDefaultRateCodeRental(OrderRec."Plant Location", TRUE, '');
+          IF (ToRateCode <> '') AND (ToRateCode <> PlantOrderLineRec."From Rate Code") THEN BEGIN
+            IF PlantRateCodeRec.ReadPlantRateCode(OrderRec."Plant Location",ToRateCode,'') THEN BEGIN
+              IF PlantRateCodeRec.Percentage = 100 THEN
+                PlantOrderLineRec."To Rate Code" := ToRateCode;
+            END;
+          END;
+        END;
+        //DP00485.en
+        IF PlantOrderLineRec."To Rate Code" = '' THEN
+          OrderLineRec.TESTFIELD("From Rate Code");
+        PlantOrderLineRec.INSERT(FALSE);
+      END;
+    END;
+
+    PROCEDURE FillFieldsFromPlantInventory@1100525005();
+    VAR
+      PlantInventRec@1100525000 : Record 11012555;
+      POLineRec@1100525002 : Record 11012557;
+    BEGIN
+      PlantInventRec.SETRANGE(Removed, FALSE);
+      PlantInventRec.SETRANGE(Location, OrderRec."Plant Location");
+      PlantInventRec.SETRANGE("Plant Type", PlantOrderLineRec."Plant Type");
+      PlantInventRec.SETRANGE("Plant No.", PlantOrderLineRec."No.");
+      PlantInventRec.SETRANGE("Rate Code", PlantOrderLineRec."From Rate Code");
+      PlantInventRec.SETRANGE(Sold, FALSE);
+      PlantInventRec.SETFILTER("Present from", '<=%1', PlantOrderLineRec."Transfer Date");
+      PlantInventRec.SETFILTER(Quantity, '>%1', 0);
+
+      IF PlantOrderLineRec."Expected return on" = 0D THEN BEGIN
+        PlantInventRec.SETFILTER("Expected return on", '>%1', PlantOrderLineRec."Transfer Date");
+        IF PlantInventRec.FINDFIRST THEN BEGIN
+          REPEAT
+            IF PlantInventRec."Expected return on" > PlantOrderLineRec."Expected return on" THEN
+              PlantOrderLineRec."Expected return on" := PlantInventRec."Expected return on";
+            PlantInventRec.SETFILTER("Expected return on", '>%1', PlantInventRec."Expected return on");
+          UNTIL PlantInventRec.NEXT = 0;
+        END;
+        PlantInventRec.SETRANGE("Expected return on");  //* Reset filter
+      END;
+
+      IF PlantOrderLineRec."To Employee No." = '' THEN BEGIN
+        PlantInventRec.SETFILTER("Employee No.", '<>%1', '');
+        IF PlantInventRec.FINDFIRST THEN BEGIN
+          PlantOrderLineRec."To Employee Company" := PlantInventRec."Employee Company";
+          PlantOrderLineRec."To Employee No." := PlantInventRec."Employee No.";
+        END;
+        PlantInventRec.SETRANGE("Employee No.");  //* Reset filter
+      END;
+
+      //C008414.so
+      //IF (PlantOrderLineRec.Element = '') AND (PlantLocRec."Project No." <> '') THEN BEGIN
+      //  PlantInventRec.SETRANGE("Arrival Order Type", PlantInventRec."Arrival Order Type"::"Plant Order");
+      //  PlantInventRec.SETFILTER("Arrival Order", '<>%1', '');
+      //  PlantInventRec.SETFILTER("Arrival Order Line", '<>%1', 0);
+      //  IF PlantInventRec.FINDFIRST THEN BEGIN
+      //    REPEAT
+      //      IF POLineRec.GET(PlantInventRec."Arrival Order", PlantInventRec."Arrival Order Line") THEN BEGIN
+      //        IF POLineRec.Element <> '' THEN
+      //          PlantOrderLineRec.Element := POLineRec.Element;
+      //      END;
+      //    UNTIL (PlantInventRec.NEXT = 0) AND (PlantOrderLineRec.Element = '')
+      //  END;
+      //  PlantInventRec.SETRANGE("Arrival Order Type");  //* Reset filters
+      //  PlantInventRec.SETRANGE("Arrival Order");       //*
+      //  PlantInventRec.SETRANGE("Arrival Order Line");  //*
+      //END;
+      //C008414.eo
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

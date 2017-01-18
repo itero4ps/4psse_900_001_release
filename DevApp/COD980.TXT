@@ -1,0 +1,611 @@
+OBJECT Codeunit 980 Payment Registration Mgt.
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00.00.44974;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      NothingToPostErr@1000 : TextConst 'ENU=There is nothing to post.';
+      EmptyDateReceivedErr@1001 : TextConst 'ENU=Date Received is missing for line with Document No. %1.';
+      ConfirmPostPaymentsQst@1003 : TextConst '@@@="%1=number of payments to post";ENU=Do you want to post the %1 payments?';
+      CloseQst@1002 : TextConst 'ENU=The %1 check box is selected on one or more lines. Do you want to close the window without posting these lines?';
+      TempTableErr@1044 : TextConst 'ENU=The table passed as a parameter must be temporary.';
+      SalesOrderTxt@1015 : TextConst 'ENU=Sales Order';
+      SalesBlanketOrderTxt@1021 : TextConst 'ENU=Sales Blanket Order';
+      SalesQuoteTxt@1020 : TextConst 'ENU=Sales Quote';
+      SalesInvoiceTxt@1018 : TextConst 'ENU=Sales Invoice';
+      SalesReturnOrderTxt@1013 : TextConst 'ENU=Sales Return Order';
+      SalesCreditMemoTxt@1019 : TextConst 'ENU=Sales Credit Memo';
+      ServiceQuoteTxt@1014 : TextConst 'ENU=Service Quote';
+      ServiceOrderTxt@1007 : TextConst 'ENU=Service Order';
+      ServiceInvoiceTxt@1006 : TextConst 'ENU=Service Invoice';
+      ServiceCreditMemoTxt@1055 : TextConst 'ENU=Service Credit Memo';
+      ReminderTxt@1016 : TextConst 'ENU=Reminder';
+      FinChrgMemoTxt@1017 : TextConst 'ENU="Finance Charge Memo "';
+      DistinctDateReceivedErr@1004 : TextConst 'ENU=To post as a lump payment, the %1 field must have the same value in all lines where the %2 check box is selected.';
+      DistinctCustomerErr@1008 : TextConst 'ENU=To post as lump payment, the customer must be same value on all lines where the %1 check box is selected.';
+      ConfirmLumpPaymentQst@1005 : TextConst '@@@="%1=number of payments to post, %2 sum of amount received.";ENU=Do you want to post the %1 payments as a lump sum of %2?';
+      ForeignCurrNotSuportedErr@1009 : TextConst '@@@="%1 = Document Type; %2 = Description; %3 = Payment Registration Setup; Cash Receipt Journal should have the same translation as the pages with the same name.";ENU=The document with type %1 and description %2 must have the same currency code as the payment you are registering.\\To register the payment, you must change %3 to use a balancing account with the same currency as the document. Alternatively, use the Cash Receipt Journal page to process the payment.';
+      PreviewMode@1010 : Boolean;
+
+    PROCEDURE RunSetup@2();
+    VAR
+      PaymentRegistrationSetup@1000 : Record 980;
+      SetupOK@1001 : Boolean;
+      RunFullSetup@1002 : Boolean;
+    BEGIN
+      IF NOT PaymentRegistrationSetup.GET(USERID) THEN
+        RunFullSetup := TRUE
+      ELSE
+        RunFullSetup := NOT PaymentRegistrationSetup.ValidateMandatoryFields(FALSE);
+
+      IF RunFullSetup THEN
+        SetupOK := PAGE.RUNMODAL(PAGE::"Payment Registration Setup") = ACTION::LookupOK
+      ELSE
+        IF PaymentRegistrationSetup."Use this Account as Def." THEN
+          SetupOK := TRUE
+        ELSE
+          SetupOK := PAGE.RUNMODAL(PAGE::"Balancing Account Setup") = ACTION::LookupOK;
+
+      IF NOT SetupOK THEN
+        ERROR('');
+    END;
+
+    LOCAL PROCEDURE Post@1(VAR TempPaymentRegistrationBuffer@1000 : TEMPORARY Record 981;LumpPayment@1005 : Boolean);
+    VAR
+      BankAcc@1007 : Record 270;
+      PaymentRegistrationSetup@1002 : Record 980;
+      GenJournalLine@1001 : Record 81;
+      GenJnlBatch@1004 : Record 232;
+      GenJnlTemplate@1006 : Record 80;
+      NoSeriesMgt@1003 : Codeunit 396;
+      GenJnlPostBatch@1009 : Codeunit 13;
+    BEGIN
+      WITH PaymentRegistrationSetup DO BEGIN
+        GET(USERID);
+        ValidateMandatoryFields(TRUE);
+        GenJnlTemplate.GET("Journal Template Name");
+        GenJnlBatch.GET("Journal Template Name","Journal Batch Name");
+      END;
+
+      GenJournalLine.SETRANGE("Journal Template Name",PaymentRegistrationSetup."Journal Template Name");
+      GenJournalLine.SETRANGE("Journal Batch Name",PaymentRegistrationSetup."Journal Batch Name");
+      IF GenJournalLine.FINDLAST THEN
+        GenJournalLine.SETFILTER("Line No.",'>%1',GenJournalLine."Line No.");
+
+      TempPaymentRegistrationBuffer.FINDSET;
+      REPEAT
+        IF TempPaymentRegistrationBuffer."Date Received" = 0D THEN
+          ERROR(STRSUBSTNO(EmptyDateReceivedErr,TempPaymentRegistrationBuffer."Document No."));
+        IF NOT LumpPayment THEN
+          UpdatePmtDiscountDateOnCustLedgerEntry(TempPaymentRegistrationBuffer);
+        WITH GenJournalLine DO BEGIN
+          INIT;
+          "Journal Template Name" := PaymentRegistrationSetup."Journal Template Name";
+          "Journal Batch Name" := PaymentRegistrationSetup."Journal Batch Name";
+          "Line No." += 10000;
+
+          "Source Code" := GenJnlTemplate."Source Code";
+          "Reason Code" := GenJnlBatch."Reason Code";
+          "Posting No. Series" := GenJnlBatch."Posting No. Series";
+
+          VALIDATE("Posting Date",TempPaymentRegistrationBuffer."Date Received");
+          VALIDATE("Account Type","Account Type"::Customer);
+          VALIDATE("Document Type","Document Type"::Payment);
+          "Document No." := NoSeriesMgt.GetNextNo(GenJnlBatch."No. Series","Posting Date",FALSE);
+          VALIDATE("Bal. Account Type",PaymentRegistrationSetup.GetGLBalAccountType);
+          VALIDATE("Account No.",TempPaymentRegistrationBuffer."Source No.");
+          VALIDATE(Amount,-TempPaymentRegistrationBuffer."Amount Received");
+          VALIDATE("Bal. Account No.",PaymentRegistrationSetup."Bal. Account No.");
+          IF "Bal. Account Type" = "Bal. Account Type"::"Bank Account" THEN BEGIN
+            BankAcc.GET("Bal. Account No.");
+            VALIDATE("Currency Code",BankAcc."Currency Code");
+          END;
+          CheckCurrencyCode(TempPaymentRegistrationBuffer,GenJournalLine,PaymentRegistrationSetup,LumpPayment);
+          IF LumpPayment THEN
+            "Applies-to ID" := "Document No."
+          ELSE BEGIN
+            VALIDATE("Applies-to Doc. Type",TempPaymentRegistrationBuffer."Document Type");
+            VALIDATE("Applies-to Doc. No.",TempPaymentRegistrationBuffer."Document No.");
+          END;
+          INSERT(TRUE);
+        END;
+      UNTIL TempPaymentRegistrationBuffer.NEXT = 0;
+
+      IF NOT PreviewMode THEN
+        CODEUNIT.RUN(CODEUNIT::"Gen. Jnl.-Post Batch",GenJournalLine)
+      ELSE
+        GenJnlPostBatch.Preview(GenJournalLine);
+    END;
+
+    PROCEDURE ConfirmClose@4(VAR PaymentRegistrationBuffer@1000 : Record 981) : Boolean;
+    BEGIN
+      WITH PaymentRegistrationBuffer DO BEGIN
+        RESET;
+        SETRANGE("Payment Made",TRUE);
+        IF NOT ISEMPTY THEN
+          EXIT(CONFIRM(STRSUBSTNO(CloseQst,FIELDCAPTION("Payment Made"))));
+      END;
+
+      EXIT(TRUE);
+    END;
+
+    [TryFunction]
+    PROCEDURE ConfirmPost@3(VAR PaymentRegistrationBuffer@1000 : Record 981);
+    VAR
+      PaymentRegistrationBuffer2@1001 : Record 981;
+      Confirmed@1003 : Boolean;
+    BEGIN
+      PaymentRegistrationBuffer2.COPYFILTERS(PaymentRegistrationBuffer);
+      WITH PaymentRegistrationBuffer DO BEGIN
+        CheckPaymentsToPost(PaymentRegistrationBuffer);
+        IF NOT PreviewMode THEN
+          Confirmed := CONFIRM(STRSUBSTNO(ConfirmPostPaymentsQst,COUNT),TRUE);
+
+        IF PreviewMode OR Confirmed THEN BEGIN
+          Post(PaymentRegistrationBuffer,FALSE);
+          PopulateTable;
+        END;
+        COPYFILTERS(PaymentRegistrationBuffer2);
+      END
+    END;
+
+    PROCEDURE FindRecords@77(VAR TempDocumentSearchResult@1000 : TEMPORARY Record 983;DocNoFilter@1001 : Code[20];AmountFilter@1002 : Decimal;AmountTolerancePerc@1026 : Decimal);
+    BEGIN
+      IF NOT TempDocumentSearchResult.ISTEMPORARY THEN
+        ERROR(TempTableErr);
+
+      TempDocumentSearchResult.RESET;
+      TempDocumentSearchResult.DELETEALL;
+      DocNoFilter := STRSUBSTNO('*%1*',DocNoFilter);
+
+      FindSalesHeaderRecords(TempDocumentSearchResult,DocNoFilter,AmountFilter,AmountTolerancePerc);
+      FindServiceHeaderRecords(TempDocumentSearchResult,DocNoFilter,AmountFilter,AmountTolerancePerc);
+      FindReminderHeaderRecords(TempDocumentSearchResult,DocNoFilter,AmountFilter,AmountTolerancePerc);
+      FindFinChargeMemoHeaderRecords(TempDocumentSearchResult,DocNoFilter,AmountFilter,AmountTolerancePerc);
+    END;
+
+    LOCAL PROCEDURE FindSalesHeaderRecords@14(VAR TempDocumentSearchResult@1000 : TEMPORARY Record 983;DocNoFilter@1001 : Code[20];AmountFilter@1002 : Decimal;AmountTolerancePerc@1026 : Decimal);
+    VAR
+      SalesHeader@1010 : Record 36;
+    BEGIN
+      IF SalesHeader.READPERMISSION THEN BEGIN
+        SalesHeader.RESET;
+        SalesHeader.SETFILTER("No.",DocNoFilter);
+        IF SalesHeader.FINDSET THEN
+          REPEAT
+            SalesHeader.CALCFIELDS(Amount,"Amount Including VAT");
+            IF IsWithinTolerance(SalesHeader."Amount Including VAT",AmountFilter,AmountTolerancePerc) THEN
+              InsertDocSearchResult(TempDocumentSearchResult,SalesHeader."No.",SalesHeader."Document Type",DATABASE::"Sales Header",
+                GetSalesHeaderDescription(SalesHeader),SalesHeader."Amount Including VAT");
+          UNTIL SalesHeader.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE FindServiceHeaderRecords@13(VAR TempDocumentSearchResult@1000 : TEMPORARY Record 983;DocNoFilter@1001 : Code[20];AmountFilter@1002 : Decimal;AmountTolerancePerc@1026 : Decimal);
+    VAR
+      ServiceHeader@1003 : Record 5900;
+      ServiceLine@1005 : Record 5902;
+    BEGIN
+      IF ServiceHeader.READPERMISSION THEN BEGIN
+        ServiceHeader.RESET;
+        ServiceHeader.SETFILTER("No.",DocNoFilter);
+        IF ServiceHeader.FINDSET THEN
+          REPEAT
+            ServiceLine.RESET;
+            ServiceLine.SETRANGE("Document Type",ServiceHeader."Document Type");
+            ServiceLine.SETRANGE("Document No.",ServiceHeader."No.");
+            ServiceLine.CALCSUMS("Amount Including VAT");
+            IF IsWithinTolerance(ServiceLine."Amount Including VAT",AmountFilter,AmountTolerancePerc) THEN
+              InsertDocSearchResult(
+                TempDocumentSearchResult,ServiceHeader."No.",ServiceHeader."Document Type",DATABASE::"Service Header",
+                GetServiceHeaderDescription(ServiceHeader),ServiceLine."Amount Including VAT");
+          UNTIL ServiceHeader.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE FindReminderHeaderRecords@17(VAR TempDocumentSearchResult@1000 : TEMPORARY Record 983;DocNoFilter@1001 : Code[20];AmountFilter@1002 : Decimal;AmountTolerancePerc@1026 : Decimal);
+    VAR
+      ReminderHeader@1003 : Record 295;
+    BEGIN
+      IF ReminderHeader.READPERMISSION THEN BEGIN
+        ReminderHeader.RESET;
+        ReminderHeader.SETFILTER("No.",DocNoFilter);
+        IF ReminderHeader.FINDSET THEN
+          REPEAT
+            ReminderHeader.CALCFIELDS("Remaining Amount","Interest Amount");
+            IF IsWithinTolerance(ReminderHeader."Remaining Amount",AmountFilter,AmountTolerancePerc) OR
+               IsWithinTolerance(ReminderHeader."Interest Amount",AmountFilter,AmountTolerancePerc)
+            THEN
+              InsertDocSearchResult(TempDocumentSearchResult,ReminderHeader."No.",0,DATABASE::"Reminder Header",
+                ReminderTxt,ReminderHeader."Remaining Amount");
+          UNTIL ReminderHeader.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE FindFinChargeMemoHeaderRecords@19(VAR TempDocumentSearchResult@1000 : TEMPORARY Record 983;DocNoFilter@1001 : Code[20];AmountFilter@1002 : Decimal;AmountTolerancePerc@1026 : Decimal);
+    VAR
+      FinChargeMemoHeader@1028 : Record 302;
+    BEGIN
+      IF FinChargeMemoHeader.READPERMISSION THEN BEGIN
+        FinChargeMemoHeader.RESET;
+        FinChargeMemoHeader.SETFILTER("No.",DocNoFilter);
+        IF FinChargeMemoHeader.FINDSET THEN
+          REPEAT
+            FinChargeMemoHeader.CALCFIELDS("Remaining Amount","Interest Amount");
+            IF IsWithinTolerance(FinChargeMemoHeader."Remaining Amount",AmountFilter,AmountTolerancePerc) OR
+               IsWithinTolerance(FinChargeMemoHeader."Interest Amount",AmountFilter,AmountTolerancePerc)
+            THEN
+              InsertDocSearchResult(TempDocumentSearchResult,FinChargeMemoHeader."No.",0,DATABASE::"Finance Charge Memo Header",
+                FinChrgMemoTxt,FinChargeMemoHeader."Remaining Amount");
+          UNTIL FinChargeMemoHeader.NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE ShowRecords@66(VAR TempDocumentSearchResult@1000 : TEMPORARY Record 983);
+    VAR
+      ReminderHeader@1025 : Record 295;
+      FinanceChargeMemoHeader@1026 : Record 302;
+    BEGIN
+      CASE TempDocumentSearchResult."Table ID" OF
+        DATABASE::"Sales Header":
+          ShowSalesHeaderRecords(TempDocumentSearchResult);
+        DATABASE::"Service Header":
+          ShowServiceHeaderRecords(TempDocumentSearchResult);
+        DATABASE::"Reminder Header":
+          BEGIN
+            ReminderHeader.GET(TempDocumentSearchResult."Doc. No.");
+            PAGE.RUN(PAGE::Reminder,ReminderHeader);
+          END;
+        DATABASE::"Finance Charge Memo Header":
+          BEGIN
+            FinanceChargeMemoHeader.GET(TempDocumentSearchResult."Doc. No.");
+            PAGE.RUN(PAGE::"Finance Charge Memo",FinanceChargeMemoHeader);
+          END;
+      END;
+    END;
+
+    LOCAL PROCEDURE ShowSalesHeaderRecords@28(VAR TempDocumentSearchResult@1000 : TEMPORARY Record 983);
+    VAR
+      SalesHeader@1001 : Record 36;
+    BEGIN
+      TempDocumentSearchResult.TESTFIELD("Table ID",DATABASE::"Sales Header");
+      SalesHeader.SETRANGE("Document Type",TempDocumentSearchResult."Doc. Type");
+      SalesHeader.SETRANGE("No.",TempDocumentSearchResult."Doc. No.");
+
+      CASE TempDocumentSearchResult."Doc. Type" OF
+        SalesHeader."Document Type"::Quote:
+          PAGE.RUN(PAGE::"Sales Quote",SalesHeader);
+        SalesHeader."Document Type"::"Blanket Order":
+          PAGE.RUN(PAGE::"Blanket Sales Order",SalesHeader);
+        SalesHeader."Document Type"::Order:
+          PAGE.RUN(PAGE::"Sales Order",SalesHeader);
+        SalesHeader."Document Type"::Invoice:
+          PAGE.RUN(PAGE::"Sales Invoice",SalesHeader);
+        SalesHeader."Document Type"::"Return Order":
+          PAGE.RUN(PAGE::"Sales Return Order",SalesHeader);
+        SalesHeader."Document Type"::"Credit Memo":
+          PAGE.RUN(PAGE::"Sales Credit Memo",SalesHeader);
+        ELSE
+          PAGE.RUN(0,SalesHeader);
+      END;
+    END;
+
+    LOCAL PROCEDURE ShowServiceHeaderRecords@33(VAR TempDocumentSearchResult@1000 : TEMPORARY Record 983);
+    VAR
+      ServiceHeader@1001 : Record 5900;
+    BEGIN
+      TempDocumentSearchResult.TESTFIELD("Table ID",DATABASE::"Service Header");
+      ServiceHeader.SETRANGE("Document Type",TempDocumentSearchResult."Doc. Type");
+      ServiceHeader.SETRANGE("No.",TempDocumentSearchResult."Doc. No.");
+
+      CASE TempDocumentSearchResult."Doc. Type" OF
+        ServiceHeader."Document Type"::Quote:
+          PAGE.RUN(PAGE::"Service Quote",ServiceHeader);
+        ServiceHeader."Document Type"::Order:
+          PAGE.RUN(PAGE::"Service Order",ServiceHeader);
+        ServiceHeader."Document Type"::Invoice:
+          PAGE.RUN(PAGE::"Service Invoice",ServiceHeader);
+        ServiceHeader."Document Type"::"Credit Memo":
+          PAGE.RUN(PAGE::"Service Credit Memo",ServiceHeader);
+        ELSE
+          PAGE.RUN(0,ServiceHeader);
+      END;
+    END;
+
+    [TryFunction]
+    PROCEDURE ConfirmPostLumpPayment@10(VAR PaymentRegistrationBuffer@1000 : Record 981);
+    VAR
+      PaymentRegistrationBuffer2@1001 : Record 981;
+      Confirmed@1003 : Boolean;
+    BEGIN
+      PaymentRegistrationBuffer2.COPY(PaymentRegistrationBuffer);
+      WITH PaymentRegistrationBuffer DO BEGIN
+        CheckPaymentsToPost(PaymentRegistrationBuffer);
+        CreateLumpPayment(PaymentRegistrationBuffer);
+        IF NOT PreviewMode THEN
+          Confirmed := CONFIRM(
+              STRSUBSTNO(
+                ConfirmLumpPaymentQst,
+                COUNT,
+                FORMAT("Amount Received",0,'<Precision,2><Standard Format,0>')),TRUE);
+
+        IF PreviewMode OR Confirmed THEN BEGIN
+          // IF NOT PreviewMode THEN
+          MODIFY;
+          SETRANGE("Amount Received","Amount Received");
+          Post(PaymentRegistrationBuffer,TRUE);
+          PopulateTable;
+        END;
+        COPY(PaymentRegistrationBuffer2);
+      END
+    END;
+
+    LOCAL PROCEDURE UpdatePmtDiscountDateOnCustLedgerEntry@5(TempPaymentRegistrationBuffer@1001 : TEMPORARY Record 981);
+    VAR
+      CustLedgerEntry@1000 : Record 21;
+    BEGIN
+      CustLedgerEntry.LOCKTABLE;
+      CustLedgerEntry.GET(TempPaymentRegistrationBuffer."Ledger Entry No.");
+      IF CustLedgerEntry."Pmt. Discount Date" <> TempPaymentRegistrationBuffer."Pmt. Discount Date" THEN BEGIN
+        CustLedgerEntry."Pmt. Discount Date" := TempPaymentRegistrationBuffer."Pmt. Discount Date";
+        CODEUNIT.RUN(CODEUNIT::"Cust. Entry-Edit",CustLedgerEntry);
+      END;
+    END;
+
+    LOCAL PROCEDURE InsertDocSearchResult@88(VAR TempDocumentSearchResult@1000 : TEMPORARY Record 983;DocNo@1001 : Code[20];DocType@1006 : Integer;TableID@1003 : Integer;DocTypeDescription@1002 : Text[50];Amount@1004 : Decimal);
+    BEGIN
+      IF NOT TempDocumentSearchResult.GET(DocType,DocNo,TableID) THEN BEGIN
+        TempDocumentSearchResult.INIT;
+        TempDocumentSearchResult."Doc. No." := DocNo;
+        TempDocumentSearchResult."Doc. Type" := DocType;
+        TempDocumentSearchResult."Table ID" := TableID;
+        TempDocumentSearchResult.Description := DocTypeDescription;
+        TempDocumentSearchResult.Amount := Amount;
+        TempDocumentSearchResult.INSERT(TRUE);
+      END;
+    END;
+
+    PROCEDURE SetToleranceLimits@100(Amount@1000 : Decimal;AmountTolerance@1001 : Decimal;ToleranceTxt@1002 : Text) : Text;
+    VAR
+      GLSetup@1003 : Record 98;
+    BEGIN
+      GLSetup.GET;
+      IF (AmountTolerance > 0) AND (AmountTolerance <= 100) AND (Amount <> 0) THEN
+        EXIT(STRSUBSTNO(ToleranceTxt,FORMAT((1 - AmountTolerance / 100) * Amount,0,'<Precision,2><Standard Format,0>'),
+            FORMAT((1 + AmountTolerance / 100) * Amount,0,'<Precision,2><Standard Format,0>')));
+
+      EXIT('');
+    END;
+
+    LOCAL PROCEDURE IsWithinTolerance@111(Amount@1000 : Decimal;FilterAmount@1002 : Decimal;TolerancePct@1001 : Decimal) : Boolean;
+    BEGIN
+      IF FilterAmount = 0 THEN
+        EXIT(TRUE);
+
+      EXIT((Amount >= (1 - TolerancePct / 100) * FilterAmount) AND
+        (Amount <= (1 + TolerancePct / 100) * FilterAmount));
+    END;
+
+    LOCAL PROCEDURE GetSalesHeaderDescription@99(SalesHeader@1000 : Record 36) : Text[50];
+    BEGIN
+      CASE SalesHeader."Document Type" OF
+        SalesHeader."Document Type"::Quote:
+          EXIT(SalesQuoteTxt);
+        SalesHeader."Document Type"::"Blanket Order":
+          EXIT(SalesBlanketOrderTxt);
+        SalesHeader."Document Type"::Order:
+          EXIT(SalesOrderTxt);
+        SalesHeader."Document Type"::Invoice:
+          EXIT(SalesInvoiceTxt);
+        SalesHeader."Document Type"::"Return Order":
+          EXIT(SalesReturnOrderTxt);
+        SalesHeader."Document Type"::"Credit Memo":
+          EXIT(SalesCreditMemoTxt);
+        ELSE
+          EXIT(SalesOrderTxt);
+      END;
+    END;
+
+    LOCAL PROCEDURE GetServiceHeaderDescription@31(ServiceHeader@1000 : Record 5900) : Text[50];
+    BEGIN
+      CASE ServiceHeader."Document Type" OF
+        ServiceHeader."Document Type"::Quote:
+          EXIT(ServiceQuoteTxt);
+        ServiceHeader."Document Type"::Order:
+          EXIT(ServiceOrderTxt);
+        ServiceHeader."Document Type"::Invoice:
+          EXIT(ServiceInvoiceTxt);
+        ServiceHeader."Document Type"::"Credit Memo":
+          EXIT(ServiceCreditMemoTxt);
+        ELSE
+          EXIT(ServiceOrderTxt);
+      END;
+    END;
+
+    LOCAL PROCEDURE UpdateApplicationFieldsOnCustLedgerEntry@8(TempPaymentRegistrationBuffer@1000 : TEMPORARY Record 981);
+    VAR
+      PaymentRegistrationSetup@1003 : Record 980;
+      CustLedgerEntry@1001 : Record 21;
+      GenJnlBatch@1004 : Record 232;
+      NoSeriesMgt@1002 : Codeunit 396;
+    BEGIN
+      PaymentRegistrationSetup.GET(USERID);
+      GenJnlBatch.GET(PaymentRegistrationSetup."Journal Template Name",PaymentRegistrationSetup."Journal Batch Name");
+
+      CustLedgerEntry.LOCKTABLE;
+      CustLedgerEntry.GET(TempPaymentRegistrationBuffer."Ledger Entry No.");
+      CustLedgerEntry."Applies-to ID" :=
+        NoSeriesMgt.GetNextNo(GenJnlBatch."No. Series",TempPaymentRegistrationBuffer."Date Received",FALSE);
+      CustLedgerEntry."Amount to Apply" := TempPaymentRegistrationBuffer."Amount Received";
+      CODEUNIT.RUN(CODEUNIT::"Cust. Entry-Edit",CustLedgerEntry);
+    END;
+
+    LOCAL PROCEDURE CreateLumpPayment@6(VAR PaymentRegistrationBuffer@1000 : Record 981);
+    VAR
+      AmountReceived@1001 : Decimal;
+    BEGIN
+      CheckDistinctSourceNo(PaymentRegistrationBuffer);
+      CheckDistinctDateReceived(PaymentRegistrationBuffer);
+      IF PaymentRegistrationBuffer.FINDSET THEN
+        REPEAT
+          UpdatePmtDiscountDateOnCustLedgerEntry(PaymentRegistrationBuffer);
+          UpdateApplicationFieldsOnCustLedgerEntry(PaymentRegistrationBuffer);
+          AmountReceived += PaymentRegistrationBuffer."Amount Received";
+        UNTIL PaymentRegistrationBuffer.NEXT = 0;
+
+      PaymentRegistrationBuffer."Amount Received" := AmountReceived;
+    END;
+
+    LOCAL PROCEDURE CheckDistinctSourceNo@7(VAR PaymentRegistrationBuffer@1000 : Record 981);
+    BEGIN
+      PaymentRegistrationBuffer.SETFILTER("Source No.",'<>%1',PaymentRegistrationBuffer."Source No.");
+      IF NOT PaymentRegistrationBuffer.ISEMPTY THEN
+        ERROR(DistinctCustomerErr,PaymentRegistrationBuffer.FIELDCAPTION("Payment Made"));
+
+      PaymentRegistrationBuffer.SETRANGE("Source No.");
+    END;
+
+    LOCAL PROCEDURE CheckDistinctDateReceived@9(VAR PaymentRegistrationBuffer@1000 : Record 981);
+    BEGIN
+      PaymentRegistrationBuffer.SETFILTER("Date Received",'<>%1',PaymentRegistrationBuffer."Date Received");
+      IF NOT PaymentRegistrationBuffer.ISEMPTY THEN
+        ERROR(DistinctDateReceivedErr,PaymentRegistrationBuffer.FIELDCAPTION("Date Received"),
+          PaymentRegistrationBuffer.FIELDCAPTION("Payment Made"));
+
+      PaymentRegistrationBuffer.SETRANGE("Date Received");
+    END;
+
+    LOCAL PROCEDURE CheckPaymentsToPost@11(VAR PaymentRegistrationBuffer@1000 : Record 981);
+    BEGIN
+      PaymentRegistrationBuffer.RESET;
+      PaymentRegistrationBuffer.SETRANGE("Payment Made",TRUE);
+      PaymentRegistrationBuffer.SETFILTER("Amount Received",'<>0');
+      IF NOT PaymentRegistrationBuffer.FINDSET THEN
+        ERROR(NothingToPostErr);
+    END;
+
+    LOCAL PROCEDURE CheckCurrencyCode@20(VAR TempPaymentRegistrationBuffer@1001 : TEMPORARY Record 981;GenJnlLine@1003 : Record 81;PaymentRegistrationSetup@1004 : Record 980;LumpPayment@1000 : Boolean);
+    VAR
+      CustLedgerEntry@1002 : Record 21;
+    BEGIN
+      IF LumpPayment THEN
+        CustLedgerEntry.SETRANGE("Applies-to ID",GenJnlLine."Document No.")
+      ELSE
+        CustLedgerEntry.SETRANGE("Entry No.",TempPaymentRegistrationBuffer."Ledger Entry No.");
+
+      CustLedgerEntry.SETFILTER("Currency Code",'<>%1',GenJnlLine."Currency Code");
+      IF NOT CustLedgerEntry.ISEMPTY THEN
+        ERROR(ForeignCurrNotSuportedErr,TempPaymentRegistrationBuffer."Document Type",TempPaymentRegistrationBuffer.Description,
+          PaymentRegistrationSetup.TABLECAPTION);
+    END;
+
+    PROCEDURE CalculateBalance@12(VAR PostedBalance@1000 : Decimal;VAR UnpostedBalance@1001 : Decimal);
+    VAR
+      PaymentRegistrationSetup@1002 : Record 980;
+      GLAccount@1003 : Record 15;
+      BankAccount@1004 : Record 270;
+      GenJnlLine@1005 : Record 81;
+    BEGIN
+      PaymentRegistrationSetup.GET(USERID);
+
+      CASE PaymentRegistrationSetup."Bal. Account Type" OF
+        PaymentRegistrationSetup."Bal. Account Type"::"G/L Account":
+          BEGIN
+            IF GLAccount.GET(PaymentRegistrationSetup."Bal. Account No.") THEN
+              GLAccount.CALCFIELDS(Balance);
+            PostedBalance := GLAccount.Balance;
+            GenJnlLine.SETRANGE("Bal. Account Type",GenJnlLine."Bal. Account Type"::"G/L Account");
+          END;
+        PaymentRegistrationSetup."Bal. Account Type"::"Bank Account":
+          BEGIN
+            IF BankAccount.GET(PaymentRegistrationSetup."Bal. Account No.") THEN
+              BankAccount.CALCFIELDS(Balance);
+            PostedBalance := BankAccount.Balance;
+            GenJnlLine.SETRANGE("Bal. Account Type",GenJnlLine."Bal. Account Type"::"Bank Account");
+          END;
+      END;
+
+      GenJnlLine.SETRANGE("Bal. Account No.",PaymentRegistrationSetup."Bal. Account No.");
+      GenJnlLine.CALCSUMS(Amount);
+      UnpostedBalance := GenJnlLine.Amount;
+    END;
+
+    PROCEDURE OpenGenJnl@15();
+    VAR
+      PaymentRegistrationSetup@1000 : Record 980;
+      GenJnlLine@1001 : Record 81;
+    BEGIN
+      PaymentRegistrationSetup.GET(USERID);
+
+      GenJnlLine.FILTERGROUP := 2;
+      GenJnlLine.SETRANGE("Journal Template Name",PaymentRegistrationSetup."Journal Template Name");
+      GenJnlLine.FILTERGROUP := 0;
+
+      GenJnlLine."Journal Template Name" := '';
+      GenJnlLine."Journal Batch Name" := PaymentRegistrationSetup."Journal Batch Name";
+      PAGE.RUN(PAGE::"General Journal",GenJnlLine);
+    END;
+
+    PROCEDURE Preview@16(VAR PaymentRegistrationBuffer@1001 : Record 981;AsLump@1000 : Boolean);
+    VAR
+      TempPaymentRegistrationBuffer@1003 : TEMPORARY Record 981;
+      GenJnlPostPreview@1002 : Codeunit 19;
+      IsError@1004 : Boolean;
+    BEGIN
+      // Copy checked payments to a temp table so that we can restore the checked state after the preview.
+      CheckPaymentsToPost(PaymentRegistrationBuffer);
+      REPEAT
+        TempPaymentRegistrationBuffer := PaymentRegistrationBuffer;
+        TempPaymentRegistrationBuffer.INSERT;
+      UNTIL PaymentRegistrationBuffer.NEXT = 0;
+
+      PreviewMode := TRUE;
+      GenJnlPostPreview.Start;
+
+      IF AsLump THEN BEGIN
+        IF NOT ConfirmPostLumpPayment(PaymentRegistrationBuffer) THEN
+          IsError := GETLASTERRORTEXT <> GenJnlPostPreview.GetPreviewModeErrMessage;
+      END ELSE
+        IF NOT ConfirmPost(PaymentRegistrationBuffer) THEN
+          IsError := GETLASTERRORTEXT <> GenJnlPostPreview.GetPreviewModeErrMessage;
+
+      GenJnlPostPreview.Finish;
+      IF IsError THEN
+        ERROR(GETLASTERRORTEXT);
+
+      // Populate the table so that all records show. Then restore the checked state of the originally checked records.
+      PaymentRegistrationBuffer.PopulateTable;
+      CheckPaymentsToPost(TempPaymentRegistrationBuffer);
+      REPEAT
+        // Check to see if the record already exists before updating
+        PaymentRegistrationBuffer := TempPaymentRegistrationBuffer;
+        IF PaymentRegistrationBuffer.FIND('=') THEN BEGIN
+          PaymentRegistrationBuffer := TempPaymentRegistrationBuffer;
+          PaymentRegistrationBuffer.MODIFY;
+        END ELSE BEGIN
+          PaymentRegistrationBuffer := TempPaymentRegistrationBuffer;
+          PaymentRegistrationBuffer.INSERT;
+        END;
+      UNTIL TempPaymentRegistrationBuffer.NEXT = 0;
+      GenJnlPostPreview.ShowAllEntries;
+
+      // Preview functions throw an empty error to prevent commits
+      ERROR('');
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

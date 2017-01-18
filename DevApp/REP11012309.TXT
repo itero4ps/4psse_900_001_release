@@ -1,0 +1,210 @@
+OBJECT Report 11012309 Import ICM Order Confirmations
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=4PS9.00;
+  }
+  PROPERTIES
+  {
+    CaptionML=ENU=Import ICM Order Confirmations;
+    ProcessingOnly=Yes;
+    OnPostReport=BEGIN
+                   PrintConfirmation;  //db, 18-01-04
+                 END;
+
+  }
+  DATASET
+  {
+    { 4458;    ;DataItem;                    ;
+               DataItemTable=Table38;
+               DataItemTableView=SORTING(Document Type,No.)
+                                 WHERE(Document Type=CONST(Order),
+                                       ICM Login Code=FILTER(<>''));
+               OnAfterGetRecord=BEGIN
+                                  //kzwerver, 110505, c, #26896 (rewritten)
+                                  ProcessPurchaseHeaderRecord(0);
+                                  ProcessPurchaseHeaderRecord(1);
+
+                                  COMMIT;  //db, 17-04-13: C006986 (release each document because of rename processed file in xml/dataport)
+                                END;
+
+               ReqFilterFields=No.,Buy-from Vendor No. }
+
+  }
+  REQUESTPAGE
+  {
+    PROPERTIES
+    {
+    }
+    CONTROLS
+    {
+      { 1100525002;0;Container;
+                  ContainerType=ContentArea }
+
+      { 1100525001;1;Group  ;
+                  CaptionML=ENU=Options }
+
+      { 1100525000;2;Field  ;
+                  CaptionML=ENU=Print Confirmation;
+                  OptionCaptionML=ENU=None,Errors,All Transactions;
+                  SourceExpr=PrintConfirm }
+
+    }
+  }
+  LABELS
+  {
+  }
+  CODE
+  {
+    VAR
+      VendorRec@11012000 : Record 23;
+      i@11012001 : Integer;
+      OriginTxt@11012002 : Text[250];
+      BackupTxt@1210190000 : Text[250];
+      ICBHeader@11012003 : Record 11012324;
+      ICBLine@11012004 : Record 11012325;
+      PurchHeaderRec@1100485001 : Record 38;
+      PrintConfirm@1100485002 : 'None,Errors,All';
+
+    PROCEDURE ProcessPurchaseHeaderRecord@1210190001(Type@1210190000 : 'Confirmation,Error');
+    VAR
+      FileMgt@1100525000 : Codeunit 419;
+      lvUpdateOrder@1210190001 : Boolean;
+    BEGIN
+      //kzwerver, 110505, n, #26896
+      OriginTxt := '';
+      BackupTxt := '';
+      VendorRec.GET("Purchase Header"."Buy-from Vendor No.");
+
+      CASE Type OF
+        Type::Confirmation: BEGIN
+          OriginTxt := VendorRec."Pathname Purchase Exchange" + VendorRec."Directory ICB" +
+            "Purchase Header"."No." + '.ICB';
+          BackupTxt := VendorRec."Pathname Purchase Exchange" + VendorRec."Directory Backup ICB" +
+            "Purchase Header"."No." + '.ICB';
+        END;
+        Type::Error: BEGIN
+          OriginTxt := VendorRec."Pathname Purchase Exchange" + VendorRec."Directory EICB" +
+            "Purchase Header"."No." + '_E.ICB';
+          BackupTxt := VendorRec."Pathname Purchase Exchange" + VendorRec."Directory Backup EICB" +
+            "Purchase Header"."No." + '_E.ICB';
+        END;
+      END;
+      IF (OriginTxt = '') OR (BackupTxt = '') THEN EXIT;
+
+      ICBHeader.SETRANGE("Confirmation/Error", Type);
+      ICBHeader.SETRANGE("Order No.","Purchase Header"."No.");
+      ICBLine.SETRANGE("Confirmation/Error", Type);
+      ICBLine.SETRANGE("Order No.","Purchase Header"."No.");
+
+      IF FileMgt.ClientFileExists(OriginTxt) THEN BEGIN
+        ICBHeader.SETRANGE("Entry No.",0);
+        ICBLine.SETRANGE("Entry No.",0);
+        ICBHeader.DELETEALL;
+        ICBLine.DELETEALL;
+        RunICBXMLPort(
+          OriginTxt, BackupTxt, "Purchase Header"."No.", 0, ICBHeader."Confirmation/Error"::Confirmation);
+        lvUpdateOrder := TRUE;  //db, 16-03-09: M13962
+      END ELSE BEGIN
+        FOR i := 1 TO 25 DO
+          BEGIN
+            CASE Type OF
+              Type::Confirmation: BEGIN
+                OriginTxt := VendorRec."Pathname Purchase Exchange" + VendorRec."Directory ICB" +
+                  "Purchase Header"."No." + '_' + STRSUBSTNO('%1',i) + '.ICB';
+                BackupTxt := VendorRec."Pathname Purchase Exchange" + VendorRec."Directory Backup ICB" +
+                  "Purchase Header"."No." + '_' + STRSUBSTNO('%1',i) + '.ICB';
+              END;
+              Type::Error: BEGIN
+                OriginTxt := VendorRec."Pathname Purchase Exchange" + VendorRec."Directory EICB" +
+                  "Purchase Header"."No." + '_' + STRSUBSTNO('%1',i) + '_E.ICB';
+                BackupTxt := VendorRec."Pathname Purchase Exchange" + VendorRec."Directory Backup EICB" +
+                  "Purchase Header"."No." + '_' + STRSUBSTNO('%1',i) + '_E.ICB';
+              END;
+            END;
+            IF (OriginTxt = '') OR (BackupTxt = '') THEN EXIT;
+
+            IF FileMgt.ClientFileExists(OriginTxt) THEN BEGIN
+              ICBHeader.SETRANGE("Entry No.",i);
+              ICBLine.SETRANGE("Entry No.",i);
+              ICBHeader.DELETEALL;
+              ICBLine.DELETEALL;
+              RunICBXMLPort(
+                OriginTxt, BackupTxt, "Purchase Header"."No.", i, ICBHeader."Confirmation/Error"::Confirmation);
+              lvUpdateOrder := TRUE;  //db, 16-03-09: M13962
+            END;
+          END;
+      END;
+
+      IF lvUpdateOrder THEN
+        UpdateICMStatus;  //db, 16-03-09: M13962
+    END;
+
+    PROCEDURE UpdateICMStatus@1210190000();
+    BEGIN
+      //db, 10-12-08: M13552 (dataport 11012324 can change other fields ("Promised Receipt Date") of Purchase Header)
+      PurchHeaderRec.COPY("Purchase Header");
+      WITH PurchHeaderRec DO BEGIN
+        IF GET("Document Type","No.") THEN BEGIN  //db, 09-06-10: M17725
+          VALIDATE("ICM Status", "Purchase Header"."ICM Status"::Confirmed);
+          "ICM Order Confirm. Received on" := TODAY;
+          "Document Confirmation Received" := TRUE; //**4PS.n, call 26806
+          MODIFY(TRUE);
+        END;
+
+        IF PrintConfirm = PrintConfirm::None THEN EXIT;
+
+        ICBHeader.RESET;
+        IF PrintConfirm = PrintConfirm::Errors THEN
+          ICBHeader.SETRANGE("Confirmation/Error",ICBHeader."Confirmation/Error"::Error);
+        ICBHeader.SETRANGE("Order No.","No.");
+        IF ICBHeader.FIND('-') THEN
+          MARK := TRUE;
+
+        ICBLine.RESET;
+        IF PrintConfirm = PrintConfirm::Errors THEN
+          ICBLine.SETRANGE("Confirmation/Error",ICBHeader."Confirmation/Error"::Error);
+        ICBLine.SETRANGE("Order No.","No.");
+        IF ICBLine.FIND('-') THEN
+          MARK := TRUE;
+      END;
+    END;
+
+    PROCEDURE PrintConfirmation@1100485000();
+    VAR
+      ICMMessagesByPurchaser@1100525000 : Report 11012312;
+    BEGIN
+      PurchHeaderRec.MARKEDONLY(TRUE);
+      IF PurchHeaderRec.COUNT <> 0 THEN BEGIN
+        COMMIT;
+        ICMMessagesByPurchaser.SETTABLEVIEW(PurchHeaderRec);
+        ICMMessagesByPurchaser.SetSelection(PrintConfirm);
+        ICMMessagesByPurchaser.RUNMODAL;
+      END;
+    END;
+
+    LOCAL PROCEDURE RunICBXMLPort@1100525004(OriginTxt@1100525004 : Text[250];DestinationTxt@1100525003 : Text[250];PurchaseOrderNo@1100525002 : Code[20];SequenceNo@1100525001 : Integer;"Confirmation/Error"@1100525000 : 'Confirmation,Error');
+    VAR
+      TempBlob@1100525008 : Record 99008535;
+      ImportICMOrderConfirmations@1100525007 : XMLport 11012344;
+      ThreeTierAutomationMgt@1100525006 : Codeunit 419;
+      IStream@1100525005 : InStream;
+    BEGIN
+      ImportICMOrderConfirmations.SetSelection(
+        OriginTxt, DestinationTxt, PurchaseOrderNo, SequenceNo, "Confirmation/Error");
+      ThreeTierAutomationMgt.BLOBImport4PS(TempBlob, OriginTxt, FALSE);
+      TempBlob.Blob.CREATEINSTREAM(IStream);
+      ImportICMOrderConfirmations.SETSOURCE(IStream);
+      ImportICMOrderConfirmations.IMPORT;
+    END;
+
+    BEGIN
+    END.
+  }
+  RDLDATA
+  {
+  }
+}
+

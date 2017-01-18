@@ -1,0 +1,172 @@
+OBJECT Codeunit 760 Trailing Sales Orders Mgt.
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      TrailingSalesOrdersSetup@1006 : Record 760;
+      SalesHeader@1010 : Record 36;
+
+    PROCEDURE OnOpenPage@3(VAR TrailingSalesOrdersSetup@1000 : Record 760);
+    BEGIN
+      WITH TrailingSalesOrdersSetup DO
+        IF NOT GET(USERID) THEN BEGIN
+          LOCKTABLE;
+          "User ID" := USERID;
+          "Use Work Date as Base" := TRUE;
+          "Period Length" := "Period Length"::Month;
+          "Value to Calculate" := "Value to Calculate"::"No. of Orders";
+          "Chart Type" := "Chart Type"::"Stacked Column";
+          INSERT;
+        END;
+    END;
+
+    PROCEDURE DrillDown@4(VAR BusChartBuf@1003 : Record 485);
+    VAR
+      SalesHeader@1002 : Record 36;
+      ToDate@1004 : Date;
+      Measure@1000 : Integer;
+    BEGIN
+      Measure := BusChartBuf."Drill-Down Measure Index";
+      IF (Measure < 0) OR (Measure > 3) THEN
+        EXIT;
+      TrailingSalesOrdersSetup.GET(USERID);
+      SalesHeader.SETRANGE("Document Type",SalesHeader."Document Type"::Order);
+      IF TrailingSalesOrdersSetup."Show Orders" = TrailingSalesOrdersSetup."Show Orders"::"Delayed Orders" THEN
+        SalesHeader.SETFILTER("Shipment Date",'<%1',TrailingSalesOrdersSetup.GetStartDate);
+      IF EVALUATE(SalesHeader.Status,BusChartBuf.GetMeasureValueString(Measure),9) THEN
+        SalesHeader.SETRANGE(Status,SalesHeader.Status);
+
+      ToDate := BusChartBuf.GetXValueAsDate(BusChartBuf."Drill-Down X Index");
+      SalesHeader.SETRANGE("Document Date",0D,ToDate);
+      PAGE.RUN(PAGE::"Sales Order List",SalesHeader);
+    END;
+
+    PROCEDURE UpdateData@6(VAR BusChartBuf@1004 : Record 485);
+    VAR
+      ChartToStatusMap@1007 : ARRAY [4] OF Integer;
+      ToDate@1005 : ARRAY [5] OF Date;
+      FromDate@1000 : ARRAY [5] OF Date;
+      Value@1001 : Decimal;
+      TotalValue@1002 : Decimal;
+      ColumnNo@1003 : Integer;
+      SalesHeaderStatus@1006 : Integer;
+    BEGIN
+      TrailingSalesOrdersSetup.GET(USERID);
+      WITH BusChartBuf DO BEGIN
+        Initialize;
+        "Period Length" := TrailingSalesOrdersSetup."Period Length";
+        SetPeriodXAxis;
+
+        CreateMap(ChartToStatusMap);
+        FOR SalesHeaderStatus := 1 TO ARRAYLEN(ChartToStatusMap) DO BEGIN
+          SalesHeader.Status := ChartToStatusMap[SalesHeaderStatus];
+          AddMeasure(FORMAT(SalesHeader.Status),SalesHeader.Status,"Data Type"::Decimal,TrailingSalesOrdersSetup.GetChartType);
+        END;
+
+        IF CalcPeriods(FromDate,ToDate,BusChartBuf) THEN BEGIN
+          AddPeriods(ToDate[1],ToDate[ARRAYLEN(ToDate)]);
+
+          FOR SalesHeaderStatus := 1 TO ARRAYLEN(ChartToStatusMap) DO BEGIN
+            TotalValue := 0;
+            FOR ColumnNo := 1 TO ARRAYLEN(ToDate) DO BEGIN
+              Value := GetSalesOrderValue(ChartToStatusMap[SalesHeaderStatus],FromDate[ColumnNo],ToDate[ColumnNo]);
+              IF ColumnNo = 1 THEN
+                TotalValue := Value
+              ELSE
+                TotalValue += Value;
+              SetValueByIndex(SalesHeaderStatus - 1,ColumnNo - 1,TotalValue);
+            END;
+          END;
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE CalcPeriods@2(VAR FromDate@1002 : ARRAY [5] OF Date;VAR ToDate@1000 : ARRAY [5] OF Date;VAR BusChartBuf@1003 : Record 485) : Boolean;
+    VAR
+      MaxPeriodNo@1001 : Integer;
+      i@1005 : Integer;
+    BEGIN
+      MaxPeriodNo := ARRAYLEN(ToDate);
+      ToDate[MaxPeriodNo] := TrailingSalesOrdersSetup.GetStartDate;
+      IF ToDate[MaxPeriodNo] = 0D THEN
+        EXIT(FALSE);
+      FOR i := MaxPeriodNo DOWNTO 1 DO BEGIN
+        IF i > 1 THEN BEGIN
+          FromDate[i] := BusChartBuf.CalcFromDate(ToDate[i]);
+          ToDate[i - 1] := FromDate[i] - 1;
+        END ELSE
+          FromDate[i] := 0D
+      END;
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE GetSalesOrderValue@1(Status@1000 : Option;FromDate@1001 : Date;ToDate@1002 : Date) : Decimal;
+    BEGIN
+      IF TrailingSalesOrdersSetup."Value to Calculate" = TrailingSalesOrdersSetup."Value to Calculate"::"No. of Orders" THEN
+        EXIT(GetSalesOrderCount(Status,FromDate,ToDate));
+      EXIT(GetSalesOrderAmount(Status,FromDate,ToDate));
+    END;
+
+    LOCAL PROCEDURE GetSalesOrderAmount@25(Status@1000 : Option;FromDate@1001 : Date;ToDate@1002 : Date) : Decimal;
+    VAR
+      CurrExchRate@1004 : Record 330;
+      TrailingSalesOrderQry@1003 : Query 760;
+      Amount@1008 : Decimal;
+      TotalAmount@1005 : Decimal;
+    BEGIN
+      IF TrailingSalesOrdersSetup."Show Orders" = TrailingSalesOrdersSetup."Show Orders"::"Delayed Orders" THEN
+        TrailingSalesOrderQry.SETFILTER(ShipmentDate,'<%1',TrailingSalesOrdersSetup.GetStartDate);
+
+      TrailingSalesOrderQry.SETRANGE(Status,Status);
+      TrailingSalesOrderQry.SETRANGE(DocumentDate,FromDate,ToDate);
+      TrailingSalesOrderQry.OPEN;
+      WHILE TrailingSalesOrderQry.READ DO BEGIN
+        IF TrailingSalesOrderQry.CurrencyCode = '' THEN
+          Amount := TrailingSalesOrderQry.Amount
+        ELSE
+      //  Amount := ROUND(TrailingSalesOrderQry.Amount / CurrExchRate.ExchangeRate(TODAY,TrailingSalesOrderQry.CurrencyCode));  //**4PS.o
+          Amount := ROUND(TrailingSalesOrderQry.Amount / CurrExchRate.ExchangeRate(0, '',TODAY,TrailingSalesOrderQry.CurrencyCode,TRUE));  //**4PS.n
+        TotalAmount := TotalAmount + Amount;
+      END;
+      EXIT(TotalAmount);
+    END;
+
+    LOCAL PROCEDURE GetSalesOrderCount@7(Status@1000 : Option;FromDate@1001 : Date;ToDate@1002 : Date) : Decimal;
+    BEGIN
+      SalesHeader.SETRANGE("Document Type",SalesHeader."Document Type"::Order);
+      IF TrailingSalesOrdersSetup."Show Orders" = TrailingSalesOrdersSetup."Show Orders"::"Delayed Orders" THEN
+        SalesHeader.SETFILTER("Shipment Date",'<%1',TrailingSalesOrdersSetup.GetStartDate)
+      ELSE
+        SalesHeader.SETRANGE("Shipment Date");
+      SalesHeader.SETRANGE(Status,Status);
+      SalesHeader.SETRANGE("Document Date",FromDate,ToDate);
+      EXIT(SalesHeader.COUNT);
+    END;
+
+    PROCEDURE CreateMap@5(VAR Map@1000 : ARRAY [4] OF Integer);
+    VAR
+      SalesHeader@1001 : Record 36;
+    BEGIN
+      Map[1] := SalesHeader.Status::Released;
+      Map[2] := SalesHeader.Status::"Pending Prepayment";
+      Map[3] := SalesHeader.Status::"Pending Approval";
+      Map[4] := SalesHeader.Status::Open;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

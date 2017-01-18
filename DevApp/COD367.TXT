@@ -1,0 +1,571 @@
+OBJECT Codeunit 367 CheckManagement
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00;
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 21=rm,
+                TableData 25=rm,
+                TableData 271=rm,
+                TableData 272=rim;
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Text000@1000 : TextConst 'ENU=Check %1 already exists for this %2.';
+      Text001@1001 : TextConst 'ENU=Voiding check %1.';
+      GenJnlLine2@1002 : Record 81;
+      BankAcc@1003 : Record 270;
+      BankAccLedgEntry2@1004 : Record 271;
+      CheckLedgEntry2@1005 : Record 272;
+      SourceCodeSetup@1006 : Record 242;
+      VendorLedgEntry@1009 : Record 25;
+      GLEntry@1010 : Record 17;
+      CustLedgEntry@1011 : Record 21;
+      FALedgEntry@1012 : Record 5601;
+      BankAccLedgEntry3@1013 : Record 271;
+      GenJnlPostLine@1014 : Codeunit 12;
+      UpdateAnalysisView@1018 : Codeunit 410;
+      NextCheckEntryNo@1016 : Integer;
+      Text002@1017 : TextConst 'ENU=You cannot Financially Void checks posted in a non-balancing transaction.';
+      AppliesIDCounter@1019 : Integer;
+      NoAppliedEntryErr@1007 : TextConst 'ENU=Cannot find an applied entry within the specified filter.';
+
+    PROCEDURE InsertCheck@3(VAR CheckLedgEntry@1000 : Record 272;RecordIdToPrint@1001 : RecordID);
+    BEGIN
+      IF NextCheckEntryNo = 0 THEN BEGIN
+        CheckLedgEntry2.LOCKTABLE;
+        CheckLedgEntry2.RESET;
+        IF CheckLedgEntry2.FINDLAST THEN
+          NextCheckEntryNo := CheckLedgEntry2."Entry No." + 1
+        ELSE
+          NextCheckEntryNo := 1;
+      END;
+
+      CheckLedgEntry2.RESET;
+      CheckLedgEntry2.SETCURRENTKEY("Bank Account No.","Entry Status","Check No.");
+      CheckLedgEntry2.SETRANGE("Bank Account No.",CheckLedgEntry."Bank Account No.");
+      CheckLedgEntry2.SETFILTER(
+        "Entry Status",'%1|%2|%3',
+        CheckLedgEntry2."Entry Status"::Printed,
+        CheckLedgEntry2."Entry Status"::Posted,
+        CheckLedgEntry2."Entry Status"::"Financially Voided");
+      CheckLedgEntry2.SETRANGE("Check No.",CheckLedgEntry."Document No.");
+      IF CheckLedgEntry2.FINDFIRST THEN
+        ERROR(Text000,CheckLedgEntry."Document No.",BankAcc.TABLECAPTION);
+
+      CheckLedgEntry.Open := CheckLedgEntry.Amount <> 0;
+      CheckLedgEntry."User ID" := USERID;
+      CheckLedgEntry."Entry No." := NextCheckEntryNo;
+      CheckLedgEntry."Record ID to Print" := RecordIdToPrint;
+      CheckLedgEntry.INSERT;
+      NextCheckEntryNo := NextCheckEntryNo + 1;
+    END;
+
+    PROCEDURE VoidCheck@4(VAR GenJnlLine@1000 : Record 81);
+    VAR
+      Currency@1001 : Record 4;
+      CheckAmountLCY@1002 : Decimal;
+    BEGIN
+      GenJnlLine.TESTFIELD("Bank Payment Type",GenJnlLine2."Bank Payment Type"::"Computer Check");
+      GenJnlLine.TESTFIELD("Check Printed",TRUE);
+      GenJnlLine.TESTFIELD("Document No.");
+
+      IF GenJnlLine."Bal. Account No." = '' THEN BEGIN
+        GenJnlLine."Check Printed" := FALSE;
+        GenJnlLine.DELETE(TRUE);
+      END;
+
+      CheckAmountLCY := GenJnlLine."Amount (LCY)";
+      IF GenJnlLine."Currency Code" <> '' THEN
+        Currency.GET(GenJnlLine."Currency Code");
+
+      GenJnlLine2.RESET;
+      GenJnlLine2.SETCURRENTKEY("Journal Template Name","Journal Batch Name","Posting Date","Document No.");
+      GenJnlLine2.SETRANGE("Journal Template Name",GenJnlLine."Journal Template Name");
+      GenJnlLine2.SETRANGE("Journal Batch Name",GenJnlLine."Journal Batch Name");
+      GenJnlLine2.SETRANGE("Posting Date",GenJnlLine."Posting Date");
+      GenJnlLine2.SETRANGE("Document No.",GenJnlLine."Document No.");
+      IF GenJnlLine2.FIND('-') THEN
+        REPEAT
+          IF (GenJnlLine2."Line No." > GenJnlLine."Line No.") AND
+             (CheckAmountLCY = -GenJnlLine2."Amount (LCY)") AND
+             (GenJnlLine2."Currency Code" = '') AND (GenJnlLine."Currency Code" <> '') AND
+             (GenJnlLine2."Account Type" = GenJnlLine2."Account Type"::"G/L Account") AND
+             (GenJnlLine2."Account No." IN
+              [Currency."Conv. LCY Rndg. Debit Acc.",Currency."Conv. LCY Rndg. Credit Acc."]) AND
+             (GenJnlLine2."Bal. Account No." = '') AND NOT GenJnlLine2."Check Printed"
+          THEN
+            GenJnlLine2.DELETE // Rounding correction line
+          ELSE BEGIN
+            IF GenJnlLine."Bal. Account No." = '' THEN BEGIN
+              IF GenJnlLine2."Account No." = '' THEN BEGIN
+                GenJnlLine2."Account Type" := GenJnlLine2."Account Type"::"Bank Account";
+                GenJnlLine2."Account No." := GenJnlLine."Account No.";
+              END ELSE BEGIN
+                GenJnlLine2."Bal. Account Type" := GenJnlLine2."Account Type"::"Bank Account";
+                GenJnlLine2."Bal. Account No." := GenJnlLine."Account No.";
+              END;
+              GenJnlLine2.VALIDATE(Amount);
+              GenJnlLine2."Bank Payment Type" := GenJnlLine."Bank Payment Type";
+            END;
+            GenJnlLine2."Document No." := '';
+            GenJnlLine2."Check Printed" := FALSE;
+            GenJnlLine2.UpdateSource;
+            GenJnlLine2.MODIFY;
+          END;
+        UNTIL GenJnlLine2.NEXT = 0;
+
+      CheckLedgEntry2.RESET;
+      CheckLedgEntry2.SETCURRENTKEY("Bank Account No.","Entry Status","Check No.");
+      IF GenJnlLine.Amount <= 0 THEN
+        CheckLedgEntry2.SETRANGE("Bank Account No.",GenJnlLine."Account No.")
+      ELSE
+        CheckLedgEntry2.SETRANGE("Bank Account No.",GenJnlLine."Bal. Account No.");
+      CheckLedgEntry2.SETRANGE("Entry Status",CheckLedgEntry2."Entry Status"::Printed);
+      CheckLedgEntry2.SETRANGE("Check No.",GenJnlLine."Document No.");
+      CheckLedgEntry2.FINDFIRST;
+      CheckLedgEntry2."Original Entry Status" := CheckLedgEntry2."Entry Status";
+      CheckLedgEntry2."Entry Status" := CheckLedgEntry2."Entry Status"::Voided;
+      CheckLedgEntry2."Positive Pay Exported" := FALSE;
+      CheckLedgEntry2.Open := FALSE;
+      CheckLedgEntry2.MODIFY;
+    END;
+
+    PROCEDURE FinancialVoidCheck@5(VAR CheckLedgEntry@1000 : Record 272);
+    VAR
+      TransactionBalance@1001 : Decimal;
+      VATPostingSetup@1002 : Record 325;
+      Currency@1009 : Record 4;
+      ConfirmFinVoid@1008 : Page 695;
+      AmountToVoid@1003 : Decimal;
+      CheckAmountLCY@1004 : Decimal;
+      BalanceAmountLCY@1005 : Decimal;
+      CurrencyRoundingDebitAccount@1006 : Code[20];
+      CurrencyRoundingCreditAccount@1007 : Code[20];
+    BEGIN
+      CheckLedgEntry.TESTFIELD("Entry Status",CheckLedgEntry."Entry Status"::Posted);
+      CheckLedgEntry.TESTFIELD("Statement Status",CheckLedgEntry."Statement Status"::Open);
+      CheckLedgEntry.TESTFIELD("Bal. Account No.");
+      BankAcc.GET(CheckLedgEntry."Bank Account No.");
+      BankAccLedgEntry2.GET(CheckLedgEntry."Bank Account Ledger Entry No.");
+      SourceCodeSetup.GET;
+      WITH GLEntry DO BEGIN
+        SETCURRENTKEY("Transaction No.");
+        SETRANGE("Transaction No.",BankAccLedgEntry2."Transaction No.");
+        SETRANGE("Document No.",BankAccLedgEntry2."Document No.");
+        CALCSUMS(Amount);
+        TransactionBalance := Amount;
+      END;
+      IF TransactionBalance <> 0 THEN
+        ERROR(Text002);
+
+      CLEAR(ConfirmFinVoid);
+      ConfirmFinVoid.SetCheckLedgerEntry(CheckLedgEntry);
+      IF ConfirmFinVoid.RUNMODAL <> ACTION::Yes THEN
+        EXIT;
+
+      AmountToVoid := 0;
+      WITH CheckLedgEntry2 DO BEGIN
+        RESET;
+        SETCURRENTKEY("Bank Account No.","Entry Status","Check No.");
+        SETRANGE("Bank Account No.",CheckLedgEntry."Bank Account No.");
+        SETRANGE("Entry Status",CheckLedgEntry."Entry Status"::Posted);
+        SETRANGE("Statement Status",CheckLedgEntry."Statement Status"::Open);
+        SETRANGE("Check No.",CheckLedgEntry."Check No.");
+        SETRANGE("Check Date",CheckLedgEntry."Check Date");
+        CALCSUMS(Amount);
+        AmountToVoid := Amount;
+      END;
+
+      GenJnlLine2.INIT;
+      GenJnlLine2."System-Created Entry" := TRUE;
+      GenJnlLine2."Financial Void" := TRUE;
+      GenJnlLine2."Document No." := CheckLedgEntry."Document No.";
+      GenJnlLine2."Account Type" := GenJnlLine2."Account Type"::"Bank Account";
+      GenJnlLine2."Posting Date" := ConfirmFinVoid.GetVoidDate;
+      GenJnlLine2.VALIDATE("Account No.",CheckLedgEntry."Bank Account No.");
+      GenJnlLine2.Description := STRSUBSTNO(Text001,CheckLedgEntry."Check No.");
+      GenJnlLine2.VALIDATE(Amount,AmountToVoid);
+      CheckAmountLCY := GenJnlLine2."Amount (LCY)";
+      BalanceAmountLCY := 0;
+      CurrencyRoundingDebitAccount := '';
+      CurrencyRoundingCreditAccount := '';
+      GenJnlLine2."Source Code" := SourceCodeSetup."Financially Voided Check";
+      GenJnlLine2."Shortcut Dimension 1 Code" := BankAccLedgEntry2."Global Dimension 1 Code";
+      GenJnlLine2."Shortcut Dimension 2 Code" := BankAccLedgEntry2."Global Dimension 2 Code";
+      GenJnlLine2."Dimension Set ID" := BankAccLedgEntry2."Dimension Set ID";
+      GenJnlLine2."Allow Zero-Amount Posting" := TRUE;
+      GenJnlPostLine.RunWithCheck(GenJnlLine2);
+
+      // Mark newly posted entry as cleared for bank reconciliation purposes.
+      IF ConfirmFinVoid.GetVoidDate = CheckLedgEntry."Check Date" THEN BEGIN
+        BankAccLedgEntry3.RESET;
+        BankAccLedgEntry3.FINDLAST;
+        BankAccLedgEntry3.Open := FALSE;
+        BankAccLedgEntry3."Remaining Amount" := 0;
+        BankAccLedgEntry3."Statement Status" := BankAccLedgEntry2."Statement Status"::Closed;
+        BankAccLedgEntry3.MODIFY;
+      END;
+
+      GenJnlLine2.INIT;
+      GenJnlLine2."System-Created Entry" := TRUE;
+      GenJnlLine2."Financial Void" := TRUE;
+      GenJnlLine2."Document No." := CheckLedgEntry."Document No.";
+      GenJnlLine2."Account Type" := CheckLedgEntry."Bal. Account Type";
+      GenJnlLine2."Posting Date" := ConfirmFinVoid.GetVoidDate;
+      GenJnlLine2.VALIDATE("Account No.",CheckLedgEntry."Bal. Account No.");
+      GenJnlLine2.VALIDATE("Currency Code",BankAcc."Currency Code");
+      GenJnlLine2.Description := STRSUBSTNO(Text001,CheckLedgEntry."Check No.");
+      GenJnlLine2."Source Code" := SourceCodeSetup."Financially Voided Check";
+      GenJnlLine2."Allow Zero-Amount Posting" := TRUE;
+      CASE CheckLedgEntry."Bal. Account Type" OF
+        CheckLedgEntry."Bal. Account Type"::"G/L Account":
+          WITH GLEntry DO BEGIN
+            SETCURRENTKEY("Transaction No.");
+            SETRANGE("Transaction No.",BankAccLedgEntry2."Transaction No.");
+            SETRANGE("Document No.",BankAccLedgEntry2."Document No.");
+            SETRANGE("Posting Date",BankAccLedgEntry2."Posting Date");
+            SETFILTER("Entry No.",'<>%1',BankAccLedgEntry2."Entry No.");
+            SETRANGE("G/L Account No.",CheckLedgEntry."Bal. Account No.");
+            IF FINDSET THEN
+              REPEAT
+                GenJnlLine2.VALIDATE("Account No.","G/L Account No.");
+                GenJnlLine2.Description := STRSUBSTNO(Text001,CheckLedgEntry."Check No.");
+                GenJnlLine2.VALIDATE(Amount,-Amount - "VAT Amount");
+                BalanceAmountLCY := BalanceAmountLCY + GenJnlLine2."Amount (LCY)";
+                GenJnlLine2."Shortcut Dimension 1 Code" := "Global Dimension 1 Code";
+                GenJnlLine2."Shortcut Dimension 2 Code" := "Global Dimension 2 Code";
+                GenJnlLine2."Dimension Set ID" := "Dimension Set ID";
+                GenJnlLine2."Gen. Posting Type" := "Gen. Posting Type";
+                GenJnlLine2."Gen. Bus. Posting Group" := "Gen. Bus. Posting Group";
+                GenJnlLine2."Gen. Prod. Posting Group" := "Gen. Prod. Posting Group";
+                GenJnlLine2."VAT Bus. Posting Group" := "VAT Bus. Posting Group";
+                GenJnlLine2."VAT Prod. Posting Group" := "VAT Prod. Posting Group";
+                IF VATPostingSetup.GET("VAT Bus. Posting Group","VAT Prod. Posting Group") THEN
+                  GenJnlLine2."VAT Calculation Type" := VATPostingSetup."VAT Calculation Type";
+                GenJnlPostLine.RunWithCheck(GenJnlLine2);
+              UNTIL NEXT = 0;
+          END;
+        CheckLedgEntry."Bal. Account Type"::Customer:
+          BEGIN
+            IF ConfirmFinVoid.GetVoidType = 0 THEN BEGIN    // Unapply entry
+              IF UnApplyCustInvoices(CheckLedgEntry,ConfirmFinVoid.GetVoidDate) THEN
+                GenJnlLine2."Applies-to ID" := CheckLedgEntry."Document No.";
+            END;
+            WITH CustLedgEntry DO BEGIN
+              SETCURRENTKEY("Transaction No.");
+              SETRANGE("Transaction No.",BankAccLedgEntry2."Transaction No.");
+              SETRANGE("Document No.",BankAccLedgEntry2."Document No.");
+              SETRANGE("Posting Date",BankAccLedgEntry2."Posting Date");
+              IF FINDSET THEN
+                REPEAT
+                  CALCFIELDS("Original Amount");
+                  GenJnlLine2.VALIDATE(Amount,-"Original Amount");
+                  GenJnlLine2.VALIDATE("Currency Code","Currency Code");
+                  BalanceAmountLCY := BalanceAmountLCY + GenJnlLine2."Amount (LCY)";
+                  MakeAppliesID(GenJnlLine2."Applies-to ID",CheckLedgEntry."Document No.");
+                  GenJnlLine2."Shortcut Dimension 1 Code" := "Global Dimension 1 Code";
+                  GenJnlLine2."Shortcut Dimension 2 Code" := "Global Dimension 2 Code";
+                  GenJnlLine2."Dimension Set ID" := "Dimension Set ID";
+                  GenJnlLine2."Source Currency Code" := "Currency Code";
+                  GenJnlPostLine.RunWithCheck(GenJnlLine2);
+                UNTIL NEXT = 0;
+            END;
+          END;
+        CheckLedgEntry."Bal. Account Type"::Vendor:
+          BEGIN
+            IF ConfirmFinVoid.GetVoidType = 0 THEN BEGIN    // Unapply entry
+              IF UnApplyVendInvoices(CheckLedgEntry,ConfirmFinVoid.GetVoidDate) THEN
+                GenJnlLine2."Applies-to ID" := CheckLedgEntry."Document No.";
+            END;
+            WITH VendorLedgEntry DO BEGIN
+              SETCURRENTKEY("Transaction No.");
+              SETRANGE("Transaction No.",BankAccLedgEntry2."Transaction No.");
+              SETRANGE("Document No.",BankAccLedgEntry2."Document No.");
+              SETRANGE("Posting Date",BankAccLedgEntry2."Posting Date");
+              IF FINDSET THEN
+                REPEAT
+                  CALCFIELDS("Original Amount");
+                  GenJnlLine2.VALIDATE(Amount,-"Original Amount");
+                  GenJnlLine2.VALIDATE("Currency Code","Currency Code");
+                  BalanceAmountLCY := BalanceAmountLCY + GenJnlLine2."Amount (LCY)";
+                  MakeAppliesID(GenJnlLine2."Applies-to ID",CheckLedgEntry."Document No.");
+                  GenJnlLine2."Shortcut Dimension 1 Code" := "Global Dimension 1 Code";
+                  GenJnlLine2."Shortcut Dimension 2 Code" := "Global Dimension 2 Code";
+                  GenJnlLine2."Dimension Set ID" := "Dimension Set ID";
+                  GenJnlLine2."Source Currency Code" := "Currency Code";
+                  GenJnlPostLine.RunWithCheck(GenJnlLine2);
+                UNTIL NEXT = 0;
+            END;
+          END;
+        CheckLedgEntry."Bal. Account Type"::"Bank Account":
+          WITH BankAccLedgEntry3 DO BEGIN
+            SETCURRENTKEY("Transaction No.");
+            SETRANGE("Transaction No.",BankAccLedgEntry2."Transaction No.");
+            SETRANGE("Document No.",BankAccLedgEntry2."Document No.");
+            SETRANGE("Posting Date",BankAccLedgEntry2."Posting Date");
+            SETFILTER("Entry No.",'<>%1',BankAccLedgEntry2."Entry No.");
+            IF FINDSET THEN
+              REPEAT
+                GenJnlLine2.VALIDATE(Amount,-Amount);
+                BalanceAmountLCY := BalanceAmountLCY + GenJnlLine2."Amount (LCY)";
+                GenJnlLine2."Shortcut Dimension 1 Code" := "Global Dimension 1 Code";
+                GenJnlLine2."Shortcut Dimension 2 Code" := "Global Dimension 2 Code";
+                GenJnlLine2."Dimension Set ID" := "Dimension Set ID";
+                GenJnlPostLine.RunWithCheck(GenJnlLine2);
+              UNTIL NEXT = 0;
+          END;
+        CheckLedgEntry."Bal. Account Type"::"Fixed Asset":
+          WITH FALedgEntry DO BEGIN
+            SETCURRENTKEY("Transaction No.");
+            SETRANGE("Transaction No.",BankAccLedgEntry2."Transaction No.");
+            SETRANGE("Document No.",BankAccLedgEntry2."Document No.");
+            SETRANGE("Posting Date",BankAccLedgEntry2."Posting Date");
+            IF FINDSET THEN
+              REPEAT
+                GenJnlLine2.VALIDATE(Amount,-Amount);
+                BalanceAmountLCY := BalanceAmountLCY + GenJnlLine2."Amount (LCY)";
+                GenJnlLine2."Shortcut Dimension 1 Code" := "Global Dimension 1 Code";
+                GenJnlLine2."Shortcut Dimension 2 Code" := "Global Dimension 2 Code";
+                GenJnlLine2."Dimension Set ID" := "Dimension Set ID";
+                GenJnlPostLine.RunWithCheck(GenJnlLine2);
+              UNTIL NEXT = 0;
+          END;
+        ELSE BEGIN
+          GenJnlLine2."Bal. Account Type" := CheckLedgEntry."Bal. Account Type";
+          GenJnlLine2.VALIDATE("Bal. Account No.",CheckLedgEntry."Bal. Account No.");
+          GenJnlLine2."Shortcut Dimension 1 Code" := '';
+          GenJnlLine2."Shortcut Dimension 2 Code" := '';
+          GenJnlLine2."Dimension Set ID" := 0;
+          GenJnlPostLine.RunWithoutCheck(GenJnlLine2);
+        END;
+      END;
+
+      IF ConfirmFinVoid.GetVoidDate = CheckLedgEntry."Check Date" THEN BEGIN
+        BankAccLedgEntry2.Open := FALSE;
+        BankAccLedgEntry2."Remaining Amount" := 0;
+        BankAccLedgEntry2."Statement Status" := BankAccLedgEntry2."Statement Status"::Closed;
+        BankAccLedgEntry2.MODIFY;
+      END;
+
+      IF CheckAmountLCY + BalanceAmountLCY <> 0 THEN BEGIN  // rounding error from currency conversion
+        Currency.GET(BankAcc."Currency Code");
+        Currency.TESTFIELD("Conv. LCY Rndg. Debit Acc.");
+        Currency.TESTFIELD("Conv. LCY Rndg. Credit Acc.");
+        GenJnlLine2.INIT;
+        GenJnlLine2."System-Created Entry" := TRUE;
+        GenJnlLine2."Financial Void" := TRUE;
+        GenJnlLine2."Document No." := CheckLedgEntry."Document No.";
+        GenJnlLine2."Account Type" := GenJnlLine2."Account Type"::"G/L Account";
+        GenJnlLine2."Posting Date" := ConfirmFinVoid.GetVoidDate;
+        IF -(CheckAmountLCY + BalanceAmountLCY) > 0 THEN
+          GenJnlLine2.VALIDATE("Account No.",Currency."Conv. LCY Rndg. Debit Acc.")
+        ELSE
+          GenJnlLine2.VALIDATE("Account No.",Currency."Conv. LCY Rndg. Credit Acc.");
+        GenJnlLine2.VALIDATE("Currency Code",BankAcc."Currency Code");
+        GenJnlLine2.Description := STRSUBSTNO(Text001,CheckLedgEntry."Check No.");
+        GenJnlLine2."Source Code" := SourceCodeSetup."Financially Voided Check";
+        GenJnlLine2."Allow Zero-Amount Posting" := TRUE;
+        GenJnlLine2.VALIDATE(Amount,0);
+        GenJnlLine2."Amount (LCY)" := -(CheckAmountLCY + BalanceAmountLCY);
+        GenJnlLine2."Shortcut Dimension 1 Code" := BankAccLedgEntry2."Global Dimension 1 Code";
+        GenJnlLine2."Shortcut Dimension 2 Code" := BankAccLedgEntry2."Global Dimension 2 Code";
+        GenJnlLine2."Dimension Set ID" := BankAccLedgEntry2."Dimension Set ID";
+        GenJnlPostLine.RunWithCheck(GenJnlLine2);
+      END;
+
+      MarkCheckEntriesVoid(CheckLedgEntry,ConfirmFinVoid.GetVoidDate);
+      COMMIT;
+      UpdateAnalysisView.UpdateAll(0,TRUE);
+    END;
+
+    LOCAL PROCEDURE UnApplyVendInvoices@6(VAR CheckLedgEntry@1000 : Record 272;VoidDate@1008 : Date) : Boolean;
+    VAR
+      BankAccLedgEntry@1020001 : Record 271;
+      OrigPaymentVendLedgEntry@1020000 : Record 25;
+      PaymentDetVendLedgEntry@1020004 : Record 380;
+      GenJnlLine3@1020002 : Record 81;
+      AppliesID@1020003 : Code[50];
+    BEGIN
+      // first, find first original payment line, if any
+      BankAccLedgEntry.GET(CheckLedgEntry."Bank Account Ledger Entry No.");
+      IF CheckLedgEntry."Bal. Account Type" = CheckLedgEntry."Bal. Account Type"::Vendor THEN BEGIN
+        WITH OrigPaymentVendLedgEntry DO BEGIN
+          SETCURRENTKEY("Transaction No.");
+          SETRANGE("Transaction No.",BankAccLedgEntry."Transaction No.");
+          SETRANGE("Document No.",BankAccLedgEntry."Document No.");
+          SETRANGE("Posting Date",BankAccLedgEntry."Posting Date");
+          IF NOT FINDFIRST THEN
+            EXIT(FALSE);
+        END;
+      END ELSE
+        EXIT(FALSE);
+
+      AppliesID := CheckLedgEntry."Document No.";
+
+      PaymentDetVendLedgEntry.SETCURRENTKEY("Vendor Ledger Entry No.","Entry Type","Posting Date");
+      PaymentDetVendLedgEntry.SETRANGE("Vendor Ledger Entry No.",OrigPaymentVendLedgEntry."Entry No.");
+      PaymentDetVendLedgEntry.SETRANGE(Unapplied,FALSE);
+      PaymentDetVendLedgEntry.SETFILTER("Applied Vend. Ledger Entry No.",'<>%1',0);
+      PaymentDetVendLedgEntry.SETRANGE("Entry Type",PaymentDetVendLedgEntry."Entry Type"::Application);
+      IF NOT PaymentDetVendLedgEntry.FINDFIRST THEN
+        ERROR(NoAppliedEntryErr);
+      GenJnlLine3."Document No." := OrigPaymentVendLedgEntry."Document No.";
+      GenJnlLine3."Posting Date" := VoidDate;
+      GenJnlLine3."Account Type" := GenJnlLine3."Account Type"::Vendor;
+      GenJnlLine3."Account No." := OrigPaymentVendLedgEntry."Vendor No.";
+      GenJnlLine3.Correction := TRUE;
+      GenJnlLine3.Description := STRSUBSTNO(Text001,CheckLedgEntry."Check No.");
+      GenJnlLine3."Shortcut Dimension 1 Code" := OrigPaymentVendLedgEntry."Global Dimension 1 Code";
+      GenJnlLine3."Shortcut Dimension 2 Code" := OrigPaymentVendLedgEntry."Global Dimension 2 Code";
+      GenJnlLine3."Posting Group" := OrigPaymentVendLedgEntry."Vendor Posting Group";
+      GenJnlLine3."Source Type" := GenJnlLine3."Source Type"::Vendor;
+      GenJnlLine3."Source No." := OrigPaymentVendLedgEntry."Vendor No.";
+      GenJnlLine3."Source Code" := SourceCodeSetup."Financially Voided Check";
+      GenJnlLine3."Source Currency Code" := OrigPaymentVendLedgEntry."Currency Code";
+      GenJnlLine3."System-Created Entry" := TRUE;
+      GenJnlLine3."Financial Void" := TRUE;
+      GenJnlPostLine.UnapplyVendLedgEntry(GenJnlLine3,PaymentDetVendLedgEntry);
+
+      WITH OrigPaymentVendLedgEntry DO BEGIN
+        FINDSET(TRUE,FALSE);  // re-get the now-modified payment entry.
+        REPEAT                // set up to be applied by upcoming voiding entry.
+          MakeAppliesID(AppliesID,CheckLedgEntry."Document No.");
+          "Applies-to ID" := AppliesID;
+          CALCFIELDS("Remaining Amount");
+          "Amount to Apply" := "Remaining Amount";
+          "Accepted Pmt. Disc. Tolerance" := FALSE;
+          "Accepted Payment Tolerance" := 0;
+          MODIFY;
+        UNTIL NEXT = 0;
+      END;
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE UnApplyCustInvoices@7(VAR CheckLedgEntry@1000 : Record 272;VoidDate@1006 : Date) : Boolean;
+    VAR
+      BankAccLedgEntry@1020001 : Record 271;
+      OrigPaymentCustLedgEntry@1020000 : Record 21;
+      PaymentDetCustLedgEntry@1020004 : Record 379;
+      GenJnlLine3@1020002 : Record 81;
+      AppliesID@1020003 : Code[50];
+    BEGIN
+      // first, find first original payment line, if any
+      BankAccLedgEntry.GET(CheckLedgEntry."Bank Account Ledger Entry No.");
+      IF CheckLedgEntry."Bal. Account Type" = CheckLedgEntry."Bal. Account Type"::Customer THEN BEGIN
+        WITH OrigPaymentCustLedgEntry DO BEGIN
+          SETCURRENTKEY("Transaction No.");
+          SETRANGE("Transaction No.",BankAccLedgEntry."Transaction No.");
+          SETRANGE("Document No.",BankAccLedgEntry."Document No.");
+          SETRANGE("Posting Date",BankAccLedgEntry."Posting Date");
+          IF NOT FINDFIRST THEN
+            EXIT(FALSE);
+        END;
+      END ELSE
+        EXIT(FALSE);
+
+      AppliesID := CheckLedgEntry."Document No.";
+
+      PaymentDetCustLedgEntry.SETCURRENTKEY("Cust. Ledger Entry No.","Entry Type","Posting Date");
+      PaymentDetCustLedgEntry.SETRANGE("Cust. Ledger Entry No.",OrigPaymentCustLedgEntry."Entry No.");
+      PaymentDetCustLedgEntry.SETRANGE(Unapplied,FALSE);
+      PaymentDetCustLedgEntry.SETFILTER("Applied Cust. Ledger Entry No.",'<>%1',0);
+      PaymentDetCustLedgEntry.SETRANGE("Entry Type",PaymentDetCustLedgEntry."Entry Type"::Application);
+      IF NOT PaymentDetCustLedgEntry.FINDFIRST THEN
+        ERROR(NoAppliedEntryErr);
+      GenJnlLine3."Document No." := OrigPaymentCustLedgEntry."Document No.";
+      GenJnlLine3."Posting Date" := VoidDate;
+      GenJnlLine3."Account Type" := GenJnlLine3."Account Type"::Customer;
+      GenJnlLine3."Account No." := OrigPaymentCustLedgEntry."Customer No.";
+      GenJnlLine3.Correction := TRUE;
+      GenJnlLine3.Description := STRSUBSTNO(Text001,CheckLedgEntry."Check No.");
+      GenJnlLine3."Shortcut Dimension 1 Code" := OrigPaymentCustLedgEntry."Global Dimension 1 Code";
+      GenJnlLine3."Shortcut Dimension 2 Code" := OrigPaymentCustLedgEntry."Global Dimension 2 Code";
+      GenJnlLine3."Posting Group" := OrigPaymentCustLedgEntry."Customer Posting Group";
+      GenJnlLine3."Source Type" := GenJnlLine3."Source Type"::Customer;
+      GenJnlLine3."Source No." := OrigPaymentCustLedgEntry."Customer No.";
+      GenJnlLine3."Source Code" := SourceCodeSetup."Financially Voided Check";
+      GenJnlLine3."Source Currency Code" := OrigPaymentCustLedgEntry."Currency Code";
+      GenJnlLine3."System-Created Entry" := TRUE;
+      GenJnlLine3."Financial Void" := TRUE;
+      GenJnlPostLine.UnapplyCustLedgEntry(GenJnlLine3,PaymentDetCustLedgEntry);
+
+      WITH OrigPaymentCustLedgEntry DO BEGIN
+        FINDSET(TRUE,FALSE);  // re-get the now-modified payment entry.
+        REPEAT                // set up to be applied by upcoming voiding entry.
+          MakeAppliesID(AppliesID,CheckLedgEntry."Document No.");
+          "Applies-to ID" := AppliesID;
+          CALCFIELDS("Remaining Amount");
+          "Amount to Apply" := "Remaining Amount";
+          "Accepted Pmt. Disc. Tolerance" := FALSE;
+          "Accepted Payment Tolerance" := 0;
+          MODIFY;
+        UNTIL NEXT = 0;
+      END;
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE MarkCheckEntriesVoid@8(VAR OriginalCheckEntry@1000 : Record 272;VoidDate@1001 : Date);
+    VAR
+      RelatedCheckEntry@1002 : Record 272;
+      RelatedCheckEntry2@1003 : Record 272;
+    BEGIN
+      WITH RelatedCheckEntry DO BEGIN
+        RESET;
+        SETCURRENTKEY("Bank Account No.","Entry Status","Check No.");
+        SETRANGE("Bank Account No.",OriginalCheckEntry."Bank Account No.");
+        SETRANGE("Entry Status",OriginalCheckEntry."Entry Status"::Posted);
+        SETRANGE("Statement Status",OriginalCheckEntry."Statement Status"::Open);
+        SETRANGE("Check No.",OriginalCheckEntry."Check No.");
+        SETRANGE("Check Date",OriginalCheckEntry."Check Date");
+        SETFILTER("Entry No.",'<>%1',OriginalCheckEntry."Entry No.");
+        IF FINDSET THEN
+          REPEAT
+            RelatedCheckEntry2 := RelatedCheckEntry;
+            RelatedCheckEntry2."Original Entry Status" := "Entry Status";
+            RelatedCheckEntry2."Entry Status" := "Entry Status"::"Financially Voided";
+            RelatedCheckEntry2."Positive Pay Exported" := FALSE;
+            IF VoidDate = OriginalCheckEntry."Check Date" THEN BEGIN
+              RelatedCheckEntry2.Open := FALSE;
+              RelatedCheckEntry2."Statement Status" := RelatedCheckEntry2."Statement Status"::Closed;
+            END;
+            RelatedCheckEntry2.MODIFY;
+          UNTIL NEXT = 0;
+      END;
+
+      WITH OriginalCheckEntry DO BEGIN
+        "Original Entry Status" := "Entry Status";
+        "Entry Status" := "Entry Status"::"Financially Voided";
+        "Positive Pay Exported" := FALSE;
+        IF VoidDate = "Check Date" THEN BEGIN
+          Open := FALSE;
+          "Statement Status" := "Statement Status"::Closed;
+        END;
+        MODIFY;
+      END;
+    END;
+
+    LOCAL PROCEDURE MakeAppliesID@9(VAR AppliesID@1020000 : Code[50];CheckDocNo@1020001 : Code[20]);
+    BEGIN
+      IF AppliesID = '' THEN
+        EXIT;
+      IF AppliesID = CheckDocNo THEN
+        AppliesIDCounter := 0;
+      AppliesIDCounter := AppliesIDCounter + 1;
+      AppliesID :=
+        COPYSTR(FORMAT(AppliesIDCounter) + CheckDocNo,1,MAXSTRLEN(AppliesID));
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

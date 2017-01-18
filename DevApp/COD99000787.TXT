@@ -1,0 +1,533 @@
+OBJECT Codeunit 99000787 Create Prod. Order Lines
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    Permissions=TableData 27=r,
+                TableData 36=r,
+                TableData 37=r,
+                TableData 5406=rimd,
+                TableData 5407=rimd,
+                TableData 5408=r,
+                TableData 99000765=rim,
+                TableData 99000774=r,
+                TableData 5405=r;
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      SalesHeader@1002 : Record 36;
+      SalesLine@1003 : Record 37;
+      FamilyLine@1004 : Record 99000774;
+      MfgSetup@1005 : Record 99000765;
+      ProdOrder@1006 : Record 5405;
+      ProdOrderLine@1007 : Record 5406;
+      ProdOrderLine2@1008 : Record 5406;
+      ProdOrderComp@1009 : Record 5407;
+      ReservEntry@1010 : Record 337;
+      TrackingSpecification@1018 : Record 336;
+      TempOldProdOrderComp@1011 : TEMPORARY Record 5407;
+      ReserveSalesLine@1012 : Codeunit 99000832;
+      ReserveProdOrderComp@1013 : Codeunit 99000838;
+      ReservMgt@1017 : Codeunit 99000845;
+      CalcProdOrder@1014 : Codeunit 99000773;
+      NextProdOrderLineNo@1015 : Integer;
+      InsertNew@1016 : Boolean;
+      SalesLineIsSet@1001 : Boolean;
+
+    PROCEDURE CheckStructure@8(Status@1000 : Option;ProdOrderNo@1001 : Code[20];Direction@1002 : 'Forward,Backward';MultiLevel@1003 : Boolean;LetDueDateDecrease@1004 : Boolean);
+    BEGIN
+      ProdOrder.GET(Status,ProdOrderNo);
+      ProdOrderLine.SETRANGE(Status,Status);
+      ProdOrderLine.SETRANGE("Prod. Order No.",ProdOrderNo);
+      IF ProdOrderLine.FIND('+') THEN
+        NextProdOrderLineNo := ProdOrderLine."Line No." + 10000
+      ELSE
+        NextProdOrderLineNo := 10000;
+
+      CheckMultiLevelStructure(Direction,MultiLevel,LetDueDateDecrease);
+    END;
+
+    PROCEDURE Copy@5(ProdOrder2@1000 : Record 5405;Direction@1001 : 'Forward,Backward';VariantCode@1002 : Code[10];LetDueDateDecrease@1004 : Boolean) : Boolean;
+    VAR
+      ErrorOccured@1003 : Boolean;
+    BEGIN
+      MfgSetup.GET;
+
+      ProdOrder2.TESTFIELD("Source No.");
+      ProdOrder2.TESTFIELD("Starting Time");
+      ProdOrder2.TESTFIELD("Starting Date");
+      ProdOrder2.TESTFIELD("Ending Time");
+      ProdOrder2.TESTFIELD("Ending Date");
+      IF Direction = Direction::Backward THEN
+        ProdOrder2.TESTFIELD("Due Date");
+
+      ProdOrder := ProdOrder2;
+
+      ProdOrderLine.LOCKTABLE;
+      ProdOrderLine.SETRANGE(Status,ProdOrder.Status);
+      ProdOrderLine.SETRANGE("Prod. Order No.",ProdOrder."No.");
+      ProdOrderLine.DELETEALL(TRUE);
+
+      NextProdOrderLineNo := 10000;
+
+      InsertNew := FALSE;
+      CASE ProdOrder."Source Type" OF
+        ProdOrder."Source Type"::Item:
+          BEGIN
+            InitProdOrderLine(ProdOrder."Source No.",VariantCode,ProdOrder."Location Code");
+            ProdOrderLine.Description := ProdOrder.Description;
+            ProdOrderLine."Description 2" := ProdOrder."Description 2";
+            ProdOrderLine.VALIDATE(Quantity,ProdOrder.Quantity);
+            ProdOrderLine.UpdateDatetime;
+            IF SalesLineIsSet THEN
+              CopyDimFromSalesLine(SalesLine,ProdOrderLine);
+            ProdOrderLine.INSERT;
+            IF ProdOrderLine.HasErrorOccured THEN
+              ErrorOccured := TRUE;
+          END;
+        ProdOrder."Source Type"::Family:
+          IF NOT CopyFromFamily THEN
+            ErrorOccured := TRUE;
+        ProdOrder."Source Type"::"Sales Header":
+          BEGIN
+            InsertNew := TRUE;
+            IF ProdOrder.Status <> ProdOrder.Status::Simulated THEN
+              SalesHeader.GET(SalesHeader."Document Type"::Order,ProdOrder."Source No.")
+            ELSE
+              SalesHeader.GET(SalesHeader."Document Type"::Quote,ProdOrder."Source No.");
+            IF NOT CopyFromSalesOrder THEN
+              ErrorOccured := TRUE;
+          END;
+      END;
+
+      IF NOT ProcessProdOrderLines(Direction,LetDueDateDecrease) THEN
+        ErrorOccured := TRUE;
+      CheckMultiLevelStructure(Direction,TRUE,LetDueDateDecrease);
+      EXIT(NOT ErrorOccured);
+    END;
+
+    LOCAL PROCEDURE CopyFromFamily@3() : Boolean;
+    VAR
+      Family@1000 : Record 99000773;
+      ErrorOccured@1001 : Boolean;
+    BEGIN
+      Family.GET(ProdOrder."Source No.");
+      FamilyLine.SETCURRENTKEY("Low-Level Code");
+      FamilyLine.SETRANGE("Family No.",ProdOrder."Source No.");
+
+      IF FamilyLine.FINDSET THEN
+        REPEAT
+          IF FamilyLine."Item No." <> '' THEN BEGIN
+            InitProdOrderLine(FamilyLine."Item No.",'',ProdOrder."Location Code");
+            ProdOrderLine.Description := FamilyLine.Description;
+            ProdOrderLine."Description 2" := FamilyLine."Description 2";
+            ProdOrderLine.VALIDATE("Unit of Measure Code",FamilyLine."Unit of Measure Code");
+            ProdOrderLine.VALIDATE(Quantity,FamilyLine.Quantity * ProdOrder.Quantity);
+            ProdOrderLine."Routing No." := Family."Routing No.";
+            ProdOrderLine."Routing Reference No." := 0;
+            ProdOrderLine.UpdateDatetime;
+            InsertProdOrderLine;
+            IF ProdOrderLine.HasErrorOccured THEN
+              ErrorOccured := TRUE;
+          END;
+        UNTIL FamilyLine.NEXT = 0;
+      EXIT(NOT ErrorOccured);
+    END;
+
+    LOCAL PROCEDURE CopyFromSalesOrder@1() : Boolean;
+    VAR
+      SalesPlanLine@1000 : TEMPORARY Record 99000800;
+      TrackingSpecification@1005 : Record 336;
+      Location@1006 : Record 14;
+      LeadTimeMgt@1001 : Codeunit 5404;
+      ItemTrackingMgt@1002 : Codeunit 6500;
+      ReservMgt@1004 : Codeunit 99000845;
+      ErrorOccured@1003 : Boolean;
+    BEGIN
+      SalesLine.SETRANGE("Document Type",SalesHeader."Document Type");
+      SalesLine.SETRANGE("Document No.",SalesHeader."No.");
+      IF SalesLine.FINDSET THEN
+        REPEAT
+          SalesLine.CALCFIELDS("Reserved Quantity");
+          IF (SalesLine.Type = SalesLine.Type::Item) AND
+             (SalesLine."No." <> '') AND
+             ((SalesLine."Outstanding Quantity" - SalesLine."Reserved Quantity") <> 0)
+          THEN
+            IF IsReplSystemProdOrder(SalesLine."No.",SalesLine."Variant Code",SalesLine."Location Code") THEN BEGIN
+              SalesPlanLine.INIT;
+              SalesPlanLine."Sales Order No." := SalesLine."Document No.";
+              SalesPlanLine."Sales Order Line No." := SalesLine."Line No.";
+              SalesPlanLine.VALIDATE("Item No.",SalesLine."No.");
+              SalesPlanLine.INSERT;
+            END;
+        UNTIL SalesLine.NEXT = 0;
+
+      SalesPlanLine.SETCURRENTKEY("Low-Level Code");
+      IF SalesPlanLine.FINDSET THEN
+        REPEAT
+          SalesLine.GET(
+            SalesHeader."Document Type",
+            SalesPlanLine."Sales Order No.",
+            SalesPlanLine."Sales Order Line No.");
+          SalesLine.CALCFIELDS("Reserved Quantity");
+
+          InitProdOrderLine(SalesLine."No.",SalesLine."Variant Code",SalesLine."Location Code");
+          ProdOrderLine.Description := SalesLine.Description;
+          ProdOrderLine."Description 2" := SalesLine."Description 2";
+          SalesLine.CALCFIELDS("Reserved Qty. (Base)");
+          ProdOrderLine.VALIDATE("Quantity (Base)",SalesLine."Outstanding Qty. (Base)" - SalesLine."Reserved Qty. (Base)");
+
+          ProdOrderLine.VALIDATE("Location Code", SalesLine."Location Code"); //**4PS.n
+          IF Location.GET(ProdOrderLine."Location Code") AND NOT Location."Require Pick" AND (SalesLine."Bin Code" <> '') THEN
+            ProdOrderLine."Bin Code" := SalesLine."Bin Code";
+
+          ProdOrderLine."Due Date" := SalesLine."Shipment Date";
+          ProdOrderLine."Ending Date" :=
+            LeadTimeMgt.PlannedEndingDate(
+              ProdOrderLine."Item No.",
+              ProdOrderLine."Location Code",
+              '',
+              ProdOrderLine."Due Date",
+              '',
+              2);
+          ProdOrderLine.VALIDATE("Ending Date");
+
+          InsertProdOrderLine;
+          IF ProdOrderLine.HasErrorOccured THEN
+            ErrorOccured := TRUE;
+          ItemTrackingMgt.CopyItemTracking2(SalesLine.RowID1,ProdOrderLine.RowID1,TRUE,TRUE);
+
+          IF SalesLine."Document Type" = SalesLine."Document Type"::Order THEN BEGIN // Not simulated
+            ReserveSalesLine.SetBinding(ReservEntry.Binding::"Order-to-Order");
+            ProdOrderLine.CALCFIELDS("Reserved Quantity","Reserved Qty. (Base)");
+            ReservMgt.CreateTrackingSpecification(TrackingSpecification,
+              DATABASE::"Prod. Order Line",
+              ProdOrderLine.Status,ProdOrderLine."Prod. Order No.",'',ProdOrderLine."Line No.",0,
+              ProdOrderLine."Variant Code",ProdOrderLine."Location Code",'','',
+              ProdOrderLine."Qty. per Unit of Measure");
+            ReserveSalesLine.CreateReservationSetFrom(TrackingSpecification);
+            ReserveSalesLine.CreateReservation(
+              SalesLine,ProdOrderLine.Description,ProdOrderLine."Ending Date",
+              ProdOrderLine."Remaining Quantity" - ProdOrderLine."Reserved Quantity",
+              ProdOrderLine."Remaining Qty. (Base)" - ProdOrderLine."Reserved Qty. (Base)",'','');
+          END;
+          CopyDimFromSalesLine(SalesLine,ProdOrderLine);
+          ProdOrderLine.MODIFY;
+        UNTIL (SalesPlanLine.NEXT = 0);
+      EXIT(NOT ErrorOccured);
+    END;
+
+    LOCAL PROCEDURE InitProdOrderLine@2(ItemNo@1000 : Code[20];VariantCode@1001 : Code[10];LocationCode@1002 : Code[10]);
+    VAR
+      Item@1003 : Record 27;
+    BEGIN
+      ProdOrderLine.INIT;
+      ProdOrderLine.SetIgnoreErrors;
+      ProdOrderLine.Status := ProdOrder.Status;
+      ProdOrderLine."Prod. Order No." := ProdOrder."No.";
+      ProdOrderLine."Line No." := NextProdOrderLineNo;
+      ProdOrderLine."Routing Reference No." := ProdOrderLine."Line No.";
+      ProdOrderLine.VALIDATE("Item No.",ItemNo);
+      //ProdOrderLine."Location Code" := LocationCode; //**4PS.o
+      ProdOrderLine.VALIDATE("Location Code",LocationCode); //**4PS.n
+      ProdOrderLine."Variant Code" := VariantCode;
+      IF ProdOrder."Bin Code" <> '' THEN
+        ProdOrderLine.VALIDATE("Bin Code",ProdOrder."Bin Code")
+      ELSE
+        CalcProdOrder.SetProdOrderLineBinCodeFromRoute(ProdOrderLine,ProdOrderLine."Location Code",ProdOrderLine."Routing No.");
+
+      Item.GET(ItemNo);
+      ProdOrderLine."Scrap %" := Item."Scrap %";
+      ProdOrderLine."Due Date" := ProdOrder."Due Date";
+      ProdOrderLine."Starting Date" := ProdOrder."Starting Date";
+      ProdOrderLine."Starting Time" := ProdOrder."Starting Time";
+      ProdOrderLine."Ending Date" := ProdOrder."Ending Date";
+      ProdOrderLine."Ending Time" := ProdOrder."Ending Time";
+      ProdOrderLine."Planning Level Code" := 0;
+      ProdOrderLine."Inventory Posting Group" := Item."Inventory Posting Group";
+      ProdOrderLine.UpdateDatetime;
+      ProdOrderLine.VALIDATE("Unit Cost");
+
+      NextProdOrderLineNo := NextProdOrderLineNo + 10000;
+    END;
+
+    LOCAL PROCEDURE InsertProdOrderLine@4() : Boolean;
+    VAR
+      ProdOrderLine3@1000 : Record 5406;
+    BEGIN
+      ProdOrderLine3 := ProdOrderLine;
+      ProdOrderLine3.SETRANGE(Status,ProdOrderLine.Status);
+      ProdOrderLine3.SETRANGE("Prod. Order No.",ProdOrderLine."Prod. Order No.");
+      ProdOrderLine3.SETRANGE("Item No.",ProdOrderLine."Item No.");
+      ProdOrderLine3.SETRANGE("Variant Code",ProdOrderLine."Variant Code");
+
+      IF (NOT InsertNew) AND ProdOrderLine3.FINDFIRST THEN BEGIN
+        CopyProdOrderCompToTemp(ProdOrderLine3);
+        ProdOrderLine3.VALIDATE(Quantity,ProdOrderLine3.Quantity + ProdOrderLine.Quantity);
+        AdjustDateAndTime(ProdOrderLine3,ProdOrderLine."Due Date",ProdOrderLine."Ending Date",ProdOrderLine."Ending Time");
+
+        IF ProdOrderLine3."Planning Level Code" < ProdOrderLine."Planning Level Code" THEN BEGIN
+          ProdOrderLine3."Planning Level Code" := ProdOrderLine."Planning Level Code";
+          UpdateCompPlanningLevel(ProdOrderLine3);
+        END;
+
+        ProdOrderLine3.MODIFY;
+        ProdOrderLine := ProdOrderLine3;
+        EXIT(FALSE);
+      END;
+      ProdOrderLine.INSERT;
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE ProcessProdOrderLines@7(Direction@1000 : 'Forward,Backward';LetDueDateDecrease@1002 : Boolean) : Boolean;
+    VAR
+      ErrorOccured@1001 : Boolean;
+    BEGIN
+      ProdOrderLine.SETRANGE(Status,ProdOrder.Status);
+      ProdOrderLine.SETRANGE("Prod. Order No.",ProdOrder."No.");
+
+      IF ProdOrderLine.FINDSET(TRUE) THEN
+        REPEAT
+          IF NOT CalcProdOrder.Calculate(ProdOrderLine,Direction,TRUE,TRUE,TRUE,LetDueDateDecrease) THEN
+            ErrorOccured := TRUE;
+        UNTIL ProdOrderLine.NEXT = 0;
+
+      EXIT(NOT ErrorOccured);
+    END;
+
+    LOCAL PROCEDURE CheckMultiLevelStructure@6(Direction@1000 : 'Forward,Backward';MultiLevel@1001 : Boolean;LetDueDateDecrease@1003 : Boolean);
+    VAR
+      MultiLevelStructureCreated@1002 : Boolean;
+    BEGIN
+      ProdOrderComp.SETCURRENTKEY(Status,"Prod. Order No.","Prod. Order Line No.","Item Low-Level Code");
+      ProdOrderComp.SETRANGE(Status,ProdOrder.Status);
+      ProdOrderComp.SETRANGE("Prod. Order No.",ProdOrder."No.");
+      ProdOrderComp.SETFILTER("Planning Level Code",'>0');
+      ProdOrderComp.SETFILTER("Item No.",'<>%1','');
+      IF ProdOrderComp.FINDSET(TRUE) THEN
+        REPEAT
+          MultiLevelStructureCreated :=
+            MultiLevelStructureCreated OR
+            CheckMakeOrderLine(ProdOrderComp,ProdOrderLine,Direction,MultiLevel,LetDueDateDecrease);
+        UNTIL ProdOrderComp.NEXT = 0;
+      IF MultiLevelStructureCreated THEN
+        ReserveMultiLevelStructure(ProdOrderComp);
+    END;
+
+    LOCAL PROCEDURE CheckMakeOrderLine@15(VAR ProdOrderComp@1000 : Record 5407;VAR ProdOrderLine@1001 : Record 5406;Direction@1002 : 'Forward,Backward';MultiLevel@1003 : Boolean;LetDueDateDecrease@1010 : Boolean) : Boolean;
+    VAR
+      Item@1011 : Record 27;
+      ParentItem@1004 : Record 27;
+      ParentSKU@1005 : Record 5700;
+      SKU@1007 : Record 5700;
+      MakeProdOrder@1008 : Boolean;
+      Description2@1009 : Text[50];
+      Inserted@1006 : Boolean;
+    BEGIN
+      ProdOrderLine2.GET(ProdOrderComp.Status,ProdOrderComp."Prod. Order No.",ProdOrderComp."Prod. Order Line No.");
+      IF ParentSKU.GET(ProdOrderLine2."Location Code",ProdOrderLine2."Item No.",ProdOrderLine2."Variant Code") THEN
+        MakeProdOrder := ParentSKU."Manufacturing Policy" = ParentSKU."Manufacturing Policy"::"Make-to-Order"
+      ELSE BEGIN
+        ParentItem.GET(ProdOrderLine2."Item No.");
+        MakeProdOrder := ParentItem."Manufacturing Policy" = ParentItem."Manufacturing Policy"::"Make-to-Order";
+      END;
+
+      IF NOT MakeProdOrder THEN
+        EXIT(FALSE);
+
+      Item.GET(ProdOrderComp."Item No.");
+
+      IF SKU.GET(ProdOrderComp."Location Code",ProdOrderComp."Item No.",ProdOrderComp."Variant Code") THEN BEGIN
+        Description2 := SKU."Description 2";
+        MakeProdOrder :=
+          (SKU."Replenishment System" = SKU."Replenishment System"::"Prod. Order") AND
+          (SKU."Manufacturing Policy" = SKU."Manufacturing Policy"::"Make-to-Order");
+      END ELSE BEGIN
+        Description2 := Item."Description 2";
+        MakeProdOrder :=
+          (Item."Replenishment System" = Item."Replenishment System"::"Prod. Order") AND
+          (Item."Manufacturing Policy" = Item."Manufacturing Policy"::"Make-to-Order");
+      END;
+
+      IF NOT MakeProdOrder THEN
+        EXIT(FALSE);
+
+      InitProdOrderLine(ProdOrderComp."Item No.",ProdOrderComp."Variant Code",ProdOrderComp."Location Code");
+      ProdOrderLine.VALIDATE("Unit of Measure Code",ProdOrderComp."Unit of Measure Code");
+      ProdOrderLine."Qty. per Unit of Measure" := ProdOrderComp."Qty. per Unit of Measure";
+      ProdOrderLine."Bin Code" := ProdOrderComp."Bin Code";
+      ProdOrderLine.Description := ProdOrderComp.Description;
+      ProdOrderLine."Description 2" := Description2;
+      ProdOrderComp.CALCFIELDS("Reserved Quantity");
+      ProdOrderLine.VALIDATE(Quantity,ProdOrderComp."Expected Quantity" - ProdOrderComp."Reserved Quantity");
+      IF ProdOrderLine."Quantity (Base)" = 0 THEN
+        EXIT(FALSE);
+      ProdOrderLine."Planning Level Code" := ProdOrderComp."Planning Level Code";
+      ProdOrderLine."Due Date" := ProdOrderComp."Due Date";
+      ProdOrderLine."Ending Date" := ProdOrderComp."Due Date";
+      ProdOrderLine."Ending Time" := ProdOrderComp."Due Time";
+      ProdOrderLine.UpdateDatetime;
+      // this InsertNew is responsible for controlling if same POLine is added up or new POLine is created
+      InsertNew := InsertNew AND (ProdOrderComp."Planning Level Code" > 1);
+      Inserted := InsertProdOrderLine;
+      IF MultiLevel THEN
+        IF Inserted THEN
+          CalcProdOrder.Calculate(ProdOrderLine,Direction::Backward,TRUE,TRUE,TRUE,LetDueDateDecrease)
+        ELSE BEGIN
+          CalcProdOrder.Recalculate(ProdOrderLine,Direction::Backward,LetDueDateDecrease);
+          IF ProdOrderLine."Line No." < ProdOrderComp."Prod. Order Line No." THEN
+            UpdateProdOrderLine(ProdOrderLine,Direction,LetDueDateDecrease);
+        END
+      ELSE
+        EXIT(FALSE);
+      ProdOrderComp."Supplied-by Line No." := ProdOrderLine."Line No.";
+      ProdOrderComp.MODIFY;
+      EXIT(TRUE);
+    END;
+
+    LOCAL PROCEDURE ReserveMultiLevelStructure@9(VAR ProdOrderComp2@1000 : Record 5407);
+    VAR
+      ProdOrderComp3@1001 : Record 5407;
+      ProdOrderLine3@1002 : Record 5406;
+    BEGIN
+      ProdOrderComp3.COPY(ProdOrderComp2);
+      ProdOrderComp3.SETCURRENTKEY(Status,"Prod. Order No.","Prod. Order Line No.","Due Date");
+      ProdOrderComp3.SETFILTER("Supplied-by Line No.",'<>0');
+      IF ProdOrderComp3.FIND('+') THEN
+        REPEAT
+          IF ProdOrderLine3.GET(
+               ProdOrderComp3.Status,ProdOrderComp3."Prod. Order No.",ProdOrderComp3."Supplied-by Line No.")
+          THEN BEGIN
+            ReserveProdOrderComp.SetBinding(ReservEntry.Binding::"Order-to-Order");
+            ProdOrderComp3.CALCFIELDS("Reserved Quantity","Reserved Qty. (Base)");
+            ReservMgt.CreateTrackingSpecification(TrackingSpecification,
+              DATABASE::"Prod. Order Line",
+              ProdOrderLine3.Status,ProdOrderLine3."Prod. Order No.",'',ProdOrderLine3."Line No.",0,
+              ProdOrderLine3."Variant Code",ProdOrderLine3."Location Code",'','',
+              ProdOrderLine3."Qty. per Unit of Measure");
+            ReserveProdOrderComp.CreateReservationSetFrom(TrackingSpecification);
+            ReserveProdOrderComp.CreateReservation(
+              ProdOrderComp3,ProdOrderLine3.Description,ProdOrderLine3."Ending Date",
+              ProdOrderComp3."Remaining Quantity" - ProdOrderComp3."Reserved Quantity",
+              ProdOrderComp3."Remaining Qty. (Base)" - ProdOrderComp3."Reserved Qty. (Base)",'','');
+          END;
+        UNTIL ProdOrderComp3.NEXT(-1) = 0;
+    END;
+
+    PROCEDURE CopyDimFromSalesLine@10(SalesLine@1000 : Record 37;VAR ProdOrderLine@1001 : Record 5406);
+    BEGIN
+      ProdOrderLine."Shortcut Dimension 1 Code" := SalesLine."Shortcut Dimension 1 Code";
+      ProdOrderLine."Shortcut Dimension 2 Code" := SalesLine."Shortcut Dimension 2 Code";
+      ProdOrderLine."Dimension Set ID" := SalesLine."Dimension Set ID";
+    END;
+
+    PROCEDURE SetSalesLine@11(SalesLine2@1000 : Record 37);
+    BEGIN
+      SalesLine := SalesLine2;
+      SalesLineIsSet := TRUE;
+    END;
+
+    LOCAL PROCEDURE AdjustDateAndTime@12(VAR ProdOrderLine3@1000 : Record 5406;DueDate@1001 : Date;EndingDate@1002 : Date;EndingTime@1003 : Time);
+    BEGIN
+      IF ProdOrderLine3."Due Date" > DueDate THEN
+        ProdOrderLine3."Due Date" := DueDate;
+
+      IF ProdOrderLine3."Ending Date" > EndingDate THEN BEGIN
+        ProdOrderLine3."Ending Date" := EndingDate;
+        ProdOrderLine3."Ending Time" := EndingTime;
+      END ELSE
+        IF (ProdOrderLine3."Ending Date" = EndingDate) AND
+           (ProdOrderLine3."Ending Time" > EndingTime)
+        THEN
+          ProdOrderLine3."Ending Time" := EndingTime;
+      ProdOrderLine3.UpdateDatetime;
+    END;
+
+    LOCAL PROCEDURE UpdateCompPlanningLevel@17(ProdOrderLine3@1000 : Record 5406);
+    VAR
+      ProdOrderComp3@1001 : Record 5407;
+    BEGIN
+      // update planning level code of component
+      ProdOrderComp3.SETRANGE(Status,ProdOrderLine3.Status);
+      ProdOrderComp3.SETRANGE("Prod. Order No.",ProdOrderLine3."Prod. Order No.");
+      ProdOrderComp3.SETRANGE("Prod. Order Line No.",ProdOrderLine3."Line No.");
+      ProdOrderComp3.SETFILTER("Planning Level Code",'>0');
+      IF ProdOrderComp3.FINDSET(TRUE) THEN
+        REPEAT
+          ProdOrderComp3."Planning Level Code" := ProdOrderLine3."Planning Level Code" + 1;
+          ProdOrderComp3.MODIFY;
+        UNTIL ProdOrderComp3.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE UpdateProdOrderLine@13(VAR ProdOrderLine@1000 : Record 5406;Direction@1003 : 'Forward,Backward';LetDueDateDecrease@1004 : Boolean);
+    VAR
+      ProdOrderLine3@1002 : Record 5406;
+      ProdOrderComp3@1001 : Record 5407;
+    BEGIN
+      ProdOrderComp3.SETRANGE(Status,ProdOrderLine.Status);
+      ProdOrderComp3.SETRANGE("Prod. Order No.",ProdOrderLine."Prod. Order No.");
+      ProdOrderComp3.SETRANGE("Prod. Order Line No.",ProdOrderLine."Line No.");
+      IF ProdOrderComp3.FINDSET THEN
+        REPEAT
+          ProdOrderLine3.COPYFILTERS(ProdOrderLine);
+          ProdOrderLine3.SETRANGE("Item No.",ProdOrderComp3."Item No.");
+          ProdOrderLine3.SETRANGE("Variant Code",ProdOrderComp3."Variant Code");
+          IF ProdOrderLine3.FINDFIRST THEN BEGIN
+            ProdOrderComp3.CALCFIELDS("Reserved Quantity");
+            TempOldProdOrderComp.GET(ProdOrderComp3.Status,ProdOrderComp3."Prod. Order No.",
+              ProdOrderComp3."Prod. Order Line No.",ProdOrderComp3."Line No.");
+            ProdOrderLine3.VALIDATE(Quantity,
+              ProdOrderLine3.Quantity - TempOldProdOrderComp."Expected Quantity" +
+              ProdOrderComp3."Expected Quantity" - ProdOrderComp3."Reserved Quantity");
+            IF ProdOrderLine3."Planning Level Code" < ProdOrderComp3."Planning Level Code" THEN
+              ProdOrderLine3."Planning Level Code" := ProdOrderComp3."Planning Level Code";
+            AdjustDateAndTime(ProdOrderLine3,ProdOrderComp3."Due Date",ProdOrderComp3."Due Date",ProdOrderComp3."Due Time");
+            UpdateCompPlanningLevel(ProdOrderLine3);
+            CalcProdOrder.Recalculate(ProdOrderLine3,Direction::Backward,LetDueDateDecrease);
+            ProdOrderLine3.MODIFY;
+          END;
+        UNTIL ProdOrderComp3.NEXT = 0;
+      TempOldProdOrderComp.DELETEALL;
+    END;
+
+    LOCAL PROCEDURE CopyProdOrderCompToTemp@14(ProdOrderLine3@1000 : Record 5406);
+    VAR
+      ProdOrderComp2@1001 : Record 5407;
+    BEGIN
+      TempOldProdOrderComp.DELETEALL;
+      ProdOrderComp2.SETRANGE(Status,ProdOrderLine3.Status);
+      ProdOrderComp2.SETRANGE("Prod. Order No.",ProdOrderLine3."Prod. Order No.");
+      ProdOrderComp2.SETRANGE("Prod. Order Line No.",ProdOrderLine3."Line No.");
+      IF ProdOrderComp2.FINDSET THEN
+        REPEAT
+          TempOldProdOrderComp := ProdOrderComp2;
+          TempOldProdOrderComp.INSERT;
+        UNTIL ProdOrderComp2.NEXT = 0;
+    END;
+
+    LOCAL PROCEDURE IsReplSystemProdOrder@16(ItemNo@1001 : Code[20];VariantCode@1003 : Code[10];LocationCode@1004 : Code[10]) : Boolean;
+    VAR
+      SKU@1000 : Record 5700;
+      Item@1002 : Record 27;
+    BEGIN
+      IF SKU.GET(LocationCode,ItemNo,VariantCode) THEN
+        EXIT(SKU."Replenishment System" = SKU."Replenishment System"::"Prod. Order");
+
+      Item.GET(ItemNo);
+      EXIT(Item."Replenishment System" = Item."Replenishment System"::"Prod. Order");
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

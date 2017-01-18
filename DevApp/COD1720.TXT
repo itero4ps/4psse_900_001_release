@@ -1,0 +1,769 @@
+OBJECT Codeunit 1720 Deferral Utilities
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00.00.45243,4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      AccountingPeriod@1004 : Record 50;
+      DeferralHeader@1000 : Record 1701;
+      GenJnlCheckLine@1008 : Codeunit 11;
+      AmountRoundingPrecision@1011 : Decimal;
+      InvalidPostingDateErr@1007 : TextConst '@@@="%1=The date passed in for the posting date.";ENU=%1 is not within the range of posting dates for your company.';
+      DeferSchedOutOfBoundsErr@1022 : TextConst 'ENU=The deferral schedule falls outside the accounting periods that have been set up for the company.';
+      SelectDeferralCodeMsg@1023 : TextConst 'ENU=A deferral code must be selected for the line to view the deferral schedule.';
+
+    PROCEDURE CreateRecurringDescription@4(PostingDate@1000 : Date;Description@1001 : Text[50]) FinalDescription : Text[50];
+    VAR
+      Day@1006 : Integer;
+      Week@1005 : Integer;
+      Month@1004 : Integer;
+      Year@1002 : Integer;
+      MonthText@1003 : Text[30];
+    BEGIN
+      Day := DATE2DMY(PostingDate,1);
+      Week := DATE2DWY(PostingDate,2);
+      Month := DATE2DMY(PostingDate,2);
+      MonthText := FORMAT(PostingDate,0,'<Month Text>');
+      Year := DATE2DMY(PostingDate,3);
+      AccountingPeriod.SETRANGE("Starting Date",0D,PostingDate);
+      IF NOT AccountingPeriod.FINDLAST THEN
+        AccountingPeriod.Name := '';
+      FinalDescription :=
+        COPYSTR(STRSUBSTNO(Description,Day,Week,Month,MonthText,AccountingPeriod.Name,Year),1,MAXSTRLEN(Description));
+    END;
+
+    PROCEDURE CreateDeferralSchedule@1(DeferralCode@1008 : Code[10];DeferralDocType@1011 : Integer;GenJnlTemplateName@1012 : Code[10];GenJnlBatchName@1013 : Code[10];DocumentType@1003 : Integer;DocumentNo@1004 : Code[20];LineNo@1016 : Integer;AmountToDefer@1017 : Decimal;CalcMethod@1018 : 'Straight-Line,Equal per Period,Days per Period,User-Defined';StartDate@1019 : Date;NoOfPeriods@1020 : Integer;ApplyDeferralPercentage@1026 : Boolean;DeferralDescription@1028 : Text[50];AdjustStartDate@1001 : Boolean;CurrencyCode@1002 : Code[10]);
+    VAR
+      DeferralTemplate@1010 : Record 1700;
+      DeferralHeader@1021 : Record 1701;
+      DeferralLine@1000 : Record 1702;
+      AdjustedStartDate@1024 : Date;
+      AdjustedDeferralAmount@1027 : Decimal;
+    BEGIN
+      InitCurrency(CurrencyCode);
+      DeferralTemplate.GET(DeferralCode);
+      // "Start Date" passed in needs to be adjusted based on the Deferral Code's Start Date setting
+      IF AdjustStartDate THEN
+        AdjustedStartDate := SetStartDate(DeferralTemplate,StartDate)
+      ELSE
+        AdjustedStartDate := StartDate;
+
+      AdjustedDeferralAmount := AmountToDefer;
+      IF ApplyDeferralPercentage THEN
+        AdjustedDeferralAmount := ROUND(AdjustedDeferralAmount * (DeferralTemplate."Deferral %" / 100),AmountRoundingPrecision);
+
+      SetDeferralRecords(DeferralHeader,DeferralDocType,GenJnlTemplateName,GenJnlBatchName,DocumentType,DocumentNo,LineNo,
+        CalcMethod,NoOfPeriods,AdjustedDeferralAmount,AdjustedStartDate,
+        DeferralCode,DeferralDescription,AmountToDefer,AdjustStartDate,CurrencyCode);
+
+      CASE CalcMethod OF
+        CalcMethod::"Straight-Line":
+          CalculateStraightline(DeferralHeader,DeferralLine,DeferralTemplate);
+        CalcMethod::"Equal per Period":
+          CalculateEqualPerPeriod(DeferralHeader,DeferralLine,DeferralTemplate);
+        CalcMethod::"Days per Period":
+          CalculateDaysPerPeriod(DeferralHeader,DeferralLine,DeferralTemplate);
+        CalcMethod::"User-Defined":
+          CalculateUserDefined(DeferralHeader,DeferralLine,DeferralTemplate);
+      END;
+    END;
+
+    PROCEDURE CalcDeferralNoOfPeriods@205(CalcMethod@1003 : Option;NoOfPeriods@1004 : Integer;StartDate@1002 : Date) : Integer;
+    VAR
+      DeferralTemplate@1000 : Record 1700;
+      AccountingPeriod@1001 : Record 50;
+    BEGIN
+      CASE CalcMethod OF
+        DeferralTemplate."Calc. Method"::"Equal per Period",
+        DeferralTemplate."Calc. Method"::"User-Defined":
+          EXIT(NoOfPeriods);
+        DeferralTemplate."Calc. Method"::"Straight-Line",
+        DeferralTemplate."Calc. Method"::"Days per Period":
+          BEGIN
+            AccountingPeriod.SETFILTER("Starting Date",'>=%1',StartDate);
+            AccountingPeriod.FINDFIRST;
+            IF AccountingPeriod."Starting Date" = StartDate THEN
+              EXIT(NoOfPeriods);
+
+            EXIT(NoOfPeriods + 1);
+          END;
+      END;
+
+      DeferralTemplate."Calc. Method" := CalcMethod;
+      DeferralTemplate.FIELDERROR("Calc. Method");
+    END;
+
+    LOCAL PROCEDURE CalculateStraightline@2(DeferralHeader@1001 : Record 1701;VAR DeferralLine@1000 : Record 1702;DeferralTemplate@1002 : Record 1700);
+    VAR
+      AmountToDefer@1010 : Decimal;
+      AmountToDeferFirstPeriod@1015 : Decimal;
+      FractionOfPeriod@1016 : Decimal;
+      PeriodicDeferralAmount@1003 : Decimal;
+      RunningDeferralTotal@1014 : Decimal;
+      PeriodicCount@1004 : Integer;
+      HowManyDaysLeftInPeriod@1017 : Integer;
+      NumberOfDaysInPeriod@1013 : Integer;
+      PostDate@1005 : Date;
+      FirstPeriodDate@1011 : Date;
+      SecondPeriodDate@1012 : Date;
+      PerDiffSum@1009 : Decimal;
+    BEGIN
+      // If the Start Date passed in matches the first date of a financial period, this is essentially the same
+      // as the "Equal Per Period" deferral method, so call that function.
+      AccountingPeriod.SETFILTER("Starting Date",'>=%1',DeferralHeader."Start Date");
+      IF AccountingPeriod.FINDFIRST THEN BEGIN
+        IF AccountingPeriod."Starting Date" = DeferralHeader."Start Date" THEN BEGIN
+          CalculateEqualPerPeriod(DeferralHeader,DeferralLine,DeferralTemplate);
+          EXIT;
+        END
+      END ELSE
+        ERROR(DeferSchedOutOfBoundsErr);
+
+      PeriodicDeferralAmount := ROUND(DeferralHeader."Amount to Defer" / DeferralHeader."No. of Periods",AmountRoundingPrecision);
+
+      FOR PeriodicCount := 1 TO (DeferralHeader."No. of Periods" + 1) DO BEGIN
+        InitializeDeferralHeaderAndSetPostDate(DeferralLine,DeferralHeader,PeriodicCount,PostDate);
+
+        IF (PeriodicCount = 1) OR (PeriodicCount = (DeferralHeader."No. of Periods" + 1)) THEN BEGIN
+          IF PeriodicCount = 1 THEN BEGIN
+            CLEAR(RunningDeferralTotal);
+
+            // Get the starting date of the accounting period of the posting date is in
+            AccountingPeriod.SETFILTER("Starting Date",'<%1',PostDate);
+            IF AccountingPeriod.FINDLAST THEN
+              FirstPeriodDate := AccountingPeriod."Starting Date"
+            ELSE
+              ERROR(DeferSchedOutOfBoundsErr);
+
+            // Get the starting date of the next accounting period
+            AccountingPeriod.SETFILTER("Starting Date",'>%1',PostDate);
+            IF AccountingPeriod.FINDFIRST THEN
+              SecondPeriodDate := AccountingPeriod."Starting Date"
+            ELSE
+              ERROR(DeferSchedOutOfBoundsErr);
+
+            HowManyDaysLeftInPeriod := (SecondPeriodDate - DeferralHeader."Start Date");
+            NumberOfDaysInPeriod := (SecondPeriodDate - FirstPeriodDate);
+            FractionOfPeriod := (HowManyDaysLeftInPeriod / NumberOfDaysInPeriod);
+
+            AmountToDeferFirstPeriod := (PeriodicDeferralAmount * FractionOfPeriod);
+            AmountToDefer := ROUND(AmountToDeferFirstPeriod,AmountRoundingPrecision);
+            RunningDeferralTotal := RunningDeferralTotal + AmountToDefer;
+          END ELSE
+            // Last period
+            AmountToDefer := (DeferralHeader."Amount to Defer" - RunningDeferralTotal);
+        END ELSE BEGIN
+          AmountToDefer := ROUND(PeriodicDeferralAmount,AmountRoundingPrecision);
+          RunningDeferralTotal := RunningDeferralTotal + AmountToDefer;
+        END;
+
+        DeferralLine."Posting Date" := PostDate;
+        DeferralLine.Description := CreateRecurringDescription(PostDate,DeferralTemplate."Period Description");
+
+        IF GenJnlCheckLine.DateNotAllowed(PostDate) THEN
+          ERROR(InvalidPostingDateErr,PostDate);
+
+        PerDiffSum := PerDiffSum + ROUND(AmountToDefer / DeferralHeader."No. of Periods",AmountRoundingPrecision);
+
+        DeferralLine.Amount := AmountToDefer;
+
+        DeferralLine.INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE CalculateEqualPerPeriod@3(DeferralHeader@1001 : Record 1701;VAR DeferralLine@1000 : Record 1702;DeferralTemplate@1002 : Record 1700);
+    VAR
+      PeriodicCount@1009 : Integer;
+      PostDate@1008 : Date;
+      AmountToDefer@1007 : Decimal;
+      RunningDeferralTotal@1010 : Decimal;
+    BEGIN
+      FOR PeriodicCount := 1 TO DeferralHeader."No. of Periods" DO BEGIN
+        InitializeDeferralHeaderAndSetPostDate(DeferralLine,DeferralHeader,PeriodicCount,PostDate);
+
+        DeferralLine.VALIDATE("Posting Date",PostDate);
+        DeferralLine.Description := CreateRecurringDescription(PostDate,DeferralTemplate."Period Description");
+
+        AmountToDefer := DeferralHeader."Amount to Defer";
+        IF PeriodicCount = 1 THEN
+          CLEAR(RunningDeferralTotal);
+
+        IF PeriodicCount <> DeferralHeader."No. of Periods" THEN BEGIN
+          AmountToDefer := ROUND(AmountToDefer / DeferralHeader."No. of Periods",AmountRoundingPrecision);
+          RunningDeferralTotal := RunningDeferralTotal + AmountToDefer;
+        END ELSE
+          AmountToDefer := (DeferralHeader."Amount to Defer" - RunningDeferralTotal);
+
+        DeferralLine.Amount := AmountToDefer;
+        DeferralLine.INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE CalculateDaysPerPeriod@5(DeferralHeader@1001 : Record 1701;VAR DeferralLine@1000 : Record 1702;DeferralTemplate@1002 : Record 1700);
+    VAR
+      AmountToDefer@1016 : Decimal;
+      PeriodicCount@1012 : Integer;
+      NumberOfDaysInPeriod@1010 : Integer;
+      NumberOfDaysInSchedule@1022 : Integer;
+      NumberOfDaysIntoCurrentPeriod@1018 : Integer;
+      NumberOfPeriods@1020 : Integer;
+      PostDate@1009 : Date;
+      FirstPeriodDate@1008 : Date;
+      SecondPeriodDate@1007 : Date;
+      EndDate@1019 : Date;
+      TempDate@1021 : Date;
+      NoExtraPeriod@1017 : Boolean;
+      DailyDeferralAmount@1023 : Decimal;
+      RunningDeferralTotal@1024 : Decimal;
+    BEGIN
+      AccountingPeriod.SETFILTER("Starting Date",'>=%1',DeferralHeader."Start Date");
+      IF AccountingPeriod.FINDFIRST THEN BEGIN
+        IF AccountingPeriod."Starting Date" = DeferralHeader."Start Date" THEN
+          NoExtraPeriod := TRUE
+        ELSE
+          NoExtraPeriod := FALSE
+      END ELSE
+        ERROR(DeferSchedOutOfBoundsErr);
+
+      // If comparison used <=, it messes up the calculations
+      IF NOT NoExtraPeriod THEN BEGIN
+        AccountingPeriod.SETFILTER("Starting Date",'<%1',DeferralHeader."Start Date");
+        AccountingPeriod.FINDLAST;
+
+        NumberOfDaysIntoCurrentPeriod := (DeferralHeader."Start Date" - AccountingPeriod."Starting Date");
+      END ELSE
+        NumberOfDaysIntoCurrentPeriod := 0;
+
+      IF NoExtraPeriod THEN
+        NumberOfPeriods := DeferralHeader."No. of Periods"
+      ELSE
+        NumberOfPeriods := (DeferralHeader."No. of Periods" + 1);
+
+      FOR PeriodicCount := 1 TO NumberOfPeriods DO BEGIN
+        // Figure out the end date...
+        IF PeriodicCount = 1 THEN
+          TempDate := DeferralHeader."Start Date";
+
+        IF PeriodicCount <> NumberOfPeriods THEN BEGIN
+          AccountingPeriod.SETFILTER("Starting Date",'>%1',TempDate);
+          IF AccountingPeriod.FINDFIRST THEN
+            TempDate := AccountingPeriod."Starting Date"
+          ELSE
+            ERROR(DeferSchedOutOfBoundsErr);
+        END ELSE
+          // Last Period, special case here...
+          IF NoExtraPeriod THEN BEGIN
+            AccountingPeriod.SETFILTER("Starting Date",'>%1',TempDate);
+            IF AccountingPeriod.FINDFIRST THEN
+              TempDate := AccountingPeriod."Starting Date"
+            ELSE
+              ERROR(DeferSchedOutOfBoundsErr);
+            EndDate := TempDate;
+          END ELSE
+            EndDate := (TempDate + NumberOfDaysIntoCurrentPeriod);
+      END;
+      NumberOfDaysInSchedule := (EndDate - DeferralHeader."Start Date");
+      DailyDeferralAmount := (DeferralHeader."Amount to Defer" / NumberOfDaysInSchedule);
+
+      FOR PeriodicCount := 1 TO NumberOfPeriods DO BEGIN
+        InitializeDeferralHeaderAndSetPostDate(DeferralLine,DeferralHeader,PeriodicCount,PostDate);
+
+        IF PeriodicCount = 1 THEN BEGIN
+          CLEAR(RunningDeferralTotal);
+          FirstPeriodDate := DeferralHeader."Start Date";
+
+          // Get the starting date of the next accounting period
+          AccountingPeriod.SETFILTER("Starting Date",'>%1',PostDate);
+          AccountingPeriod.FINDFIRST;
+          SecondPeriodDate := AccountingPeriod."Starting Date";
+          NumberOfDaysInPeriod := (SecondPeriodDate - FirstPeriodDate);
+
+          AmountToDefer := ROUND(NumberOfDaysInPeriod * DailyDeferralAmount,AmountRoundingPrecision);
+          RunningDeferralTotal := RunningDeferralTotal + AmountToDefer;
+        END ELSE BEGIN
+          // Get the starting date of the accounting period of the posting date is in
+          AccountingPeriod.SETFILTER("Starting Date",'<=%1',PostDate);
+          AccountingPeriod.FINDLAST;
+          FirstPeriodDate := AccountingPeriod."Starting Date";
+
+          // Get the starting date of the next accounting period
+          AccountingPeriod.SETFILTER("Starting Date",'>%1',PostDate);
+          AccountingPeriod.FINDFIRST;
+          SecondPeriodDate := AccountingPeriod."Starting Date";
+
+          NumberOfDaysInPeriod := (SecondPeriodDate - FirstPeriodDate);
+
+          IF PeriodicCount <> NumberOfPeriods THEN BEGIN
+            // Not the last period
+            AmountToDefer := ROUND(NumberOfDaysInPeriod * DailyDeferralAmount,AmountRoundingPrecision);
+            RunningDeferralTotal := RunningDeferralTotal + AmountToDefer;
+          END ELSE
+            AmountToDefer := (DeferralHeader."Amount to Defer" - RunningDeferralTotal);
+        END;
+
+        DeferralLine."Posting Date" := PostDate;
+        DeferralLine.Description := CreateRecurringDescription(PostDate,DeferralTemplate."Period Description");
+
+        IF GenJnlCheckLine.DateNotAllowed(PostDate) THEN
+          ERROR(InvalidPostingDateErr,PostDate);
+
+        DeferralLine.Amount := AmountToDefer;
+
+        DeferralLine.INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE CalculateUserDefined@6(DeferralHeader@1001 : Record 1701;VAR DeferralLine@1000 : Record 1702;DeferralTemplate@1006 : Record 1700);
+    VAR
+      PeriodicCount@1002 : Integer;
+      PostDate@1003 : Date;
+    BEGIN
+      FOR PeriodicCount := 1 TO DeferralHeader."No. of Periods" DO BEGIN
+        InitializeDeferralHeaderAndSetPostDate(DeferralLine,DeferralHeader,PeriodicCount,PostDate);
+
+        DeferralLine."Posting Date" := PostDate;
+        DeferralLine.Description := CreateRecurringDescription(PostDate,DeferralTemplate."Period Description");
+
+        IF GenJnlCheckLine.DateNotAllowed(PostDate) THEN
+          ERROR(InvalidPostingDateErr,PostDate);
+
+        // For User-Defined, user must enter in deferral amounts
+        DeferralLine.INSERT;
+      END;
+    END;
+
+    LOCAL PROCEDURE SetStartDate@12(DeferralTemplate@1000 : Record 1700;StartDate@1001 : Date) AdjustedStartDate : Date;
+    VAR
+      DeferralStartOption@1002 : 'Posting Date,Beginning of Period,End of Period,Beginning of Next Period';
+    BEGIN
+      // "Start Date" passed in needs to be adjusted based on the Deferral Code's Start Date setting;
+      CASE DeferralTemplate."Start Date" OF
+        DeferralStartOption::"Posting Date":
+          AdjustedStartDate := StartDate;
+        DeferralStartOption::"Beginning of Period":
+          BEGIN
+            AccountingPeriod.SETRANGE("Starting Date",0D,StartDate);
+            IF AccountingPeriod.FINDLAST THEN
+              AdjustedStartDate := AccountingPeriod."Starting Date";
+          END;
+        DeferralStartOption::"End of Period":
+          BEGIN
+            AccountingPeriod.SETFILTER("Starting Date",'>%1',StartDate);
+            IF AccountingPeriod.FINDFIRST THEN
+              AdjustedStartDate := CALCDATE('<-1D>',AccountingPeriod."Starting Date");
+          END;
+        DeferralStartOption::"Beginning of Next Period":
+          BEGIN
+            AccountingPeriod.SETFILTER("Starting Date",'>%1',StartDate);
+            IF AccountingPeriod.FINDFIRST THEN
+              AdjustedStartDate := AccountingPeriod."Starting Date";
+          END;
+      END;
+    END;
+
+    PROCEDURE SetDeferralRecords@7(VAR DeferralHeader@1001 : Record 1701;DeferralDocType@1006 : Integer;GenJnlTemplateName@1013 : Code[10];GenJnlBatchName@1012 : Code[10];DocumentType@1010 : Integer;DocumentNo@1009 : Code[20];LineNo@1008 : Integer;CalcMethod@1007 : 'Straight-Line,Equal per Period,Days per Period,User-Defined';NoOfPeriods@1005 : Integer;AdjustedDeferralAmount@1003 : Decimal;AdjustedStartDate@1004 : Date;DeferralCode@1011 : Code[10];DeferralDescription@1014 : Text[50];AmountToDefer@1000 : Decimal;AdjustStartDate@1002 : Boolean;CurrencyCode@1015 : Code[10]);
+    BEGIN
+      IF NOT DeferralHeader.GET(DeferralDocType,GenJnlTemplateName,GenJnlBatchName,DocumentType,DocumentNo,LineNo) THEN BEGIN
+        // Need to create the header record.
+        DeferralHeader."Deferral Doc. Type" := DeferralDocType;
+        DeferralHeader."Gen. Jnl. Template Name" := GenJnlTemplateName;
+        DeferralHeader."Gen. Jnl. Batch Name" := GenJnlBatchName;
+        DeferralHeader."Document Type" := DocumentType;
+        DeferralHeader."Document No." := DocumentNo;
+        DeferralHeader."Line No." := LineNo;
+        DeferralHeader.INSERT;
+      END;
+      DeferralHeader."Amount to Defer" := AdjustedDeferralAmount;
+      IF AdjustStartDate THEN
+        DeferralHeader."Initial Amount to Defer" := AmountToDefer;
+      DeferralHeader."Calc. Method" := CalcMethod;
+      DeferralHeader."Start Date" := AdjustedStartDate;
+      DeferralHeader."No. of Periods" := NoOfPeriods;
+      DeferralHeader."Schedule Description" := DeferralDescription;
+      DeferralHeader."Deferral Code" := DeferralCode;
+      DeferralHeader."Currency Code" := CurrencyCode;
+      DeferralHeader.MODIFY;
+      // Remove old lines as they will be recalculated/recreated
+      RemoveDeferralLines(DeferralDocType,GenJnlTemplateName,GenJnlBatchName,DocumentType,DocumentNo,LineNo,FALSE);
+    END;
+
+    PROCEDURE RemoveOrSetDeferralSchedule@9(DeferralCode@1006 : Code[10];DeferralDocType@1001 : Integer;GenJnlTemplateName@1013 : Code[10];GenJnlBatchName@1012 : Code[10];DocumentType@1008 : Integer;DocumentNo@1007 : Code[20];LineNo@1009 : Integer;Amount@1010 : Decimal;PostingDate@1011 : Date;Description@1002 : Text[50];CurrencyCode@1004 : Code[10];AdjustStartDate@1014 : Boolean);
+    VAR
+      DeferralHeader@1005 : Record 1701;
+      DeferralTemplate@1003 : Record 1700;
+      DeferralDescription@1000 : Text[50];
+    BEGIN
+      IF DeferralCode = '' THEN
+        // If the user cleared the deferral code, we should remove the saved schedule...
+        IF DeferralHeader.GET(DeferralDocType,GenJnlTemplateName,GenJnlBatchName,DocumentType,DocumentNo,LineNo) THEN BEGIN
+          DeferralHeader.DELETE;
+          RemoveDeferralLines(DeferralDocType,GenJnlTemplateName,GenJnlBatchName,DocumentType,DocumentNo,LineNo,FALSE);
+        END;
+      IF DeferralCode <> '' THEN
+        IF LineNo <> 0 THEN
+          IF DeferralTemplate.GET(DeferralCode) THEN BEGIN
+            ValidateDeferralTemplate(DeferralTemplate);
+            IF GenJnlBatchName <> '' THEN
+              DeferralDescription := GenJnlBatchName + '-' + COPYSTR(Description,1,30)
+            ELSE
+              DeferralDescription := DocumentNo + '-' + COPYSTR(Description,1,30);
+
+            CreateDeferralSchedule(DeferralCode,DeferralDocType,
+              GenJnlTemplateName,GenJnlBatchName,DocumentType,DocumentNo,LineNo,Amount,
+              DeferralTemplate."Calc. Method",PostingDate,DeferralTemplate."No. of Periods",
+              TRUE,DeferralDescription,AdjustStartDate,CurrencyCode);
+          END;
+    END;
+
+    PROCEDURE CreateScheduleFromGL@22(GenJournalLine@1008 : Record 81;FirstEntryNo@1010 : Integer);
+    VAR
+      DeferralHeader@1001 : Record 1701;
+      DeferralLine@1002 : Record 1702;
+      DeferralTemplate@1007 : Record 1700;
+      PostedDeferralHeader@1004 : Record 1704;
+      PostedDeferralLine@1005 : Record 1705;
+      CustPostingGr@1009 : Record 92;
+      VendPostingGr@1011 : Record 93;
+      BankAcc@1013 : Record 270;
+      BankAccPostingGr@1014 : Record 277;
+      GenJnlPostLine@1003 : Codeunit 12;
+      DeferralAccount@1006 : Code[20];
+      Account@1000 : Code[20];
+      GLAccount@1012 : Code[20];
+      GLAccountType@1015 : 'G/L Account,Customer,Vendor,Bank Account,Fixed Asset,IC Partner';
+    BEGIN
+      IF DeferralHeader.GET(DeferralHeader."Deferral Doc. Type"::"G/L",
+           GenJournalLine."Journal Template Name",
+           GenJournalLine."Journal Batch Name",0,'',
+           GenJournalLine."Line No.")
+      THEN BEGIN
+        IF DeferralTemplate.GET(DeferralHeader."Deferral Code") THEN
+          DeferralAccount := DeferralTemplate."Deferral Account";
+
+        IF (GenJournalLine."Account No." = '') AND (GenJournalLine."Bal. Account No." <> '') THEN BEGIN
+          GLAccount := GenJournalLine."Bal. Account No.";
+          GLAccountType := GenJournalLine."Bal. Account Type";
+        END ELSE BEGIN
+          GLAccount := GenJournalLine."Account No.";
+          GLAccountType := GenJournalLine."Account Type";
+        END;
+
+        // Account types not G/L are not storing a GL account in the GenJnlLine's Account field, need to retrieve
+        CASE GLAccountType OF
+          GenJournalLine."Account Type"::Customer:
+            BEGIN
+              CustPostingGr.GET(GenJournalLine."Posting Group");
+              Account := CustPostingGr.GetReceivablesAccount;
+            END;
+          GenJournalLine."Account Type"::Vendor:
+            BEGIN
+              VendPostingGr.GET(GenJournalLine."Posting Group");
+              Account := VendPostingGr.GetPayablesAccount;
+            END;
+          GenJournalLine."Account Type"::"Bank Account":
+            BEGIN
+              BankAcc.GET(GLAccount);
+              BankAccPostingGr.GET(BankAcc."Bank Acc. Posting Group");
+              Account := BankAccPostingGr."G/L Bank Account No.";
+            END;
+          ELSE
+            Account := GLAccount;
+        END;
+
+        // Create the Posted Deferral Schedule with the Document Number created from the posted GL Trx...
+        PostedDeferralHeader.INIT;
+        PostedDeferralHeader.TRANSFERFIELDS(DeferralHeader);
+        PostedDeferralHeader."Deferral Doc. Type" := DeferralHeader."Deferral Doc. Type"::"G/L";
+        // Adding document number so we can connect the Ledger and Deferral Schedule details...
+        PostedDeferralHeader."Gen. Jnl. Document No." := GenJournalLine."Document No.";
+        PostedDeferralHeader."Account No." := Account;
+        PostedDeferralHeader."Document Type" := 0;
+        PostedDeferralHeader."Document No." := '';
+        PostedDeferralHeader."Line No." := GenJournalLine."Line No.";
+        PostedDeferralHeader."Currency Code" := GenJournalLine."Currency Code";
+        PostedDeferralHeader."Deferral Account" := DeferralAccount;
+        PostedDeferralHeader."Posting Date" := GenJournalLine."Posting Date";
+        PostedDeferralHeader."Entry No." := FirstEntryNo;
+        PostedDeferralHeader.INSERT;
+
+        DeferralLine.SETRANGE("Deferral Doc. Type",DeferralHeader."Deferral Doc. Type"::"G/L");
+        DeferralLine.SETRANGE("Gen. Jnl. Template Name",GenJournalLine."Journal Template Name");
+        DeferralLine.SETRANGE("Gen. Jnl. Batch Name",GenJournalLine."Journal Batch Name");
+        DeferralLine.SETRANGE("Document Type",0);
+        DeferralLine.SETRANGE("Document No.",'');
+        DeferralLine.SETRANGE("Line No.",GenJournalLine."Line No.");
+        IF DeferralLine.FINDSET THEN BEGIN
+          REPEAT
+            PostedDeferralLine.INIT;
+            PostedDeferralLine.TRANSFERFIELDS(DeferralLine);
+            PostedDeferralLine."Deferral Doc. Type" := DeferralHeader."Deferral Doc. Type"::"G/L";
+            PostedDeferralLine."Gen. Jnl. Document No." := GenJournalLine."Document No.";
+            PostedDeferralLine."Account No." := Account;
+            PostedDeferralLine."Document Type" := 0;
+            PostedDeferralLine."Document No." := '';
+            PostedDeferralLine."Line No." := GenJournalLine."Line No.";
+            PostedDeferralLine."Currency Code" := GenJournalLine."Currency Code";
+            PostedDeferralLine."Deferral Account" := DeferralAccount;
+            PostedDeferralLine.INSERT;
+          UNTIL DeferralLine.NEXT = 0;
+        END;
+      END;
+
+      GenJnlPostLine.RemoveDeferralSchedule(GenJournalLine);
+    END;
+
+    PROCEDURE DeferralCodeOnValidate@13(DeferralCode@1007 : Code[10];DeferralDocType@1006 : Integer;GenJnlTemplateName@1014 : Code[10];GenJnlBatchName@1013 : Code[10];DocumentType@1011 : Integer;DocumentNo@1010 : Code[20];LineNo@1009 : Integer;Amount@1001 : Decimal;PostingDate@1008 : Date;Description@1002 : Text[50];CurrencyCode@1012 : Code[10]);
+    VAR
+      DeferralHeader@1005 : Record 1701;
+      DeferralLine@1004 : Record 1702;
+      DeferralTemplate@1003 : Record 1700;
+      DeferralDescription@1000 : Text[50];
+    BEGIN
+      DeferralHeader.INIT;
+      DeferralLine.INIT;
+      IF DeferralCode = '' THEN
+        // If the user cleared the deferral code, we should remove the saved schedule...
+        DeferralCodeOnDelete(DeferralDocType,GenJnlTemplateName,GenJnlBatchName,DocumentType,DocumentNo,LineNo)
+      ELSE
+        IF LineNo <> 0 THEN
+          IF DeferralTemplate.GET(DeferralCode) THEN BEGIN
+            ValidateDeferralTemplate(DeferralTemplate);
+            IF GenJnlBatchName <> '' THEN
+              DeferralDescription := GenJnlBatchName + '-' + COPYSTR(Description,1,30)
+            ELSE
+              DeferralDescription := DocumentNo + '-' + COPYSTR(Description,1,30);
+            CreateDeferralSchedule(DeferralCode,DeferralDocType,
+              GenJnlTemplateName,GenJnlBatchName,DocumentType,DocumentNo,LineNo,Amount,
+              DeferralTemplate."Calc. Method",PostingDate,DeferralTemplate."No. of Periods",
+              TRUE,DeferralDescription,TRUE,CurrencyCode);
+          END;
+    END;
+
+    PROCEDURE DeferralCodeOnDelete@14(DeferralDocType@1000 : Integer;GenJnlTemplateName@1006 : Code[10];GenJnlBatchName@1005 : Code[10];DocumentType@1003 : Integer;DocumentNo@1002 : Code[20];LineNo@1001 : Integer);
+    VAR
+      DeferralHeader@1004 : Record 1701;
+    BEGIN
+      IF LineNo <> 0 THEN
+        // Deferral Additions
+        IF DeferralHeader.GET(DeferralDocType,GenJnlTemplateName,GenJnlBatchName,DocumentType,DocumentNo,LineNo) THEN BEGIN
+          DeferralHeader.DELETE;
+          RemoveDeferralLines(DeferralDocType,GenJnlTemplateName,GenJnlBatchName,DocumentType,DocumentNo,LineNo,FALSE);
+        END;
+    END;
+
+    PROCEDURE OpenLineScheduleEdit@15(DeferralCode@1006 : Code[10];DeferralDocType@1002 : Integer;GenJnlTemplateName@1015 : Code[10];GenJnlBatchName@1014 : Code[10];DocumentType@1005 : Integer;DocumentNo@1004 : Code[20];LineNo@1003 : Integer;Amount@1001 : Decimal;PostingDate@1000 : Date;Description@1010 : Text[50];CurrencyCode@1011 : Code[10]) : Boolean;
+    VAR
+      DeferralTemplate@1007 : Record 1700;
+      DeferralHeader@1008 : Record 1701;
+      DeferralSchedule@1012 : Page 1702;
+      DeferralDescription@1009 : Text[50];
+      Changed@1013 : Boolean;
+    BEGIN
+      IF DeferralCode = '' THEN
+        MESSAGE(SelectDeferralCodeMsg)
+      ELSE
+        IF DeferralTemplate.GET(DeferralCode) THEN
+          IF DeferralHeader.GET(DeferralDocType,GenJnlTemplateName,GenJnlBatchName,DocumentType,DocumentNo,LineNo) THEN BEGIN
+            DeferralSchedule.SetParameter(DeferralDocType,GenJnlTemplateName,GenJnlBatchName,DocumentType,DocumentNo,LineNo);
+            DeferralSchedule.RUNMODAL;
+            Changed := DeferralSchedule.GetParameter;
+            CLEAR(DeferralSchedule);
+          END ELSE BEGIN
+            IF GenJnlBatchName <> '' THEN
+              DeferralDescription := GenJnlBatchName + '-' + COPYSTR(Description,1,30)
+            ELSE
+              DeferralDescription := DocumentNo + '-' + COPYSTR(Description,1,30);
+            CreateDeferralSchedule(DeferralCode,DeferralDocType,
+              GenJnlTemplateName,GenJnlBatchName,DocumentType,DocumentNo,LineNo,Amount,
+              DeferralTemplate."Calc. Method",PostingDate,DeferralTemplate."No. of Periods",TRUE,DeferralDescription,TRUE,
+              CurrencyCode);
+            COMMIT;
+            IF DeferralHeader.GET(DeferralDocType,GenJnlTemplateName,GenJnlBatchName,DocumentType,DocumentNo,LineNo) THEN BEGIN
+              DeferralSchedule.SetParameter(DeferralDocType,GenJnlTemplateName,GenJnlBatchName,DocumentType,DocumentNo,LineNo);
+              DeferralSchedule.RUNMODAL;
+              Changed := DeferralSchedule.GetParameter;
+              CLEAR(DeferralSchedule);
+            END;
+          END;
+      EXIT(Changed);
+    END;
+
+    PROCEDURE OpenLineScheduleView@16(DeferralCode@1006 : Code[10];DeferralDocType@1000 : Integer;GenJnlTemplateName@1005 : Code[10];GenJnlBatchName@1004 : Code[10];DocumentType@1002 : Integer;DocumentNo@1001 : Code[20];LineNo@1003 : Integer);
+    VAR
+      DeferralTemplate@1010 : Record 1700;
+      PostedDeferralHeader@1009 : Record 1704;
+    BEGIN
+      // On view nothing will happen if the record does not exist
+      IF DeferralCode <> '' THEN
+        IF DeferralTemplate.GET(DeferralCode) THEN BEGIN
+          IF PostedDeferralHeader.GET(DeferralDocType,GenJnlTemplateName,GenJnlBatchName,DocumentType,DocumentNo,LineNo) THEN
+            PAGE.RUNMODAL(PAGE::"Deferral Schedule View",PostedDeferralHeader);
+        END;
+    END;
+
+    PROCEDURE OpenLineScheduleArchive@19(DeferralCode@1008 : Code[10];DeferralDocType@1007 : Integer;DocumentType@1001 : Integer;DocumentNo@1000 : Code[20];DocNoOccurence@1010 : Integer;VersionNo@1011 : Integer;LineNo@1004 : Integer);
+    VAR
+      DeferralHeaderArchive@1009 : Record 5127;
+    BEGIN
+      // On view nothing will happen if the record does not exist
+      IF DeferralCode <> '' THEN
+        IF DeferralHeaderArchive.GET(DeferralDocType,DocumentType,DocumentNo,DocNoOccurence,VersionNo,LineNo) THEN
+          PAGE.RUNMODAL(PAGE::"Deferral Schedule Archive",DeferralHeaderArchive);
+    END;
+
+    LOCAL PROCEDURE RemoveDeferralLines@17(DeferralDocType@1000 : Integer;GenJnlTemplateName@1008 : Code[10];GenJnlBatchName@1007 : Code[10];DocumentType@1003 : Integer;DocumentNo@1002 : Code[20];LineNo@1001 : Integer;ClearAmountToDefer@1005 : Boolean);
+    VAR
+      DeferralLine@1004 : Record 1702;
+      DeferralHeader@1006 : Record 1701;
+    BEGIN
+      IF ClearAmountToDefer THEN
+        IF DeferralHeader.GET(DeferralDocType,GenJnlTemplateName,GenJnlBatchName,DocumentType,DocumentNo,LineNo) THEN BEGIN
+          DeferralHeader."Amount to Defer" := 0;
+          DeferralHeader.MODIFY;
+          COMMIT;
+        END;
+
+      DeferralLine.SETRANGE("Deferral Doc. Type",DeferralDocType);
+      DeferralLine.SETRANGE("Gen. Jnl. Template Name",GenJnlTemplateName);
+      DeferralLine.SETRANGE("Gen. Jnl. Batch Name",GenJnlBatchName);
+      DeferralLine.SETRANGE("Document Type",DocumentType);
+      DeferralLine.SETRANGE("Document No.",DocumentNo);
+      DeferralLine.SETRANGE("Line No.",LineNo);
+      DeferralLine.DELETEALL;
+      IF ClearAmountToDefer THEN
+        COMMIT;
+    END;
+
+    LOCAL PROCEDURE ValidateDeferralTemplate@18(DeferralTemplate@1000 : Record 1700);
+    BEGIN
+      WITH DeferralTemplate DO BEGIN
+        TESTFIELD("Deferral Account");
+        TESTFIELD("Deferral %");
+        TESTFIELD("No. of Periods");
+      END;
+    END;
+
+    PROCEDURE RoundDeferralAmount@20(VAR DeferralHeader@1018 : Record 1701;CurrencyCode@1009 : Code[10];CurrencyFactor@1000 : Decimal;PostingDate@1007 : Date;VAR AmtToDefer@1015 : Decimal;VAR AmtToDeferLCY@1014 : Decimal);
+    VAR
+      DeferralLine@1006 : Record 1702;
+      CurrExchRate@1010 : Record 330;
+      UseDate@1008 : Date;
+      DeferralCount@1011 : Integer;
+      TotalAmountLCY@1012 : Decimal;
+      TotalDeferralCount@1013 : Integer;
+    BEGIN
+      // Calculate the LCY amounts for posting
+      IF PostingDate = 0D THEN
+        UseDate := WORKDATE
+      ELSE
+        UseDate := PostingDate;
+
+      DeferralHeader."Amount to Defer (LCY)" :=
+      //ROUND(CurrExchRate.ExchangeAmtFCYToLCY(UseDate,CurrencyCode,DeferralHeader."Amount to Defer",CurrencyFactor)); //**4PS.o
+        ROUND(CurrExchRate.ExchangeAmtFCYToLCY(0,'',UseDate,CurrencyCode,DeferralHeader."Amount to Defer",CurrencyFactor,FALSE)); //**4PS.n
+      DeferralHeader.MODIFY;
+      AmtToDefer := DeferralHeader."Amount to Defer";
+      AmtToDeferLCY := DeferralHeader."Amount to Defer (LCY)";
+      DeferralLine.SETRANGE("Deferral Doc. Type",DeferralHeader."Deferral Doc. Type");
+      DeferralLine.SETRANGE("Gen. Jnl. Template Name",DeferralHeader."Gen. Jnl. Template Name");
+      DeferralLine.SETRANGE("Gen. Jnl. Batch Name",DeferralHeader."Gen. Jnl. Batch Name");
+      DeferralLine.SETRANGE("Document Type",DeferralHeader."Document Type");
+      DeferralLine.SETRANGE("Document No.",DeferralHeader."Document No.");
+      DeferralLine.SETRANGE("Line No.",DeferralHeader."Line No.");
+      IF DeferralLine.FINDSET THEN BEGIN
+        TotalDeferralCount := DeferralLine.COUNT;
+        REPEAT
+          DeferralCount := DeferralCount + 1;
+          IF DeferralCount = TotalDeferralCount THEN BEGIN
+            DeferralLine."Amount (LCY)" := DeferralHeader."Amount to Defer (LCY)" - TotalAmountLCY;
+            DeferralLine.MODIFY;
+          END ELSE BEGIN
+            DeferralLine."Amount (LCY)" :=
+      //      ROUND(CurrExchRate.ExchangeAmtFCYToLCY(UseDate,CurrencyCode,DeferralLine.Amount,CurrencyFactor)); //**4PS.o
+              ROUND(CurrExchRate.ExchangeAmtFCYToLCY(0,'',UseDate,CurrencyCode,DeferralLine.Amount,CurrencyFactor,FALSE)); //**4PS.n
+            TotalAmountLCY := TotalAmountLCY + DeferralLine."Amount (LCY)";
+            DeferralLine.MODIFY;
+          END;
+        UNTIL DeferralLine.NEXT = 0;
+      END;
+    END;
+
+    LOCAL PROCEDURE InitCurrency@21(CurrencyCode@1000 : Code[10]);
+    VAR
+      Currency@1001 : Record 4;
+    BEGIN
+      IF CurrencyCode = '' THEN
+        Currency.InitRoundingPrecision
+      ELSE BEGIN
+        Currency.GET(CurrencyCode);
+        Currency.TESTFIELD("Amount Rounding Precision");
+      END;
+      AmountRoundingPrecision := Currency."Amount Rounding Precision";
+    END;
+
+    PROCEDURE GetSalesDeferralDocType@23() : Integer;
+    BEGIN
+      EXIT(DeferralHeader."Deferral Doc. Type"::Sales)
+    END;
+
+    LOCAL PROCEDURE InitializeDeferralHeaderAndSetPostDate@29(VAR DeferralLine@1000 : Record 1702;DeferralHeader@1003 : Record 1701;PeriodicCount@1002 : Integer;VAR PostDate@1001 : Date);
+    BEGIN
+      DeferralLine.INIT;
+      DeferralLine."Deferral Doc. Type" := DeferralHeader."Deferral Doc. Type";
+      DeferralLine."Gen. Jnl. Template Name" := DeferralHeader."Gen. Jnl. Template Name";
+      DeferralLine."Gen. Jnl. Batch Name" := DeferralHeader."Gen. Jnl. Batch Name";
+      DeferralLine."Document Type" := DeferralHeader."Document Type";
+      DeferralLine."Document No." := DeferralHeader."Document No.";
+      DeferralLine."Line No." := DeferralHeader."Line No.";
+      DeferralLine."Currency Code" := DeferralHeader."Currency Code";
+
+      IF PeriodicCount = 1 THEN BEGIN
+        AccountingPeriod.SETFILTER("Starting Date",'..%1',DeferralHeader."Start Date");
+        IF NOT AccountingPeriod.FINDFIRST THEN
+          ERROR(DeferSchedOutOfBoundsErr);
+
+        PostDate := DeferralHeader."Start Date"
+      END ELSE BEGIN
+        AccountingPeriod.SETFILTER("Starting Date",'>%1',PostDate);
+        IF AccountingPeriod.FINDFIRST THEN
+          PostDate := AccountingPeriod."Starting Date"
+        ELSE
+          ERROR(DeferSchedOutOfBoundsErr);
+      END;
+    END;
+
+    PROCEDURE GetPurchDeferralDocType@24() : Integer;
+    BEGIN
+      EXIT(DeferralHeader."Deferral Doc. Type"::Purchase)
+    END;
+
+    PROCEDURE GetDeferralStartDate@26(DeferralDocType@1004 : Integer;RecordDocumentType@1003 : Integer;RecordDocumentNo@1002 : Code[20];RecordLineNo@1001 : Integer;DeferralCode@1006 : Code[10];PostingDate@1007 : Date) : Date;
+    VAR
+      DeferralHeader@1000 : Record 1701;
+      DeferralTemplate@1005 : Record 1700;
+    BEGIN
+      IF DeferralHeader.GET(DeferralDocType,'','',RecordDocumentType,RecordDocumentNo,RecordLineNo) THEN
+        EXIT(DeferralHeader."Start Date");
+
+      IF DeferralTemplate.GET(DeferralCode) THEN
+        EXIT(SetStartDate(DeferralTemplate,PostingDate));
+
+      EXIT(PostingDate);
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

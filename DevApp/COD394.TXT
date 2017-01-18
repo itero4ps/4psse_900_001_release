@@ -1,0 +1,228 @@
+OBJECT Codeunit 394 FinChrgMemo-Make
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=NAVW19.00,4PS9.00;
+  }
+  PROPERTIES
+  {
+    OnRun=BEGIN
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      Cust@1000 : Record 18;
+      CustLedgEntry@1001 : Record 21;
+      CustLedgEntry2@1011 : Record 21;
+      FinChrgTerms@1002 : Record 5;
+      FinChrgMemoHeaderReq@1003 : Record 302;
+      FinChrgMemoHeader@1004 : Record 302;
+      FinChrgMemoLine@1005 : Record 303;
+      Currency@1006 : TEMPORARY Record 4;
+      TempCurrency@1015 : TEMPORARY Record 4;
+      CurrExchRate@1007 : Record 330;
+      NextLineNo@1008 : Integer;
+      CustAmountLCY@1009 : Decimal;
+      HeaderExists@1010 : Boolean;
+      OverDue@1012 : Boolean;
+
+    PROCEDURE Code@7() RetVal : Boolean;
+    BEGIN
+      WITH FinChrgMemoHeader DO
+        IF "No." <> '' THEN BEGIN
+          HeaderExists := TRUE;
+          TESTFIELD("Customer No.");
+          Cust.GET("Customer No.");
+          TESTFIELD("Document Date");
+          TESTFIELD("Fin. Charge Terms Code");
+          FinChrgMemoHeaderReq := FinChrgMemoHeader;
+          FinChrgMemoLine.SETRANGE("Finance Charge Memo No.","No.");
+          FinChrgMemoLine.DELETEALL;
+        END;
+
+      OverDue := FALSE;
+
+      WITH Cust DO BEGIN
+        TESTFIELD("Fin. Charge Terms Code");
+        IF HeaderExists THEN
+          FinChrgMemoCheck(FinChrgMemoHeader."Currency Code")
+        ELSE BEGIN
+          IF Blocked = Blocked::All THEN
+            EXIT(FALSE);
+          Currency.DELETEALL;
+          TempCurrency.DELETEALL;
+          CustLedgEntry2.COPYFILTERS(CustLedgEntry);
+          CustLedgEntry.SETCURRENTKEY("Customer No.");
+          CustLedgEntry.SETRANGE("Customer No.","No.");
+          IF CustLedgEntry.FIND('-') THEN
+            REPEAT
+              // IF CustLedgEntry."On Hold" = '' THEN BEGIN      //**4PS.o DP00794
+              IF (CustLedgEntry."On Hold" = '') AND (CustLedgEntry."Blocked for Interest" = '') THEN BEGIN   //**4PS.n DP00794
+                Currency.Code := CustLedgEntry."Currency Code";
+                IF Currency.INSERT THEN;
+              END;
+            UNTIL CustLedgEntry.NEXT = 0;
+          CustLedgEntry.COPYFILTERS(CustLedgEntry2);
+          IF Currency.FIND('-') THEN
+            REPEAT
+              FinChrgMemoCheck(Currency.Code);
+            UNTIL Currency.NEXT = 0;
+        END;
+
+        IF ((CustAmountLCY = 0) OR (CustAmountLCY < FinChrgTerms."Minimum Amount (LCY)")) AND
+           ((FinChrgTerms."Additional Fee (LCY)" = 0) OR (NOT OverDue))
+        THEN
+          EXIT(TRUE);
+        FinChrgMemoLine.LOCKTABLE;
+        FinChrgMemoHeader.LOCKTABLE;
+
+        IF HeaderExists THEN
+          MakeFinChrgMemo(FinChrgMemoHeader."Currency Code")
+        ELSE
+          IF Currency.FIND('-') THEN
+            REPEAT
+              IF TempCurrency.GET(Currency.Code) THEN
+                MakeFinChrgMemo(Currency.Code);
+            UNTIL Currency.NEXT = 0;
+      END;
+      EXIT(TRUE);
+    END;
+
+    PROCEDURE Set@6(Cust2@1000 : Record 18;VAR CustLedgEntry2@1001 : Record 21;FinChrgMemoHeaderReq2@1002 : Record 302);
+    BEGIN
+      Cust := Cust2;
+      CustLedgEntry.COPY(CustLedgEntry2);
+      FinChrgMemoHeaderReq := FinChrgMemoHeaderReq2;
+    END;
+
+    PROCEDURE SuggestLines@4(FinChrgMemoHeader2@1000 : Record 302;VAR CustLedgEntry2@1001 : Record 21);
+    BEGIN
+      FinChrgMemoHeader := FinChrgMemoHeader2;
+      CustLedgEntry.COPY(CustLedgEntry2);
+    END;
+
+    LOCAL PROCEDURE MakeFinChrgMemo@3(CurrencyCode@1000 : Code[10]);
+    BEGIN
+      IF NOT HeaderExists THEN
+        IF NOT MakeHeader(CurrencyCode,FALSE) THEN
+          EXIT;
+      NextLineNo := 0;
+      MakeLines(CurrencyCode,FALSE);
+      FinChrgMemoHeader.InsertLines;
+      FinChrgMemoHeader.MODIFY;
+    END;
+
+    LOCAL PROCEDURE FinChrgMemoCheck@5(CurrencyCode@1000 : Code[10]);
+    BEGIN
+      IF NOT HeaderExists THEN
+        MakeHeader(CurrencyCode,TRUE);
+      FinChrgTerms.GET(FinChrgMemoHeader."Fin. Charge Terms Code");
+      MakeLines(CurrencyCode,TRUE);
+    END;
+
+    LOCAL PROCEDURE MakeHeader@1(CurrencyCode@1000 : Code[10];Checking@1001 : Boolean) : Boolean;
+    BEGIN
+      WITH Cust DO BEGIN
+        IF NOT Checking THEN BEGIN
+          FinChrgMemoHeader.SETCURRENTKEY("Customer No.","Currency Code");
+          FinChrgMemoHeader.SETRANGE("Customer No.","No.");
+          FinChrgMemoHeader.SETRANGE("Currency Code",CurrencyCode);
+          IF FinChrgMemoHeader.FINDFIRST THEN
+            EXIT(FALSE);
+        END;
+        FinChrgMemoHeader.INIT;
+        FinChrgMemoHeader."No." := '';
+        FinChrgMemoHeader."Posting Date" := FinChrgMemoHeaderReq."Posting Date";
+        IF NOT Checking THEN
+          FinChrgMemoHeader.INSERT(TRUE);
+        FinChrgMemoHeader.VALIDATE("Customer No.","No.");
+        FinChrgMemoHeader.VALIDATE("Document Date",FinChrgMemoHeaderReq."Document Date");
+        FinChrgMemoHeader.VALIDATE("Currency Code",CurrencyCode);
+        IF NOT Checking THEN
+          FinChrgMemoHeader.MODIFY;
+        EXIT(TRUE);
+      END;
+    END;
+
+    LOCAL PROCEDURE MakeLines@8(CurrencyCode@1000 : Code[10];Checking@1001 : Boolean);
+    BEGIN
+      WITH Cust DO BEGIN
+        IF FinChrgTerms."Interest Calculation" IN
+           [FinChrgTerms."Interest Calculation"::"Open Entries",
+            FinChrgTerms."Interest Calculation"::"All Entries"]
+        THEN BEGIN
+          CustLedgEntry.SETCURRENTKEY("Customer No.",Open,Positive,"Due Date","Currency Code");
+          CustLedgEntry.SETRANGE("Customer No.","No.");
+          CustLedgEntry.SETRANGE(Open,TRUE);
+          CustLedgEntry.SETRANGE("On Hold",'');
+          CustLedgEntry.SETRANGE(Positive,TRUE);
+          CustLedgEntry.SETRANGE("Currency Code",CurrencyCode);
+          CustLedgEntry.SETRANGE("Blocked for Interest", ''); //**4PS.n DP00794
+          MakeLines2(CurrencyCode,Checking);
+        END;
+        IF FinChrgTerms."Interest Calculation" IN
+           [FinChrgTerms."Interest Calculation"::"Closed Entries",
+            FinChrgTerms."Interest Calculation"::"All Entries"]
+        THEN BEGIN
+          IF NOT CustLedgEntry.SETCURRENTKEY("Customer No.",Open,Positive,"Calculate Interest") THEN
+            CustLedgEntry.SETCURRENTKEY("Customer No.",Open,Positive,"Due Date","Currency Code");
+          CustLedgEntry.SETRANGE("Customer No.","No.");
+          CustLedgEntry.SETRANGE(Open,FALSE);
+          CustLedgEntry.SETRANGE("On Hold",'');
+          CustLedgEntry.SETRANGE(Positive,TRUE);
+          CustLedgEntry.SETRANGE("Currency Code",CurrencyCode);
+          CustLedgEntry.SETRANGE("Blocked for Interest", ''); //**4PS.n DP00794
+          CustLedgEntry.SETRANGE("Calculate Interest",TRUE);
+          MakeLines2(CurrencyCode,Checking);
+          CustLedgEntry.SETRANGE("Calculate Interest");
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE MakeLines2@2(CurrencyCode@1000 : Code[10];Checking@1001 : Boolean);
+    BEGIN
+      WITH Cust DO
+        IF CustLedgEntry.FIND('-') THEN
+          REPEAT
+            CLEAR(FinChrgMemoLine);
+            FinChrgMemoLine.INIT;
+            FinChrgMemoLine."Finance Charge Memo No." := FinChrgMemoHeader."No.";
+            NextLineNo := NextLineNo + 10000;
+            FinChrgMemoLine."Line No." := NextLineNo;
+            FinChrgMemoLine.SetFinChrgMemoHeader(FinChrgMemoHeader);
+            FinChrgMemoLine.Type := FinChrgMemoLine.Type::"Customer Ledger Entry";
+            FinChrgMemoLine.VALIDATE("Entry No.",CustLedgEntry."Entry No.");
+            IF CurrencyCode <> '' THEN BEGIN
+              CustAmountLCY :=
+                CustAmountLCY +
+                CurrExchRate.ExchangeAmtFCYToLCY(
+                  0, '', //**4PS.n
+                  FinChrgMemoHeader."Posting Date",CurrencyCode,FinChrgMemoLine.Amount,
+                  CurrExchRate.ExchangeRate(
+      //            FinChrgMemoHeader."Posting Date",CurrencyCode)) //**4PS.o
+                    0, '', FinChrgMemoHeader."Posting Date",CurrencyCode,TRUE),TRUE) //**4PS.n
+            END ELSE
+              CustAmountLCY := CustAmountLCY + FinChrgMemoLine.Amount;
+            IF (CustAmountLCY >= FinChrgTerms."Minimum Amount (LCY)") AND
+               (FinChrgMemoHeader."Document Date" > CALCDATE(FinChrgTerms."Grace Period",FinChrgMemoLine."Due Date"))
+            THEN
+              OverDue := TRUE;
+            IF FinChrgMemoLine.Amount <> 0 THEN
+              IF NOT Checking THEN
+                FinChrgMemoLine.INSERT
+              ELSE BEGIN
+                TempCurrency.Code := CurrencyCode;
+                IF TempCurrency.INSERT THEN;
+              END;
+          UNTIL CustLedgEntry.NEXT = 0;
+    END;
+
+    BEGIN
+    END.
+  }
+}
+

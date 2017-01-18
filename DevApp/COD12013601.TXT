@@ -4,7 +4,7 @@ OBJECT Codeunit 12013601 ExFlow
   {
     Date=;
     Time=;
-    Version List=EXF400007,4PS;
+    Version List=EXF410001,4PS;
   }
   PROPERTIES
   {
@@ -229,6 +229,10 @@ OBJECT Codeunit 12013601 ExFlow
           Show := TRUE;
         END;
 
+      // Exit if line is not modified and xrec.No. is populated (if not populated, it would be a new record)
+      IF ((xPurchLine."No." <> '') AND (NOT IsLineModifiedSync(PurchLine,xPurchLine))) THEN
+        EXIT;
+
       DocLine.RetrieveRecord(DocLine,PurchLine."Document Type",PurchLine."Document No.",PurchLine."Line No.");
 
       // Test if Approved
@@ -256,14 +260,9 @@ OBJECT Codeunit 12013601 ExFlow
       DocLine."Invoicing Amount" := PurchLine."Invoicing Amount";
       DocLine."Start Date for Invoicing" := PurchLine."Start Date for Invoicing";
       DocLine."Invoicing Code" := PurchLine."Invoicing Code";
-      //ExJakan
-      DocLine."Service Order No." := PurchLine."Service Order No.";
-      DocLine.ValidateServProj(PurchLine);
-      //ExJakan
-      ///4PS
-      DocLine."Cost Component Plant" := PurchLine."Cost Component Plant";
-      DocLine."Cost Type" := PurchLine."Cost Type";
-      //4PS
+      DocLine."First Approver" := PurchLine."First Approver";
+      DocLine."Template Rule" := PurchLine."Template Rule";
+
       ExFlowSEMgt.ExFlowCodeunit_UpdatePeriodicDocLine(DocLine,PurchLine);
 
       DocLine.MODIFY(TRUE);
@@ -494,7 +493,6 @@ OBJECT Codeunit 12013601 ExFlow
       IF Dim = '' THEN
         EXIT;
 
-
       IF Dim = GeneralLedgerSetup."Shortcut Dimension 1 Code" THEN
         Index := 1;
       IF Dim = GeneralLedgerSetup."Shortcut Dimension 2 Code" THEN
@@ -714,14 +712,8 @@ OBJECT Codeunit 12013601 ExFlow
       DocLine."Invoicing Amount" := PurchLine."Invoicing Amount";
       DocLine."Start Date for Invoicing" := PurchLine."Start Date for Invoicing";
       DocLine."Invoicing Code" := PurchLine."Invoicing Code";
-      //ExJakan
-      DocLine."Service Order No." := PurchLine."Service Order No.";
-      //ExJakan
-      ///4PS
-      DocLine."Cost Component Plant" := PurchLine."Cost Component Plant";
-      DocLine."Cost Type" := PurchLine."Cost Type";
-      //4PS
-
+      DocLine."First Approver" := PurchLine."First Approver";
+      DocLine."Template Rule" := PurchLine."Template Rule";
 
       ExFlowSEMgt.ExFlowCodeunit_UpdatePeriodicDocLine(DocLine,PurchLine);
 
@@ -777,11 +769,12 @@ OBJECT Codeunit 12013601 ExFlow
       IF AppSetUp."Min. Approval Amount (LCY)" = 0 THEN
         EXIT(TRUE);
 
-      TempLineAmt := PurchLine."Line Amount";
+      //348864
       IF PurchHeader."Currency Code" <> '' THEN
-        TempLineAmt := CurrExchRate.ExchangeAmtFCYToLCY(0,PurchHeader."Job No.",
+        PurchLine."Line Amount" := CurrExchRate.ExchangeAmtFCYToLCY(0,PurchHeader."Job No.", // 4PS
           PurchHeader."Posting Date",PurchHeader."Currency Code",
-          TempLineAmt,PurchHeader."Currency Factor",FALSE);//4PS
+          PurchLine."Line Amount",PurchHeader."Currency Factor",FALSE); // 4PS
+      //348864
 
       IF ABS(TempLineAmt) < AppSetUp."Min. Approval Amount (LCY)" THEN BEGIN
         PurchLine.Approve := FALSE;
@@ -831,6 +824,47 @@ OBJECT Codeunit 12013601 ExFlow
       DocLineApp.SETFILTER(Flowstatus, '<>%1&<>%2', DocLineApp.Flowstatus::Rejected,DocLineApp.Flowstatus::Approved);
       ApproverExist := DocLineApp.FINDFIRST;
 
+      IF (TemplateRuleCode = '') AND (PurchLine."Template Rule" <> '') THEN
+        TemplateRuleCode := PurchLine."Template Rule";
+
+      Found := FALSE;
+      IF TemplateRuleCode <> '' THEN
+        IF TemplateRule.GET(TemplateRuleCode) THEN
+          Found := TRUE;
+
+      IF NOT Found THEN BEGIN
+        CurrentDocDimFound := FALSE;
+
+        ExFlowDimMgt.GetDimFromPurchLine(PurchLine,CurrentDocDimFound,CurrentDocDimCode,CurrentDocDimValue,TempDimValue);
+
+        RuleFor := 0;
+        CASE PurchLine."Document Type" OF
+          PurchLine."Document Type"::Quote: RuleFor := 3;
+          PurchLine."Document Type"::Order: RuleFor := 1;
+          PurchLine."Document Type"::Invoice: RuleFor := 2;
+          PurchLine."Document Type"::"Credit Memo": RuleFor := 2;
+        END;
+
+        CLEAR(PurchaseHeader);
+        IF PurchLine."ExFlow Order No." <> '' THEN BEGIN
+          IF PurchLine."Document Type" = PurchLine."Document Type"::Invoice THEN BEGIN
+            IF PurchaseHeader.GET(PurchaseHeader."Document Type"::Order,PurchLine."ExFlow Order No.") THEN;
+          END
+          ELSE
+            IF PurchLine."Document Type" = PurchLine."Document Type"::"Credit Memo" THEN BEGIN
+              IF PurchaseHeader.GET(PurchaseHeader."Document Type"::"Return Order",PurchLine."ExFlow Order No.") THEN;
+            END;
+        END;
+
+        IF PurchaseHeader."No." = '' THEN
+          PurchaseHeader.GET(PurchLine."Document Type",PurchLine."Document No.");
+
+        Found := TemplateRule.FindTemplateFromPurch(PurchLine, TemplateRule, RuleFor, PurchaseHeader."Purchaser Code", TempDimValue);
+      END;
+
+      IF Found AND (TemplateRule.Code = PurchLine."Applied Template Rule") THEN
+        EXIT;
+
       IF NOT PurchLine."Approval Flow Modified" THEN BEGIN
         IF ApproverExist THEN
           DocLineApp.DELETEALL;
@@ -838,51 +872,8 @@ OBJECT Codeunit 12013601 ExFlow
         ApproverExist := FALSE;
       END;
 
-      IF (TemplateRuleCode = '') AND (PurchLine."Template Rule" <> '') THEN
-        TemplateRuleCode := PurchLine."Template Rule";
-
       IF AppSetUp."Propose always new Approvers" AND ApproverExist THEN
         DocLineApp.DELETEALL;
-
-      Found := TRUE;
-
-      IF AppSetUp."Propose always new Approvers" OR (NOT ApproverExist) THEN
-        IF NOT TemplateRule.GET(TemplateRuleCode) THEN
-          BEGIN
-            DocLineApp.RESET;
-            DocLineApp.SETCURRENTKEY("Document Line ID");
-            DocLineApp.SETRANGE("Document Line ID", DocLine.ID);
-            DocLineApp.SETFILTER(Flowstatus, '<>%1&<>%2', DocLineApp.Flowstatus::Rejected,DocLineApp.Flowstatus::Approved);
-            IF NOT DocLineApp.FINDFIRST THEN BEGIN
-              CurrentDocDimFound := FALSE;
-
-              ExFlowDimMgt.GetDimFromPurchLine(PurchLine,CurrentDocDimFound,CurrentDocDimCode,CurrentDocDimValue,TempDimValue);
-
-              RuleFor := 0;
-              CASE PurchLine."Document Type" OF
-                PurchLine."Document Type"::Quote: RuleFor := 3;
-                PurchLine."Document Type"::Order: RuleFor := 1;
-                PurchLine."Document Type"::Invoice: RuleFor := 2;
-                PurchLine."Document Type"::"Credit Memo": RuleFor := 2;
-              END;
-
-              CLEAR(PurchaseHeader);
-              IF PurchLine."ExFlow Order No." <> '' THEN BEGIN
-                IF PurchLine."Document Type" = PurchLine."Document Type"::Invoice THEN BEGIN
-                  IF PurchaseHeader.GET(PurchaseHeader."Document Type"::Order,PurchLine."ExFlow Order No.") THEN;
-                END
-                ELSE
-                  IF PurchLine."Document Type" = PurchLine."Document Type"::"Credit Memo" THEN BEGIN
-                    IF PurchaseHeader.GET(PurchaseHeader."Document Type"::"Return Order",PurchLine."ExFlow Order No.") THEN;
-                  END;
-              END;
-
-              IF PurchaseHeader."No." = '' THEN
-                PurchaseHeader.GET(PurchLine."Document Type",PurchLine."Document No.");
-
-              Found := TemplateRule.FindTemplateFromPurch(PurchLine, TemplateRule, RuleFor, PurchaseHeader."Purchaser Code", TempDimValue);
-            END;
-          END;
 
       DocLineApp.RESET;
       DocLineApp.SETCURRENTKEY("Document Line ID","Approver Order");
@@ -1097,8 +1088,8 @@ OBJECT Codeunit 12013601 ExFlow
       IF NOT PurchLine.GET(DocLine."Document Type",DocLine."Document No.",DocLine."Line No.") THEN
         CLEAR(PurchLine);
 
-      IF (TemplateRuleCode = '') AND (PurchLine."Template Rule" <> '') THEN
-        TemplateRuleCode := PurchLine."Template Rule";
+      IF (TemplateRuleCode = '') AND (DocLine."Template Rule" <> '') THEN
+        TemplateRuleCode := DocLine."Template Rule";
 
       Found := TRUE;
 
@@ -1502,13 +1493,6 @@ OBJECT Codeunit 12013601 ExFlow
           DocLineDim."Dimension Value" := ExFWorkFlowMgt.TransformDateToText(PurchLine."Start Date for Invoicing")
         ELSE
           EXIT;
-      //ExJakan
-      IF InCode = 'SERVICEORD' THEN //
-        IF  PurchLine."Service Order No." <> '' THEN
-          DocLineDim."Dimension Value" := PurchLine."Service Order No."
-        ELSE
-          EXIT;
-      //ExJakan
       //>> 4PS
       IF InCode = 'EXTCONTR_4PS' THEN // ŽTA No.
         IF PurchLine."Extension Contract" <> '' THEN
@@ -1530,7 +1514,6 @@ OBJECT Codeunit 12013601 ExFlow
           DocLineDim."Dimension Value" := PurchLine."Cost Component"
         ELSE
           EXIT;
-
       //<< 4PS
 
       IF Column."Purchase Line Field ID" <> 0 THEN BEGIN
@@ -1874,6 +1857,8 @@ OBJECT Codeunit 12013601 ExFlow
       TempCount@1100285004 : Integer;
       TempCodingRuleID@1100285070 : Integer;
       NextID@1100285071 : Integer;
+      DimOwner@1100285072 : Record 12013655;
+      DimOwnerNew@1100285073 : Record 12013655;
     BEGIN
       CASE Action OF
         'COLUMNS' :
@@ -2388,6 +2373,24 @@ OBJECT Codeunit 12013601 ExFlow
                   ExContractNew.MODIFY;
                 END;
               UNTIL ExContract.NEXT = 0;
+            END;
+          END;
+
+          'DIMOWNER':
+          BEGIN
+            DimOwner.RESET;
+            DimOwner.CHANGECOMPANY(CompName);
+            IF DimOwner.FINDSET THEN BEGIN
+              REPEAT
+                IF NOT DimOwnerNew.GET(DimOwner."Dimension Code",DimOwner."Dimension Value Code",DimOwner."Approver Type") THEN BEGIN
+                  DimOwnerNew.INIT;
+                  DimOwnerNew.TRANSFERFIELDS(DimOwner);
+                  DimOwnerNew.INSERT;
+                END ELSE BEGIN
+                  DimOwnerNew.TRANSFERFIELDS(DimOwner,FALSE);
+                  DimOwnerNew.MODIFY;
+                END;
+              UNTIL DimOwner.NEXT = 0;
             END;
           END;
 
@@ -3168,30 +3171,30 @@ OBJECT Codeunit 12013601 ExFlow
       AddJnlLine(PurchaseLine,TempAmountLCY,TempNo,PostingDate,
                  CopyDimensions>0,
                  JnlTemplateName,JnlBatchName,TempLineNo,TempDocNo,DescriptionToUse,
-                 FixedDimCode,FixedDimValue,RetrieveLinesFrom);
+                 FixedDimCode,FixedDimValue,RetrieveLinesFrom,FALSE);
 
       // Balancing Entry
       AddJnlLine(PurchaseLine,-TempAmountLCY,BalanceAccount,PostingDate,
                  (CopyDimensions=CopyDimensions::Always) OR (CopyDimensions=CopyDimensions::Fixed) OR
                  (CopyDimensions=CopyDimensions::"Fixed when blank"),
                  JnlTemplateName,JnlBatchName,TempLineNo,TempDocNo,DescriptionToUse,
-                 FixedDimCode,FixedDimValue,RetrieveLinesFrom);
+                 FixedDimCode,FixedDimValue,RetrieveLinesFrom,TRUE);
 
       // Reversal entry
       AddJnlLine(PurchaseLine,-TempAmountLCY,TempNo,ReversalDate,
                  CopyDimensions>0,
                  JnlTemplateName,JnlBatchName,TempLineNo,TempDocNo,DescriptionToUse,
-                 FixedDimCode,FixedDimValue,RetrieveLinesFrom);
+                 FixedDimCode,FixedDimValue,RetrieveLinesFrom,FALSE);
 
       // Balancing entry
       AddJnlLine(PurchaseLine,TempAmountLCY,BalanceAccount,ReversalDate,
                  (CopyDimensions=CopyDimensions::Always) OR (CopyDimensions=CopyDimensions::Fixed) OR
                  (CopyDimensions=CopyDimensions::"Fixed when blank"),
                  JnlTemplateName,JnlBatchName,TempLineNo,TempDocNo,DescriptionToUse,
-                 FixedDimCode,FixedDimValue,RetrieveLinesFrom);
+                 FixedDimCode,FixedDimValue,RetrieveLinesFrom,TRUE);
     END;
 
-    PROCEDURE AddJnlLine@1100285025(_PurchaseLine@1100285002 : Record 39;_TempAmountLCY@1100285001 : Decimal;_TempNo@1100285000 : Code[20];_PostDate@1100285004 : Date;_AddDimensions@1100285003 : Boolean;_JnlTemplateName@1100285011 : Code[10];_JnlBatchName@1100285010 : Code[10];VAR _TempLineNo@1100285013 : Integer;_TempDocNo@1100285014 : Code[20];_DescriptionToUse@1100285015 : 'PurchaseLine,OrderNoRef,VendorName';_FixedDimCode@1100285019 : ARRAY [8] OF Code[20];_FixedDimValue@1100285018 : ARRAY [8] OF Code[20];RetrieveLinesFrom@1100285017 : 'Purchase Line,Ex Document Line');
+    PROCEDURE AddJnlLine@1100285025(_PurchaseLine@1100285002 : Record 39;_TempAmountLCY@1100285001 : Decimal;_TempNo@1100285000 : Code[20];_PostDate@1100285004 : Date;_AddDimensions@1100285003 : Boolean;_JnlTemplateName@1100285011 : Code[10];_JnlBatchName@1100285010 : Code[10];VAR _TempLineNo@1100285013 : Integer;_TempDocNo@1100285014 : Code[20];_DescriptionToUse@1100285015 : 'PurchaseLine,OrderNoRef,VendorName';_FixedDimCode@1100285019 : ARRAY [8] OF Code[20];_FixedDimValue@1100285018 : ARRAY [8] OF Code[20];RetrieveLinesFrom@1100285017 : 'Purchase Line,Ex Document Line';IsBalancingRec@1000 : Boolean);
     VAR
       GenJnlLine@1100285012 : Record 81;
       GenJnlTemplate@1100285006 : Record 80;
@@ -3201,7 +3204,6 @@ OBJECT Codeunit 12013601 ExFlow
       UseFixed@1100285009 : Boolean;
       i@1100285016 : Integer;
       Index@1100285008 : Integer;
-      IsBalancingRec@1000000000 : Boolean;
     BEGIN
       GenJnlLine.INIT;
       GenJnlLine."Journal Template Name" := _JnlTemplateName;
@@ -3340,7 +3342,7 @@ OBJECT Codeunit 12013601 ExFlow
 
       IF xPurchHeader.Approve AND (NOT PurchHeader.Approve) THEN
         BEGIN
-          IF NOT IsUserSuperior(USERID) THEN
+          IF NOT IsUserSuperior( USERID) THEN
             ERROR(EXF63);
 
           IF NOT CONFIRM(EXF77) THEN
@@ -3756,6 +3758,175 @@ OBJECT Codeunit 12013601 ExFlow
       ELSE
         IF FldRef.VALUE <> xFldRef.VALUE THEN
           EXIT(TRUE);
+    END;
+
+    PROCEDURE IsLineModifiedSync@1100285007(PurchLine@1100285001 : Record 39;xPurchLine@1100285000 : Record 39) : Boolean;
+    VAR
+      Field@1100285008 : Record 2000000041;
+      RecRef@1100285002 : RecordRef;
+      FldRef@1100285003 : FieldRef;
+      xRecRef@1100285005 : RecordRef;
+      xFldRef@1100285004 : FieldRef;
+      TempValue@1100285006 : Decimal;
+      xTempValue@1100285007 : Decimal;
+    BEGIN
+      RecRef.GETTABLE(PurchLine);
+      xRecRef.GETTABLE(xPurchLine);
+
+      // Type
+      FldRef := RecRef.FIELD(5);
+      xFldRef := xRecRef.FIELD(5);
+      IF FldRef.VALUE <> xFldRef.VALUE THEN
+        EXIT(TRUE);
+
+      // No.
+      FldRef := RecRef.FIELD(6);
+      xFldRef := xRecRef.FIELD(6);
+      IF FldRef.VALUE <> xFldRef.VALUE THEN
+        EXIT(TRUE);
+
+      // Description
+      FldRef := RecRef.FIELD(11);
+      xFldRef := xRecRef.FIELD(11);
+      IF FldRef.VALUE <> xFldRef.VALUE THEN
+        EXIT(TRUE);
+
+      // Description 2
+      FldRef := RecRef.FIELD(12);
+      xFldRef := xRecRef.FIELD(12);
+      IF FldRef.VALUE <> xFldRef.VALUE THEN
+        EXIT(TRUE);
+
+      // Quantity
+      FldRef := RecRef.FIELD(15);
+      xFldRef := xRecRef.FIELD(15);
+      IF PurchLine."Document Type" IN [PurchLine."Document Type"::Quote,
+                                       PurchLine."Document Type"::Order] THEN BEGIN
+        TempValue := 0;
+        xTempValue := 0;
+        IF EVALUATE(TempValue,FORMAT(FldRef.VALUE)) THEN;
+        IF EVALUATE(xTempValue,FORMAT(xFldRef.VALUE)) THEN;
+
+        IF TempValue > xTempValue THEN
+          EXIT(TRUE);
+      END
+      ELSE
+        IF FldRef.VALUE <> xFldRef.VALUE THEN
+          EXIT(TRUE);
+
+      // Line Amount
+      FldRef := RecRef.FIELD(103);
+      xFldRef := xRecRef.FIELD(103);
+
+      IF PurchLine."Document Type" IN [PurchLine."Document Type"::Quote,
+                                       PurchLine."Document Type"::Order] THEN BEGIN
+        TempValue := 0;
+        xTempValue := 0;
+        IF EVALUATE(TempValue,FORMAT(FldRef.VALUE)) THEN;
+        IF EVALUATE(xTempValue,FORMAT(xFldRef.VALUE)) THEN;
+
+        IF TempValue > xTempValue THEN
+          EXIT(TRUE);
+      END
+      ELSE
+        IF FldRef.VALUE <> xFldRef.VALUE THEN
+          EXIT(TRUE);
+
+      // Periodic Template
+      IF Field.GET(DATABASE::"Purchase Line",11201) THEN BEGIN
+        FldRef := RecRef.FIELD(11201);
+        xFldRef := xRecRef.FIELD(11201);
+        IF FldRef.VALUE <> xFldRef.VALUE THEN
+          EXIT(TRUE);
+      END;
+      IF Field.GET(DATABASE::"Purchase Line",11202) THEN BEGIN
+        FldRef := RecRef.FIELD(11202);
+        xFldRef := xRecRef.FIELD(11202);
+        IF FldRef.VALUE <> xFldRef.VALUE THEN
+          EXIT(TRUE);
+      END;
+      // Deferral cod (2016)
+      IF Field.GET(DATABASE::"Purchase Line",1700) THEN BEGIN
+        FldRef := RecRef.FIELD(1700);
+        xFldRef := xRecRef.FIELD(1700);
+        IF FldRef.VALUE <> xFldRef.VALUE THEN
+          EXIT(TRUE);
+      END;
+
+      // Job No
+      IF Field.GET(DATABASE::"Purchase Line",45) THEN BEGIN
+        FldRef := RecRef.FIELD(45);
+        xFldRef := xRecRef.FIELD(45);
+        IF FldRef.VALUE <> xFldRef.VALUE THEN
+          EXIT(TRUE);
+      END;
+
+      // Job Task No
+      IF Field.GET(DATABASE::"Purchase Line",1001) THEN BEGIN
+        FldRef := RecRef.FIELD(1001);
+        xFldRef := xRecRef.FIELD(1001);
+        IF FldRef.VALUE <> xFldRef.VALUE THEN
+          EXIT(TRUE);
+      END;
+
+      // First approver
+      IF Field.GET(DATABASE::"Purchase Line",12013603) THEN BEGIN
+        FldRef := RecRef.FIELD(12013603);
+        xFldRef := xRecRef.FIELD(12013603);
+        IF FldRef.VALUE <> xFldRef.VALUE THEN
+          EXIT(TRUE);
+      END;
+
+      // Template rules
+      IF Field.GET(DATABASE::"Purchase Line",12013660) THEN BEGIN
+        FldRef := RecRef.FIELD(12013660);
+        xFldRef := xRecRef.FIELD(12013660);
+        IF FldRef.VALUE <> xFldRef.VALUE THEN
+          EXIT(TRUE);
+      END;
+
+      // Invoice to Customer
+      IF Field.GET(DATABASE::"Purchase Line",12013611) THEN BEGIN
+        FldRef := RecRef.FIELD(12013611);
+        xFldRef := xRecRef.FIELD(12013611);
+        IF FldRef.VALUE <> xFldRef.VALUE THEN
+          EXIT(TRUE);
+      END;
+      // Invoicing Amount
+      IF Field.GET(DATABASE::"Purchase Line",12013612) THEN BEGIN
+        FldRef := RecRef.FIELD(12013612);
+        xFldRef := xRecRef.FIELD(12013612);
+        IF FldRef.VALUE <> xFldRef.VALUE THEN
+          EXIT(TRUE);
+      END;
+      // Start Date for Invoicing
+      IF Field.GET(DATABASE::"Purchase Line",12013613) THEN BEGIN
+        FldRef := RecRef.FIELD(12013613);
+        xFldRef := xRecRef.FIELD(12013613);
+        IF FldRef.VALUE <> xFldRef.VALUE THEN
+          EXIT(TRUE);
+      END;
+      // Invoicing Code
+      IF Field.GET(DATABASE::"Purchase Line",12013614) THEN BEGIN
+        FldRef := RecRef.FIELD(12013614);
+        xFldRef := xRecRef.FIELD(12013614);
+        IF FldRef.VALUE <> xFldRef.VALUE THEN
+          EXIT(TRUE);
+      END;
+
+      // Approval flag
+      FldRef := RecRef.FIELD(12013601);
+      xFldRef := xRecRef.FIELD(12013601);
+      IF FldRef.VALUE <> xFldRef.VALUE THEN
+        EXIT(TRUE);
+
+      // Dimension
+      IF Field.GET(DATABASE::"Purchase Line",480) THEN BEGIN
+        FldRef := RecRef.FIELD(480);
+        xFldRef := xRecRef.FIELD(480);
+        IF FldRef.VALUE <> xFldRef.VALUE THEN
+          EXIT(TRUE);
+      END;
     END;
 
     PROCEDURE TestifApprovedDim@1100285066(_PurchLine@1100285002 : Record 39;_DocLine@1100285004 : Record 12013609;_AppSetup@1100285001 : Record 12013601;_SilentMode@1100285000 : Boolean);

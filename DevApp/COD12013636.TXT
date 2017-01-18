@@ -4,7 +4,7 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
   {
     Date=;
     Time=;
-    Version List=EXF400007;
+    Version List=EXF410001;
   }
   PROPERTIES
   {
@@ -22,6 +22,7 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
       EXF004@1100285002 : TextConst 'ENU=A document already on hold cannot be set on hold again! Only approve or reject are allowed.';
       EXF005@1100285007 : TextConst 'ENU=Adding manual approvers are not allowed when using the functions Reject To User or Delegate To User!';
       EXF006@1100285008 : TextConst 'ENU=You cannot delete a line that is connected to an order!';
+      EXF007@1100285009 : TextConst 'ENU=You cannot approve a document that you delegated to another user!';
       Text033@1100285003 : TextConst 'ENU=The combination of dimensions used in line with No %1 is blocked. %2';
       Text035@1100285001 : TextConst 'ENU=The combination of dimensions used in line with No %1 is invalid. %2';
       TempCreatedDocLines@1100285004 : TEMPORARY Record 12013609;
@@ -100,6 +101,8 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
       ExDocLine@1100285009 : Record 12013609;
       ExDoc@1100285010 : Record 12013608;
       TempDocLineApproved@1100285019 : TEMPORARY Record 12013609;
+      TempManuallyAddedApproversFromWeb@1100285020 : TEMPORARY Record 12013610;
+      TempDocLineAdded@1100285022 : TEMPORARY Record 12013609;
       ExFlow@1100285008 : Codeunit 12013601;
       XmlDoc@1100285003 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
       XmlNodeList@1100285002 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
@@ -110,6 +113,7 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
       TempCompName@1100285012 : Text[30];
       i@1100285001 : Integer;
       NewDocHeaderID@1100285006 : BigInteger;
+      TempID@1100285021 : BigInteger;
       AddedApprover@1100285011 : Boolean;
       DelegatedToUsed@1100285016 : Boolean;
     BEGIN
@@ -129,8 +133,12 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
 
       TempDocLineApproved.RESET;
       TempDocLineApproved.DELETEALL;
+      TempManuallyAddedApproversFromWeb.RESET;
+      TempManuallyAddedApproversFromWeb.DELETEALL;
 
       AddedApprover := FALSE;
+      TempDocLineApproved.RESET;
+      TempDocLineApproved.DELETEALL;
 
       IF XmlNode.HasChildNodes() THEN BEGIN
         XmlNodeList := XmlNode.ChildNodes();
@@ -150,7 +158,7 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
               BEGIN
                 XmlNodeRowChangeState := XmlNode.LastChild();
                 CASE XmlNodeRowChangeState.InnerText() OF
-                  'Added': InsertDocLine(XmlNode,InUserID);
+                  'Added': InsertDocLine(XmlNode,InUserID,TempDocLineAdded);
                   'Modified': ;
                   'Deleted': ;
                   '':; // Unchanged records
@@ -197,7 +205,7 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
                 CASE XmlNodeRowChangeState.InnerText() OF
                   'Added':
                     BEGIN
-                      InsertDocLineApprover(XmlNode,InUserID,TempExDocLineApp,TempDocLineApproved);
+                      InsertDocLineApprover(XmlNode,InUserID,TempExDocLineApp,TempDocLineApproved,TempManuallyAddedApproversFromWeb,TempID);
                       AddedApprover := TRUE;
                     END;
                   'Modified': UpdateDocLineApprover(XmlNode,InUserID,TempDocLineApproved,DelegatedToUsed);
@@ -230,6 +238,11 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
 
       CLEAR(Params);
 
+      IF TempDocLineAdded.FINDFIRST THEN BEGIN
+        ExDocLine.GET(TempDocLineAdded.ID);
+        ExDocLine.DocumentStatus(ExDocLine,'New');
+      END;
+
       IF NewDocHeaderID <> 0 THEN BEGIN
         ExDoc.SETCURRENTKEY("Web ID");
         ExDoc.SETRANGE("Web ID", NewDocHeaderID);
@@ -257,15 +270,24 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
       END;
 
       CASE ExFlowSetup."Check Dimensions Web" OF
-        ExFlowSetup."Check Dimensions Web"::Always: CheckDim(ExDoc.ID);
+        ExFlowSetup."Check Dimensions Web"::Always:
+          BEGIN
+            TempDocLineApproved.RESET;
+            IF TempDocLineApproved.FINDSET THEN
+              REPEAT
+                ExDocLine.GET(TempDocLineApproved.ID);
+                CheckDim(ExDocLine);
+              UNTIL TempDocLineApproved.NEXT = 0;
+          END;
         ExFlowSetup."Check Dimensions Web"::"Final Approver Only":
           BEGIN
-            ExDocLine.RESET;
-            ExDocLine.SETCURRENTKEY("Document ID");
-            ExDocLine.SETRANGE("Document ID", ExDoc.ID);
-            ExDocLine.SETFILTER(Flowstatus, '<>%1', ExDocLine.Flowstatus::Approved);
-            IF NOT ExDocLine.FINDFIRST THEN
-              CheckDim(ExDoc.ID);
+            TempDocLineApproved.RESET;
+            IF TempDocLineApproved.FINDSET THEN
+              REPEAT
+                ExDocLine.GET(TempDocLineApproved.ID);
+                IF ExDocLine.Flowstatus = ExDocLine.Flowstatus::Approved THEN
+                  CheckDim(ExDocLine);
+              UNTIL TempDocLineApproved.NEXT = 0;
           END;
       END;
 
@@ -280,10 +302,11 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
         END;
     END;
 
-    LOCAL PROCEDURE InsertDocLine@1100285022(VAR XmlNode@1100285000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";InUserID@1100285009 : Code[50]);
+    LOCAL PROCEDURE InsertDocLine@1100285022(VAR XmlNode@1100285000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";InUserID@1100285009 : Code[50];VAR TempDocLineAdded@1100285004 : TEMPORARY Record 12013609);
     VAR
       ExDocLine@1100285006 : Record 12013609;
       ExDocLine2@1100285001 : Record 12013609;
+      ExDocLine3@1100285002 : Record 12013609;
       ExDoc@1100285007 : Record 12013608;
       TempCompName@1100285010 : Text[30];
     BEGIN
@@ -311,6 +334,23 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
       ExDocLine."Created By" := InUserID;
       ExDocLine."Created Date" := CREATEDATETIME(TODAY, TIME);
       ExDocLine."New Line" := TRUE;
+
+      IF ExDocLine."Document Type" = ExDocLine."Document Type"::Requisition THEN
+        ExDocLine."Split from Parent ID" := 0;
+
+      // retrieve first approver and template rule from parent line
+      IF ExDocLine."Split from Parent ID" <> 0 THEN BEGIN
+        IF ExDocLine."Split from Parent ID" > 0 THEN
+          ExDocLine3.GET(ExDocLine."Split from Parent ID")
+        ELSE BEGIN
+          TempCreatedDocLines.GET(ExDocLine."Split from Parent ID");
+          ExDocLine3.GET(TempCreatedDocLines."Split from Parent ID")
+        END;
+
+        ExDocLine."First Approver" := ExDocLine3."First Approver";
+        ExDocLine."Template Rule" := ExDocLine3."Template Rule";
+      END;
+
       ExDocLine.INSERT;
 
       IF ExDocLine2.ID < 0 THEN BEGIN
@@ -322,8 +362,11 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
         TempCreatedDocLines.INSERT;
       END;
 
-      IF ExDocLine."Connected Line ID" = 0 THEN // do not call this function for a web receipt
-        ExDocLine.DocumentStatus(ExDocLine,'New');
+      IF (ExDocLine.Flowstatus = ExDocLine.Flowstatus::Approved) AND (ExDocLine."Connected Line ID" = 0) THEN BEGIN // do not call this function for a web receipt
+        TempDocLineAdded.INIT;
+        TempDocLineAdded.TRANSFERFIELDS(ExDocLine);
+        TempDocLineAdded.INSERT;
+      END;
     END;
 
     LOCAL PROCEDURE UpdateDocLine@1100285058(VAR XmlNode@1100285000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";InUserID@1100285008 : Code[50]);
@@ -402,9 +445,9 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
       ExDocLineDim2@1100285002 : Record 12013611;
       ExDocLine@1100285004 : Record 12013609;
       ExColumn@1100285005 : Record 12013661;
-      DimValue@1100285007 : Record 349;
       ExDoc@1100285008 : Record 12013608;
       ExQuoteToReq@1100285006 : Codeunit 12013614;
+      ExImportMgt@1100285007 : Codeunit 12013604;
       TempCompName@1100285003 : Text[30];
       TempJobNo@1100285009 : Code[20];
       TempJobTaskNo@1100285010 : Code[20];
@@ -444,15 +487,13 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
       ExDocLineDim."Document Line ID" := ExDocLine.ID;
 
       IF (NOT DeleteRec) AND (UPPERCASE(ExColumn.Code) <> 'DESCRIPTION') THEN // special handling of desc
-        ExDocLineDim.INSERT;
+        IF ExDocLineDim."Dimension Value" <> '' THEN
+          ExDocLineDim.INSERT;
 
       TempJobNo := '';
       TempJobTaskNo := '';
 
-      IF ExColumn."Dimension Code" <> '' THEN BEGIN
-        DimValue.GET(ExColumn."Dimension Code",ExDocLineDim."Dimension Value");
-      END
-      ELSE BEGIN
+      IF ExColumn."Dimension Code" = '' THEN BEGIN
         CASE ExDocLineDim."Dimension Code" OF
           'G_LACCOUNT':
             IF DeleteRec THEN
@@ -516,6 +557,37 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
               ELSE
                 ExDocLine.Description := COPYSTR(ExDocLineDim."Dimension Value",1,MAXSTRLEN(ExDocLine.Description));
             END;
+          'INV_CODE':
+            BEGIN
+              IF DeleteRec THEN
+                ExDocLine."Invoicing Code" := ''
+              ELSE
+                ExDocLine."Invoicing Code" := ExDocLineDim."Dimension Value";
+            END;
+          'CUSTOMERINV':
+            BEGIN
+              IF DeleteRec THEN
+                ExDocLine."Invoice to Customer" := FALSE
+              ELSE
+                IF UPPERCASE(ExDocLineDim."Dimension Value") IN ['1','YES','TRUE'] THEN
+                  ExDocLine."Invoice to Customer" := TRUE
+                ELSE
+                  ExDocLine."Invoice to Customer" := FALSE;
+            END;
+          'INVDATE':
+            BEGIN
+              IF DeleteRec THEN
+                ExDocLine."Start Date for Invoicing" := 0D
+              ELSE
+                ExDocLine."Start Date for Invoicing" := ExQuoteToReq.DateField(ExDocLineDim."Dimension Value");
+            END;
+          'AMOUNTINV':
+            BEGIN
+              IF DeleteRec THEN
+                ExDocLine."Invoicing Amount" := 0
+              ELSE
+                ExImportMgt.TransformNumber(ExDocLineDim."Dimension Value",ExDocLine."Invoicing Amount");
+            END;
         END;
       END;
 
@@ -531,7 +603,7 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
         ERROR(EXF001,6);
     END;
 
-    LOCAL PROCEDURE InsertDocLineApprover@1100285023(VAR XmlNode@1100285000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";InUserID@1100285009 : Code[50];VAR TempExDocLineApp@1100285005 : TEMPORARY Record 12013610;VAR TempDocLineApproved@1100285008 : TEMPORARY Record 12013609);
+    LOCAL PROCEDURE InsertDocLineApprover@1100285023(VAR XmlNode@1100285000 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";InUserID@1100285009 : Code[50];VAR TempExDocLineApp@1100285005 : TEMPORARY Record 12013610;VAR TempDocLineApproved@1100285008 : TEMPORARY Record 12013609;VAR TempManuallyAddedApproversFromWeb@1100285007 : TEMPORARY Record 12013610;VAR TempID@1100285010 : BigInteger);
     VAR
       ExDocLineApp@1100285001 : Record 12013610;
       ExDocLineApp2@1100285002 : Record 12013610;
@@ -562,7 +634,7 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
       ExDocLineApp."Created By" := InUserID;
       ExDocLineApp."Created Date" := CREATEDATETIME(TODAY, TIME);
 
-      IF ExDocLineApp.Flowstatus = ExDocLineApp.Flowstatus::Approved THEN BEGIN
+      IF (NOT ExDocLineApp."Under review") AND (ExDocLineApp.Flowstatus = ExDocLineApp.Flowstatus::Approved) THEN BEGIN
         IF NOT TempDocLineApproved.GET(ExDocLine.ID) THEN BEGIN
           TempDocLineApproved.INIT;
           TempDocLineApproved.TRANSFERFIELDS(ExDocLine);
@@ -570,24 +642,62 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
         END;
       END;
 
-      ExDocLineApp.Source := ExDocLineApp.Source::"Manually in Web";
-      ExDocLineApp.INSERT;
-
       IF ExDocLine."Split from Parent ID" < 0 THEN BEGIN
         TempCreatedDocLines.GET(ExDocLine."Split from Parent ID");
         ExDocLine."Split from Parent ID" := TempCreatedDocLines."Split from Parent ID";
       END;
 
-      ExDocLine.MODIFY;
+      IF ExDocLine."Split from Parent ID" = 0 THEN BEGIN
+        TempManuallyAddedApproversFromWeb.INIT;
+        TempManuallyAddedApproversFromWeb.TRANSFERFIELDS(ExDocLineApp);
+        TempID := TempID + 1;
+        TempManuallyAddedApproversFromWeb.ID := TempID;
+        TempManuallyAddedApproversFromWeb.INSERT;
 
-      ExDocLineApp3.RESET;
-      ExDocLineApp3.SETCURRENTKEY("Document Line ID");
-      ExDocLineApp3.SETRANGE("Document Line ID", ExDocLine."Split from Parent ID");
-      ExDocLineApp3.SETRANGE(Approver, ExDocLineApp.Approver);
-      IF NOT ExDocLineApp3.FINDFIRST THEN BEGIN
+        ExDocLineApp.Source := ExDocLineApp.Source::"Manually in Web";
+
         TempExDocLineApp.INIT;
         TempExDocLineApp.TRANSFERFIELDS(ExDocLineApp);
+        TempID := TempID + 1;
+        TempExDocLineApp.ID := TempID;
         TempExDocLineApp.INSERT;
+      END;
+
+      ExDocLineApp.INSERT;
+
+      ExDocLine.MODIFY;
+
+      // when using dynamic approvals, we still need to honor manually added approvers
+      // however, for lines being split we should only add approvers that didn't come from the split line but
+      // from the user directly
+      IF ExDocLine."Split from Parent ID" > 0 THEN BEGIN
+        ExDocLineApp3.RESET;
+        ExDocLineApp3.SETCURRENTKEY("Document Line ID");
+        ExDocLineApp3.SETRANGE("Document Line ID", ExDocLine."Split from Parent ID");
+        ExDocLineApp3.SETRANGE(Approver, ExDocLineApp.Approver);
+        IF NOT ExDocLineApp3.FINDFIRST THEN BEGIN
+          TempExDocLineApp.INIT;
+          TempExDocLineApp.TRANSFERFIELDS(ExDocLineApp);
+          TempID := TempID + 1;
+          TempExDocLineApp.ID := TempID;
+          TempExDocLineApp.INSERT;
+        END
+        ELSE BEGIN
+          ExDocLineApp.Source := ExDocLineApp3.Source;
+          ExDocLineApp.MODIFY;
+
+          // Special situation where manually added approver is added to all lines
+          // then this depends on what order the approvers are inserted
+          TempManuallyAddedApproversFromWeb.RESET;
+          TempManuallyAddedApproversFromWeb.SETRANGE(Approver, ExDocLineApp.Approver);
+          IF TempManuallyAddedApproversFromWeb.FINDFIRST THEN BEGIN
+            TempExDocLineApp.INIT;
+            TempExDocLineApp.TRANSFERFIELDS(ExDocLineApp);
+            TempID := TempID + 1;
+            TempExDocLineApp.ID := TempID;
+            TempExDocLineApp.INSERT;
+          END;
+        END;
       END;
     END;
 
@@ -616,143 +726,144 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
         IF NOT ExDocLine.RetrieveRecord(ExDocLine,ExDocLineApp2."Document Type",ExDocLineApp2."Document No.",ExDocLineApp2."Line No.") THEN
           EXIT; // No line added due to missing document line.
 
-      IF ExDocLineApp.GET(ExDocLineApp2.ID) THEN BEGIN
-        ExDocLineApp."Approved By" := ExDocLineApp2."Approved By";
-        ExDocLineApp.Comment := ExDocLineApp2.Comment;
-        ExDocLineApp.Description := ExDocLineApp2.Description;
-        ExDocLineApp.Flowstatus := ExDocLineApp2.Flowstatus;
-        IF ExDocLineApp.Flowstatus > 1 THEN
-          ExDocLineApp."Approval Date" := CREATEDATETIME(TODAY, TIME);
-        ExDocLineApp."Changed By" := InUserID;
-        ExDocLineApp."Change Date" := CREATEDATETIME(TODAY, TIME);
-        IF ExDocLineApp2."Delegated to" <> '' THEN
-          ExDocLineApp."Delegated to" := ExDocLineApp2."Delegated to";
+      ExDocLineApp.GET(ExDocLineApp2.ID);
+      IF (ExDocLineApp."Delegated to" <> '') AND (ExDocLineApp.Flowstatus = ExDocLineApp.Flowstatus::"On hold") THEN
+        ERROR(EXF007);
 
-        IF (ExDocLineApp2."Delegated to" <> '') AND (ExDocLineApp.Flowstatus = ExDocLineApp.Flowstatus::"On hold") THEN
-          // Check if already under review
-          IF ExDocLineApp."Under review" THEN
-            ERROR(EXF004);
+      ExDocLineApp."Approved By" := ExDocLineApp2."Approved By";
+      ExDocLineApp.Comment := ExDocLineApp2.Comment;
+      ExDocLineApp.Description := ExDocLineApp2.Description;
+      ExDocLineApp.Flowstatus := ExDocLineApp2.Flowstatus;
+      IF ExDocLineApp.Flowstatus > 1 THEN
+        ExDocLineApp."Approval Date" := CREATEDATETIME(TODAY, TIME);
+      ExDocLineApp."Changed By" := InUserID;
+      ExDocLineApp."Change Date" := CREATEDATETIME(TODAY, TIME);
+      IF ExDocLineApp2."Delegated to" <> '' THEN
+        ExDocLineApp."Delegated to" := ExDocLineApp2."Delegated to";
 
-        IF (ExDocLineApp2."Delegated to" <> '') AND (ExDocLineApp.Flowstatus = ExDocLineApp.Flowstatus::"On hold") THEN
-          ExDocLineApp."Under review" := TRUE;
+      IF (ExDocLineApp2."Delegated to" <> '') AND (ExDocLineApp.Flowstatus = ExDocLineApp.Flowstatus::"On hold") THEN
+        // Check if already under review
+        IF ExDocLineApp."Under review" THEN
+          ERROR(EXF004);
 
-        IF ExDocLineApp.Flowstatus = ExDocLineApp.Flowstatus::Approved THEN BEGIN
-          TempDocLineApproved.INIT;
-          TempDocLineApproved.TRANSFERFIELDS(ExDocLine);
-          TempDocLineApproved.INSERT;
+      IF (ExDocLineApp2."Delegated to" <> '') AND (ExDocLineApp.Flowstatus = ExDocLineApp.Flowstatus::"On hold") THEN
+        ExDocLineApp."Under review" := TRUE;
+
+      IF (NOT ExDocLineApp."Under review") AND (ExDocLineApp.Flowstatus = ExDocLineApp.Flowstatus::Approved) THEN BEGIN
+        TempDocLineApproved.INIT;
+        TempDocLineApproved.TRANSFERFIELDS(ExDocLine);
+        TempDocLineApproved.INSERT;
+      END;
+
+      ExDocLineApp.MODIFY;
+
+      IF ExDocLineApp2."Delegated to" <> '' THEN BEGIN
+        DelegatedToUsed := TRUE;
+
+        CASE ExDocLineApp.Flowstatus OF
+          ExDocLineApp.Flowstatus::Rejected:
+            BEGIN
+              NewExDocLineApp.INIT;
+              NewExDocLineApp.TRANSFERFIELDS(ExDocLineApp);
+              NewExDocLineApp.ID := 0;
+              NewExDocLineApp.Approver := ExDocLineApp."Delegated to";
+              NewExDocLineApp.Comment := '';
+              NewExDocLineApp."Delegated to" := '';
+
+              ExDocLineApp3.SETCURRENTKEY("Document Line ID","Approver Order");
+              ExDocLineApp3.SETRANGE("Document Line ID", ExDocLine.ID);
+              ExDocLineApp3.SETFILTER("Approver Order", '>%1', ExDocLineApp."Approver Order");
+              IF ExDocLineApp3.FINDFIRST THEN BEGIN
+                TempApproverOrder := ExDocLineApp3."Approver Order";
+
+                NewExDocLineApp."Approver Order" := ROUND(ExDocLineApp."Approver Order" +
+                                                         ((TempApproverOrder - ExDocLineApp."Approver Order") / 2),1);
+              END
+              ELSE
+                NewExDocLineApp."Approver Order" := ExDocLineApp2."Approver Order" + 10000;
+
+              CLEAR(NewExDocLineApp."Approval Date");
+              NewExDocLineApp."Approved By" := '';
+              NewExDocLineApp.Flowstatus := NewExDocLineApp.Flowstatus::Current;
+              NewExDocLineApp.Source := NewExDocLineApp.Source::"Manually in Web";
+              NewExDocLineApp.INSERT(TRUE);
+            END;
+          ExDocLineApp.Flowstatus::"On hold":
+            BEGIN
+              NewExDocLineApp.INIT;
+              NewExDocLineApp.TRANSFERFIELDS(ExDocLineApp);
+              NewExDocLineApp.ID := 0;
+              NewExDocLineApp.Approver := ExDocLineApp."Delegated to";
+              NewExDocLineApp.Comment := '';
+              NewExDocLineApp."Delegated to" := '';
+
+              ExDocLineApp3.SETCURRENTKEY("Document Line ID","Approver Order");
+              ExDocLineApp3.SETRANGE("Document Line ID", ExDocLine.ID);
+              ExDocLineApp3.SETFILTER("Approver Order", '>%1', ExDocLineApp."Approver Order");
+              IF ExDocLineApp3.FINDFIRST THEN BEGIN
+                TempApproverOrder := ExDocLineApp3."Approver Order";
+                NewExDocLineApp."Approver Order" := ROUND(ExDocLineApp."Approver Order" +
+                                                         ((TempApproverOrder - ExDocLineApp."Approver Order") / 2),1);
+              END
+              ELSE BEGIN
+                NewExDocLineApp."Approver Order" := ExDocLineApp2."Approver Order" + 10000;
+                TempApproverOrder := NewExDocLineApp."Approver Order" + 10000;
+              END;
+
+              CLEAR(NewExDocLineApp."Approval Date");
+              NewExDocLineApp."Approved By" := '';
+              NewExDocLineApp.Flowstatus := NewExDocLineApp.Flowstatus::Current;
+              NewExDocLineApp."Delegated to" := '';
+              NewExDocLineApp.Source := NewExDocLineApp.Source::"Manually in Web";
+              NewExDocLineApp.INSERT(TRUE);
+              TempApproverOrder2 := NewExDocLineApp."Approver Order";
+
+              // Add in the approver in again that put it on hold
+              NewExDocLineApp.INIT;
+              NewExDocLineApp.TRANSFERFIELDS(ExDocLineApp);
+              NewExDocLineApp.ID := 0;
+              NewExDocLineApp.Comment := '';
+              NewExDocLineApp."Approver Order" := ROUND(TempApproverOrder2 +
+                                                       ((TempApproverOrder - TempApproverOrder2) / 2),1);
+
+              CLEAR(NewExDocLineApp."Approval Date");
+              NewExDocLineApp."Approved By" := '';
+              NewExDocLineApp.Flowstatus := NewExDocLineApp.Flowstatus::"Not processed";
+              NewExDocLineApp."Under review" := FALSE;
+              NewExDocLineApp."Delegated to" := '';
+              NewExDocLineApp.Source := NewExDocLineApp.Source::"Manually in Web";
+              NewExDocLineApp.INSERT(TRUE);
+            END;
         END;
+      END
+      ELSE BEGIN
+        IF ExDocLineApp."Under review" THEN BEGIN
+          // Find previous approver and set that to approved
+          ExDocLineApp3.RESET;
+          ExDocLineApp3.SETCURRENTKEY("Document Line ID","Approver Order");
+          ExDocLineApp3.SETRANGE("Document Line ID", ExDocLine.ID);
+          ExDocLineApp3.SETFILTER("Approver Order", '<%1', ExDocLineApp."Approver Order");
+          ExDocLineApp3.SETRANGE("Under review", TRUE);
+          IF ExDocLineApp3.FINDLAST THEN BEGIN
+            ExDocLineApp3.Flowstatus := ExDocLineApp3.Flowstatus::Approved;
+            ExDocLineApp3.MODIFY;
+          END;
 
-        IF NOT ExDocLineApp.MODIFY THEN
-          ERROR(EXF001,10);
+          // Find next approver and make that current
+          ExDocLineApp3.RESET;
+          ExDocLineApp3.SETCURRENTKEY("Document Line ID","Approver Order");
+          ExDocLineApp3.SETRANGE("Document Line ID", ExDocLine.ID);
+          ExDocLineApp3.SETFILTER("Approver Order", '>%1', ExDocLineApp."Approver Order");
+          IF ExDocLineApp3.FINDFIRST THEN BEGIN
+            ExDocLineApp3.Flowstatus := ExDocLineApp3.Flowstatus::Current;
+            ExDocLineApp3.MODIFY;
 
-        IF ExDocLineApp2."Delegated to" <> '' THEN BEGIN
-          DelegatedToUsed := TRUE;
-
-          CASE ExDocLineApp.Flowstatus OF
-            ExDocLineApp.Flowstatus::Rejected:
-              BEGIN
-                NewExDocLineApp.INIT;
-                NewExDocLineApp.TRANSFERFIELDS(ExDocLineApp);
-                NewExDocLineApp.ID := 0;
-                NewExDocLineApp.Approver := ExDocLineApp."Delegated to";
-                NewExDocLineApp.Comment := '';
-                NewExDocLineApp."Delegated to" := '';
-
-                ExDocLineApp3.SETCURRENTKEY("Document Line ID","Approver Order");
-                ExDocLineApp3.SETRANGE("Document Line ID", ExDocLine.ID);
-                ExDocLineApp3.SETFILTER("Approver Order", '>%1', ExDocLineApp."Approver Order");
-                IF ExDocLineApp3.FINDFIRST THEN BEGIN
-                  TempApproverOrder := ExDocLineApp3."Approver Order";
-
-                  NewExDocLineApp."Approver Order" := ROUND(ExDocLineApp."Approver Order" +
-                                                           ((TempApproverOrder - ExDocLineApp."Approver Order") / 2),1);
-                END
-                ELSE
-                  NewExDocLineApp."Approver Order" := ExDocLineApp2."Approver Order" + 10000;
-
-                CLEAR(NewExDocLineApp."Approval Date");
-                NewExDocLineApp."Approved By" := '';
-                NewExDocLineApp.Flowstatus := NewExDocLineApp.Flowstatus::Current;
-                NewExDocLineApp.Source := NewExDocLineApp.Source::"Manually in Web";
-                NewExDocLineApp.INSERT(TRUE);
-              END;
-            ExDocLineApp.Flowstatus::"On hold":
-              BEGIN
-                NewExDocLineApp.INIT;
-                NewExDocLineApp.TRANSFERFIELDS(ExDocLineApp);
-                NewExDocLineApp.ID := 0;
-                NewExDocLineApp.Approver := ExDocLineApp."Delegated to";
-                NewExDocLineApp.Comment := '';
-                NewExDocLineApp."Delegated to" := '';
-
-                ExDocLineApp3.SETCURRENTKEY("Document Line ID","Approver Order");
-                ExDocLineApp3.SETRANGE("Document Line ID", ExDocLine.ID);
-                ExDocLineApp3.SETFILTER("Approver Order", '>%1', ExDocLineApp."Approver Order");
-                IF ExDocLineApp3.FINDFIRST THEN BEGIN
-                  TempApproverOrder := ExDocLineApp3."Approver Order";
-                  NewExDocLineApp."Approver Order" := ROUND(ExDocLineApp."Approver Order" +
-                                                           ((TempApproverOrder - ExDocLineApp."Approver Order") / 2),1);
-                END
-                ELSE BEGIN
-                  NewExDocLineApp."Approver Order" := ExDocLineApp2."Approver Order" + 10000;
-                  TempApproverOrder := NewExDocLineApp."Approver Order" + 10000;
-                END;
-
-                CLEAR(NewExDocLineApp."Approval Date");
-                NewExDocLineApp."Approved By" := '';
-                NewExDocLineApp.Flowstatus := NewExDocLineApp.Flowstatus::Current;
-                NewExDocLineApp."Delegated to" := '';
-                NewExDocLineApp.Source := NewExDocLineApp.Source::"Manually in Web";
-                NewExDocLineApp.INSERT(TRUE);
-                TempApproverOrder2 := NewExDocLineApp."Approver Order";
-
-                // Add in the approver in again that put it on hold
-                NewExDocLineApp.INIT;
-                NewExDocLineApp.TRANSFERFIELDS(ExDocLineApp);
-                NewExDocLineApp.ID := 0;
-                NewExDocLineApp.Comment := '';
-                NewExDocLineApp."Approver Order" := ROUND(TempApproverOrder2 +
-                                                         ((TempApproverOrder - TempApproverOrder2) / 2),1);
-
-                CLEAR(NewExDocLineApp."Approval Date");
-                NewExDocLineApp."Approved By" := '';
-                NewExDocLineApp.Flowstatus := NewExDocLineApp.Flowstatus::"Not processed";
-                NewExDocLineApp."Under review" := FALSE;
-                NewExDocLineApp."Delegated to" := '';
-                NewExDocLineApp.Source := NewExDocLineApp.Source::"Manually in Web";
-                NewExDocLineApp.INSERT(TRUE);
-              END;
+            ExDocLine.Flowstatus := ExDocLine.Flowstatus::Active;
           END;
         END
         ELSE BEGIN
-          IF ExDocLineApp."Under review" THEN BEGIN
-            // Find previous approver and set that to approved
-            ExDocLineApp3.RESET;
-            ExDocLineApp3.SETCURRENTKEY("Document Line ID","Approver Order");
-            ExDocLineApp3.SETRANGE("Document Line ID", ExDocLine.ID);
-            ExDocLineApp3.SETFILTER("Approver Order", '<%1', ExDocLineApp."Approver Order");
-            ExDocLineApp3.SETRANGE("Under review", TRUE);
-            IF ExDocLineApp3.FINDLAST THEN BEGIN
-              ExDocLineApp3.Flowstatus := ExDocLineApp3.Flowstatus::Approved;
-              ExDocLineApp3.MODIFY;
-            END;
-
-            // Find next approver and make that current
-            ExDocLineApp3.RESET;
-            ExDocLineApp3.SETCURRENTKEY("Document Line ID","Approver Order");
-            ExDocLineApp3.SETRANGE("Document Line ID", ExDocLine.ID);
-            ExDocLineApp3.SETFILTER("Approver Order", '>%1', ExDocLineApp."Approver Order");
-            IF ExDocLineApp3.FINDFIRST THEN BEGIN
-              ExDocLineApp3.Flowstatus := ExDocLineApp3.Flowstatus::Current;
-              ExDocLineApp3.MODIFY;
-
-              ExDocLine.Flowstatus := ExDocLine.Flowstatus::Active;
-            END;
-          END
-          ELSE BEGIN
-            IF ExDocLineApp.Flowstatus = ExDocLineApp.Flowstatus::Rejected THEN
-              ExDocLine.Flowstatus := ExDocLine.Flowstatus::Rejected;
-          END;
+          IF ExDocLineApp.Flowstatus = ExDocLineApp.Flowstatus::Rejected THEN
+            ExDocLine.Flowstatus := ExDocLine.Flowstatus::Rejected;
         END;
       END;
 
@@ -1158,14 +1269,14 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
       _nameReturn := ExLocation.Name;
     END;
 
-    LOCAL PROCEDURE CheckDim@34(DocID@1100285014 : BigInteger);
+    LOCAL PROCEDURE CheckDim@34(ExDocLine@1100285014 : Record 12013609);
     VAR
-      ExDocLine@1100285003 : Record 12013609;
       TempDimSetEntry@1100285000 : TEMPORARY Record 480;
       TempDimValueP@1100285008 : TEMPORARY Record 349;
       TempDimValueD@1100285007 : TEMPORARY Record 349;
       PurchLine@1100285010 : Record 39;
       DimValue@1100285013 : Record 349;
+      ExColumn@1100285003 : Record 12013661;
       DimMgt@1100285001 : Codeunit 408;
       ExFlowDimMgt@1100285009 : Codeunit 12013605;
       TempDimSetID@1100285002 : Integer;
@@ -1175,63 +1286,59 @@ OBJECT Codeunit 12013636 ExFlow Web Service Doc Mgt
       CurrentDocDimValue@1100285011 : Code[20];
       CurrentDocDimFound@1100285006 : Boolean;
     BEGIN
-      ExDocLine.RESET;
-      ExDocLine.SETCURRENTKEY("Document ID");
-      ExDocLine.SETRANGE("Document ID", DocID);
-      ExDocLine.SETFILTER("No.", '<>%1', '');
-      IF ExDocLine.FINDSET THEN
+      TempDimSetEntry.RESET;
+      TempDimSetEntry.DELETEALL;
+
+      CurrentDocDimFound := FALSE;
+      TempDimValueD.RESET;
+      TempDimValueD.DELETEALL;
+      TempDimValueP.RESET;
+      TempDimValueP.DELETEALL;
+      IF PurchLine.GET(ExDocLine."Document Type",ExDocLine."Document No.",ExDocLine."Line No.") THEN
+        ExFlowDimMgt.GetDimFromPurchLine(PurchLine,CurrentDocDimFound,CurrentDocDimCode,CurrentDocDimValue,TempDimValueP);
+      ExFlowDimMgt.GetDimFromDocLine(ExDocLine,CurrentDocDimFound,CurrentDocDimCode,CurrentDocDimValue,TempDimValueD);
+
+      TempDimValueP.RESET;
+      IF TempDimValueP.FINDSET THEN
         REPEAT
-          TempDimSetEntry.RESET;
-          TempDimSetEntry.DELETEALL;
+          ExColumn.SETRANGE("Dimension Code", TempDimValueP."Dimension Code");
+          IF NOT ExColumn.FINDFIRST THEN BEGIN
+            TempDimValueD.SETRANGE("Dimension Code", TempDimValueP."Dimension Code");
+            IF NOT TempDimValueD.FINDFIRST THEN BEGIN
+              TempDimValueD.INIT;
+              TempDimValueD.TRANSFERFIELDS(TempDimValueP);
+              TempDimValueD.INSERT;
+            END;
+          END;
+        UNTIL TempDimValueP.NEXT = 0;
 
-          CurrentDocDimFound := FALSE;
-          TempDimValueD.RESET;
-          TempDimValueD.DELETEALL;
-          TempDimValueP.RESET;
-          TempDimValueP.DELETEALL;
-          IF PurchLine.GET(ExDocLine."Document Type",ExDocLine."Document No.",ExDocLine."Line No.") THEN
-            ExFlowDimMgt.GetDimFromPurchLine(PurchLine,CurrentDocDimFound,CurrentDocDimCode,CurrentDocDimValue,TempDimValueP);
-          ExFlowDimMgt.GetDimFromDocLine(ExDocLine,CurrentDocDimFound,CurrentDocDimCode,CurrentDocDimValue,TempDimValueD);
+      TempDimValueD.RESET;
+      IF TempDimValueD.FINDSET THEN
+        REPEAT
+          DimValue.GET(TempDimValueD."Dimension Code",TempDimValueD.Code);
 
-          TempDimValueP.RESET;
-          IF TempDimValueP.FINDSET THEN
-            REPEAT
-              TempDimValueD.SETRANGE("Dimension Code", TempDimValueP."Dimension Code");
-              IF NOT TempDimValueD.FINDFIRST THEN BEGIN
-                TempDimValueD.INIT;
-                TempDimValueD.TRANSFERFIELDS(TempDimValueP);
-                TempDimValueD.INSERT;
-              END;
-            UNTIL TempDimValueP.NEXT = 0;
+          TempDimSetEntry.INIT;
+          TempDimSetEntry."Dimension Code" := DimValue."Dimension Code";
+          TempDimSetEntry."Dimension Value Code" := DimValue.Code;
+          TempDimSetEntry."Dimension Value ID" := DimValue."Dimension Value ID";
+          TempDimSetEntry.INSERT;
+        UNTIL TempDimValueD.NEXT = 0;
 
-          TempDimValueD.RESET;
-          IF TempDimValueD.FINDSET THEN
-            REPEAT
-              DimValue.GET(TempDimValueD."Dimension Code",TempDimValueD.Code);
+      TempDimSetID := DimMgt.GetDimensionSetID(TempDimSetEntry);
 
-              TempDimSetEntry.INIT;
-              TempDimSetEntry."Dimension Code" := DimValue."Dimension Code";
-              TempDimSetEntry."Dimension Value Code" := DimValue.Code;
-              TempDimSetEntry."Dimension Value ID" := DimValue."Dimension Value ID";
-              TempDimSetEntry.INSERT;
-            UNTIL TempDimValueD.NEXT = 0;
+      IF NOT DimMgt.CheckDimIDComb(TempDimSetID) THEN
+        ERROR(
+          Text033,
+          ExDocLine."No.",DimMgt.GetDimCombErr);
 
-          TempDimSetID := DimMgt.GetDimensionSetID(TempDimSetEntry);
-
-          IF NOT DimMgt.CheckDimIDComb(TempDimSetID) THEN
-            ERROR(
-              Text033,
-              ExDocLine."No.",DimMgt.GetDimCombErr);
-
-          TableIDArr[1] := DimMgt.TypeToTableID3(ExDocLine."Line Type");
-          NumberArr[1] := ExDocLine."No.";
-          TableIDArr[2] := DATABASE::Job;
-          NumberArr[2] := ExDocLine."Job No.";
-          IF NOT DimMgt.CheckDimValuePosting(TableIDArr,NumberArr,TempDimSetID) THEN
-            ERROR(
-              Text035,
-              ExDocLine."No.",DimMgt.GetDimValuePostingErr);
-        UNTIL ExDocLine.NEXT = 0;
+      TableIDArr[1] := DimMgt.TypeToTableID3(ExDocLine."Line Type");
+      NumberArr[1] := ExDocLine."No.";
+      TableIDArr[2] := DATABASE::Table167;
+      NumberArr[2] := ExDocLine."Job No.";
+      IF NOT DimMgt.CheckDimValuePosting(TableIDArr,NumberArr,TempDimSetID) THEN
+        ERROR(
+          Text035,
+          ExDocLine."No.",DimMgt.GetDimValuePostingErr);
     END;
 
     LOCAL PROCEDURE CheckXMLDate@1100285099(DateText@1100285000 : Text[50]) : Date;

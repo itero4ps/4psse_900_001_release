@@ -4,7 +4,7 @@ OBJECT Codeunit 11128060 VP pain.001.001.03 Default
   {
     Date=;
     Time=;
-    Version List=4PSSE.PE6.03.09 (12048857);
+    Version List=PE7.01 (12048857);
   }
   PROPERTIES
   {
@@ -26,7 +26,7 @@ OBJECT Codeunit 11128060 VP pain.001.001.03 Default
       BA017@12047966 : TextConst 'ENU=All payments are not included in the file, check the currency';
       gNoOfEntries@12047982 : Integer;
       gTotalAmountLCY@12047967 : Decimal;
-      BA019@12047968 : TextConst 'ENU=%1 must not be more than %2 days from today';
+      BA019@12047968 : TextConst 'ENU=Due Date must not be more than %1 days from today';
       BA020@12047969 : TextConst 'ENU=%1 can not last before today''s date';
       BA025@12047959 : TextConst 'ENU=%1 or %2 must be filled in for %3, %4 %5';
       gMsgId@12047975 : Code[20];
@@ -51,7 +51,8 @@ OBJECT Codeunit 11128060 VP pain.001.001.03 Default
       SEPAPayment@12047972 : Boolean;
       BA042@12047983 : TextConst 'ENU=Domestic payments are not supported for Country Code %1';
       gRegistrationNo@12047978 : Text;
-      GLSetup@1100285300 : Record 98;
+      BA043@12047973 : TextConst 'ENU=%1, %2 for Vendor %3 is not allowed';
+      BA044@12047988 : TextConst 'ENU=It is not allowed to merge Account payment';
 
     PROCEDURE Create@12047958(pPackEntryNo@12047959 : Integer;pBank@12047960 : Code[20]);
     VAR
@@ -61,7 +62,6 @@ OBJECT Codeunit 11128060 VP pain.001.001.03 Default
       tCurrency@12047961 : TEMPORARY Record 4;
     BEGIN
       Pack.GET(pPackEntryNo);
-      GLSetup.GET; //RFC155
 
       gCompanyInfo.GET;
       gCompanyInfo.TESTFIELD(Name);
@@ -120,6 +120,8 @@ OBJECT Codeunit 11128060 VP pain.001.001.03 Default
       i@12047974 : Integer;
       tAggregateDebitor@12047984 : TEMPORARY Record 11128077;
       NextAggregateNo@12047987 : Integer;
+      MaxForwardDags@12047988 : Integer;
+      LongName@12047989 : Text;
     BEGIN
       CASE pBank OF
         'DEFAULT': Bank := Bank::Default;
@@ -296,6 +298,14 @@ OBJECT Codeunit 11128060 VP pain.001.001.03 Default
       tAggregateDebitor.SETCURRENTKEY("Debitor Aggregate No.");
       // Debitor level
       IF tAggregateDebitor.FINDSET THEN REPEAT
+        // Check Due Date
+        IF tAggregateDebitor.Domestic THEN
+          MaxForwardDags := 365
+        ELSE
+          MaxForwardDags := 30;
+        IF (tAggregateDebitor."Due Date" - TODAY) > MaxForwardDags THEN
+          ERROR(BA019,MaxForwardDags);
+
         FromBankBranchNo := tAggregateDebitor."From Branch No";
         FromBankAccountNo := tAggregateDebitor."From Bank Account No";
         FromIBAN := tAggregateDebitor."From IBAN";
@@ -318,7 +328,12 @@ OBJECT Codeunit 11128060 VP pain.001.001.03 Default
         XMLWriter.AddElementAbs(Level,'BtchBookg',VPGiroType."Batch Booking");
         XMLWriter.AddElementAbs(Level,'PmtTpInf','');
 
-        XMLWriter.AddElementRel(1,'SvcLvl','');
+        IF Bank = Bank::SEB THEN BEGIN
+          IF tAggregateDebitor."Payment Method" = tAggregateDebitor."Payment Method"::Express THEN
+            XMLWriter.AddElementAbs(Level + 1,'InstrPrty','HIGH');
+        END;
+
+        XMLWriter.AddElementAbs(Level + 1,'SvcLvl','');
         IF SEPAPayment THEN
           XMLWriter.AddElementRel(1,'Cd','SEPA')
         ELSE BEGIN
@@ -412,16 +427,7 @@ OBJECT Codeunit 11128060 VP pain.001.001.03 Default
           END;
         END;
 
-        IF SEPAPayment THEN
-          XMLWriter.AddElementAbs(Level,'ChrgBr','SLEV')
-        ELSE
-          IF Domestic THEN BEGIN
-            IF Bank = Bank::SEB THEN
-              XMLWriter.AddElementAbs(Level,'ChrgBr','DEBT')
-            ELSE
-              XMLWriter.AddElementAbs(Level,'ChrgBr','SHAR');
-          END ELSE
-            XMLWriter.AddElementAbs(Level,'ChrgBr','SHAR');
+        XMLWriter.AddElementAbs(Level,'ChrgBr',GetChrgBr(VendorBankAccount));
 
         // Creditor level
         tLedgerEntryPayment.RESET;
@@ -448,8 +454,16 @@ OBJECT Codeunit 11128060 VP pain.001.001.03 Default
           XMLWriter.AddElementRel(1,'InstdAmt',GetAmountToPay(tLedgerEntryPayment,FALSE));
           XMLWriter.AddAttribute('Ccy',gVPMnm.GetPayToCurrencyCode(tLedgerEntryPayment."Currency Code"));
 
-          XMLWriter.AddElementRel(-1,'CdtrAgt','');
-          Level := XMLWriter.GetLevel;
+          Level := XMLWriter.GetLevel -1;
+
+          IF VendorBankAccount."Transit No." <> '' THEN BEGIN
+            XMLWriter.AddElementAbs(Level,'IntrmyAgt1','');
+            XMLWriter.AddElementRel(1,'FinInstnId','');
+            XMLWriter.AddElementRel(1,'BIC',VendorBankAccount."Transit No.");
+          END;
+
+          XMLWriter.AddElementAbs(Level,'CdtrAgt','');
+
           FinInstnIdIsSet := FALSE;
 
           IF VendorBankAccount.IBAN = '' THEN BEGIN
@@ -582,10 +596,9 @@ OBJECT Codeunit 11128060 VP pain.001.001.03 Default
 
           XMLWriter.AddElementAbs(Level,'Cdtr','');
 
-          IF Vendor."Name 2" <> '' THEN
-            XMLWriter.AddElementRel(1,'Nm',DELCHR(Vendor.Name,'<>') + ' ' + DELCHR(Vendor."Name 2",'<>'))
-          ELSE
-            XMLWriter.AddElementRel(1,'Nm',Vendor.Name);
+          LongName := Vendor.Name + Vendor."Name 2";
+          XMLWriter.AddElementRel(1,'Nm',COPYSTR(LongName,1,70));
+
           IF Domestic THEN BEGIN
             // Structured Address
             XMLWriter.AddElementRel(0,'PstlAdr','');
@@ -598,11 +611,15 @@ OBJECT Codeunit 11128060 VP pain.001.001.03 Default
             Vendor.TESTFIELD(Address);
             XMLWriter.AddElementRel(0,'PstlAdr','');
             XMLWriter.AddElementRel(1,'Ctry',gVPMnm.GetCountryCode(Vendor."Country/Region Code"));
+
+            // If Name is more than 70 characters place the rest in AdrLine, by specifications from SEB
+            XMLWriter.AddElementRel(0,'AdrLine',COPYSTR(LongName,71));
+
             XMLWriter.AddElementRel(0,'AdrLine',Vendor.Address);
           END;
 
           XMLWriter.AddElementAbs(Level,'CdtrAcct','');
-          IF SEPAPayment OR ((VendorBankAccount.IBAN <> '') AND NOT Domestic) THEN BEGIN
+          IF VendorBankAccount.IBAN <> '' THEN BEGIN
             XMLWriter.AddElementRel(1,'Id','');
             XMLWriter.AddElementRel(1,'IBAN',DELCHR(VendorBankAccount.IBAN));
           END ELSE BEGIN
@@ -647,15 +664,17 @@ OBJECT Codeunit 11128060 VP pain.001.001.03 Default
 
           // Regul Reporting Cross Border
           IF NOT Domestic OR SEPAPayment THEN BEGIN
-            IF tLedgerEntryPayment."Code for Bank of Sweden" = '' THEN
-              ERROR(BA029,tLedgerEntryPayment.FIELDCAPTION("Code for Bank of Sweden"));
-
-            XMLWriter.AddElementAbs(Level,'RgltryRptg','');
-            IF Bank = Bank::SEB THEN
-              XMLWriter.AddElementRel(1,'DbtCdtRptgInd','DEBT');
-            XMLWriter.AddElementAbs(Level + 1,'Dtls','');
-            XMLWriter.AddElementRel(1,'Cd',tLedgerEntryPayment."Code for Bank of Sweden");
-            XMLWriter.AddElementRel(0,'Inf',GetRegulRepCrossBorderDesc(tLedgerEntryPayment."Code for Bank of Sweden"));
+            IF FromCountryCode IN ['SE','NO'] THEN
+              IF tLedgerEntryPayment."Code for Bank of Sweden" = '' THEN
+                ERROR(BA029,tLedgerEntryPayment.FIELDCAPTION("Code for Bank of Sweden"));
+            IF tLedgerEntryPayment."Code for Bank of Sweden" <> '' THEN BEGIN
+              XMLWriter.AddElementAbs(Level,'RgltryRptg','');
+              IF Bank = Bank::SEB THEN
+                XMLWriter.AddElementRel(1,'DbtCdtRptgInd','DEBT');
+              XMLWriter.AddElementAbs(Level + 1,'Dtls','');
+              XMLWriter.AddElementRel(1,'Cd',tLedgerEntryPayment."Code for Bank of Sweden");
+              XMLWriter.AddElementRel(0,'Inf',GetRegulRepCrossBorderDesc(tLedgerEntryPayment."Code for Bank of Sweden"));
+            END;
           END;
 
           // Invoice reference must be shorter for some destinations
@@ -803,8 +822,9 @@ OBJECT Codeunit 11128060 VP pain.001.001.03 Default
               BEGIN
 
                 // Merging Entries
-                IF (tLedgerEntryPayment."Merging No." <> 0) AND Domestic THEN BEGIN
-
+                IF (tLedgerEntryPayment."Merging No." <> 0) AND Domestic AND NOT SEPAPayment THEN BEGIN
+                  IF PaymentType = 'SEBA' THEN
+                    ERROR(BA044);
                   XMLWriter.AddElementAbs(Level,RmtInf,'');
                   CLEAR(SpecificationAmount);
                   tLedgerEntry.RESET;
@@ -918,7 +938,6 @@ OBJECT Codeunit 11128060 VP pain.001.001.03 Default
 
     PROCEDURE CheckVendorEntry@12047959(ptLedgerEntryPayment@12047961 : TEMPORARY Record 11128074);
     VAR
-      MaxForwardDags@12047960 : Integer;
       VendorLedgerEntry@12047958 : Record 25;
     BEGIN
       WITH ptLedgerEntryPayment DO BEGIN
@@ -929,14 +948,8 @@ OBJECT Codeunit 11128060 VP pain.001.001.03 Default
           IF VendorLedgerEntry."Remaining Amount" > 0  THEN
             ERROR(BA008);
 
-        IF VendorLedgerEntry."Remaining Amount" < 0 THEN BEGIN
-          MaxForwardDags := 30;
-          IF (VendorLedgerEntry."Due Date" - TODAY) > MaxForwardDags THEN
-            ERROR(BA019,VendorLedgerEntry.FIELDCAPTION("Due Date"), MaxForwardDags);
-
-          IF VendorLedgerEntry."Due Date" < TODAY THEN
-            ERROR(BA020,VendorLedgerEntry.FIELDCAPTION("Due Date"));
-        END;
+        IF VendorLedgerEntry."Due Date" < TODAY THEN
+          ERROR(BA020,VendorLedgerEntry.FIELDCAPTION("Due Date"));
       END;
     END;
 
@@ -969,13 +982,15 @@ OBJECT Codeunit 11128060 VP pain.001.001.03 Default
     LOCAL PROCEDURE GetRegulRepCrossBorderDesc@12047960(pCode@12047959 : Code[10]) : Text;
     VAR
       RegulReportingCrossBorder@12047958 : Record 11128075;
-      PaymentTypeCodeAbroad@1000000000 : Record 11128511;
+      PaymentTypeCodeAbroad@1100285300 : Record 11128511;
+      GLSetup@1100285301 : Record 98;
     BEGIN
       //RFC155
       GLSetup.GET;
       //IF GLSetup."Norwegian Localization Active" AND PaymentTypeCodeAbroad.GET(pCode) THEN
-      IF GLSetup."Norwegian Localization Active" AND PaymentTypeCodeAbroad.GET(COPYSTR(pCode,1,2)) THEN
-        EXIT(PaymentTypeCodeAbroad.Description);
+      IF GLSetup."Norwegian Localization Active" THEN
+        IF PaymentTypeCodeAbroad.GET(COPYSTR(pCode,1,2)) THEN
+          EXIT(PaymentTypeCodeAbroad.Description);
       //RFC155
 
       IF RegulReportingCrossBorder.GET(pCode) THEN
@@ -1003,7 +1018,7 @@ OBJECT Codeunit 11128060 VP pain.001.001.03 Default
       XMLWriter.AddElementRel(1,'FinInstnId','');
       Level := XMLWriter.GetLevel;
       XMLWriter.AddElementRel(1,'BIC',pVendorBankAccount."SWIFT Code");
-      IF pVendorBankAccount."Bank Branch No." <> '' THEN BEGIN
+      IF gVPMnm.ClearText(pVendorBankAccount."Bank Branch No.") <> '' THEN BEGIN
         XMLWriter.AddElementAbs(Level + 1,'ClrSysMmbId','');
         XMLWriter.AddElementRel(1,'ClrSysId','');
         XMLWriter.AddElementRel(1,'Cd',pExternalClearing);
@@ -1053,6 +1068,32 @@ OBJECT Codeunit 11128060 VP pain.001.001.03 Default
           ELSE
             ERROR(BA032,pAggregateDebitor.FIELDCAPTION("Payment Method"),pAggregateDebitor."Payment Method");
         END;
+    END;
+
+    PROCEDURE GetChrgBr@1100570007(pVendorBankAccount@1100570000 : Record 288) : Text[30];
+    BEGIN
+      IF SEPAPayment THEN
+        EXIT('SLEV');
+
+      IF Domestic THEN BEGIN
+        IF Bank = Bank::SEB THEN
+          EXIT('DEBT')
+        ELSE
+          EXIT('SHAR');
+      END ELSE BEGIN
+        //Foreign
+        CASE pVendorBankAccount."Payment Charge Paid by" OF
+          pVendorBankAccount."Payment Charge Paid by"::"Sender - Swedish Cost":
+            EXIT('SHAR');
+          pVendorBankAccount."Payment Charge Paid by"::Receiver:
+            EXIT('CRED');
+          pVendorBankAccount."Payment Charge Paid by"::"Sender - All Cost":
+            EXIT('DEBT');
+          ELSE
+            ERROR(BA043,pVendorBankAccount.FIELDCAPTION("Payment Charge Paid by"),
+                        pVendorBankAccount."Payment Charge Paid by",pVendorBankAccount."Vendor No.");
+        END;
+      END;
     END;
 
     LOCAL PROCEDURE InsertRmtInfUstrdNode@12047970(pLevel@12047961 : Integer;pExternalDocumentNo@12047958 : Text;pNoOfRmtInfLines@12047959 : Integer;pFieldLength@12047963 : Integer);

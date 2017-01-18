@@ -4,7 +4,7 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
   {
     Date=;
     Time=;
-    Version List=EXF350001,NAV2013;
+    Version List=EXF400007;
   }
   PROPERTIES
   {
@@ -18,6 +18,7 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
 
             EmailHeader.RESET;
             EmailHeader.SETCURRENTKEY("Send Order");
+            EmailHeader.SETRANGE("Process Type",EmailHeader."Process Type"::Scheduled);
             IF EmailHeader.FINDSET(TRUE) THEN
               REPEAT
                 RunJob(EmailHeader);
@@ -37,13 +38,26 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
       HideMessage@1100285006 : Boolean;
       EXF007@1100285007 : TextConst 'ENU=Order No.: %1';
       EXF008@1100285008 : TextConst 'ENU=Return Order No.: %1';
+      EXF009@1100285010 : TextConst 'ENU=Do you want to send emails for job %1?';
+      EXF010@1100285013 : TextConst 'ENU=ExFlow sign in ticket';
+      EXF011@1100285012 : TextConst 'ENU=You have requested a new sign in code to ExFlow. Your code to sign in to ExFlow is:';
+      EMAILTXT@1100285009 : TextConst 'ENU=Document No. %1';
 
     PROCEDURE RunJob@1100285008(VAR EmailHeader@1100285000 : Record 12013619);
     BEGIN
+      // Starting from menu
+      IF GUIALLOWED THEN
+        IF NOT CONFIRM(STRSUBSTNO(EXF009,EmailHeader.Type),FALSE) THEN
+          ERROR(EXF003);
+
       CASE EmailHeader.Type OF
         EmailHeader.Type::"Unreceived Order": BatchSendEmailUnreceived(EmailHeader);
         EmailHeader.Type::"Header/Line Amount Mismatch": BatchSendEmailMismatch(EmailHeader);
         EmailHeader.Type::"Order not found": BatchSendEmailOrderNotFound(EmailHeader);
+        EmailHeader.Type::"Inbox Reminder": BatchSendEmailInboxReminder(EmailHeader);
+        EmailHeader.Type::"Approved Order": BatchSendEmailApprovedOrder(EmailHeader);
+        EmailHeader.Type::"Rejected Quote": BatchSendEmailRejectedQuote(EmailHeader);
+        EmailHeader.Type::"Created requisition": BatchSendEmailCreatedReq(EmailHeader);
       END;
     END;
 
@@ -59,13 +73,12 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
       WITH ExUserGroup DO BEGIN
         EmailAddr := '';
         ExUserGroupLine.RESET;
-        ExUserGroupLine.SETRANGE("Company Name", "Company Name");
         ExUserGroupLine.SETRANGE(Code, Code);
         ExUserGroupLine.SETFILTER("Starting Date", '%1|<=%2', 0D, WORKDATE);
         ExUserGroupLine.SETFILTER("Ending Date", '%1|>=%2', 0D, WORKDATE);
         IF ExUserGroupLine.FINDSET THEN BEGIN
           REPEAT
-            IF ExUserComp.GET(ExUserGroupLine."Company Name",ExUserGroupLine."User ID") THEN
+            IF ExUserComp.GET(ExUserGroupLine."User ID") THEN
               IF ExUserComp."E-mail ExFlow" <> '' THEN
                 EmailAddr := EmailAddr + ExUserComp."E-mail ExFlow" + ';'
           UNTIL ExUserGroupLine.NEXT = 0;
@@ -94,13 +107,17 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
       ImportWkshHeader@1100285000 : Record 12013587;
       ImportWkshLine@1100285003 : Record 12013588;
       Purchaser@1100285006 : Record 13;
-      TempPurchHeader@1100285004 : TEMPORARY Record 38;
+      TempPurchHeader@1100285004 : TEMPORARY Record 12013608;
       TempImportWkshHeader@1100285007 : TEMPORARY Record 12013587;
-      TempPurchaser@1100285005 : TEMPORARY Record 13;
+      TempPurchaser@1100285005 : TEMPORARY Record 12013641;
       TempImportWkshHeader2@1100285013 : TEMPORARY Record 12013587;
       ExFlowUserSetup@1100285015 : Record 12013641;
       PurchHeader@1100285017 : Record 38;
+      ExDoc@1100285020 : Record 12013608;
+      TempImportWkshHeaderVerified@1100285023 : TEMPORARY Record 12013587;
       SmtpMail@1100285001 : Codeunit 400;
+      ExFlowFileMgt@1100285019 : Codeunit 12013602;
+      ExFlowToInvoicePreCreate@1100285022 : Codeunit 12013632;
       AttachFileName@1100285008 : Text[1024];
       ToMailAddress@1100285016 : Text[1024];
       TempComment@1100285014 : Text[1024];
@@ -109,6 +126,7 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
       LF@1100285010 : Char;
       TotCounter@1100285011 : Integer;
       SentCounter@1100285012 : Integer;
+      TempID@1100285021 : BigInteger;
     BEGIN
       CR := 13;
       LF := 10;
@@ -121,16 +139,25 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
       ImportWkshLine.SETFILTER("Order No.", '<>%1', '');
       IF ImportWkshLine.FINDSET THEN
         REPEAT
-          IF (ImportWkshLine."Receipt No." = '') AND (ImportWkshLine."Return Shipment No." = '') THEN BEGIN
-            ImportWkshHeader.GET(ImportWkshLine."Inbound Document No.");
-            IF CheckLastSent(EmailHeader,ImportWkshHeader) THEN BEGIN
+          ImportWkshHeader.GET(ImportWkshLine."Inbound Document No.");
+          IF NOT TempImportWkshHeaderVerified.GET(ImportWkshHeader."Inbound Document No.") THEN BEGIN
+            ExFlowToInvoicePreCreate.VerifyDocument(ImportWkshHeader);
+            TempImportWkshHeaderVerified."Inbound Document No." := ImportWkshHeader."Inbound Document No.";
+            TempImportWkshHeaderVerified.INSERT;
+          END;
+
+          IF (ImportWkshLine.Quantity > ImportWkshLine."Quantity Received (Order)") AND
+            (ImportWkshLine."Receipt No." = '') AND (ImportWkshLine."Return Shipment No." = '') THEN BEGIN
+            IF CheckLastSent(EmailHeader,DATABASE::"Exflow Purch. Document Header",
+                             ImportWkshHeader."Inbound Document No.",ImportWkshHeader."Date Created",ImportWkshHeader."PO Matched Document") THEN BEGIN
               IF ImportWkshHeader."ExFlow Document Type" = ImportWkshHeader."ExFlow Document Type"::Invoice THEN
                 TempPurchHeader.SETRANGE("Document Type", TempPurchHeader."Document Type"::Order)
               ELSE
                 IF ImportWkshHeader."ExFlow Document Type" = ImportWkshHeader."ExFlow Document Type"::"Credit Memo" THEN
                   TempPurchHeader.SETRANGE("Document Type", TempPurchHeader."Document Type"::"Return Order");
 
-              TempPurchHeader.SETRANGE("No.", ImportWkshLine."Order No.");
+              TempPurchHeader.SETCURRENTKEY("Document No.");
+              TempPurchHeader.SETRANGE("Document No.", ImportWkshLine."Order No.");
               IF NOT TempPurchHeader.FINDFIRST THEN BEGIN
                 IF ImportWkshHeader."ExFlow Document Type" = ImportWkshHeader."ExFlow Document Type"::Invoice THEN
                   TempPurchHeader."Document Type" := TempPurchHeader."Document Type"::Order
@@ -138,26 +165,39 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
                   IF ImportWkshHeader."ExFlow Document Type" = ImportWkshHeader."ExFlow Document Type"::"Credit Memo" THEN
                     TempPurchHeader."Document Type" := TempPurchHeader."Document Type"::"Return Order";
 
-                TempPurchHeader."No." := ImportWkshLine."Order No.";
+                TempPurchHeader."Document No." := ImportWkshLine."Order No.";
+                TempPurchHeader.ID := TempID;
+                TempID := TempID + 1;
+
                 IF ImportWkshLine."Purchaser Code" <> '' THEN
-                  TempPurchHeader."Purchaser Code" := ImportWkshLine."Purchaser Code"
+                  TempPurchHeader."Assigned Receipt Group" := ImportWkshLine."Purchaser Code"
                 ELSE BEGIN
                   IF ImportWkshHeader."ExFlow Document Type" = ImportWkshHeader."ExFlow Document Type"::Invoice THEN BEGIN
                     IF PurchHeader.GET(PurchHeader."Document Type"::Order,ImportWkshLine."Order No.") THEN
-                      TempPurchHeader."Purchaser Code" := PurchHeader."Purchaser Code";
+                      TempPurchHeader."Assigned Receipt Group" := PurchHeader."Purchaser Code";
                   END
                   ELSE
                     IF ImportWkshHeader."ExFlow Document Type" = ImportWkshHeader."ExFlow Document Type"::"Credit Memo" THEN
                       IF PurchHeader.GET(PurchHeader."Document Type"::"Return Order",ImportWkshLine."Order No.") THEN
-                        TempPurchHeader."Purchaser Code" := PurchHeader."Purchaser Code";
+                        TempPurchHeader."Assigned Receipt Group" := PurchHeader."Purchaser Code";
                 END;
+
+                IF ImportWkshHeader."Document Type" = ImportWkshHeader."Document Type"::Invoice THEN
+                  ExDoc.SETRANGE("Document Type", ExDoc."Document Type"::Order)
+                ELSE
+                  IF ImportWkshHeader."Document Type" = ImportWkshHeader."Document Type"::"Credit Memo" THEN
+                    ExDoc.SETRANGE("Document Type", ExDoc."Document Type"::"Return Order");
+
+                ExDoc.SETRANGE("Document No.", ImportWkshHeader."Order No.");
+                IF ExDoc.FINDFIRST THEN
+                  TempPurchHeader."Assigned Receipt Group" := ExDoc."Created By";
 
                 TempPurchHeader.INSERT;
 
                 TempImportWkshHeader.INIT;
                 TempImportWkshHeader.TRANSFERFIELDS(ImportWkshHeader);
                 TempImportWkshHeader."Document Type" := TempPurchHeader."Document Type";
-                TempImportWkshHeader."Order No." := TempPurchHeader."No.";
+                TempImportWkshHeader."Order No." := TempPurchHeader."Document No.";
                 TempImportWkshHeader.INSERT;
 
                 TotCounter := TotCounter + 1;
@@ -169,7 +209,7 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
                 ImportWkshHeader.GET(ImportWkshLine."Inbound Document No.");
                 TempImportWkshHeader2.TRANSFERFIELDS(ImportWkshHeader);
                 TempImportWkshHeader2."Document Type" := TempPurchHeader."Document Type";
-                TempImportWkshHeader2."Order No." := TempPurchHeader."No.";
+                TempImportWkshHeader2."Order No." := TempPurchHeader."Document No.";
                 TempImportWkshHeader2.INSERT;
               END;
             END;
@@ -181,7 +221,15 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
       ImportWkshHeader.SETRANGE("PO Matched Document", TRUE);
       IF ImportWkshHeader.FINDSET THEN
         REPEAT
-          IF CheckLastSent(EmailHeader,ImportWkshHeader) THEN BEGIN
+          IF NOT TempImportWkshHeaderVerified.GET(ImportWkshHeader."Inbound Document No.") THEN BEGIN
+            ExFlowToInvoicePreCreate.VerifyDocument(ImportWkshHeader);
+
+            TempImportWkshHeaderVerified."Inbound Document No." := ImportWkshHeader."Inbound Document No.";
+            TempImportWkshHeaderVerified.INSERT;
+          END;
+
+          IF CheckLastSent(EmailHeader,DATABASE::"Exflow Purch. Document Header",
+                           ImportWkshHeader."Inbound Document No.",ImportWkshHeader."Date Created",ImportWkshHeader."PO Matched Document") THEN BEGIN
             ImportWkshLine.RESET;
             ImportWkshLine.SETRANGE("Inbound Document No.", ImportWkshHeader."Inbound Document No.");
             ImportWkshLine.SETRANGE("Exflow-Created Entry", 0);
@@ -192,7 +240,7 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
                 IF ImportWkshHeader."ExFlow Document Type" = ImportWkshHeader."ExFlow Document Type"::"Credit Memo" THEN
                   TempPurchHeader.SETRANGE("Document Type", TempPurchHeader."Document Type"::"Return Order");
 
-              TempPurchHeader.SETRANGE("No.", ImportWkshHeader."Order No.");
+              TempPurchHeader.SETRANGE("Document No.", ImportWkshHeader."Order No.");
               IF NOT TempPurchHeader.FINDFIRST THEN BEGIN
                 IF ImportWkshHeader."ExFlow Document Type" = ImportWkshHeader."ExFlow Document Type"::Invoice THEN
                   TempPurchHeader."Document Type" := TempPurchHeader."Document Type"::Order
@@ -200,26 +248,39 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
                   IF ImportWkshHeader."ExFlow Document Type" = ImportWkshHeader."ExFlow Document Type"::"Credit Memo" THEN
                     TempPurchHeader."Document Type" := TempPurchHeader."Document Type"::"Return Order";
 
-                TempPurchHeader."No." := ImportWkshHeader."Order No.";
+                TempPurchHeader."Document No." := ImportWkshHeader."Order No.";
+                TempPurchHeader.ID := TempID;
+                TempID := TempID + 1;
+
                 IF ImportWkshHeader."Purchaser Code" <> '' THEN
-                  TempPurchHeader."Purchaser Code" := ImportWkshHeader."Purchaser Code"
+                  TempPurchHeader."Assigned Receipt Group" := ImportWkshHeader."Purchaser Code"
                 ELSE BEGIN
                   IF ImportWkshHeader."ExFlow Document Type" = ImportWkshHeader."ExFlow Document Type"::Invoice THEN BEGIN
                     IF PurchHeader.GET(PurchHeader."Document Type"::Order,ImportWkshHeader."Order No.") THEN
-                      TempPurchHeader."Purchaser Code" := PurchHeader."Purchaser Code";
+                      TempPurchHeader."Assigned Receipt Group" := PurchHeader."Purchaser Code";
                   END
                   ELSE
                     IF ImportWkshHeader."ExFlow Document Type" = ImportWkshHeader."ExFlow Document Type"::"Credit Memo" THEN
                       IF PurchHeader.GET(PurchHeader."Document Type"::"Return Order",ImportWkshHeader."Order No.") THEN
-                        TempPurchHeader."Purchaser Code" := PurchHeader."Purchaser Code";
+                        TempPurchHeader."Assigned Receipt Group" := PurchHeader."Purchaser Code";
                 END;
+
+                IF ImportWkshHeader."Document Type" = ImportWkshHeader."Document Type"::Invoice THEN
+                  ExDoc.SETRANGE("Document Type", ExDoc."Document Type"::Order)
+                ELSE
+                  IF ImportWkshHeader."Document Type" = ImportWkshHeader."Document Type"::"Credit Memo" THEN
+                    ExDoc.SETRANGE("Document Type", ExDoc."Document Type"::"Return Order");
+
+                ExDoc.SETRANGE("Document No.", ImportWkshHeader."Order No.");
+                IF ExDoc.FINDFIRST THEN
+                  TempPurchHeader."Assigned Receipt Group" := ExDoc."Created By";
 
                 TempPurchHeader.INSERT;
 
                 TempImportWkshHeader.INIT;
                 TempImportWkshHeader.TRANSFERFIELDS(ImportWkshHeader);
                 TempImportWkshHeader."Document Type" := TempPurchHeader."Document Type";
-                TempImportWkshHeader."Order No." := TempPurchHeader."No.";
+                TempImportWkshHeader."Order No." := TempPurchHeader."Document No.";
                 TempImportWkshHeader.INSERT;
 
                 TotCounter := TotCounter + 1;
@@ -230,7 +291,7 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
               IF NOT TempImportWkshHeader2.FIND('-') THEN BEGIN
                 TempImportWkshHeader2.TRANSFERFIELDS(ImportWkshHeader);
                 TempImportWkshHeader2."Document Type" := TempPurchHeader."Document Type";
-                TempImportWkshHeader2."Order No." := TempPurchHeader."No.";
+                TempImportWkshHeader2."Order No." := TempPurchHeader."Document No.";
                 TempImportWkshHeader2.INSERT;
               END;
             END;
@@ -238,15 +299,38 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
         UNTIL ImportWkshHeader.NEXT = 0;
 
       TempPurchHeader.RESET;
-      TempPurchHeader.SETFILTER("Purchaser Code", '<>%1', '');
+      TempPurchHeader.SETFILTER("Assigned Receipt Group", '<>%1', '');
       IF TempPurchHeader.FIND('-') THEN
         REPEAT
-          TempPurchaser.SETRANGE(Code, TempPurchHeader."Purchaser Code");
+          TempPurchaser.SETRANGE("User ID", TempPurchHeader."Assigned Receipt Group");
           IF NOT TempPurchaser.FIND('-') THEN BEGIN
-            IF Purchaser.GET(TempPurchHeader."Purchaser Code") THEN BEGIN
+            IF ExFlowUserSetup.GET(TempPurchHeader."Assigned Receipt Group") THEN BEGIN
               TempPurchaser.INIT;
-              TempPurchaser.TRANSFERFIELDS(Purchaser);
+              TempPurchaser."User ID" := ExFlowUserSetup."User ID";
+              TempPurchaser."E-mail ExFlow" := ExFlowUserSetup."E-mail ExFlow";
+              TempPurchaser."User Name" := ExFlowUserSetup."User Name";
               TempPurchaser.INSERT;
+            END
+            ELSE BEGIN
+              IF Purchaser.GET(TempPurchHeader."Assigned Receipt Group") THEN BEGIN
+                TempPurchaser.INIT;
+                TempPurchaser."User ID" := Purchaser.Code;
+                TempPurchaser."E-mail ExFlow" := Purchaser."E-Mail";
+                TempPurchaser."User Name" := Purchaser.Name;
+
+                IF TempPurchaser."E-mail ExFlow" = '' THEN BEGIN
+                  IF ExFlowUserSetup.GET(TempPurchaser."User ID") THEN
+                    TempPurchaser."E-mail ExFlow" := ExFlowUserSetup."E-mail ExFlow"
+                  ELSE BEGIN
+                    ExFlowUserSetup.RESET;
+                    ExFlowUserSetup.SETFILTER("User Name",'%1','@'+TempPurchaser."User Name");
+                    IF ExFlowUserSetup.FINDFIRST THEN
+                      TempPurchaser."E-mail ExFlow" := ExFlowUserSetup."E-mail ExFlow";
+                  END;
+                END;
+
+                TempPurchaser.INSERT;
+              END;
             END;
           END;
         UNTIL TempPurchHeader.NEXT = 0;
@@ -256,22 +340,11 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
         REPEAT
           CLEAR(SmtpMail);
 
-          IF TempPurchaser."E-Mail" = '' THEN
-            IF ExFlowUserSetup.GET(COMPANYNAME,TempPurchaser.Code) THEN
-              TempPurchaser."E-Mail" := ExFlowUserSetup."E-mail ExFlow"
-            ELSE BEGIN
-              ExFlowUserSetup.RESET;
-              ExFlowUserSetup.SETRANGE("Company Name", COMPANYNAME);
-              ExFlowUserSetup.SETFILTER("User Name",'%1','@'+TempPurchaser.Name);
-              IF ExFlowUserSetup.FINDFIRST THEN
-                TempPurchaser."E-Mail" := ExFlowUserSetup."E-mail ExFlow";
-            END;
-
-          ToMailAddress := TempPurchaser."E-Mail";
+          ToMailAddress := TempPurchaser."E-mail ExFlow";
 
           IF ToMailAddress = '' THEN BEGIN
             IF NOT HideMessage THEN
-              ERROR(STRSUBSTNO(EXF005,TempPurchaser.Code))
+              ERROR(STRSUBSTNO(EXF005,TempPurchaser."User ID"))
             ELSE BEGIN
               IF EmailHeader."CC Email" <> '' THEN
                 ToMailAddress := EmailHeader."CC Email";
@@ -288,11 +361,11 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
             IF EmailHeader."CC Email" <> '' THEN
               SmtpMail.AddCC(EmailHeader."CC Email");
 
-            SmtpMail.AppendBody(STRSUBSTNO(EXF004,TempPurchaser.Code));
+            SmtpMail.AppendBody(STRSUBSTNO(EXF004,TempPurchaser."User ID"));
             SmtpMail.AppendBody(FORMAT(CR)+FORMAT(LF));
 
             TempPurchHeader.RESET;
-            TempPurchHeader.SETRANGE("Purchaser Code", TempPurchaser.Code);
+            TempPurchHeader.SETRANGE("Assigned Receipt Group", TempPurchaser."User ID");
             TempPurchHeader.FIND('-');
             REPEAT
               TempComment := '';
@@ -300,19 +373,19 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
 
               IF EmailHeader."Attach Image" THEN BEGIN
                 TempImportWkshHeader.SETRANGE("Document Type", TempPurchHeader."Document Type");
-                TempImportWkshHeader.SETRANGE("Order No.", TempPurchHeader."No.");
+                TempImportWkshHeader.SETRANGE("Order No.", TempPurchHeader."Document No.");
                 TempImportWkshHeader.FIND('-');
 
                 AttachFileName := TempImportWkshHeader."Image File Name";
                 CheckAttachment(AttachFileName,TempImportWkshHeader."Image Buffer ID");
 
-                SmtpMail.AddAttachment(AttachFileName,'');
+                SmtpMail.AddAttachment(AttachFileName, ExFlowFileMgt.GetFileName(AttachFileName));
 
                 TempComment := TempImportWkshHeader."Admin Comment";
                 TempComment2 := TempImportWkshHeader."Error Message";
               END;
 
-              SmtpMail.AppendBody(STRSUBSTNO(EXF001,TempPurchHeader."Document Type",TempPurchHeader."No."));
+              SmtpMail.AppendBody(STRSUBSTNO(EXF001,TempPurchHeader."Document Type",TempPurchHeader."Document No."));
 
               IF TempComment <> '' THEN BEGIN
                 SmtpMail.AppendBody(FORMAT(CR)+FORMAT(LF));
@@ -326,15 +399,14 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
               SmtpMail.AppendBody(FORMAT(CR)+FORMAT(LF));
               SmtpMail.AppendBody(FORMAT(CR)+FORMAT(LF));
 
-              // Email Log
               TempImportWkshHeader2.RESET;
               TempImportWkshHeader2.SETRANGE("Document Type", TempPurchHeader."Document Type");
-              TempImportWkshHeader2.SETRANGE("Order No.", TempPurchHeader."No.");
+              TempImportWkshHeader2.SETRANGE("Order No.", TempPurchHeader."Document No.");
               TempImportWkshHeader2.FIND('-');
               REPEAT
-                CreateEmailLog(EmailHeader.Type,TempImportWkshHeader2,ToMailAddress,TempPurchaser.Code);
+                CreateEmailLog(EmailHeader.Type,ToMailAddress,TempPurchaser."User ID",12013587,TempImportWkshHeader2."Inbound Document No.",
+                               CREATEDATETIME(TempImportWkshHeader2."Date Created",TempImportWkshHeader2."Time Created"),'');
               UNTIL TempImportWkshHeader2.NEXT = 0;
-              // Email Log
             UNTIL TempPurchHeader.NEXT = 0;
 
             EmailHeader."Last Sent" := CREATEDATETIME(TODAY,TIME);
@@ -345,7 +417,8 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
             SentCounter := SentCounter + 1;
           END
           ELSE
-            CreateEmailLog(EmailHeader.Type,TempImportWkshHeader2,ToMailAddress,TempPurchaser.Code);
+            CreateEmailLog(EmailHeader.Type,ToMailAddress,TempPurchaser."User ID",12013587,TempImportWkshHeader2."Inbound Document No.",
+                           CREATEDATETIME(TempImportWkshHeader2."Date Created",TempImportWkshHeader2."Time Created"),'');
         UNTIL TempPurchaser.NEXT = 0;
       END;
 
@@ -363,6 +436,8 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
       ExFlowUserSetup@1100285015 : Record 12013641;
       PurchHeader@1100285004 : Record 38;
       SmtpMail@1100285001 : Codeunit 400;
+      ExFlowFileMgt@1100285014 : Codeunit 12013602;
+      ExFlowToInvoicePreCreate@1100285017 : Codeunit 12013632;
       AttachFileName@1100285008 : Text[1024];
       ToMailAddress@1100285016 : Text[1024];
       TempComment@1100285013 : Text[1024];
@@ -385,9 +460,12 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
       ImportWkshHeader.SETRANGE("PO Matched Document", TRUE);
       IF ImportWkshHeader.FINDSET THEN
         REPEAT
+          ExFlowToInvoicePreCreate.VerifyDocument(ImportWkshHeader);
+
           ImportWkshHeader.CALCFIELDS("Total Amount Lines","Total Amount Incl. VAT Lines");
           IF ImportWkshHeader."Total Amount Incl. VAT Lines" <> ImportWkshHeader."Document Amount Including VAT" THEN
-            IF CheckLastSent(EmailHeader,ImportWkshHeader) THEN BEGIN
+            IF CheckLastSent(EmailHeader,DATABASE::"Exflow Purch. Document Header",
+                             ImportWkshHeader."Inbound Document No.",ImportWkshHeader."Date Created",ImportWkshHeader."PO Matched Document") THEN BEGIN
               TempImportWkshHeader.INIT;
               TempImportWkshHeader.TRANSFERFIELDS(ImportWkshHeader);
 
@@ -424,11 +502,10 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
           CLEAR(SmtpMail);
 
           IF TempPurchaser."E-Mail" = '' THEN
-            IF ExFlowUserSetup.GET(COMPANYNAME,TempPurchaser.Code) THEN
+            IF ExFlowUserSetup.GET(TempPurchaser.Code) THEN
               TempPurchaser."E-Mail" := ExFlowUserSetup."E-mail ExFlow"
             ELSE BEGIN
               ExFlowUserSetup.RESET;
-              ExFlowUserSetup.SETRANGE("Company Name", COMPANYNAME);
               ExFlowUserSetup.SETFILTER("User Name",'%1','@'+TempPurchaser.Name);
               IF ExFlowUserSetup.FINDFIRST THEN
                 TempPurchaser."E-Mail" := ExFlowUserSetup."E-mail ExFlow";
@@ -467,7 +544,7 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
                 AttachFileName := TempImportWkshHeader."Image File Name";
                 CheckAttachment(AttachFileName,TempImportWkshHeader."Image Buffer ID");
 
-                SmtpMail.AddAttachment(AttachFileName,'');
+                SmtpMail.AddAttachment(AttachFileName, ExFlowFileMgt.GetFileName(AttachFileName));
 
                 TempComment := TempImportWkshHeader."Admin Comment";
               END;
@@ -484,9 +561,8 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
 
               SmtpMail.AppendBody(FORMAT(CR)+FORMAT(LF));
 
-              // Email Log
-              CreateEmailLog(EmailHeader.Type,TempImportWkshHeader,ToMailAddress,TempPurchaser.Code);
-              // Email Log
+              CreateEmailLog(EmailHeader.Type,ToMailAddress,TempPurchaser.Code,12013587,TempImportWkshHeader."Inbound Document No.",
+                             CREATEDATETIME(TempImportWkshHeader."Date Created",TempImportWkshHeader."Time Created"),'');
             UNTIL TempImportWkshHeader.NEXT = 0;
 
             SentCounter := SentCounter + 1;
@@ -497,7 +573,8 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
             SmtpMail.Send;
           END
           ELSE
-            CreateEmailLog(EmailHeader.Type,TempImportWkshHeader,ToMailAddress,TempPurchaser.Code);
+            CreateEmailLog(EmailHeader.Type,ToMailAddress,TempPurchaser.Code,12013587,TempImportWkshHeader."Inbound Document No.",
+                           CREATEDATETIME(TempImportWkshHeader."Date Created",TempImportWkshHeader."Time Created"),'');
         UNTIL TempPurchaser.NEXT = 0;
       END;
 
@@ -515,6 +592,7 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
       TempExFlowUserSetup@1100285014 : TEMPORARY Record 12013641;
       ExUserGroupLine@1100285013 : Record 12013607;
       SmtpMail@1100285001 : Codeunit 400;
+      ExFlowFileMgt@1100285017 : Codeunit 12013602;
       AttachFileName@1100285008 : Text[1024];
       ToMailAddress@1100285016 : Text[1024];
       TempComment@1100285004 : Text[1024];
@@ -540,14 +618,18 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
           ProcessDoc := ImportWkshHeader."Order No." = '';
           IF NOT ProcessDoc THEN BEGIN
             ImportWkshLine.SETRANGE("Inbound Document No.", ImportWkshHeader."Inbound Document No.");
+            ImportWkshLine.SETFILTER(Type, '<>%1', ImportWkshLine.Type::" ");
             ImportWkshLine.SETFILTER("Order No.", '');
+            ImportWkshLine.SETFILTER("Order No. (Import)", '<>%1', '');
             ProcessDoc := ImportWkshLine.FINDFIRST;
           END;
 
           IF ProcessDoc THEN BEGIN
-            IF CheckLastSent(EmailHeader,ImportWkshHeader) THEN BEGIN
+            IF CheckLastSent(EmailHeader,DATABASE::"Exflow Purch. Document Header",
+                             ImportWkshHeader."Inbound Document No.",ImportWkshHeader."Date Created",ImportWkshHeader."PO Matched Document") THEN BEGIN
               TempImportWkshHeader.INIT;
               TempImportWkshHeader.TRANSFERFIELDS(ImportWkshHeader);
+              TempImportWkshHeader."First Approver" := TempImportWkshHeader."Purchaser Code";
 
               IF TempImportWkshHeader."Purchaser Code" <> '' THEN BEGIN
                 TempExFlowUserSetup.SETRANGE("User ID", TempImportWkshHeader."Purchaser Code");
@@ -563,11 +645,11 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
               END
               ELSE BEGIN
                 ExUserGroupLine.RESET;
-                ExUserGroupLine.SETRANGE("Company Name", COMPANYNAME);
                 ExUserGroupLine.SETRANGE(Code, ImportWkshHeader."First Approver");
                 IF ExUserGroupLine.FINDFIRST THEN
-                  IF ExFlowUserSetup.GET(COMPANYNAME,ExUserGroupLine."User ID") THEN BEGIN
-                    TempImportWkshHeader."Purchaser Code" := ExFlowUserSetup."User ID";
+                  IF ExFlowUserSetup.GET(ExUserGroupLine."User ID") THEN BEGIN
+                    TempImportWkshHeader."First Approver" := ExFlowUserSetup."User ID";
+
                     TempExFlowUserSetup.SETRANGE("User ID", ExFlowUserSetup."User ID");
                     IF NOT TempExFlowUserSetup.FIND('-') THEN BEGIN
                       TempExFlowUserSetup.INIT;
@@ -592,11 +674,10 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
           CLEAR(SmtpMail);
 
           IF TempExFlowUserSetup."E-mail ExFlow" = '' THEN
-            IF ExFlowUserSetup.GET(COMPANYNAME,TempExFlowUserSetup."User ID") THEN
+            IF ExFlowUserSetup.GET(TempExFlowUserSetup."User ID") THEN
               TempExFlowUserSetup."E-mail ExFlow" := ExFlowUserSetup."E-mail ExFlow"
             ELSE BEGIN
               ExFlowUserSetup.RESET;
-              ExFlowUserSetup.SETRANGE("Company Name", COMPANYNAME);
               ExFlowUserSetup.SETFILTER("User Name",'%1','@'+TempExFlowUserSetup."User Name");
               IF ExFlowUserSetup.FINDFIRST THEN
                 TempExFlowUserSetup."E-mail ExFlow" := ExFlowUserSetup."E-mail ExFlow";
@@ -628,7 +709,7 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
             SmtpMail.AppendBody(FORMAT(CR)+FORMAT(LF));
 
             TempImportWkshHeader.RESET;
-            TempImportWkshHeader.SETRANGE("Purchaser Code", TempExFlowUserSetup."User ID");
+            TempImportWkshHeader.SETRANGE("First Approver", TempExFlowUserSetup."User ID");
             TempImportWkshHeader.FIND('-');
             REPEAT
               TempComment := '';
@@ -636,7 +717,7 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
                 AttachFileName := TempImportWkshHeader."Image File Name";
                 CheckAttachment(AttachFileName,TempImportWkshHeader."Image Buffer ID");
 
-                SmtpMail.AddAttachment(AttachFileName,'');
+                SmtpMail.AddAttachment(AttachFileName, ExFlowFileMgt.GetFileName(AttachFileName));
 
                 TempComment := TempImportWkshHeader."Admin Comment";
               END;
@@ -659,9 +740,8 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
               SmtpMail.AppendBody(FORMAT(CR)+FORMAT(LF));
               SmtpMail.AppendBody(FORMAT(CR)+FORMAT(LF));
 
-              // Email Log
-              CreateEmailLog(EmailHeader.Type,TempImportWkshHeader,ToMailAddress,TempExFlowUserSetup."User ID");
-              // Email Log
+              CreateEmailLog(EmailHeader.Type,ToMailAddress,TempExFlowUserSetup."User ID",12013587,TempImportWkshHeader."Inbound Document No.",
+                             CREATEDATETIME(TempImportWkshHeader."Date Created",TempImportWkshHeader."Time Created"),'');
             UNTIL TempImportWkshHeader.NEXT = 0;
 
             SentCounter := SentCounter + 1;
@@ -672,7 +752,8 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
             SmtpMail.Send;
           END
           ELSE
-            CreateEmailLog(EmailHeader.Type,TempImportWkshHeader,ToMailAddress,TempExFlowUserSetup."User ID");
+            CreateEmailLog(EmailHeader.Type,ToMailAddress,TempExFlowUserSetup."User ID",12013587,TempImportWkshHeader."Inbound Document No.",
+                           CREATEDATETIME(TempImportWkshHeader."Date Created",TempImportWkshHeader."Time Created"),'');
         UNTIL TempExFlowUserSetup.NEXT = 0;
       END;
 
@@ -680,7 +761,370 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
         MESSAGE(STRSUBSTNO(EXF006, SentCounter, TotCounter));
     END;
 
-    PROCEDURE CheckAttachment@1100285000(VAR AttachFileName@1100285001 : Text[250];ExBlobID@1100285002 : Integer);
+    PROCEDURE BatchSendEmailInboxReminder@1100285012(VAR EmailHeader@1100285000 : Record 12013619);
+    VAR
+      _useSMTP@1100285029 : Boolean;
+      _bigText@1100285007 : BigText;
+      _xmlDoc@1100285011 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlDocument";
+      _xmlProcInstr@1100285010 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlProcessingInstruction";
+      _xmlNodeList@1100285009 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNodeList";
+      _xmlNode@1100285008 : DotNet "'System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Xml.XmlNode";
+      _exUserComp@1100285015 : Record 12013641;
+      _tempEXUser@1100285016 : TEMPORARY Record 12013640;
+      _exDoc@1100285013 : Record 12013608;
+      _tempEXDoc@1100285001 : TEMPORARY Record 12013608;
+      SMTPSetup@1100285031 : Record 409;
+      WebCompID@1100285032 : Record 12013630;
+      _f@1100285014 : File;
+      _f2@1100285021 : File;
+      _text@1100285019 : Text[1024];
+      _appendText@1100285020 : Text[1024];
+      _i@1100285012 : Integer;
+      _asHTML@1100285017 : Boolean;
+      CR@1100285006 : Char;
+      LF@1100285005 : Char;
+      TotCounter@1100285004 : Integer;
+      SentCounter@1100285003 : Integer;
+      ProcessDoc@1100285002 : Boolean;
+      SmtpMail@1100285018 : Codeunit 400;
+      _wsExFlow@1100285030 : Codeunit 12013635;
+      _oStream@1100285022 : OutStream;
+      _iStream@1100285026 : InStream;
+      _writeHTML@1100285023 : Boolean;
+      _color@1100285024 : Text[30];
+      _bcolor@1100285025 : Text[30];
+      _tempFilename@1100285027 : Text[250];
+      _ch@1100285028 : Char;
+    BEGIN
+      CR := 13;
+      LF := 10;
+
+      TotCounter := 0;
+      SentCounter := 0;
+
+      IF NOT SMTPSetup.GET THEN
+        CLEAR(SMTPSetup);
+      _useSMTP := SMTPSetup."SMTP Server" <> '';
+
+      _xmlDoc := _xmlDoc.XmlDocument();
+
+      // When started through NAS and job queue, emails should not go out if the company where the job
+      // queue is run from is not an active web company. Fixes the issue with duplicating a prod company
+      // into a test company
+      IF NOT GUIALLOWED THEN BEGIN
+        WebCompID.RESET;
+        WebCompID.SETRANGE("Company Name", COMPANYNAME);
+        WebCompID.SETRANGE("Web enabled", TRUE);
+        IF NOT WebCompID.FINDFIRST THEN
+          EXIT;
+      END;
+
+      WebCompID.RESET;
+      WebCompID.SETRANGE("Web enabled", TRUE);
+      IF WebCompID.FINDSET THEN
+        REPEAT
+          _exUserComp.RESET;
+          _exUserComp.CHANGECOMPANY(WebCompID."Company Name");
+          _exUserComp.SETRANGE(Blocked,FALSE);
+          _exUserComp.SETFILTER("E-mail ExFlow",'<>''''');
+          IF _exUserComp.FINDSET THEN
+            REPEAT
+              IF NOT _tempEXUser.GET(_exUserComp."User ID") THEN BEGIN
+                _tempEXUser."User ID" := _exUserComp."User ID";
+                _tempEXUser.INSERT;
+
+                // request user current inbox
+                _tempEXDoc.RESET();
+                _tempEXDoc.DELETEALL();
+
+                CLEAR(_bigText);
+                _wsExFlow.GetUserCurrentDocuments('',_exUserComp."User ID",_tempEXDoc); // empty compName = all docs
+
+                  WITH _tempEXDoc DO BEGIN
+                    RESET;
+                    IF FINDSET THEN BEGIN
+                      SendTemplateEmail(_tempEXDoc,EmailHeader,_exUserComp,SMTPSetup,DATABASE::"EX Document");
+                      SentCounter := SentCounter + 1;
+                    END;
+                  END;
+              END;
+          UNTIL _exUserComp.NEXT = 0;
+        UNTIL WebCompID.NEXT = 0;
+
+      IF NOT HideMessage AND GUIALLOWED THEN
+        MESSAGE(STRSUBSTNO(EXF006, SentCounter, TotCounter));
+    END;
+
+    PROCEDURE BatchSendEmailApprovedOrder@1100285015(VAR EmailHeader@1100285000 : Record 12013619);
+    VAR
+      _useSMTP@1100285029 : Boolean;
+      _exUserComp@1100285015 : Record 12013641;
+      _tempEXUser@1100285016 : TEMPORARY Record 12013640;
+      _exDoc@1100285013 : Record 12013608;
+      _f@1100285014 : File;
+      _f2@1100285021 : File;
+      _text@1100285019 : Text[1024];
+      _appendText@1100285020 : Text[1024];
+      _i@1100285012 : Integer;
+      _asHTML@1100285001 : Boolean;
+      CR@1100285006 : Char;
+      LF@1100285005 : Char;
+      TotCounter@1100285004 : Integer;
+      SentCounter@1100285003 : Integer;
+      ProcessDoc@1100285002 : Boolean;
+      SmtpMail@1100285018 : Codeunit 400;
+      _wsExFlow@1100285030 : Codeunit 12013635;
+      _oStream@1100285022 : OutStream;
+      _iStream@1100285026 : InStream;
+      _writeHTML@1100285023 : Boolean;
+      _color@1100285024 : Text[30];
+      _bcolor@1100285025 : Text[30];
+      _tempFilename@1100285027 : Text[250];
+      _ch@1100285028 : Char;
+      SMTPSetup@1100285007 : Record 409;
+    BEGIN
+      IF NOT (EmailHeader."Process Type" = EmailHeader."Process Type"::Scheduled) THEN
+        EXIT;
+
+      IF NOT SMTPSetup.GET THEN
+        CLEAR(SMTPSetup);
+
+      TotCounter := 0;
+      SentCounter := 0;
+      // exflow user setup comp - if user once then skip, if email <> ''
+      _exUserComp.RESET();
+      _exUserComp.SETRANGE(Blocked,FALSE);
+      _exUserComp.SETFILTER("E-mail ExFlow",'<>''''');
+      IF _exUserComp.FINDSET() THEN REPEAT
+        IF NOT _tempEXUser.GET(_exUserComp."User ID") THEN BEGIN
+          _tempEXUser."User ID" := _exUserComp."User ID";
+          _tempEXUser.INSERT;
+
+          WITH _exDoc DO BEGIN
+            RESET;
+            SETRANGE("Document Type","Document Type"::Order);
+            SETRANGE("Requisition Status","Requisition Status"::Unsubmitted);
+            SETRANGE(Initiator,_exUserComp."User ID");
+            SETRANGE(Status,Status::Approved);
+            IF FINDSET THEN BEGIN
+              SendTemplateEmail(_exDoc,EmailHeader,_exUserComp,SMTPSetup,DATABASE::"EX Document");
+              SentCounter := SentCounter + 1;
+            END;
+          END;
+        END;
+      UNTIL _exUserComp.NEXT() = 0;
+
+      IF NOT HideMessage AND GUIALLOWED THEN
+        MESSAGE(STRSUBSTNO(EXF006, SentCounter, TotCounter));
+    END;
+
+    PROCEDURE BatchSendEmailRejectedQuote@1100285013(VAR EmailHeader@1100285000 : Record 12013619);
+    VAR
+      _useSMTP@1100285029 : Boolean;
+      _exUserComp@1100285015 : Record 12013641;
+      _tempEXUser@1100285016 : TEMPORARY Record 12013640;
+      _exDoc@1100285013 : Record 12013608;
+      _TempExDoc@1100285008 : TEMPORARY Record 12013608;
+      _f@1100285014 : File;
+      _f2@1100285021 : File;
+      _text@1100285019 : Text[1024];
+      _appendText@1100285020 : Text[1024];
+      _i@1100285012 : Integer;
+      _asHTML@1100285001 : Boolean;
+      CR@1100285006 : Char;
+      LF@1100285005 : Char;
+      TotCounter@1100285004 : Integer;
+      SentCounter@1100285003 : Integer;
+      ProcessDoc@1100285002 : Boolean;
+      SmtpMail@1100285018 : Codeunit 400;
+      _wsExFlow@1100285030 : Codeunit 12013635;
+      _oStream@1100285022 : OutStream;
+      _iStream@1100285026 : InStream;
+      _writeHTML@1100285023 : Boolean;
+      _color@1100285024 : Text[30];
+      _bcolor@1100285025 : Text[30];
+      _tempFilename@1100285027 : Text[250];
+      _ch@1100285028 : Char;
+      SMTPSetup@1100285007 : Record 409;
+    BEGIN
+      IF NOT (EmailHeader."Process Type" = EmailHeader."Process Type"::Scheduled) THEN
+        EXIT;
+
+      IF NOT SMTPSetup.GET THEN
+        CLEAR(SMTPSetup);
+
+      TotCounter := 0;
+      SentCounter := 0;
+      // exflow user setup comp - if user once then skip, if email <> ''
+      _exUserComp.RESET();
+      _exUserComp.SETRANGE(Blocked,FALSE);
+      _exUserComp.SETFILTER("E-mail ExFlow",'<>''''');
+      IF _exUserComp.FINDSET() THEN REPEAT
+        IF NOT _tempEXUser.GET(_exUserComp."User ID") THEN BEGIN
+          _tempEXUser."User ID" := _exUserComp."User ID";
+          _tempEXUser.INSERT;
+
+          WITH _exDoc DO BEGIN
+            _TempExDoc.RESET;
+            _TempExDoc.DELETEALL;
+
+            RESET;
+            SETRANGE("Document Type","Document Type"::Quote);
+            SETRANGE("Requisition Status","Requisition Status"::Unsubmitted);
+            SETRANGE(Initiator,_exUserComp."User ID");
+            IF FINDSET THEN BEGIN
+              REPEAT
+                CALCFIELDS(Rejected);
+                IF Rejected THEN BEGIN
+                  _TempExDoc.INIT;
+                  _TempExDoc.TRANSFERFIELDS(_exDoc);
+                  _TempExDoc.INSERT;
+                END;
+                SentCounter := SentCounter + 1;
+              UNTIL NEXT = 0;
+
+              IF _TempExDoc.FINDSET THEN
+                SendTemplateEmail(_TempExDoc,EmailHeader,_exUserComp,SMTPSetup,DATABASE::"EX Document");
+            END;
+          END;
+        END;
+      UNTIL _exUserComp.NEXT() = 0;
+
+      IF NOT HideMessage AND GUIALLOWED THEN
+        MESSAGE(STRSUBSTNO(EXF006, SentCounter, TotCounter));
+    END;
+
+    PROCEDURE BatchSendEmailCreatedReq@1100285014(VAR EmailHeader@1100285000 : Record 12013619);
+    VAR
+      _exUserComp@1100285015 : Record 12013641;
+      _tempEXUser@1100285016 : TEMPORARY Record 12013640;
+      ArchivedExDoc@1100285009 : Record 12013622;
+      _exDoc@1100285013 : Record 12013608;
+      _TempExDoc@1100285008 : TEMPORARY Record 12013608;
+      SMTPSetup@1100285007 : Record 409;
+      EmailLog@1100285010 : Record 12013634;
+      _useSMTP@1100285011 : Boolean;
+      _f@1100285014 : File;
+      _f2@1100285021 : File;
+      _text@1100285019 : Text[1024];
+      _appendText@1100285020 : Text[1024];
+      _i@1100285012 : Integer;
+      _asHTML@1100285001 : Boolean;
+      CR@1100285006 : Char;
+      LF@1100285005 : Char;
+      TotCounter@1100285004 : Integer;
+      SentCounter@1100285003 : Integer;
+      ProcessDoc@1100285002 : Boolean;
+      SmtpMail@1100285018 : Codeunit 400;
+      _wsExFlow@1100285030 : Codeunit 12013635;
+      _oStream@1100285022 : OutStream;
+      _iStream@1100285026 : InStream;
+      _writeHTML@1100285023 : Boolean;
+      _color@1100285024 : Text[30];
+      _bcolor@1100285025 : Text[30];
+      _tempFilename@1100285027 : Text[250];
+      _ch@1100285028 : Char;
+    BEGIN
+      IF NOT (EmailHeader."Process Type" = EmailHeader."Process Type"::Scheduled) THEN
+        EXIT;
+
+      IF NOT SMTPSetup.GET THEN
+        CLEAR(SMTPSetup);
+
+      TotCounter := 0;
+      SentCounter := 0;
+      // exflow user setup comp - if user once then skip, if email <> ''
+      _exUserComp.RESET();
+      _exUserComp.SETRANGE(Blocked,FALSE);
+      _exUserComp.SETFILTER("E-mail ExFlow",'<>''''');
+      IF _exUserComp.FINDSET() THEN REPEAT
+        IF NOT _tempEXUser.GET(_exUserComp."User ID") THEN BEGIN
+          _tempEXUser."User ID" := _exUserComp."User ID";
+          _tempEXUser.INSERT;
+
+          WITH _exDoc DO BEGIN
+            _TempExDoc.RESET;
+            _TempExDoc.DELETEALL;
+
+            RESET;
+            SETRANGE("Document Type","Document Type"::Requisition);
+            SETRANGE("Created By",_exUserComp."User ID");
+            IF FINDSET THEN BEGIN
+              REPEAT
+                EmailLog.RESET;
+                EmailLog.SETCURRENTKEY(ID);
+                EmailLog.SETRANGE("Table No.", DATABASE::"EX Archived Document");
+                EmailLog.SETRANGE(ID, ArchivedExDoc.ID);
+                IF NOT EmailLog.FINDFIRST THEN BEGIN
+                  _TempExDoc.INIT;
+                  _TempExDoc.TRANSFERFIELDS(ArchivedExDoc);
+                  _TempExDoc.INSERT;
+                END;
+                SentCounter := SentCounter + 1;
+              UNTIL NEXT = 0;
+
+              IF _TempExDoc.FINDSET THEN
+                SendTemplateEmail(_TempExDoc,EmailHeader,_exUserComp,SMTPSetup,DATABASE::"EX Archived Document");
+            END;
+          END;
+        END;
+      UNTIL _exUserComp.NEXT() = 0;
+
+      IF NOT HideMessage AND GUIALLOWED THEN
+        MESSAGE(STRSUBSTNO(EXF006, SentCounter, TotCounter));
+    END;
+
+    PROCEDURE SendSSOMail@1100285016(VAR SendTo@1100285000 : Text;SSOCode@1100285001 : Text);
+    VAR
+      EmailHeader@1100285006 : Record 12013619;
+      User@1100285004 : Record 12013641;
+      WebCompID@1100285008 : Record 12013630;
+      SMTPMail@1100285002 : Codeunit 400;
+      BodyTxt@1100285003 : Text;
+      AddExists@1100285005 : Boolean;
+      SSOFile@1100285007 : File;
+    BEGIN
+      AddExists := FALSE;
+      WebCompID.RESET;
+      WebCompID.SETRANGE("Web enabled", TRUE);
+      IF WebCompID.FINDSET THEN BEGIN
+        REPEAT
+          User.RESET;
+          User.CHANGECOMPANY(WebCompID."Company Name");
+          IF User.FINDSET THEN
+            REPEAT
+              IF LOWERCASE(User."E-mail ExFlow") = LOWERCASE(SendTo) THEN
+                AddExists := TRUE;
+            UNTIL (User.NEXT = 0) OR AddExists;
+        UNTIL (WebCompID.NEXT = 0) OR AddExists;
+      END;
+
+      IF AddExists THEN BEGIN
+        EmailHeader.GET(EmailHeader.Type::"SSO Login Email");
+        BodyTxt := EXF011 + ' ' + SSOCode;
+
+        IF EmailHeader."Test Email" = 'FILE' THEN BEGIN
+          IF EXISTS('c:\temp\ssologin.txt') THEN
+            ERASE('c:\temp\ssologin.txt');
+          SSOFile.TEXTMODE(TRUE);
+          SSOFile.WRITEMODE(TRUE);
+          SSOFile.CREATE('c:\temp\ssologin.txt');
+          SSOFile.WRITE(SSOCode);
+          SSOFile.CLOSE;
+        END
+        ELSE BEGIN
+          CLEAR(SMTPMail);
+          SMTPMail.CreateMessage(EmailHeader."Sender Name",EmailHeader."Sender Address",
+                                 SendTo,EXF010,BodyTxt,FALSE);
+          SMTPMail.Send;
+          SendTo := '';
+
+          CreateEmailLog(EmailHeader.Type,SendTo,'',0,0,CREATEDATETIME(TODAY,TIME),SMTPMail.GetLastSendMailErrorText);
+        END;
+      END;
+    END;
+
+    LOCAL PROCEDURE CheckAttachment@1100285000(VAR AttachFileName@1100285001 : Text[250];ExBlobID@1100285002 : Integer);
     VAR
       ExBlob@1100285003 : Record 12013591;
       ExFlowFileMgt@1100285000 : Codeunit 12013602;
@@ -695,13 +1139,32 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
       ExFlowFileMgt.ExportBLOB(ExBlob,AttachFileName);
     END;
 
+    LOCAL PROCEDURE CheckAttachmentClient@1100285017(VAR AttachFileName@1100285001 : Text[250];ExBlobID@1100285002 : Integer);
+    VAR
+      ExBlob@1100285003 : Record 12013591;
+      ExFlowFileMgt@1100285000 : Codeunit 12013602;
+    BEGIN
+      IF ExBlobID = 0 THEN
+        EXIT;
+
+      AttachFileName := ExFlowFileMgt.ClientTempFileName(ExFlowFileMgt.GetFileName(AttachFileName),'');
+
+      ExBlob.GET(ExBlobID);
+      ExBlob.CALCFIELDS(BLOB);
+      ExFlowFileMgt.ExportBLOB(ExBlob,AttachFileName);
+    END;
+
     PROCEDURE SendEmailFromImportHeader@1100285005(EmailAddr@1100285000 : Text[1024];AttachFileName@1100285002 : Text[250];ExBlobID@1100285003 : Integer;PurchImportHeader@1100285004 : Record 12013587);
     VAR
       EmailLog@1100285001 : Record 12013634;
+      Mail@1100285005 : Codeunit 397;
     BEGIN
-      CreateEmailLog(EmailLog."Email Type"::Manual,PurchImportHeader,EmailAddr,'');
+      CreateEmailLog(EmailLog."Email Type"::Manual,EmailAddr,'',12013587,PurchImportHeader."Inbound Document No.",
+                     CREATEDATETIME(PurchImportHeader."Date Created",PurchImportHeader."Time Created"),'');
 
-      SendEmail(EmailAddr,AttachFileName,ExBlobID);
+      CheckAttachmentClient(AttachFileName,ExBlobID);
+
+      Mail.NewMessage(EmailAddr,'','','','',AttachFileName,TRUE);
     END;
 
     PROCEDURE SendEmail@1100285001(EmailAddr@1100285000 : Text[1024];AttachFileName@1100285002 : Text[250];ExBlobID@1100285003 : Integer);
@@ -710,29 +1173,218 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
     BEGIN
       CheckAttachment(AttachFileName,ExBlobID);
 
-      //Mail.NewMessage(EmailAddr,'','','',AttachFileName,TRUE);
       Mail.NewMessage(EmailAddr,'','','','',AttachFileName,TRUE);
     END;
 
-    PROCEDURE CheckLastSent@1100285004(EmailHeader@1100285000 : Record 12013619;ImportWkshHeader@1100285003 : Record 12013587) : Boolean;
+    LOCAL PROCEDURE SendTemplateEmail@1100285020(VAR TempExDoc@1100285000 : TEMPORARY Record 12013608;VAR _emailHeader@1100285004 : Record 12013619;_exUserComp@1100285005 : Record 12013641;SMTPSetup@1100285002 : Record 409;TableNo@1100285030 : Integer);
+    VAR
+      SmtpMail@1100285001 : Codeunit 400;
+      _f@1100285018 : File;
+      _f2@1100285017 : File;
+      _appendText@1100285008 : Text[1024];
+      _i@1100285006 : Integer;
+      _int@1100285007 : Integer;
+      _oStream@1100285015 : OutStream;
+      _iStream@1100285014 : InStream;
+      _writeHTML@1100285013 : Boolean;
+      _color@1100285012 : Text[30];
+      _bcolor@1100285011 : Text[30];
+      _tempFilename@1100285010 : Text[250];
+      _ch@1100285009 : Char;
+      _text@1100285003 : Text[1024];
+      AttachmentFile@1100285016 : Text[250];
+      ExAppSetup@1100285019 : Record 12013601;
+      LF@1100285020 : Char;
+      CR@1100285021 : Char;
+      dotNetArray@1100285026 : DotNet "'mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Array";
+      dotNetFile@1100285025 : DotNet "'mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.IO.File";
+      dotNetEncoding@1100285024 : DotNet "'mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.Text.Encoding";
+      dotNetFileStream@1100285023 : DotNet "'mscorlib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'.System.IO.FileStream";
+      int@1100285027 : Integer;
+      Company@1100285028 : Record 2000000006;
+      EXFileMgt@1100285029 : Codeunit 12013602;
+      ToMailAddress@1100285022 : Text[1024];
+    BEGIN
+      CR := 13;
+      LF := 10;
+
+      IF NOT SMTPSetup.GET THEN
+        CLEAR(SMTPSetup);
+
+      ExAppSetup.GET;
+
+      _emailHeader.TESTFIELD("ExFlow Web URL");
+      _emailHeader.CALCFIELDS("HTML Template File");
+
+      IF _emailHeader."HTML Template File".HASVALUE() THEN BEGIN
+        // create local template.htm from blob
+        _f.CREATETEMPFILE();
+        _tempFilename := _f.NAME +'.txt';
+        _f.CLOSE();
+        _f.CREATE(_tempFilename);
+        _f.CREATEOUTSTREAM(_oStream);
+        _emailHeader."HTML Template File".CREATEINSTREAM(_iStream);
+        COPYSTREAM(_oStream,_iStream);
+        _f.CLOSE;
+
+        IF _emailHeader."Test Email" <> '' THEN
+          ToMailAddress := _emailHeader."Test Email"
+        ELSE
+          ToMailAddress := _exUserComp."E-mail ExFlow";
+
+        dotNetArray := dotNetFile.ReadAllLines(_tempFilename,dotNetEncoding.GetEncoding(1252));
+        WITH TempExDoc DO BEGIN
+          SmtpMail.CreateMessage(_emailHeader."Sender Name",
+            _emailHeader."Sender Address",
+            ToMailAddress,
+            _emailHeader."Email Subject",_emailHeader."Email Subject",TRUE);
+
+          _writeHTML := FALSE;
+          FOR int := 0 TO (dotNetArray.Length - 1) DO BEGIN
+            _text := dotNetArray.GetValue(int); // line by line
+            IF STRPOS(_text,'<html') > 0 THEN
+              _writeHTML := TRUE;
+
+            IF _writeHTML THEN BEGIN
+              _appendText := _text;
+
+              _i := STRPOS(UPPERCASE(_text),'USER_NAME');
+              IF _i > 0 THEN BEGIN
+                _appendText := COPYSTR(_text,1,_i -1) +_exUserComp."User Name";
+                IF STRLEN(_text) > _i +9 THEN
+                  _appendText += COPYSTR(_text,_i +9);
+              END;
+
+              _i := STRPOS(UPPERCASE(_text),'EXFLOW_URL');
+              IF _i > 0 THEN BEGIN
+                _appendText := COPYSTR(_text,1,_i -1) +'<a href="' +_emailHeader."ExFlow Web URL" +'">ExFlow Web</a>';
+                IF STRLEN(_text) > _i +10 THEN
+                  _appendText += COPYSTR(_text,_i +10);
+              END;
+
+              _i := STRPOS(UPPERCASE(_text),'RESULT_TABLES');
+              IF _i > 0 THEN BEGIN
+                _appendText := '<table cellpadding ="5px" cellspacing="0px" border="0px"  style="border-left: 1px solid #eaeaea; border-bottom: 1px solid #eaeaea;">';
+                SmtpMail.AppendBody(_appendText);
+
+                _appendText := COPYSTR(_text,1,_i -1);
+                SmtpMail.AppendBody(_appendText);
+
+                REPEAT
+                  _color := '#000000';
+                  _bcolor := '#f5f5f5';
+                  IF "Due Date" < WORKDATE THEN BEGIN
+                    _bcolor := '#bb0000';
+                    _color := '#fff';
+                  END ELSE
+                    IF "Due Date" < CALCDATE('<+7D>',WORKDATE) THEN
+                      _color := '#bb0000';
+                  _appendText := STRSUBSTNO('%1 %2 %3 %4 %5 %6 %7'
+                    ,'<tr style="background-color: ' +_bcolor +'; color: #444339; font-weight:bold; font-size: 12px; font-family: Lucida Sans, Tahoma, Verdana;">'
+                    ,'<td style="width: 70px; border-right: 1px solid #eaeaea; color: ' +_color +'">' +TempExDoc."Document No." +'</td>'
+                    ,'<td style="width:100px; border-right: 1px solid #eaeaea; color: ' +_color +'">' +FORMAT(TempExDoc."Document Date") +'</td>'
+                    ,'<td style="width:100px; border-right: 1px solid #eaeaea; color: ' +_color +'">' +FORMAT(TempExDoc."Due Date") +'</td>'
+                    ,'<td style="width:150px; border-right: 1px solid #eaeaea; color: ' +_color +'">' +TempExDoc."Vendor Name" +'</td>'
+                    ,'<td style="width:150px; border-right: 1px solid #eaeaea; color: ' +_color +'">' +TempExDoc."Temp Company Name" +'</td>'
+                    ,'</tr>'
+                    );
+
+                  AttachmentFile := '';
+                  IF _emailHeader."Attach Image" THEN BEGIN
+                    AttachmentFile := ExAppSetup."Path to Used Invoices" + "Image Name";
+                    IF NOT EXFileMgt.FileExist(ExAppSetup."Path to Used Invoices", "Image Name") THEN
+                      AttachmentFile := '';
+                  END;
+
+                  SmtpMail.AppendBody(_appendText);
+                  IF AttachmentFile <> '' THEN
+                    SmtpMail.AddAttachment(AttachmentFile,"Image Name");
+
+                  CreateEmailLog(_emailHeader.Type,ToMailAddress,USERID,TableNo,TempExDoc.ID,TempExDoc."Created Date",'');
+                UNTIL NEXT = 0;
+
+                SmtpMail.AppendBody('</table>');
+              END
+              ELSE
+                SmtpMail.AppendBody(_appendText)
+            END;
+          END;
+
+          _emailHeader."Last Sent" := CREATEDATETIME(TODAY,TIME);
+          _emailHeader.MODIFY;
+          COMMIT;
+
+          IF _emailHeader."CC Email" <> '' THEN
+            SmtpMail.AddCC(_emailHeader."CC Email");
+          SmtpMail.Send();
+        END;
+
+        IF EXISTS(_tempFilename) THEN
+          ERASE(_tempFilename);
+
+      END ELSE BEGIN
+        IF _emailHeader."Test Email" <> '' THEN
+          ToMailAddress := _emailHeader."Test Email"
+        ELSE
+          ToMailAddress := _exUserComp."E-mail ExFlow";
+
+        SmtpMail.CreateMessage(_emailHeader."Sender Name",
+          _emailHeader."Sender Address",
+          ToMailAddress,
+          _emailHeader."Email Subject",_emailHeader."Email Subject",TRUE);
+
+        WITH TempExDoc DO BEGIN
+          REPEAT
+            AttachmentFile := '';
+            IF _emailHeader."Attach Image" THEN BEGIN
+              AttachmentFile := ExAppSetup."Path to Used Invoices" + "Image Name";
+              IF NOT EXFileMgt.FileExist(ExAppSetup."Path to Used Invoices", "Image Name") THEN
+                AttachmentFile := '';
+            END;
+
+            _appendText := STRSUBSTNO(EMAILTXT,TempExDoc."Document No.") ;
+
+            SmtpMail.AppendBody(_appendText);
+            SmtpMail.AppendBody(FORMAT(CR)+FORMAT(LF));
+            IF AttachmentFile <> '' THEN
+              SmtpMail.AddAttachment(AttachmentFile,"Image Name");
+
+            CreateEmailLog(_emailHeader.Type,ToMailAddress,USERID,TableNo,TempExDoc.ID,TempExDoc."Created Date",'');
+          UNTIL NEXT = 0;
+        END;
+
+        _emailHeader."Last Sent" := CREATEDATETIME(TODAY,TIME);
+        _emailHeader.MODIFY;
+
+        COMMIT;
+
+        IF _emailHeader."CC Email" <> '' THEN
+          SmtpMail.AddCC(_emailHeader."CC Email");
+        SmtpMail.Send();
+      END;
+    END;
+
+    PROCEDURE CheckLastSent@1100285004(EmailHeader@1100285000 : Record 12013619;TableNo@1100285001 : Integer;IDNo@1100285004 : BigInteger;DateCreated@1100285005 : Date;POMatchedDoc@1100285006 : Boolean) : Boolean;
     VAR
       EmailLog@1100285002 : Record 12013634;
     BEGIN
-      IF NOT ImportWkshHeader."PO Matched Document" THEN
+      IF NOT POMatchedDoc THEN
         EXIT(FALSE);
 
-      EmailLog.RESET;
-      EmailLog.SETCURRENTKEY(ID);
-      EmailLog.SETRANGE("Table No.", 12013587);
-      EmailLog.SETRANGE(ID, ImportWkshHeader."Inbound Document No.");
-      EmailLog.SETRANGE("Sent at time", CREATEDATETIME(TODAY,TIME)-23*1000*60*60, CREATEDATETIME(TODAY,TIME));
-      IF EmailLog.FINDFIRST THEN
-        EXIT(FALSE);
+      IF EmailHeader."Process Type" <> EmailHeader."Process Type"::Scheduled THEN BEGIN
+        EmailLog.RESET;
+        EmailLog.SETCURRENTKEY(ID);
+        EmailLog.SETRANGE("Table No.", TableNo);
+        EmailLog.SETRANGE(ID, IDNo);
+        EmailLog.SETRANGE("Sent at time", CREATEDATETIME(TODAY,TIME)-23*1000*60*60, CREATEDATETIME(TODAY,TIME));
+        IF EmailLog.FINDFIRST THEN
+          EXIT(FALSE);
+      END;
 
       IF EmailHeader."Delay sending (days)" = 0 THEN
         EXIT(TRUE);
 
-      IF (ImportWkshHeader."Date Created" + EmailHeader."Delay sending (days)") <= TODAY THEN
+      IF (DateCreated + EmailHeader."Delay sending (days)") <= TODAY THEN
         EXIT(TRUE)
       ELSE
         EXIT(FALSE);
@@ -756,21 +1408,21 @@ OBJECT Codeunit 12013627 ExFlow Email Mgt
       HideMessage := TRUE;
     END;
 
-    PROCEDURE CreateEmailLog@1100285011(EmailLogType@1100285001 : Integer;PurchImportHeader@1100285000 : Record 12013587;EmailAddr@1100285003 : Text[1024];PurchaserCode@1100285004 : Code[20]);
+    PROCEDURE CreateEmailLog@1100285011(EmailLogType@1100285001 : Integer;EmailAddr@1100285003 : Text[1024];PurchaserCode@1100285004 : Code[50];TableNo@1100285005 : Integer;IDNo@1100285006 : BigInteger;DateTimeCreated@1100285007 : DateTime;SMTPErrorMessage@1100285000 : Text);
     VAR
       EmailLog@1100285002 : Record 12013634;
     BEGIN
       EmailLog.INIT;
       EmailLog."Entry No." := 0;
       EmailLog."Email Type" := EmailLogType;
-      EmailLog."Table No." := 12013587;
-      EmailLog.ID := PurchImportHeader."Inbound Document No.";
-      EmailLog."Document Date Created" := PurchImportHeader."Date Created";
-      EmailLog."Document Time Created" := PurchImportHeader."Time Created";
+      EmailLog."Table No." := TableNo;
+      EmailLog.ID := IDNo;
+      EmailLog."Document Date Created" := DT2DATE(DateTimeCreated);
+      EmailLog."Document Time Created" := DT2TIME(DateTimeCreated);
       EmailLog."Sent to" := COPYSTR(EmailAddr,1,MAXSTRLEN(EmailLog."Sent to"));
       EmailLog."Sent by" := USERID;
       EmailLog."Sent at time" := CREATEDATETIME(TODAY,TIME);
-      EmailLog."Import Document No." := PurchImportHeader."Import Document No.";
+      EmailLog."Import Document No." := IDNo;
       EmailLog."Sent to Purchaser" := PurchaserCode;
       EmailLog.INSERT;
     END;

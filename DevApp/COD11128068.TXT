@@ -1,0 +1,450 @@
+OBJECT Codeunit 11128068 VP File NO Telepay
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=PE6.02 (12048865);
+  }
+  PROPERTIES
+  {
+    TableNo=11128079;
+    OnRun=VAR
+            GeneralLedgerSetup@1100570000 : Record 98;
+            CurrencyFilter@1100570002 : Text;
+          BEGIN
+            CLEAR(gTotalAmountLCY);
+            CLEAR(gNoOfPayments);
+
+            gVPSetup.GET;
+            gVPSetup.TESTFIELD("Last Sequence No. Per Rec");
+
+            GeneralLedgerSetup.GET;
+            GeneralLedgerSetup.TESTFIELD("LCY Code",'NOK');
+
+            gGiroType.GET(Rec."Giro Type Code");
+
+            gGiroType.TESTFIELD(Filename);
+            gToFile := gGiroType.Filename;
+
+            OpenFile;
+
+            gVPMnm.SetGiroType(gGiroType);
+
+            IF GeneralLedgerSetup."LCY Code" = 'NOK' THEN
+              CurrencyFilter := '''''|NOK|EUR'
+            ELSE
+              CurrencyFilter := 'NOK|EUR';
+            CreateFile(Rec,'NOK', CurrencyFilter);
+
+            CloseFile(Rec);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      gFile@1100570021 : File;
+      gVPMnm@1100570002 : Codeunit 11128061;
+      BA001@1100570026 : TextConst 'ENU=Currency %1 is not permitted for %2';
+      BA002@1100570030 : TextConst 'ENU="Amount must be positive "';
+      BA003@1100570020 : TextConst 'ENU=The length for %1 is %2 long, %3 characters are maximum';
+      gTotalAmountLCY@1100570000 : Decimal;
+      gFromFile@1100570004 : Text;
+      gToFile@1100570006 : Text;
+      gGiroType@1100570023 : Record 11128061;
+      gVPSetup@1100570022 : Record 11128066;
+      gVPPackEntry@1100570019 : Record 11128063;
+      gVendorBankAccount@1100570018 : Record 288;
+      gTotalAmount@1100570024 : Decimal;
+      gNoOfLines@1100570025 : Integer;
+      gVendor@1100570027 : Record 23;
+      gAmountToPay@1100570028 : Decimal;
+      gAmountToPayLCY@1100570029 : Decimal;
+      BA004@1100570003 : TextConst 'ENU=Max 999999 lines per day';
+      gNoOfPayments@12047959 : Integer;
+      BA005@12047960 : TextConst 'ENU=All payments are not included in the file, check the currency';
+      BA006@12047961 : TextConst 'ENU=Bank account No. to the Vendor %1 is incorrect';
+      BA007@12047962 : TextConst 'ENU=is incorrect';
+      SetSweBaseVersion@12047963 : Codeunit 11128083;
+
+    PROCEDURE CreateFile@1000000019(pPack@1070001 : Record 11128079;pCurrencyCode@1000000009 : Code[3];pCurrencyFilter@1000000010 : Text[260]);
+    VAR
+      VendLedgerEntry@1070000 : Record 25;
+      SeqContrTelepay@1000000001 : Record 11128068;
+      SeqContrTelepay2@1000000012 : Record 11128068;
+    BEGIN
+      SeqContrTelepay.LOCKTABLE;
+      IF NOT SeqContrTelepay.GET(pPack."Entry No.") THEN BEGIN
+        SeqContrTelepay.GET(0);
+
+        // If Not First Time
+        SeqContrTelepay2.RESET;
+        SeqContrTelepay2.SETFILTER("No.",'<>0');
+        IF NOT SeqContrTelepay2.ISEMPTY THEN
+          SeqContrTelepay.TESTFIELD("Last Sequence No. Per Rec");
+
+        SeqContrTelepay."Last No." := pPack."Entry No.";
+
+        IF SeqContrTelepay."Last Sequence No. Date" <> TODAY THEN BEGIN
+          SeqContrTelepay."Last Day Sequence No." := 0;
+          SeqContrTelepay."Last Sequence No. Date" := TODAY;
+        END;
+        IF SeqContrTelepay."Last Day Sequence No." = 999999 THEN
+          ERROR(BA004);
+
+        SeqContrTelepay.MODIFY;
+
+        // Infoga en ny kopia av rec 0
+        SeqContrTelepay."No." := pPack."Entry No.";
+        SeqContrTelepay."Last No." := 0;
+        SeqContrTelepay.INSERT;
+      END;
+
+      gGiroType.TESTFIELD("Account No.");
+      IF NOT Mod11Check(gGiroType."Account No.") THEN
+        gGiroType.FIELDERROR("Account No.",BA007);
+
+
+      WITH VendLedgerEntry DO BEGIN
+        gVPPackEntry.RESET;
+        gVPPackEntry.SETRANGE("Pack Entry No.",pPack."Entry No.");
+        IF NOT gVPPackEntry.FINDSET THEN
+          EXIT;
+
+        CLEAR(gTotalAmount);
+        CLEAR(gNoOfLines);
+
+        CreateLine('BETFOR00', VendLedgerEntry,SeqContrTelepay,pCurrencyCode);
+
+        REPEAT
+          gVPMnm.CheckCustomerPaymentAllowed(pPack,gVPPackEntry);
+          gNoOfPayments += 1;
+          GET(gVPPackEntry."Ledger Entry No.");  // Get Vendor Leadger Entry
+          TESTFIELD(Open,TRUE);
+          gVendorBankAccount.GET(gVPPackEntry."No.",gVPPackEntry."Bank Account Code");
+          gVendorBankAccount.TESTFIELD("Bank Account No.");
+          gVendorBankAccount.TESTFIELD(Name);
+          IF NOT Mod11Check(gVendorBankAccount."Bank Account No.") THEN
+            ERROR(BA006,gVPPackEntry."No.");
+          // kontrollera att valutan „r OK att anv„nda
+          SETFILTER("Currency Code",pCurrencyFilter);
+          IF NOT FIND THEN
+            ERROR(BA001,"Currency Code",pPack."Giro Type Code");
+          SETRANGE("Currency Code");
+
+          gVendor.GET("Vendor No.");
+          gVendor.TESTFIELD(Name);
+          gAmountToPay := gVPMnm.CalcVendAmountToPay(VendLedgerEntry);
+          gAmountToPayLCY := gVPMnm.CalcVendAmountToPayLCY(VendLedgerEntry);
+          IF gAmountToPay > 0 THEN
+            ERROR(BA002);
+          gTotalAmount += gAmountToPay;
+          gTotalAmountLCY += gAmountToPayLCY;
+          CreateLine('BETFOR21', VendLedgerEntry,SeqContrTelepay,pCurrencyCode);
+          CreateLine('BETFOR23', VendLedgerEntry,SeqContrTelepay,pCurrencyCode);
+        UNTIL gVPPackEntry.NEXT = 0;
+        CreateLine('BETFOR99', VendLedgerEntry,SeqContrTelepay,pCurrencyCode);
+      END;
+
+      // Spar SeqNo f”r n„sta nya bunt
+      SeqContrTelepay2.GET(0);
+      IF SeqContrTelepay2."Last No." = pPack."Entry No." THEN BEGIN
+        SeqContrTelepay2."Last Sequence No. Per Rec" := SeqContrTelepay."Last Sequence No. Per Rec";
+        SeqContrTelepay2."Last Sequence No. Date" := SeqContrTelepay."Last Sequence No. Date";
+        SeqContrTelepay2."Last Day Sequence No." := SeqContrTelepay."Last Day Sequence No.";
+        SeqContrTelepay2.MODIFY;
+      END;
+    END;
+
+    PROCEDURE CreateLine@1000000017(pLineType@1000000000 : Code[10];VAR pVendLedgerEntry@1000000006 : Record 25;VAR pSeqContrTelepay@1000000007 : Record 11128068;pCurrencyCode@1000000011 : Code[3]);
+    VAR
+      AppHeadTxtLine@1000000004 : Text[40];
+      SequenceNoRec@1000000009 : Code[4];
+      "Deb/Cred"@1000000012 : Code[1];
+      InvNo@1000000002 : Code[20];
+      SequenceNoDay@1000000003 : Code[6];
+    BEGIN
+      gGiroType.TESTFIELD("Account No.");
+      gGiroType.TESTFIELD("Org ID CUST");
+      pVendLedgerEntry.CALCFIELDS("Remaining Amount");
+      gNoOfLines += 1;
+
+      // Set Seq No. per Day
+      IF pSeqContrTelepay."Last Day Sequence No." = 999999 THEN
+        ERROR(BA004);
+      pSeqContrTelepay."Last Day Sequence No." += 1;
+      SequenceNoDay := gVPMnm.NFL(FORMAT(pSeqContrTelepay."Last Day Sequence No."),6);
+
+
+      // Set Seq No. Per Rec
+      IF pSeqContrTelepay."Last Sequence No. Per Rec" = 9999 THEN
+        pSeqContrTelepay."Last Sequence No. Per Rec" := 0
+      ELSE
+        pSeqContrTelepay."Last Sequence No. Per Rec" += 1;
+      SequenceNoRec := gVPMnm.NFL(FORMAT(pSeqContrTelepay."Last Sequence No. Per Rec"),4);
+
+      // S„tt lev. Fakturanr eller KID
+      IF pVendLedgerEntry."OCR No." = '' THEN
+        InvNo := COPYSTR(pVendLedgerEntry."External Document No.",1,20)
+      ELSE
+        CLEAR(InvNo);
+
+      // S„tt Debet eller kredit
+      IF pVendLedgerEntry."Remaining Amount" <= 0 THEN
+        "Deb/Cred" := 'D'
+      ELSE
+        "Deb/Cred" := 'K';
+
+      // Appl. Header
+      AppHeadTxtLine :=
+        'AH' + //ID
+        '2'  + //Version
+        '00' + //Return Code
+        'TBII' + //Procedure ID (TBII-Domestic, TBIU-Foreign, TBIO-Payment Instr).
+        gVPMnm.MMDD(TODAY) + //Transaction date (MMDD).
+        SequenceNoDay + //Seq.No
+        gVPMnm.BLK(8) + //Transcode
+        gVPMnm.BLK(11) + //Userid
+        '04'; // No. of 80 char blocks.
+
+      CASE pLineType OF
+        'BETFOR00' : BEGIN
+            WriteFileNo(320,
+            AppHeadTxtLine +
+            'BETFOR00' + //Transaction Code
+            gVPMnm.NFL(gGiroType."Org ID CUST",11) + //Enterprise Number
+            gVPMnm.BLK(11) + //Division
+            SequenceNoRec + //Sequence Control
+            gVPMnm.BLK(6) + //Reserved
+            gVPMnm.MMDD(TODAY) + //Production date
+            gVPMnm.BLK(10) + //Password
+            'VERSJON002' + //Version
+            gVPMnm.BLK(10) + //New password
+            gVPMnm.BLK(11) + //Operator No.
+            gVPMnm.BLK(1) + //Sigill: seal-use
+            gVPMnm.NFL('0',6) + //Sigill: seal date
+            gVPMnm.NFL('0',20) + //Sigill: part key
+            gVPMnm.BLK(1) + //Sigill: seal how
+            gVPMnm.BLK(143) + //Reserved
+            gVPMnm.NFL(FORMAT(pVendLedgerEntry."VP Pack No."),15) + //Own reference batch
+            gVPMnm.BLK(9) //Reserved
+            );
+          END;
+        'BETFOR01' : BEGIN
+            WriteFileNo(320,
+            AppHeadTxtLine +
+            'BETFOR01' + //Transaction Code
+            gVPMnm.NFL(gGiroType."Org ID CUST",11) + //Enterprise Number
+            gVPMnm.NFL(gGiroType."Account No.",11) + //Account number
+            SequenceNoRec + //Sequence Control
+            gVPMnm.BLK(6) + //Reference Number (blank when sending)
+            gVPMnm.YYMMDD(pVendLedgerEntry."Due Date") + //Payment Date
+            gVPMnm.TFR(pVendLedgerEntry."Vendor No.",30) + //Own ref. order (Vendor No.)
+            gVPMnm.BLK(3) + //Payment currency
+            pCurrencyCode + //Invoice currency
+            gVPMnm.BLK(3) + //Charges abroad
+            gVPMnm.BLK(3) + //Charges in Norway
+            gVPMnm.BLK(30) + //Notification indicator
+            gVPMnm.BLK(1) + //Priority Code (J=Express)
+            gVPMnm.NFL('0',8) + //Agreed exchange rate
+            gVPMnm.BLK(6) + //Forward contract no.
+            gVPMnm.NFL('0',8) + //Forward contract exchange rate
+            gVPMnm.BLK(1) + //Cheque code
+            gVPMnm.NFL('0',6) + //Value date receiving bank
+            gVPMnm.BLK(2) + //Reserved
+            gVPMnm.NFL('0',12) + //Actual exchange rate
+            gVPMnm.BLK(12) + //Execution ref. 2
+            gVPMnm.NFL('0',16) + //Amount debited
+            gVPMnm.NFL('0',16) + //Amount transferred
+            gVPMnm.BLK(5) + //Client reference
+            gVPMnm.NFL('0',6) + //Execution ref. 1
+            gVPMnm.BLK(6) + //Deal made with
+            gVPMnm.BLK(1) + //Cancellation code
+            gVPMnm.BLK(1) + //Clearing code
+            gVPMnm.NFL('0',6) + //Value date
+            gVPMnm.NFL('0',9) + //Fee
+            gVPMnm.NFL('0',12) + //Rate against nok
+            gVPMnm.BLK(1) + //Cancellation cause
+            gVPMnm.NFL('0',16) + //Ordered transferred amount
+            gVPMnm.BLK(1) + //Price info
+            gVPMnm.BLK(10) //Reserved
+            );
+          END;
+          'BETFOR02' : BEGIN
+            WriteFileNo(320,
+            AppHeadTxtLine +
+            'BETFOR02' + //Transaction Code
+            gVPMnm.NFL(gGiroType."Org ID CUST",11) + //Enterprise Number
+            gVPMnm.NFL(gGiroType."Account No.",11) + //Account number
+            SequenceNoRec + //Sequence Control
+            gVPMnm.BLK(6) + //Reference Number (blank when sending)
+            // getSWIFTSendingBank()                 //SWIFT address (sending bank)
+            // getSendingBankName()                  //Bank Name
+            // getSendingBankAddress1()              //Bank Address 1
+            // getSendingBankAddress2()              //Bank Address 2
+            // getSendingBankAddress2()              //Bank Address 3
+            // getSWIFTReceivingBank()               //SWIFT Address Corr. Bank (receiving bank)
+            // getReceivingBankCountryCode()         //Country Code Receiving Bank
+            gVPMnm.BLK(15) + //Bank Code
+            gVPMnm.BLK(35) + //Account No. TBIO
+            gVPMnm.BLK(26) //Reserved
+            );
+          END;
+          'BETFOR21' : BEGIN
+            WriteFileNo(320,
+            AppHeadTxtLine +
+            'BETFOR21' + //Transaction Code
+            gVPMnm.NFL(gGiroType."Org ID CUST",11) + //Enterprise Number
+            gVPMnm.NFL(gGiroType."Account No.",11) + //Account number
+            SequenceNoRec + //Sequence Control
+
+            gVPMnm.BLK(6) + //Reference Number (blank when sending)
+            gVPMnm.YYMMDD(pVendLedgerEntry."Due Date") + //Payment Date
+            gVPMnm.TFR(pVendLedgerEntry."Vendor No.",30) + //Own ref. order (Vendor No.)
+            gVPMnm.BLK(1) + //Reserved
+            gVPMnm.NFL(gVendorBankAccount."Bank Account No.",11) + //Payee's Account Number
+            gVPMnm.TFR(gVendorBankAccount.Name,30) + //Payee's Name
+            gVPMnm.TFR(gVendorBankAccount.Address,30) + //Address 1
+            gVPMnm.TFR(gVendorBankAccount."Address 2",30) + //Address 2
+            gVPMnm.NFL(gVendorBankAccount."Post Code",4) + //Post Code
+            gVPMnm.TFR(gVendorBankAccount.City,26) + //City
+            gVPMnm.NFL('0',15) + //Amount To Own Account
+            gVPMnm.NFL('0',3) + //Text Code
+            'F' + //Transfer Code L: Salary, M: Other mass payment, E: To own account, F: Invoice payment
+            gVPMnm.BLK(1) + //Cancellation Code
+            gVPMnm.NFL('0',15) + //Total Amount (reply field)
+            gVPMnm.BLK(5) + //Client reference
+            gVPMnm.NFL('0',6) + //Value Date (reply field)
+            gVPMnm.NFL('0',6) + //Value Date Receiving Bank
+            gVPMnm.BLK(1) + //Cancellation Cause
+            gVPMnm.BLK(9) + //Reserved
+            gVPMnm.NFL('0',10)  //Form No
+            );
+          END;
+          'BETFOR23' : BEGIN
+            WriteFileNo(320,
+            AppHeadTxtLine +
+            'BETFOR23' + //Transaction Code
+            gVPMnm.NFL(gGiroType."Org ID CUST",11) + //Enterprise Number
+            gVPMnm.NFL(gGiroType."Account No.",11) + //Account number
+            SequenceNoRec + //Sequence Control
+            gVPMnm.BLK(6) + //Reference Number (blank when sending)
+            gVPMnm.BLK(40) + //Payee Ref. Invoice (not to be used with KID)
+            gVPMnm.BLK(40) + //Payee Ref. Invoice (not to be used with KID)
+            gVPMnm.BLK(40) + //Payee Ref. Invoice (not to be used with KID)
+            gVPMnm.TFR(pVendLedgerEntry."OCR No.",27) + //KID
+            gVPMnm.TFR(pVendLedgerEntry."Document No.",30) + //Own Reference Invoice (Document No.)
+            gVPMnm.Value100(gAmountToPay, 15) + //Invoice Amount
+            "Deb/Cred" + //Debit/Credit Code
+                         //'D': Add the amount, 'K': Subtract the amount '-': Remove the invoice
+
+            gVPMnm.TFR(InvNo,20) + //Invoice Number (not to be used with KID)
+            gVPMnm.NFL('0',3) + //Serial Number (reply field)
+            gVPMnm.BLK(1) + //Cancellation Cause (reply field)
+            gVPMnm.BLK(15) + //Customer Number (not to be used with KID)
+            gVPMnm.NFL('0',8)  //Invoice Date (not to be used with KID)
+            );
+          END;
+          'BETFOR99' : BEGIN
+            WriteFileNo(320,
+            AppHeadTxtLine +
+            'BETFOR99' + //Transaction Code
+            gVPMnm.NFL(gGiroType."Org ID CUST",11) + //Enterprise Number
+            gVPMnm.BLK(11) + //Reserved
+            SequenceNoRec + //Sequence Control
+            gVPMnm.BLK(6) + //Reserved
+            gVPMnm.MMDD(TODAY) + //Production date
+            gVPMnm.NFL('0',4) + //Number Of Payments.
+            gVPMnm.NFL('0',15) + //Total Amount Batch n
+            gVPMnm.NFL(FORMAT(gNoOfLines),5) + //Number of Records
+            gVPMnm.BLK(163) + //Reserved
+            gVPMnm.BLK(4) + //Sigill: Security
+            gVPMnm.BLK(1) + //Sigill: Language
+            gVPMnm.BLK(1) + //Sigill: Version
+            gVPMnm.BLK(1) + //Sigill: Interface
+            gVPMnm.BLK(18) + //Sigill: Control field
+            gVPMnm.TFR(SetSweBaseVersion.GetSweBaseNameAndVersion,16) + //Version Software
+            gVPMnm.BLK(8) //Version Bank
+            );
+          END;
+        ELSE
+          ERROR('Line Type %1 is Not Supported!', pLineType);
+      END;
+    END;
+
+    PROCEDURE WriteFile@1070040(pLength@1070000 : Integer;pText@1070001 : Text[250]);
+    BEGIN
+      IF STRLEN(pText) > pLength THEN
+        ERROR(BA003,pText,STRLEN(pText),pLength);
+      gFile.WRITE(PADSTR(pText,pLength));
+    END;
+
+    PROCEDURE OpenFile@1070005();
+    VAR
+      RBMgt@1100570001 : Codeunit 419;
+    BEGIN
+      gFile.TEXTMODE(TRUE);
+      gFile.WRITEMODE(TRUE);
+      gFromFile := RBMgt.ServerTempFileName('.txt');
+      gFile.CREATE(gFromFile);
+    END;
+
+    PROCEDURE CloseFile@1070009(pPack@1070000 : Record 11128079);
+    VAR
+      RBMgt@1100570000 : Codeunit 419;
+      VPPackEntry@12047958 : Record 11128063;
+    BEGIN
+      VPPackEntry.RESET;
+      VPPackEntry.SETRANGE("Pack Entry No.",pPack."Entry No.");
+      IF VPPackEntry.COUNT <> gNoOfPayments THEN
+        ERROR(BA005);
+
+
+      pPack.LOCKTABLE;
+      pPack.FIND;
+      pPack."Total Amount (LCY)" := -gTotalAmountLCY;
+      pPack.MODIFY;
+      gFile.CLOSE;
+
+      RBMgt.DownloadToFile(gFromFile,gVPMnm.SetFileName(pPack,gToFile));
+    END;
+
+    PROCEDURE WriteFileNo@1000000020(pLength@1070000 : Integer;pText@1000 : Text[1024]);
+    BEGIN
+      // Write f”r Norge splittar i 4 rec a 80 pos
+      IF STRLEN(pText) <> pLength THEN
+        ERROR(BA003,pText,STRLEN(pText),pLength);
+      gFile.WRITE(COPYSTR(pText,1,80));
+      gFile.WRITE(COPYSTR(pText,81,80));
+      gFile.WRITE(COPYSTR(pText,161,80));
+      gFile.WRITE(COPYSTR(pText,241,80));
+    END;
+
+    PROCEDURE Mod11Check@12047959(pCode@12047965 : Code[1024]) : Boolean;
+    VAR
+      StrNumber@12047958 : Text;
+      Weight@12047959 : Text;
+      Modulus@12047960 : Integer;
+      CheckSum@12047961 : Integer;
+      ChSum@12047962 : Integer;
+      C@12047963 : Integer;
+      i@12047964 : Integer;
+    BEGIN
+      IF STRLEN(pCode) <> 11 THEN
+        EXIT(FALSE);
+
+      EXIT(STRCHECKSUM(pCode, '54327654321', 11) = 0);
+    END;
+
+    BEGIN
+    {
+      PEB *** Begin ***
+      PEB0091 Banking
+      PEB
+      PEB *** End ***
+    }
+    END.
+  }
+}
+

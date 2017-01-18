@@ -4,7 +4,7 @@ OBJECT Codeunit 12013598 ExFlow SE Functionality
   {
     Date=;
     Time=;
-    Version List=EXF350003,W1;
+    Version List=EXF400006,4PS;
   }
   PROPERTIES
   {
@@ -19,50 +19,354 @@ OBJECT Codeunit 12013598 ExFlow SE Functionality
       Text003@1100285000 : TextConst 'ENU=%1 does not exist.';
 
     PROCEDURE InwardNav@1000000001(VAR PurchHead@1000000000 : Record 38);
+    VAR
+      ExFlowSetup@1100285000 : Record 12013601;
     BEGIN
+      IF PurchHead."Document Type" <> PurchHead."Document Type"::Invoice THEN
+        EXIT;
+
+      ExFlowSetup.GET;
+      IF ExFlowSetup."Automatic Reg. of Inwards" = ExFlowSetup."Automatic Reg. of Inwards"::"Values from Lines" THEN
+        InwardNavBasedOnLines(PurchHead);
+      IF ExFlowSetup."Automatic Reg. of Inwards" = ExFlowSetup."Automatic Reg. of Inwards"::"Values from Header" THEN
+        InwardNavBasedOnHeader(PurchHead,ExFlowSetup);
     END;
 
     PROCEDURE InwardNavBasedOnLines@1100285002(VAR PurchHead@1000000000 : Record 38);
+    VAR
+      PurchSetup@1100285009 : Record 312;
+      InwRegHeader@1100285000 : Record 11128010;
+      InwRegLines@1100285001 : Record 11128011;
+      PurchLine@1100285006 : Record 39;
+      Currency@1100285008 : Record 4;
+      GLSetup@1100285010 : Record 98;
+      cuInward@1100285002 : Codeunit 11128010;
+      PurchLineAmount@1100285003 : Decimal;
+      NewLineNo@1100285007 : Integer;
     BEGIN
+      PurchLine.RESET;
+      PurchLine.SETRANGE("Document Type",PurchHead."Document Type");
+      PurchLine.SETRANGE("Document No.",PurchHead."No.");
+      PurchLine.SETFILTER(Type,'<>0');
+      PurchLine.SETFILTER("No.",'<>%1','');
+      IF PurchLine.FIND('-') THEN
+        BEGIN
+          PurchHead.TESTFIELD("Buy-from Vendor No.");
+          PurchHead.TESTFIELD("Pay-to Vendor No.");
+          PurchHead.TESTFIELD("VAT Bus. Posting Group");
+          PurchHead.TESTFIELD("Gen. Bus. Posting Group");
+
+          PurchSetup.GET;
+
+          InwRegHeader.INIT;
+          InwRegHeader."Document Type"           := PurchHead."Document Type";
+          InwRegHeader."Document No."            := PurchHead."No.";
+          InwRegHeader."No."                     := PurchHead."No.";
+          InwRegHeader.Responsible               := PurchHead."Purchaser Code";
+          InwRegHeader."VAT Bus. Posting Group"  := PurchHead."VAT Bus. Posting Group";
+          InwRegHeader."Vendor Posting Group"    := PurchHead."Vendor Posting Group";
+          InwRegHeader."Gen. Bus. Posting Group" := PurchHead."Gen. Bus. Posting Group";
+          InwRegHeader."Posting Date"            := PurchHead."Posting Date";
+          IF FORMAT(PurchSetup."Latest Return Date Calc.") <> '' THEN
+            InwRegHeader."Latest Return"           := CALCDATE(PurchSetup."Latest Return Date Calc.",TODAY)
+          ELSE
+            InwRegHeader."Latest Return"           := CALCDATE('<-1D>', PurchHead."Due Date");
+
+          InwRegHeader."Currency Code"           := PurchHead."Currency Code";
+          InwRegHeader."Currency Factor"         := PurchHead."Currency Factor";
+          InwRegHeader."Dimension Set ID"        := PurchHead."Dimension Set ID";
+          IF PurchHead."Document Type" = PurchHead."Document Type"::Invoice THEN
+            InwRegHeader.VALIDATE("Vendor Invoice No.", PurchHead."Vendor Invoice No.")
+          ELSE
+            InwRegHeader.VALIDATE("Vendor Invoice No.", PurchHead."Vendor Cr. Memo No.");
+
+          InwRegHeader.INSERT;
+
+          InwRegHeader.CALCFIELDS("Vendor No.");
+          InwRegHeader.CALCFIELDS("Vendor Name");
+
+          IF PurchHead."Currency Code" = '' THEN
+            Currency.InitRoundingPrecision
+          ELSE
+            Currency.GET(PurchHead."Currency Code");
+
+          NewLineNo := 0;
+
+          GLSetup.GET;
+
+          REPEAT
+            InwRegLines.SETCURRENTKEY("Document No.","VAT Prod. Posting Group","Gen. Prod. Posting Group");
+            InwRegLines.SETRANGE("Document No.", PurchHead."No.");
+            InwRegLines.SETRANGE("VAT Prod. Posting Group", PurchLine."VAT Prod. Posting Group");
+            InwRegLines.SETRANGE("Gen. Prod. Posting Group", PurchLine."Gen. Prod. Posting Group");
+
+            IF (NOT PurchSetup."Accumulated Inward Reg. Lines") OR (NOT InwRegLines.FIND('-')) THEN BEGIN
+              NewLineNo                 := NewLineNo + 10000;
+              InwRegLines.INIT;
+              InwRegLines."Document No.":= InwRegHeader."No.";
+              InwRegLines."Line No."    := NewLineNo;
+              IF PurchSetup."Accumulated Inward Reg. Lines" THEN
+                InwRegLines.INSERT(TRUE) // InwHead dimensions to the new line
+              ELSE
+                IF PurchSetup."Copy Dimensions to Inward Reg."  THEN
+                   InwRegLines.INSERT  // Dimensions is copied later from purchaseline
+                ELSE
+                   InwRegLines.INSERT(TRUE); // InwHead dimensions to the new line
+              InwRegLines.GET(InwRegLines."Document No.", InwRegLines."Line No.");
+            END;
+
+            IF PurchHead."Prices Including VAT" THEN BEGIN
+              PurchLineAmount := PurchLine."Line Amount" / (1 + (PurchLine."VAT %" / 100));
+              PurchLineAmount := ROUND(PurchLineAmount,Currency."Amount Rounding Precision" );
+            END ELSE
+              PurchLineAmount := PurchLine."Line Amount";
+
+            InwRegLines."Gen. Prod. Posting Group" := PurchLine."Gen. Prod. Posting Group";
+            InwRegLines.VALIDATE("VAT Prod. Posting Group", PurchLine."VAT Prod. Posting Group");
+            InwRegLines.VALIDATE(Amount,InwRegLines.Amount+PurchLineAmount);
+            InwRegLines."Dimension Set ID" := PurchLine."Dimension Set ID";
+            InwRegLines."Shortcut Dimension 1 Code" := PurchLine."Shortcut Dimension 1 Code";
+            InwRegLines."Shortcut Dimension 2 Code" := PurchLine."Shortcut Dimension 2 Code";
+            InwRegLines.MODIFY;
+          UNTIL PurchLine.NEXT=0;
+
+          // Post
+          CLEAR(cuInward);
+          cuInward.RUN(InwRegHeader);
+          CLEAR(cuInward);
+        END;
     END;
 
     PROCEDURE InwardNavBasedOnHeader@1100285004(VAR PurchHead@1000000000 : Record 38;ExFlowSetup@1100285011 : Record 12013601);
+    VAR
+      PurchSetup@1100285009 : Record 312;
+      InwRegHeader@1100285000 : Record 11128010;
+      InwRegLines@1100285001 : Record 11128011;
+      PurchLine@1100285006 : Record 39;
+      Currency@1100285008 : Record 4;
+      GLSetup@1100285010 : Record 98;
+      cuInward@1100285002 : Codeunit 11128010;
+      PurchLineAmount@1100285003 : Decimal;
+      NewLineNo@1100285007 : Integer;
     BEGIN
+      IF (PurchHead."Gross Invoice Amount ExFlow" = 0) AND
+         (PurchHead."Import VAT Amount" = 0) THEN
+        EXIT;
+
+      PurchLine.RESET;
+      PurchLine.SETRANGE("Document Type",PurchHead."Document Type");
+      PurchLine.SETRANGE("Document No.",PurchHead."No.");
+      PurchLine.SETFILTER(Type,'<>0');
+      PurchLine.SETFILTER("No.",'<>%1','');
+      IF PurchLine.FIND('-') THEN
+        BEGIN
+          PurchHead.TESTFIELD("Buy-from Vendor No.");
+          PurchHead.TESTFIELD("Pay-to Vendor No.");
+          PurchHead.TESTFIELD("VAT Bus. Posting Group");
+          PurchHead.TESTFIELD("Gen. Bus. Posting Group");
+
+          PurchSetup.GET;
+
+          InwRegHeader.INIT;
+          InwRegHeader."Document Type"           := PurchHead."Document Type";
+          InwRegHeader."Document No."            := PurchHead."No.";
+          InwRegHeader."No."                     := PurchHead."No.";
+          InwRegHeader.Responsible               := PurchHead."Purchaser Code";
+          InwRegHeader."VAT Bus. Posting Group"  := PurchHead."VAT Bus. Posting Group";
+          InwRegHeader."Vendor Posting Group"    := PurchHead."Vendor Posting Group";
+          InwRegHeader."Gen. Bus. Posting Group" := PurchHead."Gen. Bus. Posting Group";
+          InwRegHeader."Posting Date"            := PurchHead."Posting Date";
+          IF FORMAT(PurchSetup."Latest Return Date Calc.") <> '' THEN
+            InwRegHeader."Latest Return"           := CALCDATE(PurchSetup."Latest Return Date Calc.",TODAY)
+          ELSE
+            InwRegHeader."Latest Return"           := CALCDATE('<-1D>', PurchHead."Due Date");
+
+          InwRegHeader."Currency Code"           := PurchHead."Currency Code";
+          InwRegHeader."Currency Factor"         := PurchHead."Currency Factor";
+          InwRegHeader."Dimension Set ID"        := PurchHead."Dimension Set ID";
+          IF PurchHead."Document Type" = PurchHead."Document Type"::Invoice THEN
+            InwRegHeader.VALIDATE("Vendor Invoice No.", PurchHead."Vendor Invoice No.")
+          ELSE
+            InwRegHeader.VALIDATE("Vendor Invoice No.", PurchHead."Vendor Cr. Memo No.");
+
+          InwRegHeader.INSERT;
+
+          InwRegHeader.CALCFIELDS("Vendor No.");
+          InwRegHeader.CALCFIELDS("Vendor Name");
+
+          IF PurchHead."Currency Code" = '' THEN
+            Currency.InitRoundingPrecision
+          ELSE
+            Currency.GET(PurchHead."Currency Code");
+
+          NewLineNo := 0;
+
+          GLSetup.GET;
+
+          // Net Value
+          PurchLineAmount := PurchHead."Gross Invoice Amount ExFlow" - PurchHead."Import VAT Amount";
+          IF PurchLineAmount <> 0 THEN BEGIN
+            NewLineNo                 := NewLineNo + 10000;
+            InwRegLines.INIT;
+            InwRegLines."Document No.":= InwRegHeader."No.";
+            InwRegLines."Line No."    := NewLineNo;
+            IF PurchSetup."Accumulated Inward Reg. Lines" THEN
+              InwRegLines.INSERT(TRUE) // InwHead dimensions to the new line
+            ELSE
+              IF PurchSetup."Copy Dimensions to Inward Reg."  THEN
+                 InwRegLines.INSERT  // Dimensions is copied later from purchaseline
+              ELSE
+                 InwRegLines.INSERT(TRUE); // InwHead dimensions to the new line
+            InwRegLines.GET(InwRegLines."Document No.", InwRegLines."Line No.");
+
+            InwRegLines.VALIDATE("Gen. Prod. Posting Group", ExFlowSetup."Inward Reg. Prod. Post Gr 0%");
+            InwRegLines.VALIDATE("VAT Prod. Posting Group", ExFlowSetup."VAT Prod. Posting Group 0%");
+            InwRegLines.VALIDATE(Amount,PurchLineAmount);
+            InwRegLines."Dimension Set ID" := PurchLine."Dimension Set ID";
+            InwRegLines."Shortcut Dimension 1 Code" := PurchLine."Shortcut Dimension 1 Code";
+            InwRegLines."Shortcut Dimension 2 Code" := PurchLine."Shortcut Dimension 2 Code";
+            InwRegLines.MODIFY;
+          END;
+
+          // VAT Value
+          PurchLineAmount := PurchHead."Import VAT Amount";
+          IF PurchLineAmount <> 0 THEN BEGIN
+            NewLineNo                 := NewLineNo + 10000;
+            InwRegLines.INIT;
+            InwRegLines."Document No.":= InwRegHeader."No.";
+            InwRegLines."Line No."    := NewLineNo;
+            IF PurchSetup."Accumulated Inward Reg. Lines" THEN
+              InwRegLines.INSERT(TRUE) // InwHead dimensions to the new line
+            ELSE
+              IF PurchSetup."Copy Dimensions to Inward Reg."  THEN
+                 InwRegLines.INSERT  // Dimensions is copied later from purchaseline
+              ELSE
+                 InwRegLines.INSERT(TRUE); // InwHead dimensions to the new line
+            InwRegLines.GET(InwRegLines."Document No.", InwRegLines."Line No.");
+
+            InwRegLines.VALIDATE("Gen. Prod. Posting Group", ExFlowSetup."Inward Reg. Prod. Post Gr 100%");
+            InwRegLines.VALIDATE("VAT Prod. Posting Group", ExFlowSetup."VAT Prod. Posting Group 100%");
+            InwRegLines.VALIDATE(Amount,PurchLineAmount);
+            InwRegLines."Dimension Set ID" := PurchLine."Dimension Set ID";
+            InwRegLines."Shortcut Dimension 1 Code" := PurchLine."Shortcut Dimension 1 Code";
+            InwRegLines."Shortcut Dimension 2 Code" := PurchLine."Shortcut Dimension 2 Code";
+            InwRegLines.MODIFY;
+          END;
+
+          // Post
+          CLEAR(cuInward);
+          cuInward.RUN(InwRegHeader);
+          CLEAR(cuInward);
+        END;
     END;
 
     PROCEDURE TestInwSetup@1100285001(ExFPurchLine@1100285000 : Record 12013588);
+    VAR
+      GenPostingSetup@1100285001 : Record 252;
     BEGIN
+      IF ExFPurchLine.Type = 0 THEN
+        EXIT;
+      IF ExFPurchLine."No." = '' THEN
+        EXIT;
+
+      GenPostingSetup.RESET;
+      GenPostingSetup.SETRANGE("Gen. Bus. Posting Group",ExFPurchLine."Gen. Bus. Posting Group");
+      GenPostingSetup.SETRANGE("Gen. Prod. Posting Group",ExFPurchLine."Gen. Prod. Posting Group");
+      IF NOT GenPostingSetup.FINDFIRST THEN
+        ERROR(Text002,GenPostingSetup.TABLECAPTION,ExFPurchLine.FIELDCAPTION("Gen. Bus. Posting Group"),
+              ExFPurchLine.FIELDCAPTION("Gen. Prod. Posting Group"));
+
+      IF GenPostingSetup."Inward Reg. Bridging Account" = '' THEN
+        ERROR(Text003,GenPostingSetup.FIELDCAPTION("Inward Reg. Bridging Account"));
     END;
 
     PROCEDURE PurchHeaderUpdateInw@1100285006(VAR PurchHeader@1100285000 : Record 38);
     BEGIN
+      PurchHeader.UpdateInwardHeader;
     END;
 
     PROCEDURE PurchHeaderDeleteInw@1100285007(VAR PurchHeader@1100285000 : Record 38);
     BEGIN
+      PurchHeader.DeleteInwardHeader;
     END;
 
     PROCEDURE PerCodeLookup@1100285000(VAR ExCodingRuleLine@1100285002 : Record 12013663;VAR Text@1100285003 : Text[1024]) : Boolean;
+    VAR
+      PerCodeList@1100285001 : Page 11128020;
+      PeriodicTemplate@1100285000 : Record 11128015;
     BEGIN
+      WITH ExCodingRuleLine DO BEGIN
+        CLEAR(PerCodeList);
+        PerCodeList.LOOKUPMODE(TRUE);
+        PeriodicTemplate.RESET;
+        PerCodeList.SETTABLEVIEW(PeriodicTemplate);
+        IF PerCodeList.RUNMODAL = ACTION::LookupOK THEN
+          BEGIN
+            PerCodeList.GETRECORD(PeriodicTemplate);
+            Text := Text + PeriodicTemplate.Code;
+            "Text Range" := "Text Range" + PeriodicTemplate.Code;
+
+            EXIT(TRUE);
+          END
+        ELSE
+          EXIT(FALSE);
+      END;
     END;
 
     PROCEDURE AddAddAccGroup@1100285003(VAR ExPurchaseDocLine@1100285000 : Record 12013588;GLAcc@1100285001 : Record 15);
     BEGIN
+      // NTR Start
+      ExPurchaseDocLine."Auto. Acc. Group" := GLAcc."Auto. Acc. Group";
+      // NTR End
     END;
 
     PROCEDURE GetNoPeriods@1100285005(TemplateCode@1100285000 : Code[20]) : Integer;
+    VAR
+      PeriodicTemplate@1100285001 : Record 11128015;
     BEGIN
+      IF PeriodicTemplate.GET(TemplateCode) THEN
+        EXIT(PeriodicTemplate."No. of Periods")
+      ELSE
+        EXIT(0);
     END;
 
     PROCEDURE UpdateAccGroup@1100285008(VAR NewPurchLine@1100285000 : Record 39;OldPurchLine@1100285001 : Record 39);
     BEGIN
+      IF NewPurchLine."Auto. Acc. Group" <> OldPurchLine."Auto. Acc. Group" THEN
+        NewPurchLine.VALIDATE("Auto. Acc. Group", OldPurchLine."Auto. Acc. Group");
     END;
 
     PROCEDURE UpdateSWEBASE@1100285009(VAR PurchHeader@1100285000 : Record 38);
     BEGIN
+      // Code required for SWEBASE integration
+
+      // PurchHeader."Gross Invoice Amount" := PurchHeader."Gross Invoice Amount ExFlow";
+      // PurchHeader.MODIFY;
     END;
 
-    PROCEDURE UpdateSWEBASEOrExF@1100285010(VAR PurchHeader@1100285003 : Record 38;VAR DocHead@1100285004 : Record 12013608);
+    PROCEDURE UpdateSWEBASEOrExF@1100285010(VAR PurchHeader@1100285003 : Record 38);
+    VAR
+      PurchHeader2@1100285000 : Record 38;
+    BEGIN
+      // Code required for SWEBASE integration
+
+      // PurchHeader2.GET(PurchHeader."Document Type",PurchHeader."No.");
+      // IF PurchHeader2."Gross Invoice Amount ExFlow" <> PurchHeader."Gross Invoice Amount ExFlow" THEN
+      //   UpdateSWEBASE(PurchHeader)
+      // ELSE
+      //   IF PurchHeader2."Gross Invoice Amount" <> PurchHeader."Gross Invoice Amount" THEN
+      //     UpdateExFlowGross(PurchHeader);
+    END;
+
+    PROCEDURE UpdateExFlowGross@1100285014(VAR PurchHeader@1100285000 : Record 38);
+    BEGIN
+      // Code required for SWEBASE integration
+
+      // PurchHeader."Gross Invoice Amount ExFlow" := PurchHeader."Gross Invoice Amount";
+      // PurchHeader.MODIFY;
+    END;
+
+    PROCEDURE UpdateCustomizedFields@1100285012(VAR PurchHeader@1100285000 : Record 38;PurchImportHeader@1100285001 : Record 12013587);
     BEGIN
     END;
 
@@ -74,7 +378,249 @@ OBJECT Codeunit 12013598 ExFlow SE Functionality
       EXIT(FALSE);
     END;
 
+    PROCEDURE GetInwardImageName@1100285040(DocType@1100285002 : Integer;DocNo@1100285000 : Code[20]) : Text[250];
+    VAR
+      ExDoc2@1100285001 : Record 12013612;
+      ExFlowSeFunc@1100285004 : Codeunit 12013598;
+      InwardRegEntry@1100285005 : Record 11128012;
     BEGIN
+      InwardRegEntry.RESET;
+      InwardRegEntry.SETRANGE("Source Type",DocType);
+      InwardRegEntry.SETRANGE("Document No.",DocNo);
+      IF InwardRegEntry.FINDFIRST THEN BEGIN
+        ExDoc2.RESET;
+        ExDoc2.SETCURRENTKEY("Document No.");
+
+        CASE DocType OF
+          2: ExDoc2.SETRANGE("Document Type", ExDoc2."Document Type"::Invoice);
+          3: ExDoc2.SETRANGE("Document Type", ExDoc2."Document Type"::"Credit Memo");
+        END;
+        ExDoc2.SETRANGE("Document No.", InwardRegEntry."Source No.");
+        IF ExDoc2.FINDFIRST THEN
+          EXIT(ExDoc2."Image Name")
+        ELSE BEGIN
+          EXIT('');
+        END;
+      END;
+      EXIT('');
+    END;
+
+    PROCEDURE GetPerCodeDesc@1100285041(ExColumn@1100285001 : Record 12013661;ColValue@1100285002 : Text;CompName@1100285003 : Text[50]) : Text;
+    VAR
+      PerTempl@1100285000 : Record 11128015;
+    BEGIN
+      WITH PerTempl DO BEGIN
+        CHANGECOMPANY(CompName);
+        IF GET(ColValue) THEN
+          EXIT(Description)
+        ELSE
+          EXIT('');
+      END;
+    END;
+
+    PROCEDURE GetPerCodes@1100285042(VAR TempData@1100285000 : TEMPORARY Record 12013609;VAR TempID@1100285003 : BigInteger;CompName@1100285002 : Text[50]);
+    VAR
+      PeriodicTemplate@1100285001 : Record 11128015;
+    BEGIN
+      WITH PeriodicTemplate DO BEGIN
+        RESET;
+        CHANGECOMPANY(CompName);
+        SETFILTER(Code,'<>%1', '');
+        IF FINDSET THEN
+          REPEAT
+            TempData.ID := TempID;
+            TempData."No." := Code;
+            TempData.Description := Description;
+            TempData.INSERT;
+            TempID := TempID + 1;
+          UNTIL NEXT = 0;
+      END;
+    END;
+
+    PROCEDURE ApprovalStatusReport_CheckPerCode@1100285013(VAR PrintTempPurchLine@1100285000 : TEMPORARY Record 39;VAR PostingDate@1100285001 : Date;VAR PostRemPeriodBal@1100285002 : Boolean) : Boolean;
+    BEGIN
+      IF PrintTempPurchLine."Periodic Template Code" <> '' THEN BEGIN
+        IF (PrintTempPurchLine."Periodic Starting Date" > PostingDate) AND NOT PostRemPeriodBal THEN
+          EXIT(TRUE);
+      END;
+
+      EXIT(FALSE)
+    END;
+
+    PROCEDURE ExFlowCodeunit_UpdatePeriodicDocLine@1100285015(VAR DocLine@1100285000 : Record 12013609;VAR PurchLine@1100285001 : Record 39);
+    BEGIN
+      DocLine."Periodic Template Code" := PurchLine."Periodic Template Code";
+      DocLine."Periodic Starting Date" := PurchLine."Periodic Starting Date";
+    END;
+
+    PROCEDURE ExFlowCodeunit_UpdatePerDocLineDim@1100285016(VAR InCode@1100285002 : Code[50];VAR PurchLine@1100285000 : Record 39;VAR DocLineDim@1100285001 : Record 12013611) : Boolean;
+    VAR
+      ExFWorkFlowMgt@1100285003 : Codeunit 12013593;
+    BEGIN
+      IF InCode = 'PERCODE' THEN
+        IF PurchLine."Periodic Template Code" <> '' THEN
+          DocLineDim."Dimension Value" := PurchLine."Periodic Template Code"
+        ELSE
+          EXIT(TRUE);
+
+      IF InCode = 'PERDATE' THEN
+        IF PurchLine."Periodic Starting Date" <> 0D THEN
+          DocLineDim."Dimension Value" := ExFWorkFlowMgt.TransformDateToText(PurchLine."Periodic Starting Date")
+        ELSE
+          EXIT(TRUE);
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE ExFlowCodeunit_CreateJnlLinePer@1100285017(VAR PurchaseLine@1100285000 : Record 39;VAR RemPeriodicBalance@1100285003 : Decimal;VAR OriginalAmtLCY@1100285002 : Decimal;VAR NoOfPeriods@1100285001 : Integer;VAR TempAmountLCY@1100285004 : Decimal;VAR PostingDate@1100285005 : Date;VAR GLSetup@1100285006 : Record 98;VAR PostRemPeriodBal@1100285007 : Boolean);
+    BEGIN
+      IF PurchaseLine."Periodic Template Code" <> '' THEN BEGIN
+        NoOfPeriods := GetNoPeriods(PurchaseLine."Periodic Template Code");
+        OriginalAmtLCY := TempAmountLCY;
+        IF (PurchaseLine."Periodic Starting Date" <= PostingDate) AND (NoOfPeriods <> 0) THEN
+          TempAmountLCY := ROUND(TempAmountLCY / NoOfPeriods, GLSetup."Amount Rounding Precision")
+        ELSE
+          TempAmountLCY := 0;
+
+        IF PostRemPeriodBal THEN
+          RemPeriodicBalance := OriginalAmtLCY - TempAmountLCY;
+      END;
+    END;
+
+    PROCEDURE UpdatePurchLineCodeunit_UpdatePerPurch@1100285018(VAR ChangeJournalLine@1100285000 : Record 12013618;VAR PurchLine@1100285001 : Record 39);
+    BEGIN
+      IF ChangeJournalLine."New Periodic Template Code" <> '' THEN
+        BEGIN
+          PurchLine.VALIDATE("Periodic Template Code", ChangeJournalLine."New Periodic Template Code");
+          PurchLine.VALIDATE("Periodic Starting Date", ChangeJournalLine."New Periodic Starting Date");
+        END;
+    END;
+
+    PROCEDURE UpdatePurchLineCodeunit_UpdatePerPurchFromDoc@1100285019(VAR ChangeJournalLine@1100285000 : Record 12013618;VAR PurchLineCopy@1100285001 : Record 39;VAR PurchLine@1100285002 : Record 39;VAR DocLineDim@1100285003 : Record 12013611;VAR DocLine@1100285004 : Record 12013609);
+    VAR
+      ExWorkFlowMgt@1100285005 : Codeunit 12013593;
+    BEGIN
+      IF ChangeJournalLine."New Periodic Template Code" <> PurchLineCopy."Periodic Template Code" THEN
+        BEGIN
+          PurchLine.VALIDATE("Periodic Template Code", ChangeJournalLine."New Periodic Template Code");
+          DocLine."Periodic Template Code" := ChangeJournalLine."New Periodic Template Code";
+
+          IF DocLineDim.RetrieveRecord(DocLineDim, PurchLine."Document Type", PurchLine."Document No.",
+                            PurchLine."Line No.",'PERCODE') THEN
+            BEGIN
+              IF ChangeJournalLine."New Periodic Template Code" = '' THEN
+                DocLineDim.DELETE
+              ELSE
+                BEGIN
+                  DocLineDim."Dimension Value" := ChangeJournalLine."New Periodic Template Code";
+                  DocLineDim.MODIFY;
+                END;
+            END;
+        END;
+
+      IF ChangeJournalLine."New Periodic Starting Date" <> PurchLineCopy."Periodic Starting Date" THEN
+        BEGIN
+          PurchLine.VALIDATE("Periodic Starting Date", ChangeJournalLine."New Periodic Starting Date");
+          DocLine."Periodic Starting Date" := ChangeJournalLine."New Periodic Starting Date";
+
+          IF DocLineDim.RetrieveRecord(DocLineDim, PurchLine."Document Type", PurchLine."Document No.",
+                            PurchLine."Line No.",'PERDATE') THEN
+            BEGIN
+              IF ChangeJournalLine."New Periodic Starting Date" = 0D THEN
+                DocLineDim.DELETE
+              ELSE
+                BEGIN
+                  DocLineDim."Dimension Value" := ExWorkFlowMgt.TransformDateToText(ChangeJournalLine."New Periodic Starting Date");
+                  DocLineDim.MODIFY;
+                END;
+            END;
+        END;
+    END;
+
+    PROCEDURE UpdatePurchLineCodeunit_UpdatePerChangeJnl@1100285020(VAR ChangeJournalLine2@1100285000 : Record 12013618;VAR PurchLine@1100285001 : Record 39);
+    BEGIN
+      ChangeJournalLine2."Periodic Template Code" := PurchLine."Periodic Template Code";
+      ChangeJournalLine2."Periodic Starting Date" := PurchLine."Periodic Starting Date";
+    END;
+
+    PROCEDURE UpdatePurchLineCodeunit_UpdateNewPerChangeJnl@1100285025(VAR ChangeJournalLine2@1100285000 : Record 12013618;VAR PurchLine@1100285001 : Record 39);
+    BEGIN
+      ChangeJournalLine2."New Periodic Template Code" := PurchLine."Periodic Template Code";
+      ChangeJournalLine2."New Periodic Starting Date" := PurchLine."Periodic Starting Date";
+    END;
+
+    PROCEDURE QuoteFromRecCodeunit_UpdatePerPurch@1100285021(DimCode@1100285003 : Code[50];VAR PurchLine@1100285000 : Record 39;VAR DocLineDim@1100285001 : Record 12013611);
+    VAR
+      ExQuoteFromReq@1100285002 : Codeunit 12013614;
+    BEGIN
+      CASE DimCode OF
+        'PERCODE':
+          PurchLine."Periodic Template Code" := DocLineDim."Dimension Value";
+
+        'PERDATE':
+          PurchLine."Periodic Starting Date" := ExQuoteFromReq.DateField(DocLineDim."Dimension Value");
+      END;
+    END;
+
+    PROCEDURE QuoteFromRecCodeunit_UpdatePerDocLine@1100285022(VAR DocLine@1100285000 : Record 12013609;VAR PurchLine@1100285001 : Record 39);
+    BEGIN
+      DocLine."Periodic Template Code" := PurchLine."Periodic Template Code";
+      DocLine."Periodic Starting Date" := PurchLine."Periodic Starting Date";
+    END;
+
+    PROCEDURE SplitApprovedLinePage_UpdatePerPurch@1100285023(VAR PurchLine@1100285000 : Record 39;VAR OldPurchLine@1100285001 : Record 39);
+    BEGIN
+      PurchLine."Auto. Acc. Group" := OldPurchLine."Auto. Acc. Group";
+      PurchLine."Periodic Template Code" := OldPurchLine."Periodic Template Code";
+      PurchLine."Periodic Starting Date" := OldPurchLine."Periodic Starting Date";
+    END;
+
+    PROCEDURE ValidatePurchDocCodeunit_InsertProp@1100285024(VAR ExPurchCodeLine@1100285000 : Record 12013683;VAR ExfPurchDocLine@1100285001 : Record 12013588;VAR precExfPurchDocHead@1100285002 : Record 12013587);
+    BEGIN
+      IF ExPurchCodeLine."Periodic Template Code" <> '' THEN BEGIN
+        ExfPurchDocLine.VALIDATE("Periodic Template Code", ExPurchCodeLine."Periodic Template Code");
+        IF FORMAT(ExPurchCodeLine."Periodic Starting Date") <> '' THEN
+          ExfPurchDocLine.VALIDATE("Periodic Starting Date", CALCDATE(ExPurchCodeLine."Periodic Starting Date",
+                                                                      precExfPurchDocHead."Document Date"));
+      END;
+    END;
+
+    PROCEDURE ExFlowToInvoiceCodeunit_ValidatePer@1100285026(VAR PurchLine@1100285000 : Record 39;VAR ExFPurchDocLine@1100285001 : Record 12013588);
+    BEGIN
+    END;
+
+    BEGIN
+    {
+      Swebase changes required:
+        in InwardNavBasedOnLines and InwardNavBasedOnHeader add the lines // ExFBASE between Insert and Calcfields:
+          InwRegHeader.INSERT;
+
+          // ExFBASE
+          InwRegHeader."Due Date" := PurchHead."Due Date";
+          InwRegHeader."Document Date" := PurchHead."Document Date";
+          InwRegHeader."Amount to Pay" := PurchHead."Gross Invoice Amount ExFlow";
+          InwRegHeader."Whereof VAT Amount" := PurchHead."Import VAT Amount";
+
+          IF (InwRegHeader."Amount to Pay" - InwRegHeader."Whereof VAT Amount") <> 0 THEN
+            InwRegHeader."VAT %" := ROUND(InwRegHeader."Whereof VAT Amount" /
+              (InwRegHeader."Amount to Pay" - InwRegHeader."Whereof VAT Amount") * 100,0.00001)
+          ELSE
+            InwRegHeader."VAT %" := 100;
+          InwRegHeader.MODIFY;
+          // ExFBASE
+
+          InwRegHeader.CALCFIELDS("Vendor No.");
+
+        In UpdateSWEBASE, UpdateSWEBASEOrExF and UpdateExFlowGross
+          Remove comments and thus activate the code
+
+        In CheckNoDuplicateControl:
+            IF Vendor."No control of Ext. Doc. No." THEN
+              EXIT(TRUE);
+
+        In UpdateCustomizedFields:
+          PurchHeader."OCR No." := PurchImportHeader."Vendor Document No. 2";
+    }
     END.
   }
 }

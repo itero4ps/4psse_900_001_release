@@ -4,7 +4,7 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
   {
     Date=;
     Time=;
-    Version List=4PS9.00;
+    Version List=4PS9.00,4PSSE;
   }
   PROPERTIES
   {
@@ -59,6 +59,7 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
              END;
 
     OnDelete=BEGIN
+               TESTFIELD(Invoiced,FALSE);
                CheckInstallmentScheme(2);
                CheckSourceDocument;
                CheckRemovalContribution;  //db, 22-10-09: M16544
@@ -689,10 +690,14 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
                                                                 VALIDATE("Basic Price (LCY)", "Gross Price (LCY)" * (100 - "Sales Discount % (Item)")/100);
                                                                 CalculateBasicPriceFromLCY; // dp00116.n
 
-                                                                IF CheckItemLine THEN
-                                                                  "Basic Price Found at" := Text010
-                                                                ELSE
+                                                                //>> 160621 ITERO.AC RFC082 Added Check for Sales discount or Existing text = ''
+                                                                IF CheckItemLine THEN BEGIN
+                                                                  IF ("Sales Discount % (Item)" <> 0) OR ("Basic Price Found at" = '') THEN
+                                                                    "Basic Price Found at" := Text010;
+                                                                END ELSE BEGIN
                                                                   "Basic Price Found at" := Text009;
+                                                                END;
+                                                                //<< 160621 ITERO.AC RFC082
                                                               END;
 
                                                    CaptionML=ENU=Sales Discount % (Item);
@@ -883,6 +888,8 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
                                                    Description=ITERO }
     { 11128273;;Total Cost Price (LCY);Decimal    ;CaptionML=ENU=Total Cost Price (LCY);
                                                    Description=ITERO }
+    { 11128274;;Cost Price Adjustment;Decimal     ;CaptionML=ENU=Adjustment % (Cost Price);
+                                                   Description=ITERO }
   }
   KEYS
   {
@@ -949,6 +956,11 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
       "-- ITERO --"@1100285000 : Integer;
       UseManualPriceList@1100285001 : Code[20];
       OverruleServiceContractNo@1100528601 : Code[20];
+      Text11128001@1100525005 : TextConst 'ENU=Cost Price + Surcharge Customer Price List';
+      Text11128002@1100525006 : TextConst 'ENU=Cost Price + Cost Price adjustment';
+      Text11128003@1100525007 : TextConst 'ENU=Vendor Gross Price';
+      Text11128004@1100525008 : TextConst 'ENU=Sales Price Warehouse Item';
+      Text11128005@1100525009 : TextConst 'ENU=Unit Price Warehouse Item';
 
     PROCEDURE GetServOrder@1210190012(lvInit@1210190000 : Boolean);
     VAR
@@ -978,12 +990,32 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
       ProjSetup@1100525002 : Record 315;
       PriceHistRec@1100525001 : Record 11012315;
       RefDate@1100525000 : Date;
+      lvCustPriceList@1100525003 : Record 11128273;
     BEGIN
       lvPerc := 0;
 
       CALCFIELDS("Cost Type");
       IF NOT ServOrderRec.GET("Service Order No.") THEN
         ServOrderRec.INIT;
+      //>> 160621 ITERO.AC RFC082 (similar to ENH-007, 4PSSE, DL/DJ and LAHE 130117 in Project Cost Plus Entry)
+      IF ("Cost Type" = "Cost Type"::Material) THEN BEGIN
+        IF lvCustPriceList.GET(ServOrderRec."Price List Code") THEN
+          IF lvCustPriceList."Apply Material Surcharge" THEN BEGIN
+            IF NOT ServiceOrderExtension.GET("Service Order No.") THEN
+              CLEAR(ServiceOrderExtension);
+            EXIT(ServiceOrderExtension."Surcharge % Material");
+          END;
+      END;
+
+      IF NOT ServiceOrderExtension.GET("Service Order No.") THEN
+        CLEAR(ServiceOrderExtension);
+      IF "Price History Found" THEN
+        EXIT(0);
+      IF "Trade Item" <> '' THEN
+        IF NOT (ServiceOrderExtension."Item Price Cost Plus Entry" = ServiceOrderExtension."Item Price Cost Plus Entry"::CostPrice) THEN
+          EXIT(0);
+
+      //<< 160621 ITERO.AC RFC082
 
       //db.sn, 03-04-13: C005338
       IF "Cost Type" = "Cost Type"::Material THEN BEGIN
@@ -1113,6 +1145,7 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
       ContractHourRateRec@1100409001 : Record 11012815;
       HelpDesc@1210190001 : Text[100];
       PlantLabor@1210190000 : Boolean;
+      SESetup@1100285300 : Record 11128004;
     BEGIN
       IF "Item No." + "Basic Item" + "Trade Item" <> '' THEN EXIT;
 
@@ -1162,8 +1195,15 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
           ServSetup."Description Cost Plus Entry"::WageComponent:
             IF ((CurrFieldNo = FIELDNO("Wage Component")) OR (CurrFieldNo = 0) OR
                 ("Wage Component" <> xRec."Wage Component")) THEN
-              IF WageCompRec.GET("Wage Component") THEN
+              IF WageCompRec.GET("Wage Component") THEN BEGIN
                 Description := WageCompRec.Description;
+                //>> 160620 ITERO.SB RAD-010 Mapping of description, wage component
+                SESetup.SETRANGE(Code,WageCompRec.Code);
+                SESetup.SETRANGE("Line type",SESetup."Line type"::Mapping);
+                IF (SESetup.FINDFIRST) AND (SESetup."Value (txt)"<>'') THEN
+                  Description := SESetup."Value (txt)";
+                //<<
+              END;
         END;
         IF Description <> xRec.Description THEN
           AddDateToDescription("Posting Date");
@@ -1299,16 +1339,91 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
     END;
 
     PROCEDURE ValidateItem@31(LTypeArtOpt@11012000 : 'Item,Basic Item,Trade Item');
+    VAR
+      lvPriceHistoryFound@1100525000 : Boolean;
+      lvDoSalesPriceCalulation@1100525001 : Boolean;
+      lvSurchargeIfMissingArticles@1100525002 : Decimal;
+      lvPriceFactor@1100525003 : Decimal;
+      lvGrossPrice@1100525004 : Decimal;
+      lvRefDate@1100525005 : Date;
+      lvItemSalesPrice@1100525006 : Record 7002;
     BEGIN
       ServOrderRec.GET("Service Order No.");
       IF NOT ServContractRec.GET("Service Contract No.") THEN ServContractRec.INIT;
 
       FindCostPrice(LTypeArtOpt);  //db, 28-12-09: M16871
+      lvPriceFactor := 1;          // 160621 ITERO.AC RFC082 Just to make code similar to Project Cost Plus Entry
       "Basic Price (LCY)" := "Cost Price (LCY)";
       CalculateBasicPriceFromLCY; // dp00116.n
-      "Basic Price Found at" := FIELDCAPTION("Cost Price (LCY)");
+      //>> 160621 ITERO.AC RFC082 Check for Cost Price Behaviour, Price factors and Price List Surcharges
+      IF lvPriceFactor <> 1 THEN
+        "Basic Price Found at" := Text11128002
+      ELSE
+        "Basic Price Found at" := FIELDCAPTION("Cost Price (LCY)");
 
-      FindSalesPrice;  //db, 28-12-09: M16871
+      lvDoSalesPriceCalulation := TRUE;
+      lvPriceHistoryFound := FALSE;
+      lvGrossPrice := 0;
+
+      lvRefDate := ValidateCu.GetRefDateServOrder(ServOrderRec);
+
+      IF (LTypeArtOpt = LTypeArtOpt::"Trade Item") OR (LTypeArtOpt = LTypeArtOpt::Item) THEN BEGIN  // 160816 ITERO.AC Added price calculation for NAV Items
+        lvPriceHistoryFound := CheckIfPriceHistoryExists("Service Order No.", lvRefDate, "Trade Item", lvGrossPrice);
+
+        IF CheckCostPriceBehaviour("Service Order No.", "Customer No.") THEN BEGIN
+          IF lvPriceHistoryFound THEN BEGIN
+            "Gross Price (LCY)" := lvGrossPrice;
+            "Basic Price Found at" := Text010;
+          END
+          ELSE BEGIN
+            "Cost Price Adjustment" := (lvPriceFactor - 1) * 100;
+            "Gross Price (LCY)" := "Cost Price" * lvPriceFactor;
+            "Basic Price (LCY)" := "Gross Price (LCY)";
+          END;
+        END
+        ELSE BEGIN
+          IF lvPriceHistoryFound THEN BEGIN
+            "Basic Price Found at" := Text010;
+          END
+          ELSE BEGIN
+            lvSurchargeIfMissingArticles := GetSurchargeIfMissingArticles("Service Order No.");
+            IF lvSurchargeIfMissingArticles <> 1 THEN BEGIN
+              "Cost Price Adjustment" := (lvSurchargeIfMissingArticles - 1) * 100;
+              //VALIDATE("Gross Price", "Cost Price" * lvSurchargeIfMissingArticles);   // 160324 ITERO.AC RFC083 Do not use Validate (will lead to wrong Cost Price)
+              "Gross Price (LCY)" := "Cost Price" * lvSurchargeIfMissingArticles;
+              VALIDATE("Sales Discount % (Item)", 0);
+              "Basic Price Found at" := Text11128001;
+              lvDoSalesPriceCalulation := FALSE;
+            END
+            ELSE BEGIN
+              "Basic Price Found at" := Text11128003;
+            END;
+            //>> 161012 ITERO.AC RAD043 Get Sales price if Item not found in Customer pricelist or in Vendor Price List
+            // Warehouse Items with no sales price.. NOTE: We do not handle different Currencies in Sales Prices. All prices are calculated in LCY !
+            IF (LTypeArtOpt = LTypeArtOpt::Item) AND ("Item No." <> '') AND ("Trade Item" = '') AND (lvPriceHistoryFound = FALSE) THEN BEGIN
+              lvItemSalesPrice.SETRANGE( "Item No.", "Item No.");
+              lvItemSalesPrice.SETRANGE("Starting Date", 0D, lvRefDate);
+              IF lvItemSalesPrice.FINDLAST THEN BEGIN
+                "Gross Price (LCY)" := CalculatePriceWithoutVAT("Item No.", lvItemSalesPrice."Price Includes VAT", lvItemSalesPrice."Unit Price");
+                "Price History Found" := TRUE;
+                VALIDATE("Sales Discount % (Item)", 0);
+                "Basic Price Found at" := Text11128004;   // Sales Price Warehouse Item
+                lvDoSalesPriceCalulation := FALSE;
+              END ELSE BEGIN
+                "Basic Price Found at" := Text11128005;   // Price Warehouse Item
+              END;
+            END;
+            //<< 161012 ITERO.AC RAD043
+          END;
+        END;
+      END;
+
+      IF lvDoSalesPriceCalulation THEN BEGIN
+        "Price History Found" := lvPriceHistoryFound;
+      //<< 160621 ITERO.AC RFC082
+        FindSalesPrice;  //db, 28-12-09: M16871
+      END;
+
       VALIDATE("Surcharge %", GetSurcharge);
       GetDiscountPerc;
 
@@ -1358,6 +1473,10 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
         "Cost Price (LCY)" := lvSaveCostPrice;
       //<< 150905 ITERO.AC
 
+      //>> 160621 ITERO.AC RFC082 If not FindSalesPrice calculation is executed or article not found in customer price list, this value will remain as an information
+      "Price History Vendor No." := ValidateCu.GetPriceHistVendorNo();
+      //<< 160621 ITERO.AC RFC082
+
       //call T000440.sn
       IF CostObjectFixed AND (ServiceOrderCostPlusEntry."Cost Object" <> '') THEN BEGIN
         "Cost Object" := ServiceOrderCostPlusEntry."Cost Object";
@@ -1388,6 +1507,7 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
       lvRefPrio@1100525000 : Code[10];
       lvDiscType@1100525004 : 'Purchase,Sales';
       lvCustPriceListFromPrio@1100285000 : Code[20];
+      lvTempPriceHistVendor@1100525005 : Code[20];
     BEGIN
       //db, 28-12-09: M16871
       IF NOT CustRec.GET("Bill-to Customer No.") THEN CustRec.INIT;   //db, 08-12-10: M23704
@@ -1410,6 +1530,14 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
           Manufacturer, "Vendor (Trade Item)", "Basic Price (LCY)", "Sales Discount % (Item)", "Gross Price (LCY)", lvRefDate, '',
           lvDiscRef1, lvDiscRef2, lvRefPrio);
         //>> 150905 ITERO.AC Search for alternative Customer Price List
+        //>> 161010 ITERO.AC RAD043 Use new field "Sales Discount Term Percent" if entered and Curent Trade Item exists in Customer price list
+        IF ValidateCu.GetPriceHistFound() THEN BEGIN
+          IF ServOrderRec."Sales Discount Term Percent" <> 0 THEN BEGIN
+            "Basic Price (LCY)" := "Gross Price (LCY)" - ("Gross Price (LCY)" * ServOrderRec."Sales Discount Term Percent" / 100);
+            "Sales Discount % (Item)" := ServOrderRec."Sales Discount Term Percent";
+          END;
+        END;
+        //<< 161010 ITERO.AC RAD043
         IF NOT ValidateCu.GetPriceHistFound() THEN BEGIN
           lvCustPriceListFromPrio := GetCustPriceListFromPriority("Trade Item", lvRefDate, lvDiscRef1);
           IF lvCustPriceListFromPrio <> '' THEN BEGIN
@@ -1417,12 +1545,25 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
             ValidateCu.GetSalesDiscount(CustRec."No.", "Item No.", "Basic Item", "Trade Item",
               Manufacturer, "Vendor (Trade Item)", "Basic Price (LCY)", "Sales Discount % (Item)", "Gross Price (LCY)", lvRefDate, '',
               lvDiscRef1, lvDiscRef2, lvRefPrio);
+              //>> 161010 ITERO.AC RAD043 Use new filed "Sales Discount Term Percent" if entered
+              IF ServOrderRec."Sales Discount Term Percent" <> 0 THEN BEGIN
+                "Basic Price (LCY)" := "Gross Price (LCY)" - ("Gross Price (LCY)" * ServOrderRec."Sales Discount Term Percent" / 100);
+                "Sales Discount % (Item)" := ServOrderRec."Sales Discount Term Percent";
+              END
+              //>> 161010 ITERO.AC RAD043
           END;
         END;
         //<< 150905 ITERO.AC
         "Price History Found" := ValidateCu.GetPriceHistFound();
-        "Price History Vendor No." := ValidateCu.GetPriceHistVendorNo();
+        //>> 160621 ITERO.AC RFC082 Do not replace "Price History Vendor No." with blank
+        lvTempPriceHistVendor := ValidateCu.GetPriceHistVendorNo();
+        IF lvTempPriceHistVendor <> '' THEN
+          "Price History Vendor No." := lvTempPriceHistVendor;
+        //"Price History Vendor No." := ValidateCu.GetPriceHistVendorNo();
+        //<< 160621 ITERO.AC RFC082
+
         "Gross Price (LCY)" :=  ValidateCu.GetLatestCustGrossPrice();
+        CalculateGrossPriceFromLCY; // 160622 ITERO.AC RFC082
         IF ("Price History Found") AND (UseManualPriceList = '')  THEN BEGIN
           IF lvCustPriceListFromPrio = '' THEN
             "Price History PriceList" := ServOrderRec."Price List Code"
@@ -3013,6 +3154,12 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
       HistCostPriceItem@1210190002 : Boolean;
       HistCostPriceCostObject@1210190001 : Boolean;
       UOMMgt@1210190003 : Codeunit 5402;
+      lvServiceOrderExtension@1100525004 : Record 11071727;
+      lvSurchargeIfMissingArticles@1100525000 : Decimal;
+      lvPriceHistoryFound@1100525001 : Boolean;
+      lvPriceFactor@1100525002 : Decimal;
+      lvGrossPrice@1100525003 : Decimal;
+      lvSkipCalcInventoryPrice@1100525005 : Boolean;
     BEGIN
       //db, 10-01-11: M22696 (removed from report 11012801)
       ServSetup.GET;  //db, 10-01-11
@@ -3033,6 +3180,10 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
         CostPlusRec.VALIDATE("Service Order No.", "Service Order No.");
         CostPlusRec."Line No." := LastEntryNo + 10000;
         CostPlusRec.INSERT(TRUE);
+
+        //>> 160609 ITERO.SB Set CurrFieldNo to zero when generate cost plus entries, to get correct value in GetDescription function.
+        CostPlusRec.SetCurrFieldNoToZero();
+        //<<
 
         //C024844.sn
         IF NOT TradeItemRec.GET("Vendor (Trade Item)", "Trade Item") THEN BEGIN
@@ -3102,6 +3253,12 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
         CostPlusRec.Manufacturer := Manufacturer;
         CostPlusRec."Vendor (Trade Item)" := "Vendor (Trade Item)";
 
+        //>> 160621 ITERO.AC RFC082 Price Factor for current Cost Type. Just added to make code similar to Project Cost Plus Entry::GenerateCostPlusFromProjEntry
+        CostPlusRec.CALCFIELDS("Cost Type");
+        lvPriceFactor := 1;   // Possible to implement function for price factor ( if new fields are added in Servide Order Extension similar to fields in Project Principal added in RFC082 )
+        CostPlusRec."Cost Price Adjustment" := (lvPriceFactor - 1) * 100;
+        //<< 160621 ITERO.AC RFC082
+
         CostPlusRec.GetBasicPrice;
 
         IF "Basic Item" <> '' THEN BEGIN
@@ -3115,7 +3272,46 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
         CostPlusRec.TESTFIELD("Bill-to Customer No."); //mg, 15-04-13: C006949
         CustRec.GET(CostPlusRec."Bill-to Customer No.");  //db, 18-07-06: check option GrossMin by customer instead common setup
         IF CostPlusRec.CheckItemLine THEN BEGIN
-          IF (CostPlusRec."Basic Price (LCY)" = 0) OR (HistCostPriceItem = TRUE) THEN BEGIN  //db, 17-09-09: M14148+16524
+          //>> 160621 ITERO.AC RFC082 (Similar to changes made by LAHE 130117 and by AC in Project Cost Plus Entry)
+          //IF (CostPlusRec."Basic Price (LCY)" = 0) OR (HistCostPriceItem = TRUE) THEN BEGIN  //db, 17-09-09: M14148+16524
+          IF NOT CostPlusRec.UseCostPrice(CustRec) THEN BEGIN
+            CostPlusRec."Cost Price (LCY)" := lvCostPrice;  //db, 08-08-11
+            CostPlusRec.CalculateCostPriceFromLCY;
+            CostPlusRec."Basic Price Found at" := TABLECAPTION;
+          END ELSE BEGIN
+            IF lvServiceOrderExtension.GET("Service Order No.") THEN BEGIN
+              IF (lvServiceOrderExtension."Item Price Cost Plus Entry" = lvServiceOrderExtension."Item Price Cost Plus Entry"::CostPrice) THEN BEGIN
+                IF CostPlusRec."Price History Found" THEN BEGIN
+                  CostPlusRec."Cost Price Adjustment" := 0;
+                END ELSE BEGIN
+                  lvSkipCalcInventoryPrice := TRUE;   // 160816 ITERO.AC Added control variable to avoid inventory price calculation
+                  CostPlusRec."Basic Price (LCY)" := lvCostPrice * lvPriceFactor;
+                  CostPlusRec."Gross Price (LCY)" := lvCostPrice * lvPriceFactor;
+                  CostPlusRec.CalculateBasicPriceFromLCY;
+                  CostPlusRec.CalculateGrossPriceFromLCY;
+                  IF lvPriceFactor <> 1 THEN
+                    CostPlusRec."Basic Price Found at" := Text11128002
+                  ELSE
+                    CostPlusRec."Basic Price Found at" := TABLECAPTION;
+                END;
+              END ELSE BEGIN
+                lvGrossPrice := 0;
+                lvPriceHistoryFound := CheckIfPriceHistoryExists(CostPlusRec."Service Order No.", ServOrderRec."Reference Date (Item)", CostPlusRec."Trade Item", lvGrossPrice);
+                IF NOT lvPriceHistoryFound THEN BEGIN
+                  lvSurchargeIfMissingArticles := GetSurchargeIfMissingArticles(CostPlusRec."Service Order No.");
+                  IF lvSurchargeIfMissingArticles <> 1 THEN BEGIN
+                    CostPlusRec."Cost Price Adjustment" := (lvSurchargeIfMissingArticles - 1) * 100;
+                    CostPlusRec."Basic Price (LCY)" := lvCostPrice * lvSurchargeIfMissingArticles;
+                    CostPlusRec."Gross Price (LCY)" := lvCostPrice * lvSurchargeIfMissingArticles;
+                    CostPlusRec.CalculateBasicPriceFromLCY;
+                    CostPlusRec.CalculateGrossPriceFromLCY;
+                    CostPlusRec."Sales Discount % (Item)" :=0;
+                    CostPlusRec."Basic Price Found at" := Text11128001;
+                  END;
+                END;
+              END;
+            END;
+            //<< 160621 ITERO.AC RFC082
             CostPlusRec."Cost Price (LCY)" := lvCostPrice;  //db, 08-08-11
             CostPlusRec.CalculateCostPriceFromLCY;  // dp00116.n
             //mg.sc, 15-03-12: M33991
@@ -3139,7 +3335,10 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
                          (UPPERCASE(TradeItemRec."Packaging Unit") <> "Unit of Measure Code"));  //db,13-06-08: M10310
           IF (lvMissUnit = FALSE) AND
              ((TradeItemRec."Removal Contribution" <> 0) OR
-              CostPlusRec.ItemPriceCPEisGrossMin(CustRec)) THEN BEGIN
+              //>> 160621 ITERO.AC RFC082 (same as LAHE 130117 in Project Cost Plus Entry)
+              // CostPlusRec.ItemPriceCPEisGrossMin(CustRec)) THEN BEGIN
+              (NOT UseCostPrice(CustRec))) THEN BEGIN
+              //<< 160621 ITERO.AC RFC082
             CostPlusRec.VALIDATE("Trade Item", "Trade Item");
             lvCostPrice := CostPlusRec."Cost Price (LCY)";
             //db, 19-02-16: C028749 (disable 32761)
@@ -3191,7 +3390,7 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
               //mg.ec, 15-03-12: M33991
             END;
           END ELSE BEGIN
-            IF "Item No." <> '' THEN BEGIN
+            IF ("Item No." <> '') AND NOT (lvSkipCalcInventoryPrice) THEN BEGIN    // 160816 ITERO.AC Added control variable to avoid Inventory price calculation
               IF ItemRec.GET("Item No.") THEN BEGIN
                 //db.sn, 06-09-11: M22696
                 IF ConvertUnit = TRUE THEN BEGIN
@@ -3251,6 +3450,33 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
         IF NOT CostPlusRec.CheckItemLine AND (CostPlusRec."Basic Price (LCY)" = 0) THEN
           CostPlusRec.GetBasicPrice;
 
+        //>>160621 ITERO.AC RFC082 Add Customer Price List Surcharge if no "Trade Item" or "Item No."
+        IF NOT CostPlusRec.CheckItemLine AND (CostPlusRec."Basic Price (LCY)" = 0) THEN BEGIN
+          //CostPlusRec.GetBasicPrice;
+          IF CheckCostPriceBehaviour("Service Order No.", "Customer No.") THEN BEGIN
+            CostPlusRec."Gross Price (LCY)" := lvCostPrice * lvPriceFactor;
+            CostPlusRec."Basic Price (LCY)" := lvCostPrice * lvPriceFactor;
+            CostPlusRec.CalculateGrossPriceFromLCY;
+            CostPlusRec.CalculateBasicPriceFromLCY;
+          END
+          ELSE BEGIN
+            lvSurchargeIfMissingArticles := GetSurchargeIfMissingArticles("Service Order No.");
+            IF lvSurchargeIfMissingArticles <> 1 THEN BEGIN
+              IF lvCostPrice <> 0 THEN BEGIN
+                CostPlusRec."Cost Price Adjustment" := (lvSurchargeIfMissingArticles - 1) * 100;
+                CostPlusRec.VALIDATE("Basic Price (LCY)", lvCostPrice * lvSurchargeIfMissingArticles);
+                CostPlusRec."Cost Price (LCY)" := lvCostPrice;
+                CostPlusRec."Basic Price Found at" := Text11128001;
+              END;
+            END;
+          END;
+        END;
+
+        // Alter text if Cost Price and we have got a CostPriceSurcharge from current Projcet Principal
+        IF (CostPlusRec."Basic Price Found at" = CostPlusRec.FIELDCAPTION("Cost Price")) AND (lvPriceFactor <> 1) THEN
+          CostPlusRec."Basic Price Found at" := Text11128002;
+        //<< 160621 ITERO.AC RFC082
+
         //validate item-data disturbes quantity/unit: evaluate function CheckItemUnitConversion
         IF lvMissUnit = FALSE THEN  //db,13-06-08: M10310
           IF ConvertUnit = FALSE THEN  //db, 13-06-08: M10185
@@ -3264,7 +3490,10 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
         CostPlusRec."Sales Price (LCY)" := CostPlusRec."Basic Price (LCY)" * (1 + CostPlusRec."Surcharge %"/100);
         //>> 160222 ITERO.SB Calculate sales price
         CostPlusRec.CalculateSalesPriceFromLCY;
-        //<<
+        //<< 160222 ITERO.SB
+        //>> 160621 ITERO.AC RFC082 / IME477 (This value is used to calculate net price in Invoices)
+        CostPlusRec."Surcharge Amount" := CostPlusRec."Sales Price" - CostPlusRec."Basic Price";
+        //<< 160621 ITERO.AC
         IF "Sales Price Purch. Order" <> 0 THEN BEGIN
           CostPlusRec.VALIDATE("Sales Price (LCY)", "Sales Price Purch. Order");
           CostPlusRec."Basic Price Found at" := FIELDCAPTION("Sales Price Purch. Order");
@@ -3941,13 +4170,24 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
     END;
 
     PROCEDURE UseCostPrice@1100285000(_customer@1100285000 : Record 18) : Boolean;
+    VAR
+      lvServiceOrderExtension@1100525000 : Record 11071727;
     BEGIN
-      //>> ITERO.AC 150807
-      IF (ServOrderRec."Price List Code" <> '' ) OR (UseManualPriceList <> '') THEN BEGIN
-        EXIT((_customer."Item Price Cost Plus Project" = _customer."Item Price Cost Plus Project"::CostPrice));
-      END ELSE BEGIN
-        EXIT(TRUE);
+      //>> 160621 ITERO.AC RCF082 Rewrite of logic in order to make it similar to Project Cost Plus Entry
+      IF NOT lvServiceOrderExtension.GET(ServOrderRec."No.") THEN BEGIN
+        CLEAR(lvServiceOrderExtension);
+        EXIT(FALSE);
       END;
+      //IF (ServOrderRec."Price List Code" <> '' ) OR (UseManualPriceList <> '') THEN BEGIN
+      //>> 161016 ITERO.AC RAD043-1 Adjustment, Do not read from Customer settings !!
+      //EXIT((_customer."Item Price Cost Plus Project" = _customer."Item Price Cost Plus Project"::CostPrice)
+      //  OR ((lvServiceOrderExtension."Item Price Cost Plus Entry" = lvServiceOrderExtension."Item Price Cost Plus Entry"::CostPrice) AND NOT "Price History Found"));
+      EXIT(((lvServiceOrderExtension."Item Price Cost Plus Entry" = lvServiceOrderExtension."Item Price Cost Plus Entry"::CostPrice) AND NOT "Price History Found"));
+      //<< 161016 ITERO.AC RAD043-1
+      //END ELSE BEGIN
+      //  EXIT(TRUE);
+      //END;
+      //<< 160621 ITERO.AC RCF082
     END;
 
     PROCEDURE SetManualPriceList@1100285001(_UseManualPl@1100285000 : Code[20]);
@@ -3961,7 +4201,7 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
       lvCustPlPriority@1100285001 : Record 11128278;
       lvPriceHistRec@1100285002 : Record 11012315;
     BEGIN
-      // ITERO.AC 150905. This function tries to find an alternative Trade Item Vendor by a loop through the table "Customer Price List priority"
+      // 150905 ITERO.AC This function tries to find an alternative Trade Item Vendor by a loop through the table "Customer Price List priority"
       // and for each alternative price list: search if current article code exists in "Price History Trade Item"
 
       CLEAR(lvCustPlPriority);
@@ -3985,6 +4225,115 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
       END;
 
       EXIT('');
+    END;
+
+    PROCEDURE SetCurrFieldNoToZero@1100285300();
+    BEGIN
+      //>> 160609 ITERO.SB Set CurrFieldNo to zero when generate cost plus entries, to get correct value in GetDescription function.
+      CurrFieldNo:=0;
+      //<<
+    END;
+
+    PROCEDURE CheckCostPriceBehaviour@1100528011(pServiceOrderNo@1100525000 : Code[20];pCustomerNo@1100525001 : Code[20]) : Boolean;
+    VAR
+      lvCustomer@1100525002 : Record 18;
+      lvServiceOrderExtension@1100525003 : Record 11071727;
+    BEGIN
+      // 160621 ITERO.AC RFC082 New function used to determine if Cost Price Behaviour should be used
+
+      IF NOT lvCustomer.GET(pCustomerNo) THEN
+        CLEAR(lvCustomer);
+      IF NOT lvServiceOrderExtension.GET(pServiceOrderNo) THEN
+        CLEAR(lvServiceOrderExtension);
+      EXIT((lvCustomer."Item Price Cost Plus Service" = lvCustomer."Item Price Cost Plus Service"::CostPrice)
+        OR (lvServiceOrderExtension."Item Price Cost Plus Entry" = lvServiceOrderExtension."Item Price Cost Plus Entry"::CostPrice));
+    END;
+
+    PROCEDURE CheckIfPriceHistoryExists@1100528013(pServiceOrderNo@1100525000 : Code[20];pReferenceDate@1100525001 : Date;pItemCode@1100525002 : Code[20];VAR pGrossPrice@1100525003 : Decimal) : Boolean;
+    VAR
+      lvPriceHistRec@1100525004 : Record 11012315;
+      lvServiceOrderRec@1100525005 : Record 11012823;
+      lvPriceListCode@1100525006 : Code[20];
+      lvDiscRef@1100525007 : Code[20];
+    BEGIN
+      // 160621 ITERO.AC RFC082 New function used to Determine if "Price History Trade Item" exists for Current Customer PriceList And Current Trade Item Code
+      IF NOT lvServiceOrderRec.GET(pServiceOrderNo) THEN CLEAR(lvServiceOrderRec);
+      pGrossPrice := 0;
+
+      IF lvServiceOrderRec."Price List Code" <> '' THEN BEGIN
+        lvPriceHistRec.SETCURRENTKEY("Item Code", "Starting Date", "Price List Code");
+        lvPriceHistRec.SETRANGE("Item Code", pItemCode);
+        lvPriceHistRec.SETRANGE("Starting Date", 0D, pReferenceDate);
+        lvPriceHistRec.SETRANGE("Price List Code", lvServiceOrderRec."Price List Code");
+
+        IF lvPriceHistRec.FINDLAST THEN BEGIN
+          pGrossPrice := lvPriceHistRec."Gross Price";
+          EXIT(TRUE);
+        END ELSE BEGIN
+          // If Trade Item was not found, check for Customer Price List priority
+          lvPriceListCode := GetCustPriceListFromPriority(pItemCode, pReferenceDate, lvDiscRef);
+          IF lvPriceListCode <> '' THEN BEGIN
+            lvPriceHistRec.SETRANGE("Price List Code", lvPriceListCode);
+            IF lvPriceHistRec.FINDLAST THEN BEGIN
+              pGrossPrice := lvPriceHistRec."Gross Price";
+              EXIT(TRUE);
+            END;
+          END;
+        END;
+      END;
+
+      EXIT(FALSE);
+    END;
+
+    PROCEDURE GetSurchargeIfMissingArticles@1100525016(pServiceOrderNo@1100525000 : Code[20]) : Decimal;
+    VAR
+      lvCustPriceList@1100525001 : Record 11128273;
+      lvServiceOrderRec@1100525002 : Record 11012823;
+    BEGIN
+      // 160621 ITERO.AC RFC082 Get new Surcharge value from current Customer Price List as a factor
+      // Return 1 if there is no customer price list is selected or it doesnt exist
+
+      IF NOT lvServiceOrderRec.GET(pServiceOrderNo) THEN CLEAR(lvServiceOrderRec);
+      IF lvServiceOrderRec."Price List Code" <> '' THEN BEGIN
+        IF lvCustPriceList.GET(lvServiceOrderRec."Price List Code") THEN
+          EXIT(1 + (lvCustPriceList.SurchargeIfMissingArticles / 100))
+        ELSE
+          EXIT(1);
+      END;
+
+      EXIT(1);
+    END;
+
+    LOCAL PROCEDURE CalculatePriceWithoutVAT@1100528012(pItemCode@1100525002 : Code[10];pPriceIncludesVAT@1100525003 : Boolean;pUnitPrice@1100525001 : Integer) : Decimal;
+    VAR
+      lvItemRec@1100525004 : Record 27;
+      lvInvetSetupRec@1100525005 : Record 313;
+      lvVATPostingSetupRec@1100525007 : Record 325;
+      lvVATProdPostingGroup@1100525006 : Code[10];
+      lvVATBusPostingGroup@1100525008 : Code[10];
+      lvRetVal@1100525009 : Decimal;
+      lvVATPercent@1100525010 : Decimal;
+    BEGIN
+      // 161012 ITERO.AC RAD043 Calculate Item Sales Price excluding VAT amount
+
+      lvRetVal := pUnitPrice;
+
+      IF pPriceIncludesVAT THEN BEGIN
+        IF NOT lvInvetSetupRec.GET() THEN lvInvetSetupRec.INIT;
+        lvVATBusPostingGroup := lvInvetSetupRec."VAT Bus. Posting Group";
+
+        IF NOT lvItemRec.GET(pItemCode) THEN lvItemRec.INIT;
+        lvVATProdPostingGroup := lvItemRec."VAT Prod. Posting Group";
+
+        // Key: VAT Bus. Posting Group,VAT Prod. Posting Group
+        IF lvVATPostingSetupRec.GET(lvVATBusPostingGroup, lvVATProdPostingGroup) THEN BEGIN
+          lvVATPercent := lvVATPostingSetupRec."VAT %";
+          lvRetVal := pUnitPrice / (1 + lvVATPercent / 100);
+        END;
+
+      END;
+
+      EXIT(lvRetVal);
     END;
 
     PROCEDURE DuplicateLine@1100528605();
@@ -4056,6 +4405,14 @@ OBJECT Table 11012825 Service Order Cost Plus Entry
       151111 ITERO.PR New field: 11128273 Cost Price (LCY) Total sj„lvkostnad
       160116 ITERO.AC Set variable DontUseSingleGTIN in CodeUnit ValidateItems to avoid mixup of GTIN Code in Item Relation (Same as IME420)
       160222 ITERO.SB Calculate sales price
+      160609 ITERO.SB Set CurrFieldNo to zero when generate cost plus entries, to get correct value in GetDescription function.
+      160620 ITERO.SB RAD-010 Mapping of description, wage component
+      160621 ITERO.AC RFC082 Handle calculation for Cost Price Behaviour / Apply Material Surcharge / Bug Fixes
+      160622 ITERO.AC RFC082 Bugfix
+      160816 ITERO.AC RFC082 Handle price calculation for NAV Items in ValidateItem() and GenerateCostPlusFromServEntry()
+      161010 ITERO.AC RAD043 New field "Sales Discount Percent" in Service Order (Use either Sales Discount Group or Sales Discount Percent or none)
+      161012 ITERO.AC RAD043 Handle Sales Prices from Item Card for Items without Item Relation (No trade item)
+      161016 ITERO.AC RAD043-1 Skip check in Customer table to decide CostPlusBehaviour
     }
     END.
   }

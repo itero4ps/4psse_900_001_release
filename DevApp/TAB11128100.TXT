@@ -521,6 +521,10 @@ OBJECT Table 11128100 Sales Price Budget Lines
                                                                 IF CheckItemLine THEN BEGIN
                                                                   IF ("Sales Discount % (Item)" <> 0) OR ("Basic Price Found at" = '') THEN
                                                                     "Basic Price Found at" := Text010;
+                                                                //>> 161013 ITERO.AC RAD043 Use same logic as in Service Order
+                                                                END ELSE BEGIN
+                                                                  "Basic Price Found at" := Text009;
+                                                                //<< 161013 ITERO.AC RAD043
                                                                 END;
                                                                 //<< 160324 ITERO.AC RFC082
                                                               END;
@@ -708,6 +712,8 @@ OBJECT Table 11128100 Sales Price Budget Lines
       Text11128003@1100409001 : TextConst 'ENU=Vendor Gross Price';
       "--ITERO--"@1100409005 : Integer;
       gvUseManualPriceList@1100409004 : Code[20];
+      Text11128004@1100525006 : TextConst 'ENU=Sales Price Warehouse Item';
+      Text11128005@1100525002 : TextConst 'ENU=Unit Price Warehouse Item';
 
     PROCEDURE GetSurcharge@1100485012() lvPerc : Decimal;
     VAR
@@ -1013,6 +1019,7 @@ OBJECT Table 11128100 Sales Price Budget Lines
       lvSurchargeIfMissingArticles@1100409002 : Decimal;
       lvPriceFactor@1100409001 : Decimal;
       lvGrossPrice@1100409000 : Decimal;
+      lvItemSalesPrice@1100525000 : Record 7002;
     BEGIN
       IF NOT CheckItemLine() THEN
         EXIT;
@@ -1041,7 +1048,7 @@ OBJECT Table 11128100 Sales Price Budget Lines
       lvPriceHistoryFound := FALSE;
       lvGrossPrice := 0;
 
-      IF LTypeArtOpt = LTypeArtOpt::"Trade Item" THEN BEGIN
+      IF (LTypeArtOpt = LTypeArtOpt::"Trade Item") OR (LTypeArtOpt = LTypeArtOpt::Item) THEN BEGIN  // 161013 ITERO.AC RAD043 Added price calculation for NAV Items
         lvPriceHistoryFound := CheckIfPriceHistoryExists("Project No.", "Reference Date", "Trade Item", lvGrossPrice);
 
         IF CheckCostPriceBehaviour("Project No.", Principal ) THEN BEGIN
@@ -1073,6 +1080,22 @@ OBJECT Table 11128100 Sales Price Budget Lines
             ELSE BEGIN
               "Basic Price Found at" := Text11128003;
             END;
+            //>> 161013 ITERO.AC RAD043 Get Sales price if Item not found in Customer pricelist or in Vendor Price List
+            // Warehouse Items with no sales price
+            IF (LTypeArtOpt = LTypeArtOpt::Item) AND ("Item No." <> '') AND ("Trade Item" = '') AND (lvPriceHistoryFound = FALSE) THEN BEGIN
+              lvItemSalesPrice.SETRANGE( "Item No.", "Item No.");
+              lvItemSalesPrice.SETRANGE("Starting Date", 0D, "Reference Date");
+              IF lvItemSalesPrice.FINDLAST THEN BEGIN
+                "Gross Price" := CalculatePriceWithoutVAT("Item No.", lvItemSalesPrice."Price Includes VAT", lvItemSalesPrice."Unit Price");
+                "Price History Found" := TRUE;
+                VALIDATE("Sales Discount % (Item)", 0);
+                "Basic Price Found at" := Text11128004;   // Sales Price Warehouse Item
+                lvDoSalesPriceCalulation := FALSE;
+              END ELSE BEGIN
+                "Basic Price Found at" := Text11128005;   // Price Warehouse Item
+              END;
+            END;
+            //<< 161013 ITERO.AC RAD043
           END;
         END;
       END;
@@ -1134,6 +1157,7 @@ OBJECT Table 11128100 Sales Price Budget Lines
       lvDiscRef2@1100525002 : Code[20];
       lvRefPrio@1100525001 : Code[10];
       lvDiscType@1100525000 : 'Purchase,Sales';
+      lvCustPriceListFromPrio@1100525005 : Code[20];
       lvTempPriceHistVendor@1100409000 : Code[20];
     BEGIN
       //db, 28-12-09: M16871
@@ -1156,6 +1180,30 @@ OBJECT Table 11128100 Sales Price Budget Lines
         ValidateCu.GetSalesDiscount(CustRec."No.", "Item No.", "Basic Item", "Trade Item",
         Manufacturer, "Vendor (Trade Item)", "Basic Price", "Sales Discount % (Item)", "Gross Price", "Reference Date", '',
           lvDiscRef1, lvDiscRef2, lvRefPrio);
+        //>> 161013 ITERO.AC * Search for alternative Customer Price List
+        //                   * RAD043 Use new field "Sales Discount Term Percent" if entered and Curent Trade Item exists in Customer price list
+        IF ValidateCu.GetPriceHistFound() THEN BEGIN
+          IF Job4PS."Sales Discount Term Percent" <> 0 THEN BEGIN
+            "Basic Price" := "Gross Price" - ("Gross Price" * Job4PS."Sales Discount Term Percent" / 100);
+            "Sales Discount % (Item)" := Job4PS."Sales Discount Term Percent";
+          END;
+        END;
+        // Check for alternative price list
+        IF NOT ValidateCu.GetPriceHistFound() THEN BEGIN
+          lvCustPriceListFromPrio := GetCustPriceListFromPriority("Trade Item", lvRefDate, lvDiscRef1);
+          IF lvCustPriceListFromPrio <> '' THEN BEGIN
+            ValidateCu.SetPriceListCode(lvCustPriceListFromPrio);
+            ValidateCu.GetSalesDiscount(CustRec."No.", "Item No.", "Basic Item", "Trade Item",
+              Manufacturer, "Vendor (Trade Item)", "Basic Price", "Sales Discount % (Item)", "Gross Price", "Reference Date", '',
+              lvDiscRef1, lvDiscRef2, lvRefPrio);
+              // Use new filed "Sales Discount Term Percent" if entered
+              IF Job4PS."Sales Discount Term Percent" <> 0 THEN BEGIN
+                "Basic Price" := "Gross Price" - ("Gross Price" * Job4PS."Sales Discount Term Percent" / 100);
+                "Sales Discount % (Item)" := Job4PS."Sales Discount Term Percent";
+              END
+          END;
+        END;
+        //<< 161013 ITERO.AC RAD043
 
         //>> 160324 ITERO.AC RFC082 (Same as IME-299 IME-355, RFC001-2 plus changes in RFC082)
         "Price History Found" := ValidateCu.GetPriceHistFound();
@@ -2351,6 +2399,37 @@ OBJECT Table 11128100 Sales Price Budget Lines
       END;
     END;
 
+    PROCEDURE GetCustPriceListFromPriority@1100285005(lvTradeItem@1100285000 : Code[20];lvRefDate@1100285003 : Date;VAR lvDiscRef1@1100285004 : Code[20]) : Code[20];
+    VAR
+      lvCustPlPriority@1100285001 : Record 11128278;
+      lvPriceHistRec@1100285002 : Record 11012315;
+    BEGIN
+      // 161011 ITERO.AC This function tries to find an alternative Trade Item Vendor by a loop through the table "Customer Price List priority"
+      // and for each alternative price list: search if current article code exists in "Price History Trade Item"
+
+      CLEAR(lvCustPlPriority);
+      lvCustPlPriority.SETCURRENTKEY(Priority,"Price List Code");
+
+      IF lvCustPlPriority.FINDSET THEN BEGIN
+        REPEAT
+
+          lvPriceHistRec.SETCURRENTKEY("Item Code", "Starting Date", "Price List Code");
+          lvPriceHistRec.SETRANGE("Item Code", lvTradeItem);
+          lvPriceHistRec.SETRANGE("Starting Date", 0D, lvRefDate);
+          lvPriceHistRec.SETRANGE("Price List Code", lvCustPlPriority."Price List Code");
+
+          IF lvPriceHistRec.FINDLAST THEN BEGIN
+            IF lvCustPlPriority."Sales Discount Term Group 1" <> '' THEN
+               lvDiscRef1 := lvCustPlPriority."Sales Discount Term Group 1";
+            EXIT(lvPriceHistRec."Price List Code");
+          END;
+
+        UNTIL lvCustPlPriority.NEXT=0;
+      END;
+
+      EXIT('');
+    END;
+
     PROCEDURE CheckCostPriceBehaviour@1100409005(pProjectNo@1100409001 : Code[20];pPrincipalNo@1100409002 : Code[20]) : Boolean;
     VAR
       lvProjPrincipal@1100290001 : Record 11012005;
@@ -2443,6 +2522,38 @@ OBJECT Table 11128100 Sales Price Budget Lines
       END;
     END;
 
+    LOCAL PROCEDURE CalculatePriceWithoutVAT@1100525012(pItemCode@1100525002 : Code[10];pPriceIncludesVAT@1100525003 : Boolean;pUnitPrice@1100525001 : Integer) : Decimal;
+    VAR
+      lvItemRec@1100525004 : Record 27;
+      lvInvetSetupRec@1100525005 : Record 313;
+      lvVATPostingSetupRec@1100525007 : Record 325;
+      lvVATProdPostingGroup@1100525006 : Code[10];
+      lvVATBusPostingGroup@1100525008 : Code[10];
+      lvRetVal@1100525009 : Decimal;
+      lvVATPercent@1100525010 : Decimal;
+    BEGIN
+      // 161012 ITERO.AC RAD043 Calculate Item Sales Price excluding VAT amount
+
+      lvRetVal := pUnitPrice;
+
+      IF pPriceIncludesVAT THEN BEGIN
+        IF NOT lvInvetSetupRec.GET() THEN lvInvetSetupRec.INIT;
+        lvVATBusPostingGroup := lvInvetSetupRec."VAT Bus. Posting Group";
+
+        IF NOT lvItemRec.GET(pItemCode) THEN lvItemRec.INIT;
+        lvVATProdPostingGroup := lvItemRec."VAT Prod. Posting Group";
+
+        // Key: VAT Bus. Posting Group,VAT Prod. Posting Group
+        IF lvVATPostingSetupRec.GET(lvVATBusPostingGroup, lvVATProdPostingGroup) THEN BEGIN
+          lvVATPercent := lvVATPostingSetupRec."VAT %";
+          lvRetVal := pUnitPrice / (1 + lvVATPercent / 100);
+        END;
+
+      END;
+
+      EXIT(lvRetVal);
+    END;
+
     BEGIN
     {
       4PS01 JD 13 maart 2007, melding 8332, Bij wijzigen regiemutaties waarschuwing op projectstatus >technisch gereed
@@ -2456,6 +2567,8 @@ OBJECT Table 11128100 Sales Price Budget Lines
       150323 IME321 ITERO.SB Apply material surcharge
       160324 ITERO.AC RFC082 Added same logic as in Project Cost Plus Entry (plus changes from IME-299 IME-355, RFC001-2 in ValidateItem, FindSalesPrice, FindCostPrice)
       160414 ITERO.AC RFC082 Added field Cost Price Adjustment and removed recalculation of Cost Price
+      161013 * ITERO.AC RAD043 New field "Sales Discount Percent" in Project/Job (Use either Sales Discount Group or Sales Discount Percent or none)
+             * ITERO.AC RAD043 Handle Sales Prices from Item Card for Items without Item Relation (No trade item)
     }
     END.
   }

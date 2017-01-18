@@ -1,0 +1,441 @@
+OBJECT Report 11128066 VP Feedback Nordea Corp. DA1
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=PE6.03.04 (12048863);
+  }
+  PROPERTIES
+  {
+    CaptionML=ENU=Report back from Nordea Corporate DA1;
+    ShowPrintStatus=No;
+    ProcessingOnly=Yes;
+    OnPreReport=BEGIN
+                  TxtFile.TEXTMODE := TRUE;
+                  ServerFileName := FileMgt.ServerTempFileName('');
+                  IF NOT UPLOAD(PEB008,'',PEB009,'',ServerFileName) THEN
+                    ERROR('');
+                  TxtFile.OPEN(ServerFileName);
+                END;
+
+    OnPostReport=VAR
+                   NoSeriesMgt@12047958 : Codeunit 396;
+                 BEGIN
+                   GetSetup;
+
+                   GenJnlBatch.GET(GenJournalLine."Journal Template Name",GenJournalLine."Journal Batch Name");
+                   DocumentNo := NoSeriesMgt.TryGetNextNo(GenJnlBatch."No. Series",WORKDATE);
+                   GenJnlTemplate.GET(GenJournalLine."Journal Template Name");
+
+                   Window.OPEN('@1@@@@@@@@@@@@@@@@@@@@@@@@@');
+                   WHILE TxtFile.LEN <> TxtFile.POS DO BEGIN
+                     Window.UPDATE(1,ROUND((TxtFile.POS/TxtFile.LEN*10000),1.0));
+                     TxtFile.READ(TxtLine);
+                     LineType := COPYSTR(TxtLine,1,4);
+                     CASE LineType OF
+                       'MH01':
+                         BEGIN // Opening Line
+                           IF COPYSTR(TxtLine,5,6) <> 'DEBADV' THEN
+                             ERROR(PEB010);
+                           IsDomesticEURPay := COPYSTR(TxtLine,48,3) = 'EUR';
+                           IsLocalCurrencyOnGLAccount := COPYSTR(TxtLine,66,3) = GeneralLedgerSetup."LCY Code";
+                           PostingDate := Txt2Date(TxtLine,37,8);
+                           IF BankAccountNo = '' THEN
+                             ERROR(PEB007);
+
+                           IF NOT IsLocalCurrencyOnGLAccount THEN BEGIN
+                             IF (AccountType <> AccountType::"Bank Account") THEN
+                               IF CONFIRM(PEB013,TRUE) THEN
+                                 ERROR('');
+                             IF BankAccount.GET(BankAccountNo) THEN BEGIN
+                               IF BankAccount."Currency Code" <> COPYSTR(TxtLine,66,3) THEN
+                                 IF CONFIRM(PEB014,TRUE,BankAccount."Currency Code",COPYSTR(TxtLine,66,3)) THEN
+                                   ERROR('');
+                             END;
+                           END;
+                         END;
+                       'DR00':
+                         BEGIN
+                           InsertVendorPayLines;
+
+                           IF IsDomesticEURPay AND (COPYSTR(TxtLine,75,1) <> 'I') THEN
+                             ERROR(PEB003);
+
+                           tGenLines."Line No." += 1;
+                           tGenLines.INIT;
+                           tGenLines."Document Type" := tGenLines."Document Type"::Invoice;
+                           tGenLines."Amount (LCY)" := Txt2Dec(TxtLine,23,13);
+                           tGenLines.Amount := tGenLines."Amount (LCY)";
+                           tGenLines."Currency Factor" := 1;
+                           IF IsDomesticEURPay THEN
+                             tGenLines."Currency Code" := 'EUR'
+                           ELSE
+                             tGenLines."Currency Code" := 'SEK';
+                           tGenLines.INSERT;
+                         END;
+                       'DR01':
+                         BEGIN
+                           tGenLines.Amount := Txt2Dec(TxtLine,23,13);
+                           tGenLines."Currency Code" := COPYSTR(TxtLine,45,3);
+                           tGenLines."Currency Factor" := tGenLines."Amount (LCY)" / tGenLines.Amount;
+                           tGenLines.MODIFY;
+                         END;
+                       'BA00':
+                         BEGIN
+                           tGenLines."Document No." := COPYSTR(TxtLine,39,20);
+                           tGenLines."Account Type" := GetAccountType(COPYSTR(TxtLine,39 - 7));
+                           tGenLines.MODIFY;
+                         END;
+                       'CNDB','CNKR':
+                         BEGIN
+                           tGenLines."Line No." += 1;
+                           IF LineType = 'CNDB' THEN
+                             tGenLines."Document Type" := tGenLines."Document Type"::Invoice
+                           ELSE
+                             tGenLines."Document Type" := tGenLines."Document Type"::"Credit Memo";
+
+                           tGenLines.Amount := Txt2Dec(TxtLine,40,13);
+                           tGenLines."Amount (LCY)" := tGenLines.Amount * tGenLines."Currency Factor";
+                           tGenLines."Document No." := COPYSTR(TxtLine,60,20);
+                           tGenLines."Account Type" := GetAccountType(COPYSTR(TxtLine,60 - 7));
+                           tGenLines.INSERT;
+                         END;
+                       'MT01':
+                         BEGIN // End line
+                           InsertVendorPayLines;
+
+                           InitGenJournal;
+                           GenJournalLine."Document Type" := GenJournalLine."Document Type"::Payment;
+                           GenJournalLine.VALIDATE("Posting Date",PostingDate);
+
+                           GenJournalLine.VALIDATE("Account Type",AccountType);
+                           GenJournalLine.VALIDATE("Account No.",BankAccountNo);
+                           GenJournalLine.VALIDATE(Amount,-Txt2Dec(TxtLine,12,15));
+
+                           GenJournalLine.INSERT;
+                         END;
+                     END;
+                   END;
+
+                   TxtFile.CLOSE;
+                   ERASE(ServerFileName);
+                 END;
+
+  }
+  DATASET
+  {
+  }
+  REQUESTPAGE
+  {
+    PROPERTIES
+    {
+      SaveValues=Yes;
+    }
+    CONTROLS
+    {
+      { 1900000001;0;Container;
+                  ContainerType=ContentArea }
+
+      { 1070009;1;Field     ;
+                  CaptionML=ENU=Account Type;
+                  OptionCaptionML=ENU=G/L Account,,,Bank Account;
+                  SourceExpr=AccountType;
+                  OnValidate=BEGIN
+                               CLEAR(BankAccountNo);
+                             END;
+                              }
+
+      { 1070006;1;Field     ;
+                  CaptionML=ENU=Account No;
+                  SourceExpr=BankAccountNo;
+                  OnValidate=BEGIN
+                               IF BankAccountNo = '' THEN
+                                 EXIT;
+                               CASE AccountType OF
+                                 AccountType::"G/L Account": GLAccount.GET(BankAccountNo);
+                                 AccountType::"Bank Account": BankAccount.GET(BankAccountNo);
+                               END;
+                             END;
+
+                  OnLookup=BEGIN
+                             CASE AccountType OF
+                               AccountType::"G/L Account":
+                                 BEGIN
+                                   IF PAGE.RUNMODAL(0,GLAccount) = ACTION::LookupOK THEN
+                                     BankAccountNo := GLAccount."No.";
+                                 END;
+                               AccountType::"Bank Account":
+                                 BEGIN
+                                   IF PAGE.RUNMODAL(0,BankAccount) = ACTION::LookupOK THEN
+                                     BankAccountNo := BankAccount."No.";
+                                 END;
+                             END;
+                           END;
+                            }
+
+    }
+  }
+  LABELS
+  {
+  }
+  CODE
+  {
+    VAR
+      TxtFile@1070017 : File;
+      TxtLine@1070016 : Text[1000];
+      GenJournalLine@1070015 : Record 81;
+      VendorLedgerEntry@1070013 : Record 25;
+      CustLedgerEntry@1100570002 : Record 21;
+      DocumentNo@12047965 : Code[30];
+      PostingDate@1070011 : Date;
+      LineType@1070010 : Code[10];
+      Window@1070008 : Dialog;
+      AccountType@1070003 : 'G/L Account,Customer,Vendor,Bank Account,Fixed Asset';
+      BankAccountNo@1070002 : Code[20];
+      GLAccount@1070001 : Record 15;
+      BankAccount@1070000 : Record 270;
+      PEB001@1070025 : TextConst 'ENU=File Name must not be blank';
+      PEB002@12047971 : TextConst 'ENU=Wrong Currency Code: %1 is in the file from the Bank';
+      PEB003@12047973 : TextConst 'ENU=It is a Domesic EUR payment but not a Domesic file';
+      PEB004@1070022 : TextConst 'ENU="Wrong reference. Doc. No.: "';
+      PEB005@1070021 : TextConst 'ENU=The Decimal Value "%1" is wrong.';
+      PEB006@12047961 : TextConst 'ENU=Wrong Amount: %1 is in the file from the Bank';
+      PEB007@1070019 : TextConst 'ENU=You must enter Account No.';
+      PEB008@1070027 : TextConst 'ENU=Import File Name';
+      PEB009@1070026 : TextConst 'ENU=Text Files|*.txt|All Files|*.*';
+      FileMgt@12047959 : Codeunit 419;
+      ServerFileName@12047958 : Text;
+      PEB010@12047962 : TextConst 'ENU=Wrong file type';
+      GenJnlTemplate@12047966 : Record 80;
+      GenJnlBatch@12047967 : Record 232;
+      VPMgt@12047968 : Codeunit 11128061;
+      IsLocalCurrencyOnGLAccount@12047969 : Boolean;
+      GeneralLedgerSetup@12047970 : Record 98;
+      tGenLines@12047964 : TEMPORARY Record 81;
+      SetupOK@12047960 : Boolean;
+      IsDomesticEURPay@12047972 : Boolean;
+      PEB012@12047974 : TextConst 'ENU=The Amount should be posted on a GL Account, not on a Bank Account\Abort';
+      PEB013@12047975 : TextConst 'ENU=The Amount should be posted on a Bank Account, not at a GL Account\Abort';
+      PEB014@12047976 : TextConst 'ENU=Bank Account Currency is %1, the file''s Currency is %2\Abort';
+      PEB015@1100570000 : TextConst 'ENU=%1 %2 is not supported';
+      PayToAccountType@1100570001 : ' ,Vendor,Customer';
+
+    PROCEDURE InitGenJournal@12047959();
+    BEGIN
+      GenJournalLine.INIT;
+      GenJournalLine."Line No." += 10000;
+
+      GenJournalLine."Source Code" := GenJnlTemplate."Source Code";
+      GenJournalLine."Reason Code" := GenJnlBatch."Reason Code";
+      GenJournalLine."Posting No. Series" := GenJnlBatch."Posting No. Series";
+      GenJournalLine."Document No." := DocumentNo;
+    END;
+
+    PROCEDURE SetGenJournal@1070011(InGenJournalLine@1070000 : Record 81);
+    BEGIN
+      GenJournalLine := InGenJournalLine;
+    END;
+
+    PROCEDURE VendorInvioceExists@1070012(InDocumentNo@1070001 : Code[20]) : Boolean;
+    BEGIN
+      VendorLedgerEntry.SETCURRENTKEY("Document No.");
+      VendorLedgerEntry.SETRANGE(Open,TRUE);
+      VendorLedgerEntry.SETRANGE("Document No.",InDocumentNo);
+      EXIT(VendorLedgerEntry.FIND('-'));
+    END;
+
+    PROCEDURE CustomerInvioceExists@1100570007(InDocumentNo@1070001 : Code[20]) : Boolean;
+    BEGIN
+      CustLedgerEntry.SETCURRENTKEY("Document No.");
+      CustLedgerEntry.SETRANGE(Open,TRUE);
+      CustLedgerEntry.SETRANGE("Document No.",InDocumentNo);
+      EXIT(CustLedgerEntry.FIND('-'));
+    END;
+
+    PROCEDURE VendorCreditMemoExists@1070015(InDocumentNo@1070001 : Code[20]) : Boolean;
+    BEGIN
+      VendorLedgerEntry.SETCURRENTKEY("Document No.");
+      VendorLedgerEntry.SETRANGE(Open,TRUE);
+      VendorLedgerEntry.SETRANGE("Document No.",InDocumentNo);
+      EXIT(VendorLedgerEntry.FIND('-'));
+    END;
+
+    PROCEDURE Txt2Date@1070010(InText@1070000 : Text[250];StartPos@1070005 : Integer;Length@1070004 : Integer) : Date;
+    BEGIN
+      InText := COPYSTR(InText,StartPos,Length);
+      EXIT(DMY2DATE(Txt2Int(InText,7,2),Txt2Int(InText,5,2),Txt2Int(InText,1,4)));
+    END;
+
+    PROCEDURE Txt2Int@1070001(InText@1070000 : Text[250];StartPos@1070001 : Integer;Length@1070002 : Integer) rOutInt : Integer;
+    BEGIN
+      IF NOT EVALUATE(rOutInt,COPYSTR(InText,StartPos,Length)) THEN
+        EXIT(0);
+    END;
+
+    PROCEDURE Txt2Dec@1070003(InText@1070002 : Text[250];StartPos@1070001 : Integer;Length@1070000 : Integer) rOutDec : Decimal;
+    BEGIN
+      IF NOT EVALUATE(rOutDec,COPYSTR(InText,StartPos,Length)) THEN
+        ERROR(PEB005,COPYSTR(InText,StartPos,Length));
+      rOutDec := rOutDec/100;
+    END;
+
+    PROCEDURE InsertVendorPayLines@12047958();
+    BEGIN
+      tGenLines.RESET;
+      IF tGenLines.COUNT > 1 THEN
+        tGenLines.SETFILTER("Line No.",'2..');
+
+      IF tGenLines.FINDSET THEN REPEAT
+        InitGenJournal;
+        GenJournalLine.VALIDATE("Posting Date",PostingDate);
+
+        // Invoice
+        IF tGenLines."Document Type" = tGenLines."Document Type"::Invoice THEN BEGIN
+          CASE PayToAccountType OF
+            PayToAccountType::Vendor:
+              BEGIN
+                IF VendorInvioceExists(tGenLines."Document No.") THEN BEGIN
+                  GenJournalLine.VALIDATE("Account Type",GenJournalLine."Account Type"::Vendor);
+                  GenJournalLine."Document Type" := GenJournalLine."Document Type"::Payment;
+                  GenJournalLine.VALIDATE("Account No.",VendorLedgerEntry."Vendor No.");
+
+                  VendorLedgerEntry.CALCFIELDS("Remaining Amount");
+                  IF (-VendorLedgerEntry."Remaining Amount" = tGenLines.Amount) AND (GetCurrencyCode(GenJournalLine."Currency Code") = tGenLines."Currency Code") THEN BEGIN
+                    GenJournalLine.VALIDATE(Amount,tGenLines.Amount);
+                    IF IsLocalCurrencyOnGLAccount THEN
+                      GenJournalLine.VALIDATE("Amount (LCY)",tGenLines."Amount (LCY)");
+
+                    GenJournalLine."Applies-to Doc. Type" := GenJournalLine."Applies-to Doc. Type"::Invoice;
+                    GenJournalLine."Applies-to Doc. No." := VendorLedgerEntry."Document No.";
+                    VPMgt.T81_GetDescription(GenJournalLine);
+                  END ELSE BEGIN
+                    IF GetCurrencyCode(GenJournalLine."Currency Code") <> tGenLines."Currency Code" THEN
+                      GenJournalLine .VALIDATE(Description, COPYSTR(STRSUBSTNO(PEB002,tGenLines."Currency Code"),1,50))
+                    ELSE
+                      GenJournalLine .VALIDATE(Description, COPYSTR(STRSUBSTNO(PEB006,tGenLines.Amount),1,50));
+                    GenJournalLine."Applies-to Doc. Type" := GenJournalLine."Applies-to Doc. Type"::Invoice;
+                    GenJournalLine."Applies-to Doc. No." := VendorLedgerEntry."Document No.";
+                  END;
+
+                END ELSE
+                  GenJournalLine.VALIDATE(Description, COPYSTR(PEB004 + ' ' + tGenLines."Document No.",1,50))
+              END;
+            PayToAccountType::Customer:
+              BEGIN
+                IF CustomerInvioceExists(tGenLines."Document No.") THEN BEGIN
+                  GenJournalLine.VALIDATE("Account Type",GenJournalLine."Account Type"::Customer);
+                  GenJournalLine."Document Type" := GenJournalLine."Document Type"::Refund;
+                  GenJournalLine.VALIDATE("Account No.",CustLedgerEntry."Customer No.");
+
+                  CustLedgerEntry.CALCFIELDS("Remaining Amount");
+                  IF (-CustLedgerEntry."Remaining Amount" = tGenLines.Amount) AND (GetCurrencyCode(GenJournalLine."Currency Code") = tGenLines."Currency Code") THEN BEGIN
+                    GenJournalLine.VALIDATE(Amount,tGenLines.Amount);
+                    IF IsLocalCurrencyOnGLAccount THEN
+                      GenJournalLine.VALIDATE("Amount (LCY)",tGenLines."Amount (LCY)");
+
+                    GenJournalLine."Applies-to Doc. Type" := GenJournalLine."Applies-to Doc. Type"::"Credit Memo";
+                    GenJournalLine."Applies-to Doc. No." := CustLedgerEntry."Document No.";
+                    VPMgt.T81_GetDescription(GenJournalLine);
+                  END ELSE BEGIN
+                    IF GetCurrencyCode(GenJournalLine."Currency Code") <> tGenLines."Currency Code" THEN
+                      GenJournalLine .VALIDATE(Description, COPYSTR(STRSUBSTNO(PEB002,tGenLines."Currency Code"),1,50))
+                    ELSE
+                      GenJournalLine .VALIDATE(Description, COPYSTR(STRSUBSTNO(PEB006,tGenLines.Amount),1,50));
+                    GenJournalLine."Applies-to Doc. Type" := GenJournalLine."Applies-to Doc. Type"::"Credit Memo";
+                    GenJournalLine."Applies-to Doc. No." := CustLedgerEntry."Document No.";
+                  END;
+
+                END ELSE
+                  GenJournalLine.VALIDATE(Description, COPYSTR(PEB004 + ' VKund: ' + tGenLines."Document No.",1,50))
+              END;
+            ELSE
+              ERROR(PEB015,'PayToAccountType',PayToAccountType);
+          END;
+        // Credit
+        END ELSE BEGIN
+          IF VendorCreditMemoExists(tGenLines."Document No.") THEN BEGIN
+            GenJournalLine.VALIDATE("Account Type",GenJournalLine."Account Type"::Vendor);
+            GenJournalLine."Document Type" := GenJournalLine."Document Type"::Refund;
+            GenJournalLine.VALIDATE("Account No.",VendorLedgerEntry."Vendor No.");
+
+            VendorLedgerEntry.CALCFIELDS("Remaining Amount");
+            IF (VendorLedgerEntry."Remaining Amount" = tGenLines.Amount) AND (GetCurrencyCode(GenJournalLine."Currency Code") = tGenLines."Currency Code") THEN BEGIN
+              GenJournalLine.VALIDATE(Amount,-tGenLines.Amount);
+              IF IsLocalCurrencyOnGLAccount THEN
+                GenJournalLine.VALIDATE("Amount (LCY)",-tGenLines."Amount (LCY)");
+
+              GenJournalLine."Applies-to Doc. Type" := GenJournalLine."Applies-to Doc. Type"::"Credit Memo";
+              GenJournalLine."Applies-to Doc. No." := VendorLedgerEntry."Document No.";
+              VPMgt.T81_GetDescription(GenJournalLine);
+            END ELSE BEGIN
+              IF GetCurrencyCode(GetCurrencyCode(GenJournalLine."Currency Code")) <> tGenLines."Currency Code" THEN
+                GenJournalLine .VALIDATE(Description, COPYSTR(STRSUBSTNO(PEB002,tGenLines."Currency Code"),1,50))
+              ELSE
+                GenJournalLine.VALIDATE(Description, COPYSTR(STRSUBSTNO(PEB006,-tGenLines.Amount),1,50));
+              GenJournalLine."Applies-to Doc. Type" := GenJournalLine."Applies-to Doc. Type"::"Credit Memo";
+              GenJournalLine."Applies-to Doc. No." := VendorLedgerEntry."Document No.";
+            END;
+          END ELSE
+            GenJournalLine.VALIDATE(Description, COPYSTR(PEB004 + ' ' + tGenLines."Document No.",1,50))
+        END;
+
+        GenJournalLine.INSERT;
+      UNTIL tGenLines.NEXT = 0;
+
+      CLEAR(tGenLines);
+      tGenLines.RESET;
+      tGenLines.DELETEALL;
+    END;
+
+    PROCEDURE GetCurrencyCode@12047960(pCurrencyCode@12047958 : Code[10]) : Code[10];
+    BEGIN
+      GetSetup;
+      IF pCurrencyCode = '' THEN
+        EXIT(GeneralLedgerSetup."LCY Code")
+      ELSE
+        EXIT(pCurrencyCode);
+    END;
+
+    PROCEDURE GetSetup@12047961();
+    BEGIN
+      IF SetupOK THEN
+        EXIT;
+      GeneralLedgerSetup.GET;
+      GeneralLedgerSetup.TESTFIELD("LCY Code");
+
+      SetupOK := TRUE;
+    END;
+
+    LOCAL PROCEDURE GetAccountType@1100570000(pDocumentNo@1100570000 : Text) : Integer;
+    BEGIN
+      CASE UPPERCASE(COPYSTR(pDocumentNo,1,6)) OF
+        UPPERCASE('Vernr:'):
+          BEGIN
+            PayToAccountType := PayToAccountType::Vendor;
+            EXIT(GenJournalLine."Account Type"::Vendor);
+          END;
+        UPPERCASE('VKund:'):
+          BEGIN
+            PayToAccountType := PayToAccountType::Customer;
+            EXIT(GenJournalLine."Account Type"::Customer);
+          END;
+        ELSE
+          ERROR(PEB015,GenJournalLine.FIELDCAPTION("Account Type"),pDocumentNo);
+      END;
+    END;
+
+    BEGIN
+    {
+      PEB *** Begin ***
+      PEB0091 Banking
+      PEB
+      PEB *** End ***
+    }
+    END.
+  }
+  RDLDATA
+  {
+  }
+}
+

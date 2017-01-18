@@ -1,0 +1,665 @@
+OBJECT Codeunit 11128069 VP File Nordea Corporate PO3
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=PE6.03 (12048866);
+  }
+  PROPERTIES
+  {
+    TableNo=11128079;
+    OnRun=VAR
+            GiroType@1100570003 : Record 11128061;
+            VPPackEntry@12047959 : Record 11128063;
+            tCurrency@12047960 : TEMPORARY Record 4;
+          BEGIN
+            CLEAR(gTotalAmountLCY);
+            CLEAR(gNoOfPayments);
+
+            gCompanyInfo.GET;
+            gCompanyInfo.TESTFIELD(Name);
+            gCompanyInfo.TESTFIELD("Phone No.");
+            gCompanyInfo.TESTFIELD("Registration No.");
+
+            GiroType.GET(Rec."Giro Type Code");
+            GiroType.TESTFIELD(Filename);
+            gToFile := GiroType.Filename;
+            GiroType.TESTFIELD("Plus Giro No.");
+
+            gPostGiroNo := gVPMnm.ClearText(GiroType."Plus Giro No.");
+
+            IF NOT gVPMnm.SumCheck10Control(gPostGiroNo) THEN
+              ERROR(STRSUBSTNO(BA004, GiroType.FIELDCAPTION("Plus Giro No."),GiroType.TABLECAPTION));
+
+            CheckPaymentRelation(Rec);
+
+            OpenFile;
+
+            gVPMnm.SetGiroType(GiroType);
+
+            // Check for Blank "Payment Relation"
+            VPPackEntry.RESET;
+            VPPackEntry.SETRANGE("Pack Entry No.","Entry No.");
+            VPPackEntry.SETRANGE("Payment Relation",VPPackEntry."Payment Relation"::" ");
+            IF VPPackEntry.FINDSET THEN
+              VPPackEntry.TESTFIELD("Payment Relation");
+
+            // Domestic
+            VPPackEntry.RESET;
+            VPPackEntry.SETRANGE("Pack Entry No.","Entry No.");
+            VPPackEntry.SETRANGE("Payment Relation",VPPackEntry."Payment Relation"::Domestic);
+            IF NOT VPPackEntry.ISEMPTY THEN BEGIN
+
+              // Check LCY Code SEK or EUR
+              gVPMnm.CheckSEKEURCurrency(Rec,'<>SEK&<>EUR');
+
+              // Get all invoices for Currency SEK
+              CreateFileDomestic(Rec,'SEK');
+
+              // Get all invoices for Currency EUR
+              CreateFileDomestic(Rec,'EUR');
+            END;
+
+            // Foreign
+
+            VPPackEntry.RESET;
+            VPPackEntry.SETRANGE("Pack Entry No.","Entry No.");
+            VPPackEntry.SETRANGE("Payment Relation",VPPackEntry."Payment Relation"::Foreign);
+            IF VPPackEntry.FINDSET THEN BEGIN
+              REPEAT
+                tCurrency.INIT;
+                tCurrency.Code := VPPackEntry."Payment from Currency Code";
+                IF tCurrency.INSERT THEN;
+              UNTIL VPPackEntry.NEXT = 0;
+
+              IF tCurrency.FINDSET THEN REPEAT
+                CreateFileForeign(Rec,tCurrency.Code);
+              UNTIL tCurrency.NEXT = 0;
+
+            END;
+            CloseFile(Rec);
+          END;
+
+  }
+  CODE
+  {
+    VAR
+      gFile@1100570021 : File;
+      gVPMnm@1100570002 : Codeunit 11128061;
+      BA001@1100570014 : TextConst 'ENU=Only 9 files per day can be sent to PG';
+      BA002@1100570020 : TextConst 'ENU=The length for %1 is %2 long, %3 characters are maximum';
+      BA003@1100570010 : TextConst 'ENU=%1 is not correct for %4 %2 %3.';
+      BA004@1100570017 : TextConst 'ENU=%1 is not correct in %2.';
+      BA005@1100570007 : TextConst 'ENU=For payment in EUR use Plus Giro No. not blank for Vendor %1';
+      BA006@1100570013 : TextConst 'ENU=%1 too long for %5 %2 %3, max %4 char.';
+      BA007@1100570012 : TextConst 'ENU=When %1 is used, it is not possible to make a Credit Memo, the problem is with Vendor %2 %3 and Document No. %4';
+      gTotalAmountLCY@1100570000 : Decimal;
+      gFromFile@1100570004 : Text;
+      gToFile@1100570006 : Text;
+      gPostGiroNo@1100570016 : Code[20];
+      BA008@12047958 : TextConst 'ENU=You can not send rows with negative amount in the file.\Merge debit and credit with features found in the journal.';
+      gCompanyInfo@12047960 : Record 79;
+      BA010@12047961 : TextConst 'ENU=%1 can oly be Check or Account';
+      BA011@12047962 : TextConst 'ENU=%1 must not be Blank for %4 %2 %3';
+      BA012@12047963 : TextConst 'ENU=%1 or %2 must be filled in for Vendor %3';
+      BA013@12047964 : TextConst 'ENU=Code for Bank of Sweden  is missing for %1 %2, Document No. %3 Vendor %4 %5';
+      gNoOfPayments@12047965 : Integer;
+      BA017@12047966 : TextConst 'ENU=All payments are not included in the file, check the currency';
+      BA018@12047959 : TextConst 'ENU=It is not allowed to merge payments for %2 Giro, Vendor %1';
+      BA019@12047967 : TextConst 'ENU=It is not allowed to merge payments for Bank Payment, Vendor %1';
+      BA020@12047968 : TextConst 'ENU=It is maximum allowed to merge %1 payments';
+      BA021@12047969 : TextConst 'ENU=It is not allowed to merge payments for Check Payment, Vendor %1';
+      BA022@12047970 : TextConst 'ENU=You can not send merged rows with zero amounts in the file of type overseas.';
+
+    PROCEDURE CreateFileDomestic@1070008(pPack@1070000 : Record 11128079;pCurrencyCode@1070007 : Code[10]);
+    VAR
+      PmtType@1070002 : Text[2];
+      PayByAccountNo@1070004 : Code[20];
+      PayClearingNo@12047959 : Code[5];
+      DueDate@1070005 : Date;
+      CreditMemoDueDate@1070006 : Date;
+      TotalAmount@1100570000 : Decimal;
+      NoOfPayments@1100570001 : Integer;
+      Vendor@1100570006 : Record 23;
+      Customer@1100570005 : Record 18;
+      Currency@1100570007 : Record 4;
+      VPPackEntry@1100570009 : Record 11128063;
+      VendBankAccount@1100570003 : Record 288;
+      CustBankAccount@1100570004 : Record 287;
+      AmountToPay@1100570012 : Decimal;
+      AmountToPayLCY@1100570013 : Decimal;
+      Pack2@1100570015 : Record 11128079;
+      ExternalDocumentNo@12047958 : Text;
+      tLedgerEntryPayment@12047960 : TEMPORARY Record 11128074;
+      tLedgerEntry@12047961 : TEMPORARY Record 11128074;
+      tBankAccount@1100570002 : TEMPORARY Record 288;
+      SourceTypeCaption@1100570008 : Text;
+      tPayerSource@1100570010 : TEMPORARY Record 23;
+    BEGIN
+      VPPackEntry.RESET;
+      VPPackEntry.SETRANGE("Pack Entry No.",pPack."Entry No.");
+      VPPackEntry.SETRANGE("Payment Relation",VPPackEntry."Payment Relation"::Domestic);
+      VPPackEntry.SETRANGE("Payment to Currency Code",pCurrencyCode);
+      IF NOT gVPMnm.GetPaymentEntries(VPPackEntry,tLedgerEntryPayment,tLedgerEntry,TRUE,TRUE) THEN
+        EXIT;
+
+      CLEAR(TotalAmount);
+      CLEAR(NoOfPayments);
+
+      WriteFile(80,'MH00' +
+        gVPMnm.BLK(8)+
+        gVPMnm.TFR(gVPMnm.ClearText(gCompanyInfo."Registration No."),10) +
+        gVPMnm.BLK(12)+
+        gVPMnm.TFR(gPostGiroNo,10)+
+        gVPMnm.TFR(pCurrencyCode,3)+
+        gVPMnm.BLK(6)+
+        gVPMnm.TFR(pCurrencyCode,3));
+
+      WITH tLedgerEntryPayment DO BEGIN
+        FINDFIRST;
+        REPEAT
+
+          CLEAR(PayClearingNo);
+          CLEAR(PayByAccountNo);
+
+          TESTFIELD(Open,TRUE);
+          CLEAR(tBankAccount);
+          CASE Type OF
+            Type::Vendor :
+              BEGIN
+                VendBankAccount.GET("No.","Bank Account Code");
+                tBankAccount.TRANSFERFIELDS(VendBankAccount);
+              END;
+            Type::Customer :
+              BEGIN
+                CustBankAccount.GET("No.","Bank Account Code");
+                tBankAccount.TRANSFERFIELDS(CustBankAccount);
+              END;
+          END;
+
+          CASE Type OF
+            Type::Vendor:
+              BEGIN
+                Vendor.GET("No.");
+                SourceTypeCaption := Vendor.TABLECAPTION;
+                tPayerSource.TRANSFERFIELDS(Vendor);
+              END;
+            Type::Customer:
+              BEGIN
+                Customer.GET("No.");
+                SourceTypeCaption := Customer.TABLECAPTION;
+                tPayerSource."No." := Customer."No.";
+                tPayerSource.Name := Customer.Name;
+                tPayerSource.Address := Customer.Address;
+                tPayerSource."Address 2" := Customer."Address 2";
+                tPayerSource."Post Code" := tPayerSource."Post Code";
+                tPayerSource.City := Customer.City;
+              END;
+          END;
+
+          IF "Remaining Amount" > 0  THEN
+            ERROR(BA008);
+
+          Currency.RESET;
+          IF Currency.FIND('-') THEN BEGIN
+            IF gVPMnm.IsEURCurr("Currency Code") THEN
+              IF tBankAccount."Plus Giro No." = '' THEN
+                ERROR(BA005,"No.");
+          END ELSE
+            TESTFIELD("Currency Code",'');
+          CLEAR(Currency);
+
+
+          IF tBankAccount."Plus Giro No." <> '' THEN BEGIN
+            PayByAccountNo := gVPMnm.ClearText(tBankAccount."Plus Giro No.");
+            IF PayByAccountNo = '' THEN
+              ERROR(BA003,tBankAccount.FIELDCAPTION("Plus Giro No."),tPayerSource."No.", tPayerSource.Name,SourceTypeCaption);
+            IF NOT gVPMnm.SumCheck10Control(PayByAccountNo) THEN
+              ERROR(BA003,tBankAccount.FIELDCAPTION("Plus Giro No."),tPayerSource."No.", tPayerSource.Name,SourceTypeCaption);
+            PmtType := '00'; // Plus Giro
+            ExternalDocumentNo := "External Document No.";
+          END ELSE BEGIN
+            IF (tBankAccount."Bank Giro No." = '') AND
+               (tBankAccount."Bank Account No." = '') THEN BEGIN
+              PmtType := '02'; // Utbetalnigskort
+              ExternalDocumentNo := '';
+            END ELSE BEGIN
+              IF tBankAccount."Bank Giro No." <> '' THEN BEGIN
+                PayByAccountNo := gVPMnm.ClearText(tBankAccount."Bank Giro No.");
+                IF PayByAccountNo = '' THEN
+                  ERROR(BA003,tBankAccount.FIELDCAPTION("Bank Giro No."),tPayerSource."No.", tPayerSource.Name,SourceTypeCaption);
+                IF NOT gVPMnm.SumCheck10Control(PayByAccountNo) THEN
+                  ERROR(BA003,tBankAccount.FIELDCAPTION("Bank Giro No."),tPayerSource."No.", tPayerSource.Name,SourceTypeCaption);
+                PmtType := '05';  // Bank Giro
+                ExternalDocumentNo := "External Document No.";
+              END ELSE BEGIN
+                PayClearingNo := gVPMnm.ClearText(tBankAccount."Bank Branch No.");
+                IF PayClearingNo = '' THEN
+                  ERROR(BA011,tBankAccount.FIELDCAPTION("Bank Branch No."),tPayerSource."No.",tPayerSource.Name,SourceTypeCaption);
+                IF STRLEN(PayClearingNo) > 5 THEN
+                  ERROR(BA006,tBankAccount.FIELDCAPTION("Bank Branch No."),tPayerSource."No.",tPayerSource.Name,5,SourceTypeCaption);
+                PayByAccountNo := gVPMnm.ClearText(tBankAccount."Bank Account No.");
+                IF PayByAccountNo = '' THEN
+                  ERROR(BA003,tBankAccount.FIELDCAPTION("Bank Account No."),tPayerSource."No.", tPayerSource.Name,SourceTypeCaption);
+                IF STRLEN(PayByAccountNo) > 11 THEN
+                  ERROR(BA006,tBankAccount.FIELDCAPTION("Bank Account No."),tPayerSource."No.",tPayerSource.Name,11,SourceTypeCaption);
+                PmtType := '09';  // Bank Account
+                ExternalDocumentNo := COPYSTR("External Document No.",1,12);
+              END;
+            END;
+          END;
+
+          IF "Due Date" < TODAY THEN BEGIN
+            DueDate := TODAY;
+            "Due Date" := TODAY;
+          END ELSE
+            DueDate := "Due Date";
+
+          AmountToPay := "Remaining Amount";
+          AmountToPayLCY := "Remaining Amt. (LCY)";
+
+          TotalAmount += AmountToPay;
+          gTotalAmountLCY += AmountToPayLCY;
+          NoOfPayments += 1;
+
+          IF "Merging No." <> 0 THEN
+            ExternalDocumentNo := '';
+
+          WriteFile(80,'PI00'+
+            gVPMnm.TFR(PmtType,2)+
+            gVPMnm.TFR(PayClearingNo,5)+
+            gVPMnm.TFR(PayByAccountNo,11)+
+            gVPMnm.BLK(2)+
+            gVPMnm.Date2Text(DueDate,8)+
+            gVPMnm.NFL(gVPMnm.Value100(AmountToPay,13),13)+
+            gVPMnm.TFR(ExternalDocumentNo,25));
+
+          IF "Merging No." = 0 THEN
+            WriteFile(80,'BA00'+
+              gVPMnm.BLK(27)+
+              gVPMnm.TFR(GetInternalRefText("Document No.",Type),35));
+
+          IF "Merging No." <> 0 THEN BEGIN
+            tLedgerEntry.RESET;
+            tLedgerEntry.SETRANGE("Merging No.","Merging No.");
+            IF tLedgerEntry.COUNT > 300  THEN
+              ERROR(BA020,300);
+
+            CASE PmtType OF
+              '02': ERROR(BA018,tPayerSource."No.",SourceTypeCaption);
+              '09': ERROR(BA019,tPayerSource."No.",SourceTypeCaption);
+            END;
+
+            // Invoice
+            tLedgerEntry.RESET;
+            tLedgerEntry.SETRANGE("Merging No.","Merging No.");
+            tLedgerEntry.SETFILTER("Remaining Amount",'<0');
+            tLedgerEntry.FINDSET;
+            REPEAT
+              WriteFile(80,'CNDB'+
+                gVPMnm.TFR(tLedgerEntry."External Document No.",35) +
+                gVPMnm.NFL(gVPMnm.Value100(tLedgerEntry."Remaining Amount",13),13) +
+                gVPMnm.TFR(GetInternalRefText(tLedgerEntry."Document No.",Type),28));
+              gNoOfPayments += 1;
+            UNTIL tLedgerEntry.NEXT = 0;
+
+            // Credit
+            tLedgerEntry.RESET;
+            tLedgerEntry.SETRANGE("Merging No.","Merging No.");
+            tLedgerEntry.SETFILTER("Remaining Amount",'>0');
+            tLedgerEntry.FINDSET;
+            REPEAT
+              WriteFile(80,'CNKR'+
+                gVPMnm.TFR(tLedgerEntry."External Document No.",35) +
+                gVPMnm.NFL(gVPMnm.Value100(tLedgerEntry."Remaining Amount",13),13) +
+                gVPMnm.TFR(GetInternalRefText(tLedgerEntry."Document No.",Type),28));
+              gNoOfPayments += 1;
+            UNTIL tLedgerEntry.NEXT = 0;
+          END ELSE
+            gNoOfPayments += 1;
+
+
+          IF PmtType = '02' THEN BEGIN // Utbetalnigskort
+            WriteFile(80,'BE01'+
+              gVPMnm.BLK(18)+
+              gVPMnm.TFR(tPayerSource.Name,33));
+
+            WriteFile(80,'BE02'+
+              gVPMnm.TFR(gVPMnm.ClearText(tPayerSource."Post Code"),9)+
+              gVPMnm.TFR(tPayerSource.City,25));
+
+            WriteFile(80,'BE03'+
+              gVPMnm.TFR(tPayerSource.Address,35)+
+              gVPMnm.TFR(tPayerSource."Address 2",35));
+
+          END;
+        UNTIL NEXT = 0;
+
+        WriteFile(80,'MT00'+
+          gVPMnm.BLK(25)+
+          gVPMnm.NFL(FORMAT(NoOfPayments),7)+
+          gVPMnm.NFL(gVPMnm.Value100(TotalAmount,15),15));
+      END;
+    END;
+
+    PROCEDURE CreateFileForeign@1070003(pPack@1070000 : Record 11128079;pCurrencyCode@12047959 : Code[10]);
+    VAR
+      PmtType@1070002 : Text[3];
+      ReceiverCode@1070004 : Text[33];
+      ReceiverLine1@1070005 : Text[33];
+      ReceiverLine2@1070006 : Text[33];
+      ContractNo@1070007 : Text[6];
+      TransferCode@1070008 : Text[1];
+      DueDate@1070010 : Date;
+      CreditMemoDueDate@1070011 : Date;
+      CurrencyCode@1070012 : Code[10];
+      AmountToPay@1100570004 : Decimal;
+      AmountToPayLCY@1100570003 : Decimal;
+      TotalAmount@1100570001 : Decimal;
+      NoOfPayments@12047960 : Integer;
+      Vendor@1100570008 : Record 23;
+      Currency@1100570009 : Record 4;
+      GiroType@1100570014 : Record 11128061;
+      VPPackEntry@1100570012 : Record 11128063;
+      VendorBankAccount@1100570011 : Record 288;
+      Pack2@12047958 : Record 11128079;
+      PayByAccountNo@12047961 : Code[35];
+      tLedgerEntryPayment@12047963 : TEMPORARY Record 11128074;
+      tLedgerEntry@12047962 : TEMPORARY Record 11128074;
+    BEGIN
+      GiroType.GET(pPack."Giro Type Code");
+      GiroType.TESTFIELD("Plus Giro No.");
+
+      VPPackEntry.RESET;
+      VPPackEntry.SETRANGE("Pack Entry No.",pPack."Entry No.");
+      VPPackEntry.SETRANGE("Payment Relation",VPPackEntry."Payment Relation"::Foreign);
+      VPPackEntry.SETFILTER("Payment from Currency Code",pCurrencyCode);
+      IF NOT gVPMnm.GetPaymentEntries(VPPackEntry,tLedgerEntryPayment,tLedgerEntry,TRUE,FALSE) THEN
+        EXIT;
+
+      CLEAR(TotalAmount);
+      CLEAR(NoOfPayments);
+
+      WriteFile(80,'MH00' +
+        gVPMnm.BLK(8)+
+        gVPMnm.TFR(gVPMnm.ClearText(gCompanyInfo."Registration No."),10) +
+        gVPMnm.BLK(12)+
+        gVPMnm.TFR(gPostGiroNo,10)+
+        gVPMnm.TFR(pCurrencyCode,3)+
+        gVPMnm.BLK(6)+
+        gVPMnm.TFR(pCurrencyCode,3));
+
+      WITH tLedgerEntryPayment DO BEGIN
+        FINDFIRST;
+        REPEAT
+          TESTFIELD(Open,TRUE);
+          CLEAR(PayByAccountNo);
+          VendorBankAccount.GET("No.","Bank Account Code");
+
+          CASE TRUE OF
+            "Remaining Amount" > 0: ERROR(BA008);
+            "Remaining Amount" = 0: ERROR(BA022);
+          END;
+
+          CLEAR(PmtType);
+          ReceiverCode := '1';
+          CLEAR(ReceiverLine1);
+          CLEAR(ReceiverLine2);
+          CLEAR(ContractNo);
+          TransferCode := '1';
+
+          Vendor.GET("No.");
+          IF gVPMnm.IsLocalCurr("Currency Code") THEN BEGIN
+            CLEAR(Currency);
+            CurrencyCode := gVPMnm.GetSEKEURCurrencyCode;
+          END ELSE BEGIN
+            Currency.GET("Currency Code");
+            CurrencyCode := "Currency Code";
+          END;
+
+          IF "Code for Bank of Sweden" = '' THEN
+            ERROR(BA013,
+                  "Document Type","External Document No.","Document No.",Vendor."No.",Vendor.Name);
+
+          CASE VendorBankAccount."Payment Type" OF
+            VendorBankAccount."Payment Type"::Account:
+              BEGIN
+                PmtType := 'SWT';
+                CASE TRUE OF
+                  VendorBankAccount.IBAN <> '':
+                    BEGIN
+                      PayByAccountNo := VendorBankAccount.IBAN;
+                      VendorBankAccount.TESTFIELD("SWIFT Code");
+                    END;
+                  gVPMnm.ClearText(VendorBankAccount."Bank Account No.") <> '':
+                    BEGIN
+                      PayByAccountNo := gVPMnm.ClearText(VendorBankAccount."Bank Account No.");
+                    END;
+                  ELSE
+                    ERROR(BA012,VendorBankAccount.FIELDCAPTION(IBAN),VendorBankAccount.FIELDCAPTION("Bank Account No."),Vendor."No.");
+                END;
+              END;
+            VendorBankAccount."Payment Type"::Check:
+              BEGIN
+                IF "Merging No." <> 0 THEN
+                  ERROR(BA021,Vendor."No.");
+                PmtType := 'CHK';
+              END;
+            ELSE
+              ERROR(BA010,VendorBankAccount.FIELDCAPTION("Payment Type"));
+          END;
+
+          IF "Due Date" < TODAY THEN BEGIN
+            DueDate := TODAY;
+            "Due Date" := TODAY;
+          END ELSE
+            DueDate := "Due Date";
+
+          AmountToPay := "Remaining Amount";
+          AmountToPayLCY := "Remaining Amt. (LCY)";
+
+
+          WriteFile(80,'PI00'+
+            '03'+
+            gVPMnm.BLK(18)+
+            gVPMnm.Date2Text(DueDate,8)+
+            gVPMnm.NFL(gVPMnm.Value100(AmountToPay,13),13)+
+            gVPMnm.BLK(21)+
+            gVPMnm.TFR("Code for Bank of Sweden",3)+
+            gVPMnm.BLK(2)+
+            gVPMnm.TFR(CurrencyCode,3)+
+            gVPMnm.BLK(2)+
+            'B');
+          IF "Merging No." = 0 THEN
+            WriteFile(80,'BA00'+
+              gVPMnm.BLK(27)+
+              gVPMnm.TFR(GetInternalRefText("Document No.",Type),35));
+
+          WriteFile(80,'BE00'+
+            gVPMnm.BLK(18)+
+            PmtType+
+            'S'+
+            gVPMnm.BLK(19)+
+            gVPMnm.TFR(PayByAccountNo,35));
+
+          Vendor.TESTFIELD(Name);
+          Vendor.TESTFIELD(Address);
+          Vendor.TESTFIELD("Country/Region Code");
+
+          WriteFile(80,'BE01'+
+            gVPMnm.BLK(18)+
+            gVPMnm.TFR(Vendor.Name,35)+
+            gVPMnm.TFR(Vendor."Country/Region Code",3));
+
+          WriteFile(80,'BE03'+
+            gVPMnm.TFR(Vendor.Address,35)+
+            gVPMnm.TFR(GetPostalCityAddressLine(Vendor."Post Code",Vendor.City,Vendor."Country/Region Code"),35));
+
+          IF "Merging No." = 0 THEN
+            WriteFile(80,'BM99'+
+              gVPMnm.TFR("External Document No.",35));
+
+
+          WriteFile(80,'IB01'+
+            gVPMnm.BLK(3)+
+            gVPMnm.TFR(VendorBankAccount."SWIFT Code",11)+
+            gVPMnm.BLK(9)+
+            gVPMnm.TFR(VendorBankAccount.Name,35)+
+            gVPMnm.TFR(VendorBankAccount."Transit No.",15));
+
+          WriteFile(80,'IB02'+
+            gVPMnm.BLK(13)+
+            gVPMnm.TFR(GetPostalCityAddressLine(VendorBankAccount."Post Code",VendorBankAccount.City,VendorBankAccount."Country/Region Code"),35));
+
+          WriteFile(80,'IB03'+
+            gVPMnm.TFR(VendorBankAccount.Address,35)+
+            gVPMnm.TFR(VendorBankAccount."Address 2",35));
+
+          TotalAmount += AmountToPay;
+          gTotalAmountLCY += AmountToPayLCY;
+          NoOfPayments += 1;
+
+          IF "Merging No." <> 0 THEN BEGIN
+            tLedgerEntry.RESET;
+            tLedgerEntry.SETRANGE("Merging No.","Merging No.");
+            IF tLedgerEntry.COUNT > 4  THEN
+              ERROR(BA020,4);
+
+            // Invoice
+            tLedgerEntry.RESET;
+            tLedgerEntry.SETRANGE("Merging No.","Merging No.");
+            tLedgerEntry.SETFILTER("Remaining Amount",'<0');
+            tLedgerEntry.FINDSET;
+            REPEAT
+              WriteFile(80,'CNDB'+
+                gVPMnm.TFR(tLedgerEntry."External Document No.",35) +
+                gVPMnm.NFL(gVPMnm.Value100(tLedgerEntry."Remaining Amount",13),13) +
+                gVPMnm.TFR(GetInternalRefText(tLedgerEntry."Document No.",Type),28));
+              gNoOfPayments += 1;
+            UNTIL tLedgerEntry.NEXT = 0;
+
+            // Credit
+            tLedgerEntry.RESET;
+            tLedgerEntry.SETRANGE("Merging No.","Merging No.");
+            tLedgerEntry.SETFILTER("Remaining Amount",'>0');
+            tLedgerEntry.FINDSET;
+            REPEAT
+              WriteFile(80,'CNKR'+
+                gVPMnm.TFR(tLedgerEntry."External Document No.",35) +
+                gVPMnm.NFL(gVPMnm.Value100(tLedgerEntry."Remaining Amount",13),13) +
+                gVPMnm.TFR(GetInternalRefText(tLedgerEntry."Document No.",Type),28));
+              gNoOfPayments += 1;
+            UNTIL tLedgerEntry.NEXT = 0;
+
+          END ELSE
+            gNoOfPayments += 1;
+
+        UNTIL NEXT = 0;
+
+        WriteFile(80,'MT00'+
+          gVPMnm.BLK(25)+
+          gVPMnm.NFL(FORMAT(NoOfPayments),7)+
+          gVPMnm.NFL(gVPMnm.Value100(TotalAmount,15),15));
+
+      END;
+    END;
+
+    PROCEDURE CheckPaymentRelation@12047958(pPack@12047958 : Record 11128079);
+    VAR
+      VPPackEntry@12047959 : Record 11128063;
+      VendorBankAccount@12047960 : Record 288;
+    BEGIN
+      VPPackEntry.RESET;
+      VPPackEntry.SETRANGE("Pack Entry No.",pPack."Entry No.");
+      VPPackEntry.SETRANGE("Payment Relation",VPPackEntry."Payment Relation"::" ");
+      VPPackEntry.SETRANGE(Type,VPPackEntry.Type::Vendor);
+      IF VPPackEntry.FINDSET THEN BEGIN
+        // Test Field to get a better Error Message
+        VendorBankAccount.GET(VPPackEntry."No.",VPPackEntry."Bank Account Code");
+        VendorBankAccount.TESTFIELD("Payment Relation");
+      END;
+
+      VPPackEntry.RESET;
+      VPPackEntry.SETRANGE("Pack Entry No.",pPack."Entry No.");
+      VPPackEntry.SETRANGE(Type,VPPackEntry.Type::Customer);
+      IF VPPackEntry.FINDSET THEN REPEAT
+        VPPackEntry."Payment Relation" := VPPackEntry."Payment Relation"::Domestic;
+        VPPackEntry.MODIFY;
+      UNTIL VPPackEntry.NEXT = 0;
+    END;
+
+    PROCEDURE WriteFile@1070040(pLength@1070000 : Integer;pText@1070001 : Text[250]);
+    BEGIN
+      IF STRLEN(pText) > pLength THEN
+        ERROR(BA002,pText,STRLEN(pText),pLength);
+      gFile.WRITE(PADSTR(pText,pLength));
+    END;
+
+    PROCEDURE OpenFile@1070005();
+    VAR
+      RBMgt@1100570001 : Codeunit 419;
+    BEGIN
+      gFile.TEXTMODE(TRUE);
+      gFile.WRITEMODE(TRUE);
+      gFromFile := RBMgt.ServerTempFileName('.txt');
+      gFile.CREATE(gFromFile);
+    END;
+
+    PROCEDURE CloseFile@1070009(pPack@1070000 : Record 11128079);
+    VAR
+      RBMgt@1100570000 : Codeunit 419;
+      VPPackEntry@12047958 : Record 11128063;
+    BEGIN
+      VPPackEntry.RESET;
+      VPPackEntry.SETRANGE("Pack Entry No.",pPack."Entry No.");
+      IF VPPackEntry.COUNT <> gNoOfPayments THEN
+        ERROR(BA017);
+
+      pPack.LOCKTABLE;
+      pPack.FIND;
+      pPack."Total Amount (LCY)" := -gTotalAmountLCY;
+      pPack.MODIFY;
+      gFile.CLOSE;
+
+      RBMgt.DownloadToFile(gFromFile,gVPMnm.SetFileName(pPack,gToFile));
+    END;
+
+    PROCEDURE GetPostalCityAddressLine@12047959(pPostCode@12047960 : Code[20];pCity@12047961 : Code[20];pCountry@12047962 : Code[20]) : Text;
+    VAR
+      AddrArray@12047967 : ARRAY [8] OF Text[90];
+      FormatAddress@12047968 : Codeunit 365;
+      Country@12047959 : Record 9;
+    BEGIN
+      FormatAddress.FormatAddr(AddrArray,'','','','','',pCity,pPostCode,'',pCountry);
+
+      IF NOT Country.GET(pCountry) THEN
+        EXIT('');
+
+      IF Country.Name <> AddrArray[2] THEN
+        EXIT('')
+      ELSE
+        EXIT(AddrArray[1]);
+    END;
+
+    PROCEDURE GetInternalRefText@1100570000(pDocNo@12047958 : Text;pType@12047959 : 'Vendor,Customer') : Text;
+    BEGIN
+      CASE pType OF
+        pType::Vendor : EXIT('Vernr: ' + pDocNo);
+        pType::Customer : EXIT('VKund: ' + pDocNo);
+        ELSE
+          ERROR('pType "%1" st”ds ej', pType);
+      END;
+    END;
+
+    BEGIN
+    {
+      PEB *** Begin ***
+      PEB0091 Banking
+      PEB
+      PEB *** End ***
+    }
+    END.
+  }
+}
+

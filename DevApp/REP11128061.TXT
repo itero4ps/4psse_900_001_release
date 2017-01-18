@@ -1,0 +1,319 @@
+OBJECT Report 11128061 VP Create Payment Suggestions
+{
+  OBJECT-PROPERTIES
+  {
+    Date=;
+    Time=;
+    Version List=PE6.03.06 (12048858);
+  }
+  PROPERTIES
+  {
+    CaptionML=ENU=VP Create Payment Suggestions;
+    ProcessingOnly=Yes;
+    OnPreReport=BEGIN
+                  IF (NOT IncludeVendPayments) AND (NOT IncludeCustPayments) THEN
+                    ERROR(BA002);
+
+                  gGiroType.TESTFIELD(Code);
+                  gPaymentSuggestionLine.RESET;
+                  gPaymentSuggestionLine.SETRANGE("Giro Type Code",gGiroType.Code);
+                  gPaymentSuggestionLine.DELETEALL;
+
+                  CLEAR(gPaymentSuggestionLine);
+                  gPaymentSuggestionLine."Giro Type Code" := gGiroType.Code;
+                  tVendorLedgerEntry.RESET;
+                  tVendorLedgerEntry.DELETEALL;
+                  tCustLedgerEntry.RESET;
+                  tCustLedgerEntry.DELETEALL;
+                END;
+
+    OnPostReport=BEGIN
+                   CleanFromVendorsWithZeroOrCredit;
+
+                   tVendorLedgerEntry.RESET;
+                   tVendorLedgerEntry.SETCURRENTKEY("Vendor No.","Currency Code");
+                   IF tVendorLedgerEntry.FINDSET AND IncludeVendPayments THEN REPEAT
+                     gPaymentSuggestionLine.INIT;
+                     gPaymentSuggestionLine."Line No." += 10000;
+                     gPaymentSuggestionLine.Type :=   gPaymentSuggestionLine.Type::Vendor;
+                     gPaymentSuggestionLine."No." := tVendorLedgerEntry."Vendor No.";
+                     gPaymentSuggestionLine.VALIDATE("Ledger Entry No.",tVendorLedgerEntry."Entry No.");
+                     IF UsePaymentDisc AND
+                        (tVendorLedgerEntry."Remaining Pmt. Disc. Possible" <> 0) AND
+                        (tVendorLedgerEntry."Pmt. Discount Date" >= TODAY)
+                     THEN
+                       gPaymentSuggestionLine.VALIDATE("Due Date/Payment Date", tVendorLedgerEntry."Pmt. Discount Date");
+
+                     gPaymentSuggestionLine.INSERT;
+                   UNTIL tVendorLedgerEntry.NEXT = 0;
+
+                   tCustLedgerEntry.RESET;
+                   tCustLedgerEntry.SETCURRENTKEY("Customer No.","Currency Code");
+                   IF tCustLedgerEntry.FINDSET AND IncludeCustPayments THEN REPEAT
+                     gPaymentSuggestionLine.INIT;
+                     gPaymentSuggestionLine."Line No." += 10000;
+                     gPaymentSuggestionLine.Type := gPaymentSuggestionLine.Type::Customer;
+                     gPaymentSuggestionLine."No." := CustLedgerEntry."Customer No.";
+                     gPaymentSuggestionLine.VALIDATE("Ledger Entry No.",tCustLedgerEntry."Entry No.");
+                     IF UsePaymentDisc AND
+                        (tCustLedgerEntry."Remaining Pmt. Disc. Possible" <> 0) AND
+                        (tCustLedgerEntry."Pmt. Discount Date" >= TODAY)
+                     THEN
+                       gPaymentSuggestionLine.VALIDATE("Due Date/Payment Date", tCustLedgerEntry."Pmt. Discount Date");
+
+                     gPaymentSuggestionLine.INSERT;
+                   UNTIL tCustLedgerEntry.NEXT = 0;
+                 END;
+
+  }
+  DATASET
+  {
+    { 1100570000;;DataItem;                  ;
+               DataItemTable=Table288;
+               DataItemTableView=SORTING(Vendor No.,Code)
+                                 WHERE(Giro Type Code=FILTER(<>''));
+               OnPreDataItem=BEGIN
+                               SETRANGE("Giro Type Code",gGiroType.Code);
+                             END;
+                              }
+
+    { 1100570001;1;DataItem;                 ;
+               DataItemTable=Table25;
+               DataItemTableView=SORTING(Vendor No.,Open,Positive,Due Date,Currency Code)
+                                 WHERE(Open=CONST(Yes),
+                                       VP Pack No.=CONST(0),
+                                       On Hold=CONST());
+               OnPreDataItem=BEGIN
+                               // Get Invoices
+                               VendorLedgerEntry.RESET;
+                               VendorLedgerEntry.COPY("Vendor Ledger Entry");
+                               VendorLedgerEntry.SETRANGE("Document Type",VendorLedgerEntry."Document Type"::Invoice);
+                               IF UsePaymentDisc THEN
+                                 VendorLedgerEntry.SETRANGE("Remaining Pmt. Disc. Possible",0);
+                               IF LastDueDateToPayReq <> 0D THEN
+                                 VendorLedgerEntry.SETRANGE("Due Date",0D,LastDueDateToPayReq);
+                               IF VendorLedgerEntry.FINDSET THEN REPEAT
+                                 gVendor.GET(VendorLedgerEntry."Vendor No.");
+                                 IF gVendor.Blocked = gVendor.Blocked::" " THEN BEGIN
+                                   AggregateSource(VendorLedgerEntry);
+                                   tVendorLedgerEntry := VendorLedgerEntry;
+                                   IF tVendorLedgerEntry.INSERT THEN;
+                                 END;
+                               UNTIL VendorLedgerEntry.NEXT = 0;
+
+                               // Get all Credit Memos without Due Date filter
+                               VendorLedgerEntry.RESET;
+                               VendorLedgerEntry.COPY("Vendor Ledger Entry");
+                               VendorLedgerEntry.SETFILTER("Document Type",'<>%1',VendorLedgerEntry."Document Type"::Invoice);
+                               VendorLedgerEntry.SETRANGE("Due Date");
+                               IF VendorLedgerEntry.FINDSET THEN REPEAT
+                                 gVendor.GET(VendorLedgerEntry."Vendor No.");
+                                 IF gVendor.Blocked = gVendor.Blocked::" " THEN BEGIN
+                                   AggregateSource(VendorLedgerEntry);
+                                   tVendorLedgerEntry := VendorLedgerEntry;
+                                   IF tVendorLedgerEntry.INSERT THEN;
+                                 END;
+                               UNTIL VendorLedgerEntry.NEXT = 0;
+
+                               IF UsePaymentDisc THEN BEGIN
+                                 VendorLedgerEntry.RESET;
+                                 VendorLedgerEntry.COPY("Vendor Ledger Entry");
+                                 VendorLedgerEntry.SETFILTER("Remaining Pmt. Disc. Possible",'<>0');
+                                 VendorLedgerEntry.SETRANGE("Due Date");
+                                 IF LastDueDateToPayReq <> 0D THEN
+                                   VendorLedgerEntry.SETRANGE("Pmt. Discount Date",0D,LastDueDateToPayReq);
+                                 IF VendorLedgerEntry.FINDSET THEN REPEAT
+                                   gVendor.GET(VendorLedgerEntry."Vendor No.");
+                                   IF gVendor.Blocked = gVendor.Blocked::" " THEN BEGIN
+                                     AggregateSource(VendorLedgerEntry);
+                                     tVendorLedgerEntry := VendorLedgerEntry;
+                                     IF tVendorLedgerEntry.INSERT THEN;
+                                   END;
+                                 UNTIL VendorLedgerEntry.NEXT = 0;
+                               END;
+                             END;
+
+               ReqFilterFields=Vendor No.,Posting Date;
+               DataItemLink=Vendor No.=FIELD(Vendor No.) }
+
+    { 1100570003;;DataItem;                  ;
+               DataItemTable=Table287;
+               DataItemTableView=SORTING(Customer No.,Code)
+                                 WHERE(Giro Type Code=FILTER(<>''));
+               OnPreDataItem=BEGIN
+                               SETRANGE("Giro Type Code",gGiroType.Code);
+                             END;
+                              }
+
+    { 1100570002;1;DataItem;                 ;
+               DataItemTable=Table21;
+               DataItemTableView=SORTING(Customer No.,Open,Positive,Due Date,Currency Code)
+                                 WHERE(Open=CONST(Yes),
+                                       Remaining Amount=FILTER(<0),
+                                       VP Pack No.=CONST(0),
+                                       On Hold=CONST());
+               OnPreDataItem=BEGIN
+                               CustLedgerEntry.RESET;
+                               CustLedgerEntry.COPY("Cust. Ledger Entry");
+                               IF UsePaymentDisc THEN
+                                 CustLedgerEntry.SETRANGE("Remaining Pmt. Disc. Possible",0);
+                               IF LastDueDateToPayReq <> 0D THEN
+                                 CustLedgerEntry.SETRANGE("Due Date",0D,LastDueDateToPayReq);
+                               IF CustLedgerEntry.FINDSET THEN REPEAT
+                                 Cust.GET(CustLedgerEntry."Customer No.");
+                                 IF Cust.Blocked = Cust.Blocked::" " THEN BEGIN
+                                   tCustLedgerEntry := CustLedgerEntry;
+                                   IF tCustLedgerEntry.INSERT THEN;
+                                 END;
+                               UNTIL CustLedgerEntry.NEXT = 0;
+
+                               IF UsePaymentDisc THEN BEGIN
+                                 CustLedgerEntry.RESET;
+                                 CustLedgerEntry.COPY("Cust. Ledger Entry");
+                                 CustLedgerEntry.SETFILTER("Remaining Pmt. Disc. Possible",'<>0');
+                                 CustLedgerEntry.SETRANGE("Due Date");
+                                 IF LastDueDateToPayReq <> 0D THEN
+                                   CustLedgerEntry.SETRANGE("Pmt. Discount Date",0D,LastDueDateToPayReq);
+                                 IF CustLedgerEntry.FINDSET THEN REPEAT
+                                   Cust.GET(CustLedgerEntry."Customer No.");
+                                   IF Cust.Blocked = Cust.Blocked::" " THEN BEGIN
+                                     tCustLedgerEntry := CustLedgerEntry;
+                                     IF tCustLedgerEntry.INSERT THEN;
+                                   END;
+                                 UNTIL CustLedgerEntry.NEXT = 0;
+                               END;
+                             END;
+
+               ReqFilterFields=Customer No.,Posting Date;
+               DataItemLink=Customer No.=FIELD(Customer No.) }
+
+  }
+  REQUESTPAGE
+  {
+    PROPERTIES
+    {
+      OnOpenPage=BEGIN
+                   IncludeVendPayments := TRUE;
+                   IncludeCustPayments := TRUE;
+                 END;
+
+    }
+    CONTROLS
+    {
+      { 12047962;0;Container;
+                  ContainerType=ContentArea }
+
+      { 12047961;1;Group    ;
+                  CaptionML=ENU=Options;
+                  GroupType=Group }
+
+      { 12047959;2;Field    ;
+                  Name=LastPaymentDate;
+                  CaptionML=ENU=Last Payment Date;
+                  SourceExpr=LastDueDateToPayReq }
+
+      { 12047958;2;Field    ;
+                  Name=UsePaymentDisc;
+                  CaptionML=ENU=Find Payment Discounts;
+                  SourceExpr=UsePaymentDisc;
+                  MultiLine=Yes }
+
+      { 12047960;2;Field    ;
+                  Name=IncludeVendPayments;
+                  CaptionML=ENU=Include Vendor Payments;
+                  SourceExpr=IncludeVendPayments }
+
+      { 12047963;2;Field    ;
+                  Name=IncludeCustPayments;
+                  CaptionML=ENU=Include Customer Payments;
+                  SourceExpr=IncludeCustPayments }
+
+      { 12047964;2;Field    ;
+                  Name=ExcludeVendorsWithBalances;
+                  CaptionML=ENU=Exclude Vendors with Balances that are;
+                  OptionCaptionML=ENU=" ,Crediting,Zero,Crediting & Zero";
+                  SourceExpr=ExcludeVendorsWithBalancesThatAre }
+
+    }
+  }
+  LABELS
+  {
+  }
+  CODE
+  {
+    VAR
+      VendorBankAccount@1100570000 : Record 288;
+      gPaymentSuggestionLine@1100570002 : Record 11128065;
+      gGiroType@1100570003 : Record 11128061;
+      gVendor@12047958 : Record 23;
+      CodeforBankofSweden@1100570005 : Code[10];
+      UsePaymentDisc@12047959 : Boolean;
+      tVendorLedgerEntry@12047960 : TEMPORARY Record 25;
+      VendorLedgerEntry@12047961 : Record 25;
+      LastDueDateToPayReq@12047962 : Date;
+      CustBankAccount@1100570001 : Record 287;
+      tCustLedgerEntry@1100570006 : TEMPORARY Record 21;
+      CustLedgerEntry@1100570004 : Record 21;
+      Cust@1100570007 : Record 18;
+      IncludeVendPayments@12047964 : Boolean;
+      IncludeCustPayments@12047965 : Boolean;
+      BA002@12047966 : TextConst 'ENU=You must choose Include Vendor Payments or Include Customer Payments';
+      tSourceAggregate@12047967 : TEMPORARY Record 11128076;
+      ExcludeVendorsWithBalancesThatAre@12047969 : ' ,Crediting,Zero,Crediting & Zero';
+
+    PROCEDURE SetGiroTypeCode@1100570000(pGiroTypeCode@1100570000 : Code[10]);
+    BEGIN
+      gGiroType.Code := pGiroTypeCode;
+    END;
+
+    LOCAL PROCEDURE AggregateSource@12047958(VendorLedgerEntry@12047959 : Record 25);
+    BEGIN
+      IF ExcludeVendorsWithBalancesThatAre = ExcludeVendorsWithBalancesThatAre::" " THEN
+        EXIT;
+      VendorLedgerEntry.CALCFIELDS("Remaining Amount");
+      tSourceAggregate."Source Type" := tSourceAggregate."Source Type"::Vendor;
+      tSourceAggregate."Source No." := VendorLedgerEntry."Vendor No.";
+      tSourceAggregate."Currency Code" := VendorLedgerEntry."Currency Code";
+      IF NOT tSourceAggregate.FIND THEN BEGIN
+        tSourceAggregate.Amount := VendorLedgerEntry."Remaining Amount";
+        tSourceAggregate.INSERT;
+      END ELSE BEGIN
+        tSourceAggregate.Amount += VendorLedgerEntry."Remaining Amount";
+        tSourceAggregate.MODIFY;
+      END;
+    END;
+
+    LOCAL PROCEDURE CleanFromVendorsWithZeroOrCredit@12047980();
+    BEGIN
+      IF ExcludeVendorsWithBalancesThatAre = ExcludeVendorsWithBalancesThatAre::" " THEN
+        EXIT;
+
+      tSourceAggregate.RESET;
+      tSourceAggregate.SETRANGE("Source Type",tSourceAggregate."Source Type"::Vendor);
+      CASE ExcludeVendorsWithBalancesThatAre OF
+        ExcludeVendorsWithBalancesThatAre::Crediting: tSourceAggregate.SETFILTER(Amount,'>0');
+        ExcludeVendorsWithBalancesThatAre::Zero: tSourceAggregate.SETRANGE(Amount,0);
+        ExcludeVendorsWithBalancesThatAre::"Crediting & Zero": tSourceAggregate.SETFILTER(Amount,'0..');
+      END;
+      IF tSourceAggregate.FINDSET THEN REPEAT
+        tVendorLedgerEntry.RESET;
+        tVendorLedgerEntry.SETRANGE("Vendor No.",tSourceAggregate."Source No.");
+        tVendorLedgerEntry.SETRANGE("Currency Code",tSourceAggregate."Currency Code");
+        tVendorLedgerEntry.DELETEALL;
+      UNTIL tSourceAggregate.NEXT = 0;
+    END;
+
+    BEGIN
+    {
+      PEB *** Begin ***
+      PEB0091 Banking
+      PEB
+      PEB *** End ***
+    }
+    END.
+  }
+  RDLDATA
+  {
+  }
+}
+
